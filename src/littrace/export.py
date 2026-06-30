@@ -4,19 +4,28 @@ import json
 import re
 
 from littrace.citations import citation_records_for_papers
+from littrace.config import LitTraceConfig, load_config
 from littrace.models import LiteratureWorkspace
+from littrace.quality_report import build_quality_report
 from littrace.session import ChatSession
 from littrace.storyline import build_storyline_from_workspace
 from littrace.tables import build_comparison_matrices
 
 
-def export_session_bundle(session: ChatSession, workspace: LiteratureWorkspace) -> dict[str, str]:
+def export_session_bundle(
+    session: ChatSession,
+    workspace: LiteratureWorkspace,
+    config: LitTraceConfig | None = None,
+) -> dict[str, str]:
+    config = config or load_config()
     session.artifacts_dir.mkdir(parents=True, exist_ok=True)
     markdown_path = session.artifacts_dir / "research_brief.md"
     bibtex_path = session.artifacts_dir / "references.bib"
     ris_path = session.artifacts_dir / "references.ris"
     acs_path = session.artifacts_dir / "references_acs.txt"
     nature_path = session.artifacts_dir / "references_nature.txt"
+    quality_path = session.artifacts_dir / "quality_report.json"
+    si_path = session.artifacts_dir / "supplementary_links.json"
     json_path = session.artifacts_dir / "workspace_export.json"
 
     markdown_path.write_text(render_markdown_brief(workspace), encoding="utf-8")
@@ -24,6 +33,14 @@ def export_session_bundle(session: ChatSession, workspace: LiteratureWorkspace) 
     ris_path.write_text(render_ris(workspace), encoding="utf-8")
     acs_path.write_text(render_numbered_references(workspace, style="acs"), encoding="utf-8")
     nature_path.write_text(render_numbered_references(workspace, style="nature"), encoding="utf-8")
+    quality_path.write_text(
+        build_quality_report(config, workspace).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    si_path.write_text(
+        json.dumps(workspace.supplementary_links, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     json_path.write_text(
         json.dumps(workspace.model_dump(mode="json"), ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -35,6 +52,8 @@ def export_session_bundle(session: ChatSession, workspace: LiteratureWorkspace) 
         "ris": str(ris_path),
         "acs": str(acs_path),
         "nature": str(nature_path),
+        "quality": str(quality_path),
+        "supplementary": str(si_path),
         "json": str(json_path),
     }
 

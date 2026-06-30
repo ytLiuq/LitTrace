@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from littrace.config import load_config
+from littrace.config_wizard import write_config_template
 
 
 def test_load_config_reads_env_local_without_config_file(monkeypatch, tmp_path):
@@ -24,3 +25,13 @@ def test_load_config_reads_env_local_without_config_file(monkeypatch, tmp_path):
     assert config.llm.api_key == "test-key"
     assert config.llm.base_url == "https://example.com"
     assert config.llm.model == "deepseek-test"
+
+
+def test_write_config_template_creates_yaml(tmp_path):
+    target = tmp_path / "config.yaml"
+
+    result = write_config_template(target)
+
+    assert result.created
+    assert target.exists()
+    assert "unpaywall_email" in target.read_text(encoding="utf-8")

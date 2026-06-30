@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -259,12 +260,35 @@ def merge_papers(papers: list[PaperMetadata]) -> list[PaperMetadata]:
     merged: dict[str, PaperMetadata] = {}
     for paper in papers:
         key = paper.doi.lower() if paper.doi else _title_key(paper.title)
+        if paper.doi is None:
+            fuzzy_key = _find_fuzzy_title_key(merged, paper)
+            if fuzzy_key:
+                key = fuzzy_key
         existing = merged.get(key)
         if existing is None:
             merged[key] = paper
             continue
         merged[key] = _merge_paper(existing, paper)
     return list(merged.values())
+
+
+def _find_fuzzy_title_key(merged: dict[str, PaperMetadata], paper: PaperMetadata) -> str | None:
+    candidate = _title_tokens(paper.title)
+    if not candidate:
+        return None
+    for key, existing in merged.items():
+        if paper.year and existing.year and abs(paper.year - existing.year) > 1:
+            continue
+        existing_tokens = _title_tokens(existing.title)
+        overlap = len(candidate & existing_tokens) / max(len(candidate | existing_tokens), 1)
+        same_first_author = (
+            bool(paper.authors)
+            and bool(existing.authors)
+            and paper.authors[0].split()[-1].lower() == existing.authors[0].split()[-1].lower()
+        )
+        if overlap >= 0.82 or (overlap >= 0.68 and same_first_author):
+            return key
+    return None
 
 
 def rank_papers(papers: list[PaperMetadata], request: PaperSearchRequest) -> list[PaperMetadata]:
@@ -358,6 +382,15 @@ def _bounded(value: float | int | None) -> float | None:
 
 def _title_key(title: str) -> str:
     return _slug(title).lower()
+
+
+def _title_tokens(title: str) -> set[str]:
+    stopwords = {"the", "a", "an", "of", "and", "for", "with", "by", "on", "in", "to"}
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", title.lower())
+        if len(token) > 2 and token not in stopwords
+    }
 
 
 def _merge_paper(left: PaperMetadata, right: PaperMetadata) -> PaperMetadata:

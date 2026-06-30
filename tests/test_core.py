@@ -104,6 +104,29 @@ def test_merge_papers_deduplicates_by_doi_and_prefers_oa():
     assert str(papers[0].pdf_url) == "https://example.org/paper.pdf"
 
 
+def test_merge_papers_deduplicates_fuzzy_titles_with_same_author_year():
+    papers = merge_papers(
+        [
+            PaperMetadata(
+                paper_id="left",
+                title="MXene flexible pressure sensor with improved cycling stability",
+                authors=["Ada Lovelace"],
+                year=2026,
+            ),
+            PaperMetadata(
+                paper_id="right",
+                title="MXene Flexible Pressure Sensors with Improved Cycling Stability",
+                authors=["Ada Lovelace"],
+                year=2026,
+                abstract="Merged abstract.",
+            ),
+        ]
+    )
+
+    assert len(papers) == 1
+    assert papers[0].abstract == "Merged abstract."
+
+
 def test_rank_papers_prefers_recent_papers_when_other_signals_match():
     papers = rank_papers(
         [

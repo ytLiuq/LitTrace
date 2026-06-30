@@ -20,6 +20,7 @@ from littrace.auto_resume import AutoResumeResult, auto_resume_downloaded_pdfs
 from littrace.citations import audit_citation_links, citation_records_for_papers
 from littrace.chat import handle_chat
 from littrace.config import load_config
+from littrace.config_wizard import ConfigWizardResult, write_config_template
 from littrace.context import apply_context_update
 from littrace.downloads import execute_downloads
 from littrace.export import export_session_bundle
@@ -57,6 +58,7 @@ from littrace.publisher_retrieval import (
     merge_retrieval_result_into_workspace,
     parse_publisher_article_html,
 )
+from littrace.quality_report import QualityReport, build_quality_report
 from littrace.session import (
     append_message,
     load_or_create_session,
@@ -73,6 +75,7 @@ from littrace.supplementary import (
 )
 from littrace.source_router import route_sources
 from littrace.workflow import run_research_graph, run_search_preview
+from littrace.tracing import append_trace
 
 app = FastAPI(title="LitTrace API", version="0.1.0")
 
@@ -82,6 +85,11 @@ WORKSPACE = LiteratureWorkspace()
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/config/init", response_model=ConfigWizardResult)
+def config_init(path: str = "config.yaml", overwrite: bool = False) -> ConfigWizardResult:
+    return write_config_template(path, overwrite=overwrite)
 
 
 @app.get("/sources/materials-chemistry")
@@ -102,7 +110,9 @@ def agents_status() -> list[AgentRuntimeStatus]:
 @app.post("/search/preview", response_model=LiteratureWorkspace)
 async def search_preview(request: PaperSearchRequest) -> LiteratureWorkspace:
     global WORKSPACE
-    WORKSPACE = await run_search_preview(request, load_config())
+    config = load_config()
+    WORKSPACE = await run_search_preview(request, config)
+    append_trace(config, "search_preview", {"topic": request.topic, "papers": len(WORKSPACE.papers)})
     return WORKSPACE
 
 
@@ -135,6 +145,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     save_workspace(session, WORKSPACE)
     append_message(session, "user", request)
     append_message(session, "assistant", response)
+    append_trace(config, "chat", {"action": response.action, "session_id": session.session_id})
     return response
 
 
@@ -240,6 +251,7 @@ def downloads_resume(session_id: str | None = None) -> AutoResumeResult:
     WORKSPACE, result = auto_resume_downloaded_pdfs(config, WORKSPACE, session)
     if session:
         save_workspace(session, WORKSPACE)
+    append_trace(config, "downloads_resume", result.model_dump(mode="json"))
     return result
 
 
@@ -338,3 +350,8 @@ def eval_end_to_end(topic: str | None = None) -> EvalMetricReport:
 @app.get("/eval/golden", response_model=GoldenEvalReport)
 def eval_golden() -> GoldenEvalReport:
     return run_golden_eval(load_config())
+
+
+@app.get("/quality", response_model=QualityReport)
+def quality() -> QualityReport:
+    return build_quality_report(load_config(), WORKSPACE)

@@ -7,6 +7,7 @@ from littrace.attachments import attach_pdf_to_paper, check_download_presence
 from littrace.auto_resume import auto_resume_downloaded_pdfs
 from littrace.chat import handle_chat
 from littrace.config import load_config
+from littrace.config_wizard import write_config_template
 from littrace.export import export_session_bundle
 from littrace.golden_eval import run_golden_eval
 from littrace.login_flow import launch_login_for_paper
@@ -17,6 +18,7 @@ from littrace.publisher_retrieval import (
     fetch_publisher_search_results,
     merge_retrieval_result_into_workspace,
 )
+from littrace.quality_report import build_quality_report
 from littrace.session import append_message, create_chat_session, save_workspace
 from littrace.storyline import render_structured_storyline_report
 from littrace.storyline_review import review_storyline
@@ -47,7 +49,7 @@ async def run_shell() -> None:
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /attach N path.pdf /attach-si N path /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
+        "/dashboard /quality /init-config /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -82,6 +84,20 @@ async def run_shell() -> None:
             continue
         if message in {"/dashboard", "/tui"}:
             print(format_dashboard(state))
+            continue
+        if message == "/quality":
+            report = build_quality_report(config, state.workspace)
+            print("Quality metrics:")
+            for name, value in report.metrics.items():
+                print(f"- {name}: {value}")
+            if report.warnings:
+                print("注意：" + "；".join(report.warnings[:8]))
+            continue
+        if message == "/init-config":
+            result = write_config_template()
+            print(f"Config: {'created' if result.created else 'not changed'} at {result.path}")
+            if result.warnings:
+                print("注意：" + "；".join(result.warnings))
             continue
         if message == "/parse":
             message = "解析当前文献全文"

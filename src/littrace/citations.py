@@ -5,6 +5,7 @@ from collections.abc import Iterable
 
 import httpx
 
+from littrace.cache import cache_key, read_text_cache, write_text_cache
 from littrace.config import LitTraceConfig
 from littrace.harnesses import check_citations
 from littrace.models import CitationAudit, CitationRecord, LinkStatus, PaperMetadata
@@ -37,7 +38,7 @@ async def audit_citation_links(
     timeout = httpx.Timeout(config.api.request_timeout_seconds)
     headers = {"User-Agent": config.api.user_agent}
     async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=False) as client:
-        checked_records = [await check_link(client, record) for record in records]
+        checked_records = [await check_link(client, record, config) for record in records]
     result = check_citations(checked_records)
     return CitationAudit(
         records=checked_records,
@@ -51,7 +52,12 @@ async def audit_citation_links(
 async def check_link(
     client: httpx.AsyncClient,
     record: CitationRecord,
+    config: LitTraceConfig | None = None,
 ) -> CitationRecord:
+    if config is not None:
+        cached = read_text_cache(config, "citation_links", cache_key(str(record.access_url)))
+        if cached:
+            return CitationRecord.model_validate_json(cached)
     try:
         response = await client.head(str(record.access_url))
         if response.status_code == 405:
@@ -59,14 +65,29 @@ async def check_link(
     except httpx.HTTPError as exc:
         record.link_status = LinkStatus.FAILED
         record.error = f"{exc.__class__.__name__}: {exc}"
+        if config is not None:
+            write_text_cache(
+                config,
+                "citation_links",
+                cache_key(str(record.access_url)),
+                record.model_dump_json(),
+            )
         return record
 
     record.status_code = response.status_code
-    return _with_link_check_result(
+    checked = _with_link_check_result(
         record,
         status_code=response.status_code,
         checked_url=response.headers.get("location") or str(record.access_url),
     )
+    if config is not None:
+        write_text_cache(
+            config,
+            "citation_links",
+            cache_key(str(record.access_url)),
+            checked.model_dump_json(),
+        )
+    return checked
 
 
 def _with_link_check_result(

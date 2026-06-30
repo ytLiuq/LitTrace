@@ -52,6 +52,10 @@ def test_search_context_and_download_plan_api():
     statuses = response.json()
     assert any(status["workflow_node"] == "route_publishers" for status in statuses)
 
+    response = client.get("/quality")
+    assert response.status_code == 200
+    assert "metrics" in response.json()
+
     response = client.get("/publishers/routes")
     assert response.status_code == 200
     publisher_routes = response.json()

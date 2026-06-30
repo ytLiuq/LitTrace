@@ -72,6 +72,8 @@ Shell commands:
 /show-context
 /papers
 /dashboard
+/quality
+/init-config
 /login N
 /attach N /path/to/paper.pdf
 /attach-si N /path/to/si.pdf
@@ -174,6 +176,8 @@ curl -X POST http://127.0.0.1:8000/chat \
   -d '{"message":"检索 MXene flexible sensor 的最新论文","live":false}'
 
 curl http://127.0.0.1:8000/context
+curl -X POST "http://127.0.0.1:8000/config/init?path=config.yaml"
+curl http://127.0.0.1:8000/quality
 curl http://127.0.0.1:8000/citations/context
 curl -X POST http://127.0.0.1:8000/citations/audit
 curl -X POST http://127.0.0.1:8000/downloads/plan

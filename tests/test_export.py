@@ -62,7 +62,16 @@ def test_export_session_bundle_writes_artifacts(tmp_path):
 
     paths = export_session_bundle(session, workspace)
 
-    assert set(paths) == {"markdown", "bibtex", "ris", "acs", "nature", "json"}
+    assert set(paths) == {
+        "markdown",
+        "bibtex",
+        "ris",
+        "acs",
+        "nature",
+        "quality",
+        "supplementary",
+        "json",
+    }
     assert all((tmp_path / session.session_id) in path.parents for path in map(__import__("pathlib").Path, paths.values()))
 
 
