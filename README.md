@@ -126,7 +126,11 @@ page and stores page-aware evidence spans.
   Unpaywall, and preferred publisher families.
 - `Citation Verifier` builds citation records and audits access links.
 - `Access Manager` plans compliant downloads and marks login-required papers
-  instead of bypassing authentication.
+  instead of bypassing authentication. Login-required papers return an
+  `open_login_popup` action with the authorized URL, target path, and manual
+  handoff instructions.
+- `Publisher Connector` maps papers to publisher families such as ACS, Wiley,
+  Nature, MDPI, RSC, and Elsevier, then emits DOI/publisher access routes.
 - `PDF/OCR Parser` exposes metadata-only, Docling, and PaddleOCR tools.
 - `Table Agent` extracts performance cells into evidence-preserving matrices.
 - `Research Storyline Agent` builds conservative solution-limit-response chains
@@ -159,6 +163,8 @@ curl -X POST http://127.0.0.1:8000/parse/context
 curl -X POST http://127.0.0.1:8000/tables/extract
 curl http://127.0.0.1:8000/tables/matrix
 curl http://127.0.0.1:8000/agents/crew
+curl http://127.0.0.1:8000/agents/status
+curl http://127.0.0.1:8000/publishers/routes
 ```
 
 `/citations/audit` treats `requires_login` as a valid, traceable access state:

@@ -47,6 +47,17 @@ def test_search_context_and_download_plan_api():
     roles = response.json()
     assert any(role["name"] == "Citation Verifier" for role in roles)
 
+    response = client.get("/agents/status")
+    assert response.status_code == 200
+    statuses = response.json()
+    assert any(status["workflow_node"] == "route_publishers" for status in statuses)
+
+    response = client.get("/publishers/routes")
+    assert response.status_code == 200
+    publisher_routes = response.json()
+    assert len(publisher_routes["routes"]) == 3
+    assert any(route["publisher_family"] == "acs" for route in publisher_routes["routes"])
+
     response = client.post("/downloads/execute", json={"paper_ids": [], "dry_run": True})
     assert response.status_code == 200
     result = response.json()
@@ -68,6 +79,7 @@ def test_search_context_and_download_plan_api():
     workflow = response.json()
     assert workflow["citation_audit"] is None
     assert workflow["download_plan"] is None
+    assert workflow["publisher_routes"] is not None
     assert workflow["parse_report"] is not None
     assert workflow["table_harness"] is not None
     assert workflow["comparison_matrix"] is not None
@@ -90,6 +102,10 @@ def test_search_context_and_download_plan_api():
     assert response.json()["action"] == "list_context"
     session_id = response.json()["session_id"]
     assert session_id
+
+    response = client.post("/chat", json={"message": "agent状态"})
+    assert response.status_code == 200
+    assert response.json()["action"] == "agent_status"
 
     response = client.post(f"/sessions/{session_id}/export")
     assert response.status_code == 200

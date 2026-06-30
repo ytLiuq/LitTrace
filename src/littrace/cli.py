@@ -89,6 +89,10 @@ async def run_shell() -> None:
                 f"下载计划：{response.download_plan.downloadable_count} 篇可处理，"
                 f"{response.download_plan.requires_login_count} 篇需要登录。"
             )
+        if response.publisher_routes:
+            routes = response.publisher_routes.get("routes", [])
+            login_count = sum(1 for route in routes if route.get("requires_login"))
+            print(f"出版商路线：{len(routes)} 条，{login_count} 条可能需要登录。")
         if response.comparison_matrix:
             print(f"性能矩阵：{len(response.comparison_matrix.matrices)} 个指标组。")
         if response.warnings:

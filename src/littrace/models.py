@@ -107,6 +107,7 @@ class DownloadExecutionItem(BaseModel):
     status: str
     target_path: str | None = None
     login_url: HttpUrl | None = None
+    login_instructions: list[str] = Field(default_factory=list)
     error: str | None = None
 
 
@@ -141,6 +142,7 @@ class ResearchRunRequest(BaseModel):
     search: PaperSearchRequest
     audit_citations: bool = True
     plan_downloads: bool = True
+    route_publishers: bool = True
     parse_full_text: bool = False
     extract_tables: bool = False
     build_storyline: bool = False
@@ -150,6 +152,7 @@ class ResearchRunResult(BaseModel):
     workspace: LiteratureWorkspace
     citation_audit: CitationAudit | None = None
     download_plan: DownloadPlan | None = None
+    publisher_routes: object | None = None
     parse_report: dict[str, object] | None = None
     table_harness: dict[str, object] | None = None
     comparison_matrix: "ComparisonMatrixReport | None" = None
@@ -171,6 +174,7 @@ class ChatResponse(BaseModel):
     research_result: ResearchRunResult | None = None
     citations: list[CitationRecord] = Field(default_factory=list)
     download_plan: DownloadPlan | None = None
+    publisher_routes: object | None = None
     comparison_matrix: "ComparisonMatrixReport | None" = None
     warnings: list[str] = Field(default_factory=list)
 

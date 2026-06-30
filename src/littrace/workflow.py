@@ -8,6 +8,7 @@ from littrace.context import add_papers
 from littrace.config import LitTraceConfig, load_config
 from littrace.models import LiteratureWorkspace, PaperSearchRequest, ResearchRunResult
 from littrace.parsing import parse_workspace_papers
+from littrace.publisher_connectors import build_publisher_route_report
 from littrace.search import LiveSearchClient, MockMaterialsSearchClient
 from littrace.source_router import SourceRoute, route_sources
 from littrace.storyline import build_storyline_from_workspace, verify_storyline_preview
@@ -19,6 +20,7 @@ class ResearchWorkflowState(TypedDict, total=False):
     config: LitTraceConfig
     audit_citations_enabled: bool
     plan_downloads_enabled: bool
+    route_publishers_enabled: bool
     parse_full_text_enabled: bool
     extract_tables_enabled: bool
     build_storyline_enabled: bool
@@ -26,6 +28,7 @@ class ResearchWorkflowState(TypedDict, total=False):
     workspace: LiteratureWorkspace
     citation_audit: object
     download_plan: object
+    publisher_routes: object
     parse_report: object
     table_harness: object
     comparison_matrix: object
@@ -118,6 +121,12 @@ def build_littrace_graph():
         state["download_plan"] = build_download_plan(config, papers, selected_ids)
         return state
 
+    async def route_publishers(state: ResearchWorkflowState) -> ResearchWorkflowState:
+        workspace = state["workspace"]
+        papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
+        state["publisher_routes"] = build_publisher_route_report(papers).model_dump()
+        return state
+
     async def build_storyline(state: ResearchWorkflowState) -> ResearchWorkflowState:
         workspace = state["workspace"]
         claims = build_storyline_from_workspace(workspace)
@@ -144,6 +153,8 @@ def build_littrace_graph():
             return "audit_citations"
         if state.get("plan_downloads_enabled", True):
             return "plan_downloads"
+        if state.get("route_publishers_enabled", True):
+            return "route_publishers"
         if state.get("parse_full_text_enabled", False):
             return "parse_full_text"
         if state.get("extract_tables_enabled", False):
@@ -155,6 +166,8 @@ def build_littrace_graph():
     def after_audit(state: ResearchWorkflowState) -> str:
         if state.get("plan_downloads_enabled", True):
             return "plan_downloads"
+        if state.get("route_publishers_enabled", True):
+            return "route_publishers"
         if state.get("parse_full_text_enabled", False):
             return "parse_full_text"
         if state.get("extract_tables_enabled", False):
@@ -164,6 +177,13 @@ def build_littrace_graph():
         return END
 
     def after_download_plan(state: ResearchWorkflowState) -> str:
+        if state.get("route_publishers_enabled", True):
+            return "route_publishers"
+        if state.get("parse_full_text_enabled", False):
+            return "parse_full_text"
+        return END
+
+    def after_publisher_routes(state: ResearchWorkflowState) -> str:
         if state.get("parse_full_text_enabled", False):
             return "parse_full_text"
         if state.get("extract_tables_enabled", False):
@@ -189,6 +209,7 @@ def build_littrace_graph():
     graph.add_node("search_papers", search_papers)
     graph.add_node("audit_citations", audit_citations)
     graph.add_node("plan_downloads", plan_downloads)
+    graph.add_node("route_publishers", route_publishers)
     graph.add_node("parse_full_text", parse_full_text)
     graph.add_node("extract_tables", extract_tables)
     graph.add_node("build_storyline", build_storyline)
@@ -197,6 +218,7 @@ def build_littrace_graph():
     graph.add_conditional_edges("search_papers", after_search)
     graph.add_conditional_edges("audit_citations", after_audit)
     graph.add_conditional_edges("plan_downloads", after_download_plan)
+    graph.add_conditional_edges("route_publishers", after_publisher_routes)
     graph.add_conditional_edges("parse_full_text", after_parse)
     graph.add_conditional_edges("extract_tables", after_extract_tables)
     graph.add_edge("build_storyline", END)
@@ -208,6 +230,7 @@ async def run_research_graph(
     config: LitTraceConfig | None = None,
     audit_citations_enabled: bool = True,
     plan_downloads_enabled: bool = True,
+    route_publishers_enabled: bool = True,
     parse_full_text_enabled: bool = False,
     extract_tables_enabled: bool = False,
     build_storyline_enabled: bool = False,
@@ -223,6 +246,11 @@ async def run_research_graph(
         download_plan = (
             build_download_plan(config, papers, set(workspace.context.selected_for_download))
             if plan_downloads_enabled
+            else None
+        )
+        publisher_routes = (
+            build_publisher_route_report(papers).model_dump()
+            if route_publishers_enabled
             else None
         )
         parse_report = None
@@ -241,6 +269,7 @@ async def run_research_graph(
             workspace=workspace,
             citation_audit=citation_audit,
             download_plan=download_plan,
+            publisher_routes=publisher_routes,
             parse_report=parse_report,
             table_harness=table_harness,
             comparison_matrix=comparison_matrix,
@@ -253,6 +282,7 @@ async def run_research_graph(
             "config": config,
             "audit_citations_enabled": audit_citations_enabled,
             "plan_downloads_enabled": plan_downloads_enabled,
+            "route_publishers_enabled": route_publishers_enabled,
             "parse_full_text_enabled": parse_full_text_enabled,
             "extract_tables_enabled": extract_tables_enabled,
             "build_storyline_enabled": build_storyline_enabled,
@@ -262,6 +292,7 @@ async def run_research_graph(
         workspace=state["workspace"],
         citation_audit=state.get("citation_audit"),
         download_plan=state.get("download_plan"),
+        publisher_routes=state.get("publisher_routes"),
         parse_report=state.get("parse_report"),
         table_harness=state.get("table_harness"),
         comparison_matrix=state.get("comparison_matrix"),

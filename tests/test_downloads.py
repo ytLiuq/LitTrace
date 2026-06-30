@@ -22,3 +22,6 @@ async def test_execute_downloads_returns_login_action_for_gated_papers():
 
     assert result.requires_login_count == 1
     assert result.items[0].action == "open_login_popup"
+    assert result.items[0].target_path
+    assert result.items[0].login_instructions
+    assert "authorized route" in result.items[0].login_instructions[1]

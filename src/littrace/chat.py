@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from littrace.access import build_download_plan
+from littrace.agents import agent_runtime_statuses
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
 from littrace.context import apply_context_update
@@ -14,6 +15,7 @@ from littrace.models import (
     PaperSearchRequest,
 )
 from littrace.parsing import parse_workspace_papers
+from littrace.publisher_connectors import build_publisher_route_report
 from littrace.storyline import build_storyline_from_workspace
 from littrace.tables import build_comparison_matrices, extract_performance_cells
 from littrace.workflow import run_research_graph, run_search_preview
@@ -42,6 +44,16 @@ async def handle_chat(
                 action="list_context",
                 workspace=workspace,
                 citations=_active_citations(workspace),
+            ),
+            workspace,
+        )
+
+    if intent.actions == ["agent_status"]:
+        return (
+            ChatResponse(
+                reply=_format_agent_status(),
+                action="agent_status",
+                workspace=workspace,
             ),
             workspace,
         )
@@ -103,6 +115,7 @@ async def _run_composite_intent(
     download_plan = None
     matrix = None
     research_result = None
+    publisher_routes = None
 
     if "search" in intent.actions:
         workspace = await run_search_preview(
@@ -117,6 +130,7 @@ async def _run_composite_intent(
         replies.append(
             f"已围绕“{intent.topic}”检索并更新上下文，当前保留 {len(workspace.context.active_papers)} 篇文献。"
         )
+        publisher_routes = build_publisher_route_report(_active_papers(workspace)).model_dump()
         action = "search"
 
     if "parse" in intent.actions:
@@ -173,6 +187,7 @@ async def _run_composite_intent(
             research_result=research_result,
             citations=_active_citations(workspace),
             download_plan=download_plan,
+            publisher_routes=publisher_routes,
             comparison_matrix=matrix,
             warnings=warnings,
         ),
@@ -190,6 +205,16 @@ def _active_papers(workspace: LiteratureWorkspace):
 
 def _active_citations(workspace: LiteratureWorkspace):
     return citation_records_for_papers(_active_papers(workspace))
+
+
+def _format_agent_status() -> str:
+    lines = ["当前 Agent 开发状态："]
+    for status in agent_runtime_statuses():
+        flag = "可执行" if status.implemented else "待开发"
+        node = f"，节点：{status.workflow_node}" if status.workflow_node else ""
+        remaining = "；剩余：" + " / ".join(status.remaining_work) if status.remaining_work else ""
+        lines.append(f"- {status.name}: {flag}，runtime: {status.runtime}{node}{remaining}")
+    return "\n".join(lines)
 
 
 def _apply_download_selection(

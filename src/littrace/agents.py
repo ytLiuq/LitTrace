@@ -10,6 +10,16 @@ class AgentRoleSpec(BaseModel):
     tools: list[str] = Field(default_factory=list)
 
 
+class AgentRuntimeStatus(BaseModel):
+    name: str
+    role_layer: str
+    runtime: str
+    implemented: bool
+    workflow_node: str | None = None
+    callable_tools: list[str] = Field(default_factory=list)
+    remaining_work: list[str] = Field(default_factory=list)
+
+
 LITTRACE_CREW_ROLES = [
     AgentRoleSpec(
         name="Source Router",
@@ -30,6 +40,24 @@ LITTRACE_CREW_ROLES = [
         tools=["build_download_plan", "execute_downloads"],
     ),
     AgentRoleSpec(
+        name="Publisher Connector",
+        goal="Map papers to publisher families and authorized access routes.",
+        backstory="A source-aware connector that prefers DOI landing pages and known OA PDFs.",
+        tools=["build_publisher_route_report", "infer_publisher_family"],
+    ),
+    AgentRoleSpec(
+        name="PDF/OCR Parser",
+        goal="Parse downloaded or user-provided PDFs into traceable text, table, and page evidence.",
+        backstory="A document parser that treats page-aware evidence as the unit of trust.",
+        tools=["parse_workspace_papers", "docling", "paddleocr"],
+    ),
+    AgentRoleSpec(
+        name="Table Extractor",
+        goal="Extract material performance metrics into provenance-preserving comparison matrices.",
+        backstory="A careful evaluator who keeps units, snippets, and comparability warnings attached.",
+        tools=["extract_performance_cells", "build_comparison_matrices", "check_performance_cells"],
+    ),
+    AgentRoleSpec(
         name="Storyline Verifier",
         goal="Constrain research narratives to evidence-backed solution-limit-response chains.",
         backstory="A skeptical materials scientist who rejects broad claims without paper-level evidence.",
@@ -40,6 +68,74 @@ LITTRACE_CREW_ROLES = [
 
 def crew_role_specs() -> list[AgentRoleSpec]:
     return LITTRACE_CREW_ROLES
+
+
+def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
+    return [
+        AgentRuntimeStatus(
+            name="Source Router",
+            role_layer="CrewAI role + LangGraph node",
+            runtime="LangGraph",
+            implemented=True,
+            workflow_node="plan_sources",
+            callable_tools=["route_sources"],
+            remaining_work=["Add publisher-native search APIs where access terms allow it."],
+        ),
+        AgentRuntimeStatus(
+            name="Citation Verifier",
+            role_layer="CrewAI role + LangGraph node",
+            runtime="LangGraph",
+            implemented=True,
+            workflow_node="audit_citations",
+            callable_tools=["citation_records_for_papers", "audit_citation_links"],
+            remaining_work=["Cache link checks and classify institution-login redirects."],
+        ),
+        AgentRuntimeStatus(
+            name="Access Manager",
+            role_layer="CrewAI role + callable tool",
+            runtime="Local async tool",
+            implemented=True,
+            workflow_node="plan_downloads",
+            callable_tools=["build_download_plan", "execute_downloads"],
+            remaining_work=["Connect open_login_popup to an actual desktop/browser window."],
+        ),
+        AgentRuntimeStatus(
+            name="Publisher Connector",
+            role_layer="CrewAI role + LangGraph node",
+            runtime="LangGraph",
+            implemented=True,
+            workflow_node="route_publishers",
+            callable_tools=["build_publisher_route_report", "infer_publisher_family"],
+            remaining_work=["Add ACS/Wiley/Nature-specific metadata enrichment adapters."],
+        ),
+        AgentRuntimeStatus(
+            name="PDF/OCR Parser",
+            role_layer="CrewAI role + LangGraph node",
+            runtime="LangGraph",
+            implemented=True,
+            workflow_node="parse_full_text",
+            callable_tools=["parse_workspace_papers", "docling", "paddleocr"],
+            remaining_work=["Benchmark parser quality on real chemistry/materials PDFs."],
+        ),
+        AgentRuntimeStatus(
+            name="Table Extractor",
+            role_layer="CrewAI role + LangGraph node",
+            runtime="LangGraph",
+            implemented=True,
+            workflow_node="extract_tables",
+            callable_tools=["extract_performance_cells", "build_comparison_matrices"],
+            remaining_work=["Expand materials-specific metric vocabulary and unit normalization."],
+        ),
+        AgentRuntimeStatus(
+            name="Storyline Verifier",
+            role_layer="CrewAI role + LangGraph node",
+            runtime="LangGraph",
+            implemented=True,
+            workflow_node="build_storyline",
+            callable_tools=["build_storyline_from_workspace", "check_storyline_claims"],
+            remaining_work=["Use LLM only after evidence spans are selected, with citation guardrails."],
+        ),
+    ]
 
 
 def build_crewai_agents():

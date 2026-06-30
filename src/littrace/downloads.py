@@ -47,11 +47,19 @@ async def _execute_one(
     dry_run: bool,
 ) -> DownloadExecutionItem:
     if paper.access_type == AccessType.REQUIRES_LOGIN:
+        target_path = _target_pdf_path(config, paper)
         return DownloadExecutionItem(
             paper_id=paper.paper_id,
             action="open_login_popup",
             status="requires_login",
+            target_path=str(target_path),
             login_url=str(paper.pdf_url or (paper.source_urls[0] if paper.source_urls else None)),
+            login_instructions=[
+                "Open the login URL in an authenticated browser session.",
+                "Sign in through the institution, publisher account, or other authorized route.",
+                f"Download the PDF manually to: {target_path}",
+                "Return to LitTrace and run parsing after the PDF is present.",
+            ],
         )
     if paper.access_type != AccessType.OPEN_ACCESS or not paper.pdf_url:
         return DownloadExecutionItem(

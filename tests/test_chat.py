@@ -17,6 +17,7 @@ async def test_chat_search_updates_workspace():
     assert response.action == "search"
     assert workspace.context.active_papers
     assert response.citations
+    assert response.publisher_routes is not None
 
 
 @pytest.mark.anyio
@@ -91,3 +92,15 @@ async def test_chat_can_select_downloads_by_index():
     )
 
     assert workspace.context.selected_for_download == ["p1"]
+
+
+@pytest.mark.anyio
+async def test_chat_reports_agent_status():
+    response, _ = await handle_chat(
+        ChatRequest(message="agent状态"),
+        LiteratureWorkspace(),
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
+    )
+
+    assert response.action == "agent_status"
+    assert "Publisher Connector" in response.reply

@@ -9,7 +9,7 @@ from littrace.eval_api import (
     storyline_metrics,
 )
 from littrace.access import build_download_plan
-from littrace.agents import AgentRoleSpec, crew_role_specs
+from littrace.agents import AgentRoleSpec, AgentRuntimeStatus, agent_runtime_statuses, crew_role_specs
 from littrace.citations import audit_citation_links, citation_records_for_papers
 from littrace.chat import handle_chat
 from littrace.config import load_config
@@ -32,6 +32,7 @@ from littrace.models import (
     ResearchRunResult,
 )
 from littrace.parsing import parse_workspace_papers
+from littrace.publisher_connectors import PublisherRouteReport, publisher_routes_for_workspace
 from littrace.session import (
     append_message,
     load_or_create_session,
@@ -62,6 +63,11 @@ def agents_crew() -> list[AgentRoleSpec]:
     return crew_role_specs()
 
 
+@app.get("/agents/status", response_model=list[AgentRuntimeStatus])
+def agents_status() -> list[AgentRuntimeStatus]:
+    return agent_runtime_statuses()
+
+
 @app.post("/search/preview", response_model=LiteratureWorkspace)
 async def search_preview(request: PaperSearchRequest) -> LiteratureWorkspace:
     global WORKSPACE
@@ -77,6 +83,7 @@ async def workflow_research(request: ResearchRunRequest) -> ResearchRunResult:
         load_config(),
         audit_citations_enabled=request.audit_citations,
         plan_downloads_enabled=request.plan_downloads,
+        route_publishers_enabled=request.route_publishers,
         parse_full_text_enabled=request.parse_full_text,
         extract_tables_enabled=request.extract_tables,
         build_storyline_enabled=request.build_storyline,
@@ -126,6 +133,11 @@ def download_plan() -> DownloadPlan:
     selected_ids = set(WORKSPACE.context.selected_for_download)
     papers = [WORKSPACE.papers[paper_id] for paper_id in WORKSPACE.context.active_papers]
     return build_download_plan(config, papers, selected_ids)
+
+
+@app.get("/publishers/routes", response_model=PublisherRouteReport)
+def publisher_routes() -> PublisherRouteReport:
+    return publisher_routes_for_workspace(WORKSPACE)
 
 
 @app.post("/downloads/execute", response_model=DownloadExecutionResult)
