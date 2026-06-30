@@ -21,6 +21,20 @@ class PublisherRouteReport(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class PublisherSearchPlan(BaseModel):
+    publisher_family: str
+    query_url: HttpUrl
+    purpose: str
+    requires_browser: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+class PublisherSearchPlanReport(BaseModel):
+    topic: str
+    plans: list[PublisherSearchPlan]
+    warnings: list[str] = Field(default_factory=list)
+
+
 PUBLISHER_ALIASES = {
     "acs": ["american chemical society", "acs", "acs nano", "nano letters"],
     "wiley": ["wiley", "advanced materials", "advanced functional materials"],
@@ -29,6 +43,17 @@ PUBLISHER_ALIASES = {
     "rsc": ["royal society of chemistry", "rsc"],
     "elsevier": ["elsevier", "science direct", "sciencedirect"],
 }
+
+PUBLISHER_SEARCH_TEMPLATES = {
+    "acs": "https://pubs.acs.org/action/doSearch?AllField={query}",
+    "wiley": "https://onlinelibrary.wiley.com/action/doSearch?AllField={query}",
+    "nature": "https://www.nature.com/search?q={query}",
+    "mdpi": "https://www.mdpi.com/search?q={query}",
+    "rsc": "https://pubs.rsc.org/en/results?searchtext={query}",
+    "elsevier": "https://www.sciencedirect.com/search?qs={query}",
+}
+
+PREFERRED_MATERIALS_PUBLISHERS = ["acs", "wiley", "nature", "mdpi", "rsc", "elsevier"]
 
 
 def build_publisher_route_report(papers: list[PaperMetadata]) -> PublisherRouteReport:
@@ -44,6 +69,36 @@ def build_publisher_route_report(papers: list[PaperMetadata]) -> PublisherRouteR
 def publisher_routes_for_workspace(workspace: LiteratureWorkspace) -> PublisherRouteReport:
     papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
     return build_publisher_route_report(papers)
+
+
+def build_publisher_search_plan(
+    topic: str,
+    families: list[str] | None = None,
+) -> PublisherSearchPlanReport:
+    from urllib.parse import quote_plus
+
+    selected = families or PREFERRED_MATERIALS_PUBLISHERS
+    plans: list[PublisherSearchPlan] = []
+    warnings: list[str] = []
+    query = quote_plus(topic)
+    for family in selected:
+        template = PUBLISHER_SEARCH_TEMPLATES.get(family)
+        if not template:
+            warnings.append(f"No publisher search template for {family}")
+            continue
+        plans.append(
+            PublisherSearchPlan(
+                publisher_family=family,
+                query_url=template.format(query=query),
+                purpose=f"Search {family} landing pages for materials/chemistry literature.",
+                requires_browser=family in {"acs", "wiley", "nature", "elsevier"},
+                notes=[
+                    "Use this route for publisher-native discovery and access-state inspection.",
+                    "Do not bypass authentication or license checks.",
+                ],
+            )
+        )
+    return PublisherSearchPlanReport(topic=topic, plans=plans, warnings=warnings)
 
 
 def build_publisher_route(paper: PaperMetadata) -> PublisherAccessRoute:

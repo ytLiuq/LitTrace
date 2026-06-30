@@ -135,3 +135,33 @@ def test_build_comparison_matrices_marks_mixed_units_not_comparable():
 
     assert "Mixed units" in report.matrices[0].warnings[0]
     assert not report.matrices[0].rows[0].comparable
+
+
+def test_extract_materials_chemistry_metrics():
+    workspace = LiteratureWorkspace(
+        parsed_papers={
+            "p1": {
+                "sections": [
+                    {
+                        "name": "Electrochemical results",
+                        "text": (
+                            "The electrode showed conductivity 120 S/m, specific capacitance "
+                            "245 F/g, cycle retention 91 %, and tensile strength 18 MPa."
+                        ),
+                        "evidence": {
+                            "paper_id": "p1",
+                            "page": 4,
+                            "parser": "docling",
+                            "confidence": 0.84,
+                        },
+                    }
+                ]
+            }
+        }
+    )
+
+    workspace, harness = extract_performance_cells(workspace)
+
+    metrics = {cell.metric for cell in workspace.performance_cells}
+    assert harness.passed
+    assert {"conductivity", "specific capacitance", "cycle retention", "tensile strength"} <= metrics

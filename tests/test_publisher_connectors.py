@@ -1,5 +1,9 @@
 from littrace.models import AccessType, PaperMetadata
-from littrace.publisher_connectors import build_publisher_route, build_publisher_route_report
+from littrace.publisher_connectors import (
+    build_publisher_route,
+    build_publisher_route_report,
+    build_publisher_search_plan,
+)
 
 
 def test_publisher_connector_infers_materials_publishers():
@@ -48,3 +52,12 @@ def test_publisher_connector_uses_doi_landing_page():
 
     assert str(route.landing_url) == "https://doi.org/10.1002/adfm.example"
     assert "DOI landing page" in route.notes[0]
+
+
+def test_publisher_search_plan_builds_official_routes():
+    report = build_publisher_search_plan("MXene flexible sensor", families=["acs", "wiley"])
+
+    assert [plan.publisher_family for plan in report.plans] == ["acs", "wiley"]
+    assert "pubs.acs.org" in str(report.plans[0].query_url)
+    assert "MXene+flexible+sensor" in str(report.plans[0].query_url)
+    assert report.plans[0].requires_browser

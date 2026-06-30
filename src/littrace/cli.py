@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.export import export_session_bundle
+from littrace.login_flow import launch_login_for_paper
 from littrace.models import ChatRequest, LiteratureWorkspace
+from littrace.pdf_benchmark import benchmark_pdf_parsing
 from littrace.session import append_message, create_chat_session, save_workspace
 
 
@@ -31,7 +33,10 @@ async def run_shell() -> None:
         session_root=str(session.root),
     )
     print("LitTrace agent shell")
-    print("输入研究任务开始。命令：/context /hide-context /show-context /papers /export /quit")
+    print(
+        "输入研究任务开始。命令：/context /hide-context /show-context /papers "
+        "/login N /parse /table /storyline /benchmark /export /quit"
+    )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
     print(f"folder:  {state.session_root}")
@@ -62,6 +67,39 @@ async def run_shell() -> None:
             continue
         if message in {"/context", "/papers"}:
             print(format_context_panel(state.workspace))
+            continue
+        if message == "/parse":
+            message = "解析当前文献全文"
+        if message == "/table":
+            message = "生成当前文献性能对比表"
+        if message == "/storyline":
+            message = "生成当前文献发展脉络"
+        if message.startswith("/login "):
+            index = _parse_index_arg(message)
+            paper_id = _paper_id_for_index(state.workspace, index) if index else None
+            if not paper_id:
+                print("没有找到这个编号的文献。")
+                continue
+            paper = state.workspace.papers[paper_id]
+            result = launch_login_for_paper(config, paper)
+            print(f"登录页: {result.login_url or '无'}")
+            print(f"目标路径: {result.target_path or '无'}")
+            for instruction in result.instructions:
+                print(f"- {instruction}")
+            if result.error:
+                print(f"错误: {result.error}")
+            continue
+        if message == "/benchmark":
+            report = benchmark_pdf_parsing(state.workspace, config)
+            print(
+                "PDF/OCR benchmark: "
+                f"active={report.active_papers}, local_pdf={report.local_pdf_count}, "
+                f"parsed={report.parsed_count}, metadata_only={report.metadata_only_count}, "
+                f"page_evidence={report.parsed_with_page_evidence}, "
+                f"avg_conf={report.average_evidence_confidence}"
+            )
+            if report.warnings:
+                print("注意：" + "；".join(report.warnings))
             continue
         if message == "/export":
             paths = export_session_bundle(session, state.workspace)
@@ -125,6 +163,25 @@ def format_context_panel(workspace: LiteratureWorkspace) -> str:
     if len(ids) > 12:
         lines.append(f"... 还有 {len(ids) - 12} 篇")
     return "\n".join(lines)
+
+
+def _parse_index_arg(message: str) -> int | None:
+    parts = message.split()
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _paper_id_for_index(workspace: LiteratureWorkspace, index: int | None) -> str | None:
+    if index is None:
+        return None
+    position = index - 1
+    if position < 0 or position >= len(workspace.context.active_papers):
+        return None
+    return workspace.context.active_papers[position]
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
 from littrace.context import apply_context_update
 from littrace.intent import ChatIntent, parse_chat_intent
-from littrace.llm import chat_completion, research_assistant_system_prompt
 from littrace.models import (
     ChatRequest,
     ChatResponse,
@@ -16,6 +15,11 @@ from littrace.models import (
 )
 from littrace.parsing import parse_workspace_papers
 from littrace.publisher_connectors import build_publisher_route_report
+from littrace.research_writer import (
+    fallback_evidence_answer,
+    write_evidence_grounded_answer,
+    write_storyline_narrative,
+)
 from littrace.storyline import build_storyline_from_workspace
 from littrace.tables import build_comparison_matrices, extract_performance_cells
 from littrace.workflow import run_research_graph, run_search_preview
@@ -73,12 +77,7 @@ async def handle_chat(
     if _should_run_composite(intent):
         return await _run_composite_intent(intent, request, workspace, config)
 
-    llm_reply = await chat_completion(
-        config,
-        research_assistant_system_prompt(),
-        message,
-        workspace,
-    )
+    llm_reply = await write_evidence_grounded_answer(config, message, workspace)
     if llm_reply.used_llm:
         return (
             ChatResponse(
@@ -86,6 +85,17 @@ async def handle_chat(
                 action="llm_chat",
                 workspace=workspace,
                 citations=_active_citations(workspace),
+            ),
+            workspace,
+        )
+    if workspace.context.active_papers:
+        return (
+            ChatResponse(
+                reply=fallback_evidence_answer(message, workspace),
+                action="evidence_answer",
+                workspace=workspace,
+                citations=_active_citations(workspace),
+                warnings=[llm_reply.error] if llm_reply.error else [],
             ),
             workspace,
         )
@@ -155,7 +165,13 @@ async def _run_composite_intent(
         if not storyline:
             replies.append("当前证据不足以生成真实的发展脉络。建议先检索并解析全文。")
         else:
-            replies.append("已基于当前证据生成发展脉络草案；低证据部分会保持保守。")
+            narrative = await write_storyline_narrative(config, workspace)
+            if narrative.used_llm:
+                replies.append(narrative.text)
+            else:
+                replies.append("已基于当前证据生成发展脉络草案；低证据部分会保持保守。")
+                if narrative.error:
+                    warnings.append(narrative.error)
         result = await run_research_graph(
             PaperSearchRequest(topic=intent.topic or request.message, live=False),
             config,

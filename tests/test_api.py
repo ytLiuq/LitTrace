@@ -58,6 +58,17 @@ def test_search_context_and_download_plan_api():
     assert len(publisher_routes["routes"]) == 3
     assert any(route["publisher_family"] == "acs" for route in publisher_routes["routes"])
 
+    response = client.get("/publishers/search-plan", params={"topic": "MXene sensor"})
+    assert response.status_code == 200
+    assert response.json()["plans"]
+
+    response = client.post(
+        "/downloads/login/mxene-flexible-sensor-wiley-2026",
+        params={"dry_run": True},
+    )
+    assert response.status_code == 200
+    assert response.json()["target_path"].endswith("paper.pdf")
+
     response = client.post("/downloads/execute", json={"paper_ids": [], "dry_run": True})
     assert response.status_code == 200
     result = response.json()
@@ -88,6 +99,10 @@ def test_search_context_and_download_plan_api():
     response = client.post("/parse/context")
     assert response.status_code == 200
     assert response.json()["parsed_papers"]
+
+    response = client.get("/eval/pdf-benchmark")
+    assert response.status_code == 200
+    assert "active_papers" in response.json()
 
     response = client.post("/tables/extract")
     assert response.status_code == 200

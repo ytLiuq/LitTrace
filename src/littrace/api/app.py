@@ -16,6 +16,7 @@ from littrace.config import load_config
 from littrace.context import apply_context_update
 from littrace.downloads import execute_downloads
 from littrace.export import export_session_bundle
+from littrace.login_flow import LoginLaunchResult, launch_login_for_paper
 from littrace.models import (
     ChatRequest,
     ChatResponse,
@@ -32,7 +33,13 @@ from littrace.models import (
     ResearchRunResult,
 )
 from littrace.parsing import parse_workspace_papers
-from littrace.publisher_connectors import PublisherRouteReport, publisher_routes_for_workspace
+from littrace.pdf_benchmark import PDFBenchmarkReport, benchmark_pdf_parsing
+from littrace.publisher_connectors import (
+    PublisherRouteReport,
+    PublisherSearchPlanReport,
+    build_publisher_search_plan,
+    publisher_routes_for_workspace,
+)
 from littrace.session import (
     append_message,
     load_or_create_session,
@@ -140,11 +147,23 @@ def publisher_routes() -> PublisherRouteReport:
     return publisher_routes_for_workspace(WORKSPACE)
 
 
+@app.get("/publishers/search-plan", response_model=PublisherSearchPlanReport)
+def publisher_search_plan(topic: str) -> PublisherSearchPlanReport:
+    return build_publisher_search_plan(topic)
+
+
 @app.post("/downloads/execute", response_model=DownloadExecutionResult)
 async def downloads_execute(request: DownloadExecutionRequest) -> DownloadExecutionResult:
     config = load_config()
     papers = [WORKSPACE.papers[paper_id] for paper_id in WORKSPACE.context.active_papers]
     return await execute_downloads(config, papers, request)
+
+
+@app.post("/downloads/login/{paper_id}", response_model=LoginLaunchResult)
+def downloads_login(paper_id: str, dry_run: bool = False) -> LoginLaunchResult:
+    config = load_config()
+    paper = WORKSPACE.papers[paper_id]
+    return launch_login_for_paper(config, paper, dry_run=dry_run)
 
 
 @app.post("/parse/context", response_model=LiteratureWorkspace)
@@ -191,6 +210,11 @@ def eval_retrieval(topic: str | None = None) -> EvalMetricReport:
 @app.post("/eval/pdf-parsing", response_model=EvalMetricReport)
 def eval_pdf_parsing(topic: str | None = None) -> EvalMetricReport:
     return EvalMetricReport(run_id="preview", topic=topic, metrics=parsing_metrics())
+
+
+@app.get("/eval/pdf-benchmark", response_model=PDFBenchmarkReport)
+def eval_pdf_benchmark() -> PDFBenchmarkReport:
+    return benchmark_pdf_parsing(WORKSPACE, load_config())
 
 
 @app.post("/eval/storyline", response_model=EvalMetricReport)

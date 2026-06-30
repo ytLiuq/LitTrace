@@ -8,7 +8,7 @@ from littrace.context import add_papers
 from littrace.config import LitTraceConfig, load_config
 from littrace.models import LiteratureWorkspace, PaperSearchRequest, ResearchRunResult
 from littrace.parsing import parse_workspace_papers
-from littrace.publisher_connectors import build_publisher_route_report
+from littrace.publisher_connectors import build_publisher_route_report, build_publisher_search_plan
 from littrace.search import LiveSearchClient, MockMaterialsSearchClient
 from littrace.source_router import SourceRoute, route_sources
 from littrace.storyline import build_storyline_from_workspace, verify_storyline_preview
@@ -61,6 +61,7 @@ async def run_search_preview(
         "discipline": request.discipline,
         "year_min": request.year_min,
         "source_routes": [route.name for route in routes],
+        "publisher_search_plan": build_publisher_search_plan(request.topic).model_dump(),
         "search_mode": "live" if use_live else "mock",
         "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
     }
@@ -100,6 +101,7 @@ def build_littrace_graph():
             "discipline": request.discipline,
             "year_min": request.year_min,
             "source_routes": [route.name for route in state.get("routes", [])],
+            "publisher_search_plan": build_publisher_search_plan(request.topic).model_dump(),
             "search_mode": "live" if use_live else "mock",
             "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
         }

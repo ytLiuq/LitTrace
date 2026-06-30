@@ -79,7 +79,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             implemented=True,
             workflow_node="plan_sources",
             callable_tools=["route_sources"],
-            remaining_work=["Add publisher-native search APIs where access terms allow it."],
+            remaining_work=["Turn publisher search-plan URLs into optional browser-assisted retrieval."],
         ),
         AgentRuntimeStatus(
             name="Citation Verifier",
@@ -97,7 +97,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             implemented=True,
             workflow_node="plan_downloads",
             callable_tools=["build_download_plan", "execute_downloads"],
-            remaining_work=["Connect open_login_popup to an actual desktop/browser window."],
+            remaining_work=["Detect when the manually downloaded PDF has appeared and resume parsing."],
         ),
         AgentRuntimeStatus(
             name="Publisher Connector",
@@ -106,7 +106,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             implemented=True,
             workflow_node="route_publishers",
             callable_tools=["build_publisher_route_report", "infer_publisher_family"],
-            remaining_work=["Add ACS/Wiley/Nature-specific metadata enrichment adapters."],
+            remaining_work=["Parse publisher search result pages when terms and authentication allow it."],
         ),
         AgentRuntimeStatus(
             name="PDF/OCR Parser",
@@ -115,7 +115,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             implemented=True,
             workflow_node="parse_full_text",
             callable_tools=["parse_workspace_papers", "docling", "paddleocr"],
-            remaining_work=["Benchmark parser quality on real chemistry/materials PDFs."],
+            remaining_work=["Expand the benchmark from session metrics to a curated golden PDF set."],
         ),
         AgentRuntimeStatus(
             name="Table Extractor",
@@ -124,7 +124,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             implemented=True,
             workflow_node="extract_tables",
             callable_tools=["extract_performance_cells", "build_comparison_matrices"],
-            remaining_work=["Expand materials-specific metric vocabulary and unit normalization."],
+            remaining_work=["Add stronger unit conversion and chemistry-specific comparability rules."],
         ),
         AgentRuntimeStatus(
             name="Storyline Verifier",
@@ -133,7 +133,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             implemented=True,
             workflow_node="build_storyline",
             callable_tools=["build_storyline_from_workspace", "check_storyline_claims"],
-            remaining_work=["Use LLM only after evidence spans are selected, with citation guardrails."],
+            remaining_work=["Add sentence-level citation validation for generated narratives."],
         ),
     ]
 

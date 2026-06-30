@@ -71,6 +71,11 @@ Shell commands:
 /hide-context
 /show-context
 /papers
+/login N
+/parse
+/table
+/storyline
+/benchmark
 /export
 /quit
 ```
@@ -85,6 +90,10 @@ Conversation examples:
 取消选择第 2 篇
 生成发展脉络
 ```
+
+For login-gated papers, `/login N` opens the authorized publisher or DOI page in
+the local browser and prints the exact target path where the PDF should be
+saved for the current session/parser flow.
 
 Each shell run creates a folder under `storage.sessions_dir` (default:
 `./sessions/<timestamp-id>/`) containing:
@@ -165,6 +174,9 @@ curl http://127.0.0.1:8000/tables/matrix
 curl http://127.0.0.1:8000/agents/crew
 curl http://127.0.0.1:8000/agents/status
 curl http://127.0.0.1:8000/publishers/routes
+curl "http://127.0.0.1:8000/publishers/search-plan?topic=MXene%20sensor"
+curl -X POST "http://127.0.0.1:8000/downloads/login/{paper_id}?dry_run=true"
+curl http://127.0.0.1:8000/eval/pdf-benchmark
 ```
 
 `/citations/audit` treats `requires_login` as a valid, traceable access state:

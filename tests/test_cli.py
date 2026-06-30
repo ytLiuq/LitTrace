@@ -1,4 +1,4 @@
-from littrace.cli import format_context_panel
+from littrace.cli import _paper_id_for_index, _parse_index_arg, format_context_panel
 from littrace.context import add_papers
 from littrace.models import LiteratureWorkspace, PaperMetadata
 
@@ -33,3 +33,14 @@ def test_format_context_panel_marks_selected_papers():
 
     assert "已选下载 1 篇" in panel
     assert "* 1. Paper" in panel
+
+
+def test_cli_index_helpers():
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [PaperMetadata(paper_id="p1", title="Paper")],
+    )
+
+    assert _parse_index_arg("/login 1") == 1
+    assert _paper_id_for_index(workspace, 1) == "p1"
+    assert _paper_id_for_index(workspace, 2) is None

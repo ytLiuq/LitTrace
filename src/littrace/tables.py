@@ -27,13 +27,25 @@ METRIC_DIRECTIONS = {
     "mse": False,
     "mae": False,
     "rmse": False,
+    "conductivity": True,
+    "specific capacitance": True,
+    "capacity": True,
+    "retention": True,
+    "cycle retention": True,
+    "selectivity": True,
+    "young's modulus": None,
+    "tensile strength": True,
+    "strain range": True,
 }
 
 METRIC_PATTERN = re.compile(
-    r"(?P<metric>sensitivity|gauge factor|response time|recovery time|limit of detection|accuracy|f1|auc|mse|mae|rmse|lod|gf)"
+    r"(?P<metric>sensitivity|gauge factor|response time|recovery time|limit of detection|"
+    r"specific capacitance|cycle retention|young'?s modulus|tensile strength|strain range|"
+    r"conductivity|capacity|retention|selectivity|accuracy|f1|auc|mse|mae|rmse|lod|gf)"
     r"[^0-9+\-.]{0,40}"
     r"(?P<value>[+-]?\d+(?:\.\d+)?)"
-    r"\s*(?P<unit>%|ms|s|kPa-1|Pa-1|ppm|MPa|kPa|Pa|)?",
+    r"\s*(?P<unit>%|ms|s|S/m|S cm-1|S/cm|mS/cm|F/g|mF/cm2|mAh/g|mAh g-1|"
+    r"kPa-1|Pa-1|ppm|GPa|MPa|kPa|Pa|cycles|)?",
     re.IGNORECASE,
 )
 
@@ -167,6 +179,8 @@ def _normalize_metric(metric: str) -> str:
         return "gauge factor"
     if normalized == "lod":
         return "limit of detection"
+    if normalized in {"youngs modulus", "young's modulus"}:
+        return "young's modulus"
     return normalized
 
 
@@ -228,7 +242,20 @@ def _row_sort_key(metric: str):
 
 
 def _guess_dataset(text: str) -> str | None:
-    known_datasets = ["ETTm1", "ETTm2", "ETTh1", "ETTh2", "MNIST", "CIFAR-10"]
+    known_datasets = [
+        "ETTm1",
+        "ETTm2",
+        "ETTh1",
+        "ETTh2",
+        "MNIST",
+        "CIFAR-10",
+        "human motion",
+        "artificial sweat",
+        "PBS",
+        "electrochemical workstation",
+        "cyclic bending",
+        "cycling test",
+    ]
     lowered = text.lower()
     for dataset in known_datasets:
         if dataset.lower() in lowered:

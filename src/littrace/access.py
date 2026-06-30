@@ -16,6 +16,10 @@ def paper_storage_dir(config: LitTraceConfig, paper: PaperMetadata) -> Path:
     return config.storage.paper_library_dir / year / doi_slug
 
 
+def target_pdf_path(config: LitTraceConfig, paper: PaperMetadata) -> Path:
+    return paper_storage_dir(config, paper) / "paper.pdf"
+
+
 def plan_download(
     config: LitTraceConfig,
     paper: PaperMetadata,
