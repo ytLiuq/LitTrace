@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+import os
 from pathlib import Path
 
 import yaml
@@ -61,6 +62,16 @@ class APIConfig(BaseModel):
     enable_live_search: bool = False
 
 
+class LLMConfig(BaseModel):
+    provider: str = "deepseek"
+    api_key: str | None = None
+    base_url: str = "https://api.deepseek.com"
+    model: str = "deepseek-chat"
+    request_timeout_seconds: float = 30.0
+    temperature: float = 0.2
+    enabled: bool = True
+
+
 class LiteratureContextDefaults(BaseModel):
     visible_to_user: bool = True
     default_year_min: int = 2023
@@ -78,6 +89,7 @@ class EvalConfig(BaseModel):
 class LitTraceConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     api: APIConfig = Field(default_factory=APIConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     paper_download: PaperDownloadConfig = Field(default_factory=PaperDownloadConfig)
     parsing: ParsingConfig = Field(default_factory=ParsingConfig)
     literature_context: LiteratureContextDefaults = Field(
@@ -87,10 +99,32 @@ class LitTraceConfig(BaseModel):
 
 
 def load_config(path: str | Path = "config.yaml") -> LitTraceConfig:
+    _load_env_file(Path(".env.local"))
     config_path = Path(path)
     if not config_path.exists():
-        return LitTraceConfig()
+        return _with_env_overrides(LitTraceConfig())
 
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
-    return LitTraceConfig.model_validate(raw)
+    return _with_env_overrides(LitTraceConfig.model_validate(raw))
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value.strip().strip('"').strip("'")
+
+
+def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
+    config.llm.api_key = os.environ.get("DEEPSEEK_API_KEY") or config.llm.api_key
+    config.llm.base_url = os.environ.get("DEEPSEEK_BASE_URL") or config.llm.base_url
+    config.llm.model = os.environ.get("DEEPSEEK_MODEL") or config.llm.model
+    return config

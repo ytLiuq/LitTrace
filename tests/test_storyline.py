@@ -1,3 +1,5 @@
+from littrace.context import add_papers
+from littrace.harnesses import check_storyline_claims
 from littrace.models import PaperMetadata
 from littrace.models import LiteratureWorkspace
 from littrace.storyline import (
@@ -26,8 +28,9 @@ def test_storyline_preview_is_conservative_with_metadata_only():
 
 
 def test_storyline_from_parsed_text_builds_solution_limit_response_claims():
-    workspace = LiteratureWorkspace(
-        parsed_papers={
+    workspace = add_papers(
+        LiteratureWorkspace(
+            parsed_papers={
             "p1": {
                 "sections": [
                     {
@@ -47,7 +50,9 @@ def test_storyline_from_parsed_text_builds_solution_limit_response_claims():
                     },
                 ]
             }
-        }
+            }
+        ),
+        [PaperMetadata(paper_id="p1", title="One Paper", year=2026)],
     )
 
     claims = build_storyline_from_workspace(workspace)
@@ -57,3 +62,51 @@ def test_storyline_from_parsed_text_builds_solution_limit_response_claims():
         "remaining_limitation",
         "later_response",
     }
+
+
+def test_storyline_builds_conservative_chain_across_parsed_papers():
+    workspace = add_papers(
+        LiteratureWorkspace(
+            parsed_papers={
+                "p1": {
+                    "sections": [
+                        {
+                            "name": "Methods",
+                            "text": "The fabrication method defines the sensing film.",
+                            "evidence": {"page": 2, "parser": "docling"},
+                        }
+                    ]
+                },
+                "p2": {
+                    "sections": [
+                        {
+                            "name": "Challenges",
+                            "text": "A remaining limitation is drift during cycling.",
+                            "evidence": {"page": 7, "parser": "docling"},
+                        }
+                    ]
+                },
+                "p3": {
+                    "sections": [
+                        {
+                            "name": "Discussion",
+                            "text": "The encapsulated structure can address drift and improve stability.",
+                            "evidence": {"page": 9, "parser": "docling"},
+                        }
+                    ]
+                },
+            }
+        ),
+        [
+            PaperMetadata(paper_id="p1", title="Earlier Method", year=2023),
+            PaperMetadata(paper_id="p2", title="Observed Limitation", year=2024),
+            PaperMetadata(paper_id="p3", title="Later Response", year=2026),
+        ],
+    )
+
+    claims = build_storyline_from_workspace(workspace)
+    chain = [claim for claim in claims if claim.claim_type == "solution_limit_response_chain"]
+
+    assert chain
+    assert "不应扩展为未验证的领域共识" in chain[0].claim
+    assert check_storyline_claims(chain).passed

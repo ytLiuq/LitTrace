@@ -12,6 +12,10 @@ class ChatIntent:
     journals: list[str] = field(default_factory=list)
     skip_download: bool = False
     show_context: bool | None = None
+    select_all_downloads: bool = False
+    clear_download_selection: bool = False
+    select_indices: list[int] = field(default_factory=list)
+    deselect_indices: list[int] = field(default_factory=list)
 
 
 JOURNAL_ALIASES = {
@@ -34,6 +38,18 @@ def parse_chat_intent(message: str) -> ChatIntent:
         intent.actions.append("search")
     if any(token in lowered for token in ["下载", "download"]):
         intent.actions.append("download")
+    if any(token in lowered for token in ["选择", "选中", "select"]):
+        intent.actions.append("select_downloads")
+    if any(token in lowered for token in ["取消选择", "取消下载", "deselect", "unselect"]):
+        intent.actions.append("deselect_downloads")
+    if any(token in lowered for token in ["全部下载", "全都下载", "下载全部", "download all"]):
+        intent.select_all_downloads = True
+        if "select_downloads" not in intent.actions:
+            intent.actions.append("select_downloads")
+    if any(token in lowered for token in ["清空下载", "都不下载", "clear downloads"]):
+        intent.clear_download_selection = True
+        if "deselect_downloads" not in intent.actions:
+            intent.actions.append("deselect_downloads")
     if any(token in lowered for token in ["解析", "全文", "ocr", "parse"]):
         intent.actions.append("parse")
     if any(token in lowered for token in ["表格", "性能", "对比", "matrix", "table"]):
@@ -51,6 +67,13 @@ def parse_chat_intent(message: str) -> ChatIntent:
     if any(token in lowered for token in ["先别下载", "不要下载", "不下载", "skip download"]):
         intent.skip_download = True
         intent.actions = [action for action in intent.actions if action != "download"]
+
+    indices = _extract_indices(message)
+    if indices:
+        if "取消" in message or "deselect" in lowered or "unselect" in lowered:
+            intent.deselect_indices = indices
+        elif "下载" in message or "选择" in message or "select" in lowered:
+            intent.select_indices = indices
 
     year_match = re.search(r"(20\d{2})\s*(?:年)?(?:后|以后|之后|以来|起)?", message)
     if year_match:
@@ -76,3 +99,12 @@ def topic_from_message(message: str) -> str:
         cleaned = re.sub(re.escape(alias), " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ：:，,。.")
     return cleaned or message.strip()
+
+
+def _extract_indices(message: str) -> list[int]:
+    indices: list[int] = []
+    for match in re.finditer(r"(?:第\s*)?(\d{1,3})(?:\s*篇)?", message):
+        value = int(match.group(1))
+        if value > 0:
+            indices.append(value)
+    return list(dict.fromkeys(indices))

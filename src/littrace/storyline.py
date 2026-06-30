@@ -63,6 +63,9 @@ def _claims_from_parsed_papers(workspace: LiteratureWorkspace) -> list[Storyline
     limitation_evidence: list[EvidenceSpan] = []
     method_evidence: list[EvidenceSpan] = []
     response_evidence: list[EvidenceSpan] = []
+    by_paper: dict[str, dict[str, list[EvidenceSpan]]] = defaultdict(
+        lambda: {"method": [], "limitation": [], "response": []}
+    )
     for paper_id, parsed in workspace.parsed_papers.items():
         for section in parsed.get("sections", []):
             text = str(section.get("text") or "")
@@ -70,38 +73,38 @@ def _claims_from_parsed_papers(workspace: LiteratureWorkspace) -> list[Storyline
             lowered = f"{name} {text}".lower()
             evidence = section.get("evidence") or {}
             if "limit" in lowered or "challenge" in lowered:
-                limitation_evidence.append(
-                    EvidenceSpan(
-                        paper_id=paper_id,
-                        section=name or "parsed_text",
-                        snippet=text[:240] or name,
-                        page=evidence.get("page"),
-                        parser=evidence.get("parser"),
-                        confidence=0.7,
-                    )
+                span = EvidenceSpan(
+                    paper_id=paper_id,
+                    section=name or "parsed_text",
+                    snippet=text[:240] or name,
+                    page=evidence.get("page"),
+                    parser=evidence.get("parser"),
+                    confidence=0.7,
                 )
+                limitation_evidence.append(span)
+                by_paper[paper_id]["limitation"].append(span)
             if "method" in lowered or "fabrication" in lowered or "synthesis" in lowered:
-                method_evidence.append(
-                    EvidenceSpan(
-                        paper_id=paper_id,
-                        section=name or "parsed_text",
-                        snippet=text[:240] or name,
-                        page=evidence.get("page"),
-                        parser=evidence.get("parser"),
-                        confidence=0.7,
-                    )
+                span = EvidenceSpan(
+                    paper_id=paper_id,
+                    section=name or "parsed_text",
+                    snippet=text[:240] or name,
+                    page=evidence.get("page"),
+                    parser=evidence.get("parser"),
+                    confidence=0.7,
                 )
+                method_evidence.append(span)
+                by_paper[paper_id]["method"].append(span)
             if any(token in lowered for token in ["improve", "enhance", "address", "overcome"]):
-                response_evidence.append(
-                    EvidenceSpan(
-                        paper_id=paper_id,
-                        section=name or "parsed_text",
-                        snippet=text[:240] or name,
-                        page=evidence.get("page"),
-                        parser=evidence.get("parser"),
-                        confidence=0.7,
-                    )
+                span = EvidenceSpan(
+                    paper_id=paper_id,
+                    section=name or "parsed_text",
+                    snippet=text[:240] or name,
+                    page=evidence.get("page"),
+                    parser=evidence.get("parser"),
+                    confidence=0.7,
                 )
+                response_evidence.append(span)
+                by_paper[paper_id]["response"].append(span)
 
     claims: list[StorylineClaim] = []
     if method_evidence:
@@ -131,4 +134,55 @@ def _claims_from_parsed_papers(workspace: LiteratureWorkspace) -> list[Storyline
                 confidence=0.72,
             )
         )
+    chain_claim = _build_solution_limit_response_chain(workspace, by_paper)
+    if chain_claim:
+        claims.append(chain_claim)
     return claims
+
+
+def _build_solution_limit_response_chain(
+    workspace: LiteratureWorkspace,
+    by_paper: dict[str, dict[str, list[EvidenceSpan]]],
+) -> StorylineClaim | None:
+    dated_papers = [
+        workspace.papers[paper_id]
+        for paper_id in workspace.context.active_papers
+        if paper_id in by_paper and workspace.papers[paper_id].year is not None
+    ]
+    dated_papers.sort(key=lambda paper: (paper.year or 0, paper.title))
+
+    prior = next((paper for paper in dated_papers if by_paper[paper.paper_id]["method"]), None)
+    limitation = next(
+        (paper for paper in dated_papers if by_paper[paper.paper_id]["limitation"]),
+        None,
+    )
+    response = next(
+        (
+            paper
+            for paper in dated_papers
+            if by_paper[paper.paper_id]["response"]
+            and (limitation is None or (paper.year or 0) >= (limitation.year or 0))
+        ),
+        None,
+    )
+
+    if not prior or not limitation or not response:
+        return None
+
+    evidence = [
+        by_paper[prior.paper_id]["method"][0],
+        by_paper[limitation.paper_id]["limitation"][0],
+        by_paper[response.paper_id]["response"][0],
+    ]
+    claim = (
+        f"可形成一条保守的发展链：{prior.year} 年左右的工作“{prior.title}”提供了方法或制备路线；"
+        f"{limitation.year} 年的“{limitation.title}”暴露或讨论了局限/挑战；"
+        f"{response.year} 年的“{response.title}”出现了回应性改进表述。"
+        "这只是基于已解析片段的证据链，不应扩展为未验证的领域共识。"
+    )
+    return StorylineClaim(
+        claim=claim,
+        claim_type="solution_limit_response_chain",
+        evidence=evidence,
+        confidence=0.76,
+    )

@@ -5,6 +5,7 @@ from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
 from littrace.context import apply_context_update
 from littrace.intent import ChatIntent, parse_chat_intent
+from littrace.llm import chat_completion, research_assistant_system_prompt
 from littrace.models import (
     ChatRequest,
     ChatResponse,
@@ -45,8 +46,37 @@ async def handle_chat(
             workspace,
         )
 
+    if any(action in intent.actions for action in ["select_downloads", "deselect_downloads"]):
+        workspace, reply = _apply_download_selection(workspace, intent)
+        return (
+            ChatResponse(
+                reply=reply,
+                action="select_downloads",
+                workspace=workspace,
+                citations=_active_citations(workspace),
+            ),
+            workspace,
+        )
+
     if _should_run_composite(intent):
         return await _run_composite_intent(intent, request, workspace, config)
+
+    llm_reply = await chat_completion(
+        config,
+        research_assistant_system_prompt(),
+        message,
+        workspace,
+    )
+    if llm_reply.used_llm:
+        return (
+            ChatResponse(
+                reply=llm_reply.text,
+                action="llm_chat",
+                workspace=workspace,
+                citations=_active_citations(workspace),
+            ),
+            workspace,
+        )
 
     return (
         ChatResponse(
@@ -162,6 +192,42 @@ def _active_citations(workspace: LiteratureWorkspace):
     return citation_records_for_papers(_active_papers(workspace))
 
 
+def _apply_download_selection(
+    workspace: LiteratureWorkspace,
+    intent: ChatIntent,
+) -> tuple[LiteratureWorkspace, str]:
+    active_ids = list(workspace.context.active_papers)
+    if intent.select_all_downloads:
+        selected = active_ids
+    else:
+        selected = list(workspace.context.selected_for_download)
+
+    if intent.clear_download_selection:
+        selected = []
+
+    for index in intent.select_indices:
+        paper_id = _paper_id_for_index(active_ids, index)
+        if paper_id and paper_id not in selected:
+            selected.append(paper_id)
+
+    for index in intent.deselect_indices:
+        paper_id = _paper_id_for_index(active_ids, index)
+        if paper_id in selected:
+            selected.remove(paper_id)
+
+    workspace.context.selected_for_download = selected
+    if not active_ids:
+        return workspace, "当前上下文还没有文献，暂时无法选择下载。"
+    if not selected:
+        return workspace, "已清空下载选择。"
+
+    names = []
+    for paper_id in selected:
+        paper = workspace.papers[paper_id]
+        names.append(f"{active_ids.index(paper_id) + 1}. {paper.title}")
+    return workspace, "已选择下载：\n" + "\n".join(names)
+
+
 def _apply_literature_filters(
     workspace: LiteratureWorkspace,
     intent: ChatIntent,
@@ -196,7 +262,8 @@ def _format_current_papers(workspace: LiteratureWorkspace) -> str:
         paper = workspace.papers[paper_id]
         year = paper.year or "n.d."
         journal = paper.journal or paper.publisher or "unknown source"
-        lines.append(f"{index}. {paper.title} ({year}, {journal})")
+        selected = "，已选下载" if paper_id in workspace.context.selected_for_download else ""
+        lines.append(f"{index}. {paper.title} ({year}, {journal}{selected})")
     return "\n".join(lines)
 
 
@@ -205,3 +272,10 @@ def _should_run_composite(intent: ChatIntent) -> bool:
         action in intent.actions
         for action in ["search", "download", "parse", "table", "storyline"]
     )
+
+
+def _paper_id_for_index(active_ids: list[str], index: int) -> str | None:
+    position = index - 1
+    if position < 0 or position >= len(active_ids):
+        return None
+    return active_ids[position]

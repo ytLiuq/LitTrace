@@ -53,6 +53,17 @@ For the Codex-style local agent shell:
 littrace
 ```
 
+Optional DeepSeek-compatible chat support is loaded from `.env.local`:
+
+```env
+DEEPSEEK_API_KEY=...
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+`.env.local` is ignored by Git. If these values are missing, the shell falls
+back to deterministic local commands and help text.
+
 Shell commands:
 
 ```text
@@ -62,6 +73,17 @@ Shell commands:
 /papers
 /export
 /quit
+```
+
+Conversation examples:
+
+```text
+检索 2024 年后的 AFM 和 ACS Nano，先别下载，生成性能对比表
+显示上下文
+选择第 1、3 篇下载
+全部下载
+取消选择第 2 篇
+生成发展脉络
 ```
 
 Each shell run creates a folder under `storage.sessions_dir` (default:
@@ -97,6 +119,20 @@ parsing:
 PaddleOCR handles raster images directly. For PDFs, LitTrace uses optional
 `pypdfium2` to render pages to temporary PNG files, then runs PaddleOCR page by
 page and stores page-aware evidence spans.
+
+## Agent Status
+
+- `Source Router` routes materials/chemistry queries toward OpenAlex, Crossref,
+  Unpaywall, and preferred publisher families.
+- `Citation Verifier` builds citation records and audits access links.
+- `Access Manager` plans compliant downloads and marks login-required papers
+  instead of bypassing authentication.
+- `PDF/OCR Parser` exposes metadata-only, Docling, and PaddleOCR tools.
+- `Table Agent` extracts performance cells into evidence-preserving matrices.
+- `Research Storyline Agent` builds conservative solution-limit-response chains
+  from parsed evidence and refuses unsupported broad narratives.
+- `Dialogue Agent` is the primary product surface: a local shell with a
+  hideable literature context panel.
 
 ## API Preview
 

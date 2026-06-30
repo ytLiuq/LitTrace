@@ -32,6 +32,7 @@ async def run_shell() -> None:
     )
     print("LitTrace agent shell")
     print("输入研究任务开始。命令：/context /hide-context /show-context /papers /export /quit")
+    print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
     print(f"folder:  {state.session_root}")
     print()
@@ -102,12 +103,21 @@ def format_context_panel(workspace: LiteratureWorkspace) -> str:
     ids = workspace.context.active_papers
     if not ids:
         return "[上下文窗] 当前没有文献。"
-    lines = [f"[上下文窗] 当前文献 {len(ids)} 篇"]
+    selected = set(workspace.context.selected_for_download)
+    visibility = "显示" if workspace.context.visible_to_user else "隐藏"
+    lines = [
+        f"[上下文窗:{visibility}] 当前文献 {len(ids)} 篇，已选下载 {len(selected)} 篇",
+        "提示：可输入“选择第 1、3 篇下载”“全部下载”“取消选择第 2 篇”。",
+    ]
     for index, paper_id in enumerate(ids[:12], start=1):
         paper = workspace.papers[paper_id]
         year = paper.year or "n.d."
         source = paper.journal or paper.publisher or "unknown source"
-        lines.append(f"{index}. {paper.title} ({year}, {source}, {paper.access_type})")
+        marker = "*" if paper_id in selected else " "
+        lines.append(
+            f"{marker} {index}. {paper.title} "
+            f"({year}, {source}, {paper.access_type}, id={paper.paper_id})"
+        )
     if len(ids) > 12:
         lines.append(f"... 还有 {len(ids) - 12} 篇")
     return "\n".join(lines)

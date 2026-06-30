@@ -47,6 +47,7 @@ def check_storyline_claims(claims: list[StorylineClaim]) -> HarnessResult:
         "prior_solution",
         "remaining_limitation",
         "later_response",
+        "solution_limit_response_chain",
         "unresolved_gap",
         "trend_by_year_and_method",
     }
@@ -62,6 +63,8 @@ def check_storyline_claims(claims: list[StorylineClaim]) -> HarnessResult:
             "later_response",
         }:
             warnings.append(f"Claim should have at least two supporting papers: {claim.claim}")
+        if claim.claim_type == "solution_limit_response_chain" and len(claim.evidence) < 3:
+            errors.append(f"Storyline chain lacks solution-limit-response evidence: {claim.claim}")
         if claim.confidence < 0.7:
             warnings.append(f"Low-confidence storyline claim: {claim.claim}")
 

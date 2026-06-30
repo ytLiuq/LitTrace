@@ -1,8 +1,9 @@
 import pytest
 
 from littrace.chat import handle_chat
-from littrace.config import LitTraceConfig
-from littrace.models import ChatRequest, LiteratureWorkspace
+from littrace.config import LLMConfig, LitTraceConfig
+from littrace.context import add_papers
+from littrace.models import ChatRequest, LiteratureWorkspace, PaperMetadata
 
 
 @pytest.mark.anyio
@@ -43,7 +44,7 @@ async def test_chat_help_for_unknown_intent():
     response, _ = await handle_chat(
         ChatRequest(message="你好"),
         LiteratureWorkspace(),
-        LitTraceConfig(),
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
     )
 
     assert response.action == "help"
@@ -62,3 +63,31 @@ async def test_chat_composite_search_and_table():
     assert response.comparison_matrix is not None
     assert "download" not in response.action
     assert workspace.context.filters["year_min"] == 2024
+
+
+@pytest.mark.anyio
+async def test_chat_can_select_downloads_by_index():
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [
+            PaperMetadata(paper_id="p1", title="First"),
+            PaperMetadata(paper_id="p2", title="Second"),
+        ],
+    )
+
+    response, workspace = await handle_chat(
+        ChatRequest(message="选择第 1、2 篇下载"),
+        workspace,
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
+    )
+
+    assert response.action == "select_downloads"
+    assert workspace.context.selected_for_download == ["p1", "p2"]
+
+    response, workspace = await handle_chat(
+        ChatRequest(message="取消选择第 2 篇"),
+        workspace,
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
+    )
+
+    assert workspace.context.selected_for_download == ["p1"]
