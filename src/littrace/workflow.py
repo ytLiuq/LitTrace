@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TypedDict
 
 from littrace.access import build_download_plan
+from littrace.agent_interactions import build_agent_interaction_report
 from littrace.citations import audit_citation_links
 from littrace.context import add_papers
 from littrace.config import LitTraceConfig, load_config
@@ -34,6 +35,7 @@ class ResearchWorkflowState(TypedDict, total=False):
     comparison_matrix: object
     storyline: object
     storyline_harness: object
+    agent_interactions: object
 
 
 async def run_search_preview(
@@ -272,6 +274,7 @@ async def run_research_graph(
             citation_audit=citation_audit,
             download_plan=download_plan,
             publisher_routes=publisher_routes,
+            agent_interactions=build_agent_interaction_report(workspace),
             parse_report=parse_report,
             table_harness=table_harness,
             comparison_matrix=comparison_matrix,
@@ -295,6 +298,7 @@ async def run_research_graph(
         citation_audit=state.get("citation_audit"),
         download_plan=state.get("download_plan"),
         publisher_routes=state.get("publisher_routes"),
+        agent_interactions=build_agent_interaction_report(state["workspace"]),
         parse_report=state.get("parse_report"),
         table_harness=state.get("table_harness"),
         comparison_matrix=state.get("comparison_matrix"),

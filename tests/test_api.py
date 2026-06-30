@@ -64,6 +64,10 @@ def test_search_context_and_download_plan_api():
     assert response.status_code == 200
     assert response.json()["steps"]
 
+    response = client.get("/agents/interactions")
+    assert response.status_code == 200
+    assert response.json()["handoffs"]
+
     response = client.get("/quality")
     assert response.status_code == 200
     assert "metrics" in response.json()
@@ -129,6 +133,7 @@ def test_search_context_and_download_plan_api():
     assert workflow["citation_audit"] is None
     assert workflow["download_plan"] is None
     assert workflow["publisher_routes"] is not None
+    assert workflow["agent_interactions"] is not None
     assert workflow["parse_report"] is not None
     assert workflow["table_harness"] is not None
     assert workflow["comparison_matrix"] is not None

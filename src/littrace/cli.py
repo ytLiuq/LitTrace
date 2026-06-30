@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 
 from littrace.attachments import attach_pdf_to_paper, check_download_presence
+from littrace.agent_interactions import build_agent_interaction_report
 from littrace.agent_audits import audit_parser_agent, audit_storyline_agent, audit_table_agent
 from littrace.agent_strength import build_agent_portfolio_report
 from littrace.auto_resume import auto_resume_downloaded_pdfs
@@ -52,7 +53,7 @@ async def run_shell() -> None:
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /attach N path.pdf /attach-si N path /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /quality /agents /agent-audits /plan topic /init-config /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
+        "/dashboard /quality /agents /agent-flow /agent-audits /plan topic /init-config /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -103,6 +104,18 @@ async def run_shell() -> None:
                 print(f"- {agent.name}: {agent.level} ({agent.score})")
             if report.recommendations:
                 print("建议：" + "；".join(report.recommendations))
+            continue
+        if message == "/agent-flow":
+            report = build_agent_interaction_report(state.workspace)
+            print(
+                f"Agent handoffs: ready={report.ready_count}, blocked={report.blocked_count}, complete={report.complete_count}"
+            )
+            for handoff in report.handoffs:
+                print(
+                    f"- {handoff.from_agent} -> {handoff.to_agent}: {handoff.status} | {handoff.artifact}"
+                )
+            if report.recommended_next_agents:
+                print("下一步建议：" + "，".join(report.recommended_next_agents))
             continue
         if message == "/agent-audits":
             for report in [

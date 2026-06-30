@@ -74,6 +74,7 @@ Shell commands:
 /dashboard
 /quality
 /agents
+/agent-flow
 /agent-audits
 /plan MXene sensor
 /init-config
@@ -201,6 +202,7 @@ curl http://127.0.0.1:8000/agents/crew
 curl http://127.0.0.1:8000/agents/status
 curl http://127.0.0.1:8000/agents/strength
 curl http://127.0.0.1:8000/agents/audits
+curl http://127.0.0.1:8000/agents/interactions
 curl "http://127.0.0.1:8000/agents/plan?topic=MXene%20sensor"
 curl http://127.0.0.1:8000/publishers/routes
 curl "http://127.0.0.1:8000/publishers/search-plan?topic=MXene%20sensor"

@@ -9,6 +9,7 @@ from littrace.eval_api import (
     storyline_metrics,
 )
 from littrace.access import build_download_plan
+from littrace.agent_interactions import AgentInteractionReport, build_agent_interaction_report
 from littrace.agents import AgentRoleSpec, AgentRuntimeStatus, agent_runtime_statuses, crew_role_specs
 from littrace.agent_audits import AgentAuditReport, audit_parser_agent, audit_storyline_agent, audit_table_agent
 from littrace.agent_strength import AgentPortfolioReport, build_agent_portfolio_report
@@ -128,6 +129,11 @@ def agents_audits() -> list[AgentAuditReport]:
 @app.get("/agents/plan", response_model=ResearchPlan)
 def agents_plan(topic: str) -> ResearchPlan:
     return build_research_plan(topic, WORKSPACE)
+
+
+@app.get("/agents/interactions", response_model=AgentInteractionReport)
+def agents_interactions() -> AgentInteractionReport:
+    return build_agent_interaction_report(WORKSPACE)
 
 
 @app.post("/search/preview", response_model=LiteratureWorkspace)

@@ -8,6 +8,8 @@ def test_research_plan_starts_with_retrieval_when_empty():
 
     assert plan.warnings
     assert plan.steps[0].agent == "Source Router"
+    assert plan.steps[0].handoff_to == "Search/Retrieval Agent"
+    assert plan.steps[0].quality_gate
 
 
 def test_research_plan_includes_access_and_citation_when_context_exists():

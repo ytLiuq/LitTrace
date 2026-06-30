@@ -155,6 +155,7 @@ class ResearchRunResult(BaseModel):
     citation_audit: CitationAudit | None = None
     download_plan: DownloadPlan | None = None
     publisher_routes: object | None = None
+    agent_interactions: object | None = None
     parse_report: dict[str, object] | None = None
     table_harness: dict[str, object] | None = None
     comparison_matrix: "ComparisonMatrixReport | None" = None
