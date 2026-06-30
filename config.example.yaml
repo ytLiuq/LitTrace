@@ -1,0 +1,70 @@
+storage:
+  paper_library_dir: "./data/papers"
+  metadata_dir: "./data/metadata"
+  cache_dir: "./data/cache"
+  sessions_dir: "./sessions"
+
+api:
+  user_agent: "LitTrace/0.1 mailto:your-email@example.com"
+  openalex_api_key: null
+  unpaywall_email: "your-email@example.com"
+  crossref_mailto: "your-email@example.com"
+  request_timeout_seconds: 20
+  enable_live_search: true
+
+paper_download:
+  mode: "ask_each_time"
+  organize_by: "year_doi"
+  filename_template: "{year}_{first_author}_{short_title}_{doi_hash}.pdf"
+  save_metadata_even_if_pdf_skipped: true
+  allow_requires_login_download: true
+
+parsing:
+  default_parser: "metadata_only"
+  preferred_engines:
+    - "docling"
+    - "paddleocr"
+    - "marker"
+    - "grobid"
+  docling:
+    export_markdown: true
+    extract_tables: true
+    extract_figures: true
+  paddleocr:
+    lang: "en"
+    use_angle_cls: true
+    pdf_render_scale: 2.0
+    max_pages: null
+
+literature_context:
+  visible_to_user: true
+  default_year_min: 2023
+  default_recent_year_min: 2023
+  preferred_disciplines:
+    - "materials science"
+    - "chemistry"
+  preferred_publishers:
+    - "Wiley"
+    - "American Chemical Society"
+    - "Springer Nature"
+    - "Royal Society of Chemistry"
+    - "Elsevier"
+    - "MDPI"
+    - "Nature Portfolio"
+  preferred_journals:
+    - "Advanced Materials"
+    - "Advanced Functional Materials"
+    - "ACS Nano"
+    - "Nano Letters"
+    - "Chemistry of Materials"
+    - "Nature Materials"
+    - "Nature Communications"
+    - "Small"
+    - "Materials Today"
+    - "Sensors and Actuators"
+    - "Polymers"
+    - "Nanomaterials"
+
+eval:
+  golden_set_dir: "./eval/golden"
+  traces_dir: "./eval/traces"

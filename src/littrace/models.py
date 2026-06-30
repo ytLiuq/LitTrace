@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+from enum import StrEnum
+
+from pydantic import BaseModel, Field, HttpUrl
+
+
+class AccessType(StrEnum):
+    OPEN_ACCESS = "open_access"
+    REQUIRES_LOGIN = "requires_login"
+    UNAVAILABLE = "unavailable"
+    METADATA_ONLY = "metadata_only"
+    USER_UPLOAD = "user_upload"
+
+
+class LinkStatus(StrEnum):
+    VERIFIED_200 = "verified_200"
+    VERIFIED_REDIRECT = "verified_redirect"
+    REQUIRES_LOGIN = "requires_login"
+    FAILED = "failed"
+    UNCHECKED = "unchecked"
+
+
+class PaperMetadata(BaseModel):
+    paper_id: str
+    title: str
+    authors: list[str] = Field(default_factory=list)
+    year: int | None = None
+    journal: str | None = None
+    publisher: str | None = None
+    doi: str | None = None
+    abstract: str | None = None
+    citation_count: int | None = None
+    source_urls: list[HttpUrl] = Field(default_factory=list)
+    pdf_url: HttpUrl | None = None
+    access_type: AccessType = AccessType.METADATA_ONLY
+    relevance_score: float | None = None
+    recency_score: float | None = None
+
+
+class PaperSearchRequest(BaseModel):
+    topic: str
+    discipline: str = "materials chemistry"
+    year_min: int | None = 2023
+    limit: int = 20
+    wants_recent: bool = True
+    live: bool | None = None
+
+
+class PaperSearchResult(BaseModel):
+    request: PaperSearchRequest
+    papers: list[PaperMetadata]
+
+
+class LiteratureContext(BaseModel):
+    visible_to_user: bool = True
+    active_papers: list[str] = Field(default_factory=list)
+    excluded_papers: list[str] = Field(default_factory=list)
+    pinned_papers: list[str] = Field(default_factory=list)
+    selected_for_download: list[str] = Field(default_factory=list)
+    filters: dict[str, object] = Field(default_factory=dict)
+
+
+class LiteratureWorkspace(BaseModel):
+    context: LiteratureContext = Field(default_factory=LiteratureContext)
+    papers: dict[str, PaperMetadata] = Field(default_factory=dict)
+    parsed_papers: dict[str, dict[str, object]] = Field(default_factory=dict)
+    performance_cells: list["PerformanceCell"] = Field(default_factory=list)
+
+
+class ContextUpdate(BaseModel):
+    visible_to_user: bool | None = None
+    include_paper_ids: list[str] = Field(default_factory=list)
+    exclude_paper_ids: list[str] = Field(default_factory=list)
+    pin_paper_ids: list[str] = Field(default_factory=list)
+    unpin_paper_ids: list[str] = Field(default_factory=list)
+    select_for_download: list[str] = Field(default_factory=list)
+    deselect_for_download: list[str] = Field(default_factory=list)
+    filters: dict[str, object] | None = None
+
+
+class DownloadPlanItem(BaseModel):
+    paper_id: str
+    title: str
+    access_type: AccessType
+    decision: str
+    can_download: bool = False
+    requires_login: bool = False
+    target_dir: str
+
+
+class DownloadPlan(BaseModel):
+    items: list[DownloadPlanItem]
+    target_root: str
+    requires_login_count: int = 0
+    downloadable_count: int = 0
+
+
+class DownloadExecutionRequest(BaseModel):
+    paper_ids: list[str] = Field(default_factory=list)
+    dry_run: bool = False
+
+
+class DownloadExecutionItem(BaseModel):
+    paper_id: str
+    action: str
+    status: str
+    target_path: str | None = None
+    login_url: HttpUrl | None = None
+    error: str | None = None
+
+
+class DownloadExecutionResult(BaseModel):
+    items: list[DownloadExecutionItem]
+    downloaded_count: int = 0
+    requires_login_count: int = 0
+    skipped_count: int = 0
+
+
+class CitationRecord(BaseModel):
+    paper_id: str
+    citation_text: str
+    access_url: HttpUrl
+    link_status: LinkStatus = LinkStatus.UNCHECKED
+    doi: str | None = None
+    checked_url: HttpUrl | None = None
+    status_code: int | None = None
+    requires_login: bool = False
+    error: str | None = None
+
+
+class CitationAudit(BaseModel):
+    records: list[CitationRecord]
+    passed: bool
+    score: float
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ResearchRunRequest(BaseModel):
+    search: PaperSearchRequest
+    audit_citations: bool = True
+    plan_downloads: bool = True
+    parse_full_text: bool = False
+    extract_tables: bool = False
+    build_storyline: bool = False
+
+
+class ResearchRunResult(BaseModel):
+    workspace: LiteratureWorkspace
+    citation_audit: CitationAudit | None = None
+    download_plan: DownloadPlan | None = None
+    parse_report: dict[str, object] | None = None
+    table_harness: dict[str, object] | None = None
+    comparison_matrix: "ComparisonMatrixReport | None" = None
+    storyline: list["StorylineClaim"] | None = None
+
+
+class ChatRequest(BaseModel):
+    message: str
+    live: bool | None = None
+    session_id: str | None = None
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    action: str
+    session_id: str | None = None
+    session_root: str | None = None
+    workspace: LiteratureWorkspace | None = None
+    research_result: ResearchRunResult | None = None
+    citations: list[CitationRecord] = Field(default_factory=list)
+    download_plan: DownloadPlan | None = None
+    comparison_matrix: "ComparisonMatrixReport | None" = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class EvidenceSpan(BaseModel):
+    paper_id: str
+    section: str | None = None
+    page: int | None = None
+    table_id: str | None = None
+    row_label: str | None = None
+    column_label: str | None = None
+    snippet: str | None = None
+    parser: str | None = None
+    confidence: float = 0.0
+
+
+class PerformanceCell(BaseModel):
+    paper_id: str
+    task: str | None = None
+    dataset: str | None = None
+    metric: str
+    value: float | str
+    unit: str | None = None
+    higher_is_better: bool | None = None
+    method_name: str | None = None
+    evidence: EvidenceSpan
+
+
+class ComparisonMatrixRow(BaseModel):
+    paper_id: str
+    title: str | None = None
+    year: int | None = None
+    metric: str
+    value: float | str
+    unit: str | None = None
+    task: str | None = None
+    dataset: str | None = None
+    method_name: str | None = None
+    higher_is_better: bool | None = None
+    comparable: bool = True
+    warnings: list[str] = Field(default_factory=list)
+    evidence: EvidenceSpan
+
+
+class ComparisonMatrix(BaseModel):
+    metric: str
+    rows: list[ComparisonMatrixRow]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ComparisonMatrixReport(BaseModel):
+    matrices: list[ComparisonMatrix]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class StorylineClaim(BaseModel):
+    claim: str
+    claim_type: str
+    evidence: list[EvidenceSpan]
+    confidence: float = 0.0

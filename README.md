@@ -1,0 +1,129 @@
+# LitTrace
+
+LitTrace is a materials and chemistry research agent for traceable literature
+workflows. It helps researchers search papers, manage the active literature
+context, optionally download PDFs, parse full text with OCR tools, build
+evidence-grounded comparison tables, and generate truthful research storylines.
+
+LitTrace is intentionally a **LangGraph + CrewAI** project:
+
+- **LangGraph** is the primary stateful workflow engine for source routing,
+  search, citation auditing, download planning, OCR parsing, and later
+  storyline/table verification.
+- **CrewAI** is the optional role layer for research-team style agents such as
+  Source Router, Citation Verifier, Access Manager, and Storyline Verifier.
+
+## Product Principles
+
+- The active literature context is visible and editable by the user.
+- PDFs are never downloaded by surprise. Download behavior is controlled by
+  configuration and explicit user selection.
+- Every paper-related answer must carry citations and checked access links.
+- Storylines must be grounded in evidence: what earlier papers solved, what
+  limits remained, and how later papers responded.
+- Performance tables must preserve provenance down to paper, page, table, row,
+  column, snippet, parser, and confidence.
+- Evaluation APIs are first-class so retrieval, parsing, extraction, storyline,
+  and end-to-end quality can improve measurably.
+
+## Initial Scope
+
+- Materials/chemistry source routing for Crossref, OpenAlex, Semantic Scholar,
+  Unpaywall, arXiv, and publisher links such as Wiley, ACS, Springer Nature,
+  RSC, Elsevier, MDPI, and Nature Portfolio.
+- Configurable paper storage folders.
+- Literature context panel state for show/hide, include/exclude, pinning,
+  filtering, and download selection.
+- Pluggable OCR/PDF parsing tool interface.
+- Harness interfaces for citations, links, tables, and storylines.
+- FastAPI evaluation endpoints.
+
+## Local Development
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+uvicorn littrace.api.app:app --reload
+```
+
+For the Codex-style local agent shell:
+
+```bash
+littrace
+```
+
+Shell commands:
+
+```text
+/context
+/hide-context
+/show-context
+/papers
+/export
+/quit
+```
+
+Each shell run creates a folder under `storage.sessions_dir` (default:
+`./sessions/<timestamp-id>/`) containing:
+
+```text
+workspace.json
+messages.jsonl
+artifacts/
+```
+
+Copy `config.example.yaml` to `config.yaml` and set `storage.paper_library_dir`
+before running workflows that may download PDFs.
+
+To enable the optional Docling parser backend:
+
+```bash
+pip install -e ".[parsers]"
+```
+
+Then set one of:
+
+```yaml
+parsing:
+  default_parser: "docling"
+```
+
+```yaml
+parsing:
+  default_parser: "paddleocr"  # "paddlerocr" is accepted as an alias
+```
+
+PaddleOCR handles raster images directly. For PDFs, LitTrace uses optional
+`pypdfium2` to render pages to temporary PNG files, then runs PaddleOCR page by
+page and stores page-aware evidence spans.
+
+## API Preview
+
+```bash
+curl -X POST http://127.0.0.1:8000/search/preview \
+  -H "Content-Type: application/json" \
+  -d '{"topic":"MXene flexible sensor","limit":5,"live":true}'
+
+curl -X POST http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message":"检索 MXene flexible sensor 的最新论文","live":false}'
+
+curl http://127.0.0.1:8000/context
+curl http://127.0.0.1:8000/citations/context
+curl -X POST http://127.0.0.1:8000/citations/audit
+curl -X POST http://127.0.0.1:8000/downloads/plan
+curl -X POST http://127.0.0.1:8000/downloads/execute \
+  -H "Content-Type: application/json" \
+  -d '{"paper_ids":[],"dry_run":true}'
+curl -X POST http://127.0.0.1:8000/workflow/research \
+  -H "Content-Type: application/json" \
+  -d '{"search":{"topic":"MXene flexible sensor","live":false},"audit_citations":false,"plan_downloads":false,"parse_full_text":true,"build_storyline":true}'
+curl -X POST http://127.0.0.1:8000/parse/context
+curl -X POST http://127.0.0.1:8000/tables/extract
+curl http://127.0.0.1:8000/tables/matrix
+curl http://127.0.0.1:8000/agents/crew
+```
+
+`/citations/audit` treats `requires_login` as a valid, traceable access state:
+the link resolves, but the user must authenticate through an authorized route.
