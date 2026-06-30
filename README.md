@@ -71,11 +71,16 @@ Shell commands:
 /hide-context
 /show-context
 /papers
+/dashboard
 /login N
+/attach N /path/to/paper.pdf
+/check-downloads
 /parse
 /table
 /storyline
+/storyline-report
 /benchmark
+/golden-eval
 /export
 /quit
 ```
@@ -93,7 +98,9 @@ Conversation examples:
 
 For login-gated papers, `/login N` opens the authorized publisher or DOI page in
 the local browser and prints the exact target path where the PDF should be
-saved for the current session/parser flow.
+saved for the current session/parser flow. `/check-downloads` detects whether
+those PDFs have appeared, and `/attach N /path/to/paper.pdf` copies an existing
+local PDF into the expected LitTrace folder for that paper.
 
 Each shell run creates a folder under `storage.sessions_dir` (default:
 `./sessions/<timestamp-id>/`) containing:
@@ -175,8 +182,13 @@ curl http://127.0.0.1:8000/agents/crew
 curl http://127.0.0.1:8000/agents/status
 curl http://127.0.0.1:8000/publishers/routes
 curl "http://127.0.0.1:8000/publishers/search-plan?topic=MXene%20sensor"
+curl -X POST "http://127.0.0.1:8000/publishers/retrieve?topic=MXene%20sensor&family=acs"
 curl -X POST "http://127.0.0.1:8000/downloads/login/{paper_id}?dry_run=true"
+curl -X POST http://127.0.0.1:8000/downloads/check
+curl -X POST "http://127.0.0.1:8000/papers/{paper_id}/attach-pdf?source_path=/path/to/paper.pdf"
+curl http://127.0.0.1:8000/storyline/report
 curl http://127.0.0.1:8000/eval/pdf-benchmark
+curl http://127.0.0.1:8000/eval/golden
 ```
 
 `/citations/audit` treats `requires_login` as a valid, traceable access state:

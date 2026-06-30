@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
+from littrace.attachments import attach_pdf_to_paper, check_download_presence
 from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.export import export_session_bundle
+from littrace.golden_eval import run_golden_eval
 from littrace.login_flow import launch_login_for_paper
 from littrace.models import ChatRequest, LiteratureWorkspace
 from littrace.pdf_benchmark import benchmark_pdf_parsing
 from littrace.session import append_message, create_chat_session, save_workspace
+from littrace.storyline import render_structured_storyline_report
 
 
 @dataclass
@@ -35,7 +38,8 @@ async def run_shell() -> None:
     print("LitTrace agent shell")
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
-        "/login N /parse /table /storyline /benchmark /export /quit"
+        "/login N /attach N path.pdf /check-downloads /parse /table /storyline "
+        "/dashboard /storyline-report /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -68,12 +72,18 @@ async def run_shell() -> None:
         if message in {"/context", "/papers"}:
             print(format_context_panel(state.workspace))
             continue
+        if message == "/dashboard":
+            print(format_dashboard(state))
+            continue
         if message == "/parse":
             message = "解析当前文献全文"
         if message == "/table":
             message = "生成当前文献性能对比表"
         if message == "/storyline":
             message = "生成当前文献发展脉络"
+        if message == "/storyline-report":
+            print(render_structured_storyline_report(state.workspace))
+            continue
         if message.startswith("/login "):
             index = _parse_index_arg(message)
             paper_id = _paper_id_for_index(state.workspace, index) if index else None
@@ -89,6 +99,33 @@ async def run_shell() -> None:
             if result.error:
                 print(f"错误: {result.error}")
             continue
+        if message.startswith("/attach "):
+            parsed = _parse_attach_args(message)
+            if not parsed:
+                print("用法：/attach N /path/to/paper.pdf")
+                continue
+            index, source_path = parsed
+            paper_id = _paper_id_for_index(state.workspace, index)
+            if not paper_id:
+                print("没有找到这个编号的文献。")
+                continue
+            result = attach_pdf_to_paper(config, state.workspace, paper_id, source_path)
+            print(f"PDF 绑定: {'成功' if result.attached else '失败'}")
+            print(f"目标路径: {result.target_path}")
+            if result.error:
+                print(f"错误: {result.error}")
+            save_workspace(session, state.workspace)
+            continue
+        if message == "/check-downloads":
+            report = check_download_presence(config, state.workspace)
+            print(
+                f"PDF 检测：{report.ready_to_parse_count} 篇已就绪，"
+                f"{report.missing_count} 篇缺失。"
+            )
+            for item in report.items[:12]:
+                marker = "ok" if item.exists else "missing"
+                print(f"- [{marker}] {item.title}: {item.expected_path}")
+            continue
         if message == "/benchmark":
             report = benchmark_pdf_parsing(state.workspace, config)
             print(
@@ -98,6 +135,14 @@ async def run_shell() -> None:
                 f"page_evidence={report.parsed_with_page_evidence}, "
                 f"avg_conf={report.average_evidence_confidence}"
             )
+            if report.warnings:
+                print("注意：" + "；".join(report.warnings))
+            continue
+        if message == "/golden-eval":
+            report = run_golden_eval(config)
+            print(f"Golden eval: cases={report.case_count}, dir={report.golden_set_dir}")
+            for name, value in report.metrics.items():
+                print(f"- {name}: {value}")
             if report.warnings:
                 print("注意：" + "；".join(report.warnings))
             continue
@@ -165,12 +210,40 @@ def format_context_panel(workspace: LiteratureWorkspace) -> str:
     return "\n".join(lines)
 
 
+def format_dashboard(state: ShellState) -> str:
+    workspace = state.workspace
+    active = len(workspace.context.active_papers)
+    selected = len(workspace.context.selected_for_download)
+    parsed = len(workspace.parsed_papers)
+    cells = len(workspace.performance_cells)
+    visible = "显示" if workspace.context.visible_to_user else "隐藏"
+    lines = [
+        "[LitTrace Dashboard]",
+        f"session: {state.session_id}",
+        f"folder:  {state.session_root}",
+        f"context: {active} papers, panel={visible}, selected_downloads={selected}",
+        f"parsing: {parsed} parsed records, performance_cells={cells}",
+        "commands: /context /login N /attach N path.pdf /check-downloads /parse /table /storyline-report /benchmark /export",
+    ]
+    return "\n".join(lines)
+
+
 def _parse_index_arg(message: str) -> int | None:
     parts = message.split()
     if len(parts) != 2:
         return None
     try:
         return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _parse_attach_args(message: str) -> tuple[int, str] | None:
+    parts = message.split(maxsplit=2)
+    if len(parts) != 3:
+        return None
+    try:
+        return int(parts[1]), parts[2]
     except ValueError:
         return None
 

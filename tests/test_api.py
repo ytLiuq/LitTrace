@@ -69,6 +69,10 @@ def test_search_context_and_download_plan_api():
     assert response.status_code == 200
     assert response.json()["target_path"].endswith("paper.pdf")
 
+    response = client.post("/downloads/check")
+    assert response.status_code == 200
+    assert "ready_to_parse_count" in response.json()
+
     response = client.post("/downloads/execute", json={"paper_ids": [], "dry_run": True})
     assert response.status_code == 200
     result = response.json()
@@ -111,6 +115,14 @@ def test_search_context_and_download_plan_api():
     response = client.get("/tables/matrix")
     assert response.status_code == 200
     assert "matrices" in response.json()
+
+    response = client.get("/storyline/report")
+    assert response.status_code == 200
+    assert "markdown" in response.json()
+
+    response = client.get("/eval/golden")
+    assert response.status_code == 200
+    assert "metrics" in response.json()
 
     response = client.post("/chat", json={"message": "当前文献有哪些？"})
     assert response.status_code == 200

@@ -10,12 +10,19 @@ from littrace.eval_api import (
 )
 from littrace.access import build_download_plan
 from littrace.agents import AgentRoleSpec, AgentRuntimeStatus, agent_runtime_statuses, crew_role_specs
+from littrace.attachments import (
+    AttachmentResult,
+    DownloadPresenceReport,
+    attach_pdf_to_paper,
+    check_download_presence,
+)
 from littrace.citations import audit_citation_links, citation_records_for_papers
 from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.context import apply_context_update
 from littrace.downloads import execute_downloads
 from littrace.export import export_session_bundle
+from littrace.golden_eval import GoldenEvalReport, run_golden_eval
 from littrace.login_flow import LoginLaunchResult, launch_login_for_paper
 from littrace.models import (
     ChatRequest,
@@ -40,6 +47,7 @@ from littrace.publisher_connectors import (
     build_publisher_search_plan,
     publisher_routes_for_workspace,
 )
+from littrace.publisher_retrieval import PublisherRetrievalResult, fetch_publisher_search_results
 from littrace.session import (
     append_message,
     load_or_create_session,
@@ -47,6 +55,7 @@ from littrace.session import (
     save_workspace,
 )
 from littrace.tables import build_comparison_matrices, extract_performance_cells
+from littrace.storyline import render_structured_storyline_report
 from littrace.source_router import route_sources
 from littrace.workflow import run_research_graph, run_search_preview
 
@@ -152,6 +161,14 @@ def publisher_search_plan(topic: str) -> PublisherSearchPlanReport:
     return build_publisher_search_plan(topic)
 
 
+@app.post("/publishers/retrieve", response_model=PublisherRetrievalResult)
+async def publisher_retrieve(topic: str, family: str = "acs") -> PublisherRetrievalResult:
+    plan_report = build_publisher_search_plan(topic, families=[family])
+    if not plan_report.plans:
+        raise KeyError(f"No publisher search plan for {family}")
+    return await fetch_publisher_search_results(load_config(), plan_report.plans[0])
+
+
 @app.post("/downloads/execute", response_model=DownloadExecutionResult)
 async def downloads_execute(request: DownloadExecutionRequest) -> DownloadExecutionResult:
     config = load_config()
@@ -164,6 +181,16 @@ def downloads_login(paper_id: str, dry_run: bool = False) -> LoginLaunchResult:
     config = load_config()
     paper = WORKSPACE.papers[paper_id]
     return launch_login_for_paper(config, paper, dry_run=dry_run)
+
+
+@app.post("/downloads/check", response_model=DownloadPresenceReport)
+def downloads_check() -> DownloadPresenceReport:
+    return check_download_presence(load_config(), WORKSPACE)
+
+
+@app.post("/papers/{paper_id}/attach-pdf", response_model=AttachmentResult)
+def attach_pdf(paper_id: str, source_path: str) -> AttachmentResult:
+    return attach_pdf_to_paper(load_config(), WORKSPACE, paper_id, source_path)
 
 
 @app.post("/parse/context", response_model=LiteratureWorkspace)
@@ -187,6 +214,11 @@ def tables_extract() -> ResearchRunResult:
 @app.get("/tables/matrix", response_model=ComparisonMatrixReport)
 def tables_matrix() -> ComparisonMatrixReport:
     return build_comparison_matrices(WORKSPACE)
+
+
+@app.get("/storyline/report")
+def storyline_report() -> dict[str, str]:
+    return {"markdown": render_structured_storyline_report(WORKSPACE)}
 
 
 @app.get("/citations/context", response_model=list[CitationRecord])
@@ -231,3 +263,8 @@ def eval_end_to_end(topic: str | None = None) -> EvalMetricReport:
     metrics["pdf_download_success_rate"] = 0.0
     metrics["citation_link_verified_rate"] = 0.0
     return EvalMetricReport(run_id="preview", topic=topic, metrics=metrics)
+
+
+@app.get("/eval/golden", response_model=GoldenEvalReport)
+def eval_golden() -> GoldenEvalReport:
+    return run_golden_eval(load_config())

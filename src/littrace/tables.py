@@ -11,6 +11,7 @@ from littrace.models import (
     LiteratureWorkspace,
     PerformanceCell,
 )
+from littrace.units import normalize_metric_unit
 
 
 METRIC_DIRECTIONS = {
@@ -68,9 +69,10 @@ def build_comparison_matrices(workspace: LiteratureWorkspace) -> ComparisonMatri
     matrices: list[ComparisonMatrix] = []
     report_warnings: list[str] = []
     for metric, cells in sorted(grouped.items()):
-        units = {cell.unit for cell in cells if cell.unit}
-        datasets = {cell.dataset for cell in cells if cell.dataset}
-        tasks = {cell.task for cell in cells if cell.task}
+        normalized_cells = [_normalized_cell(cell) for cell in cells]
+        units = {cell.unit for cell in normalized_cells if cell.unit}
+        datasets = {cell.dataset for cell in normalized_cells if cell.dataset}
+        tasks = {cell.task for cell in normalized_cells if cell.task}
         matrix_warnings: list[str] = []
         if len(units) > 1:
             matrix_warnings.append(f"Mixed units for {metric}: {sorted(units)}")
@@ -87,13 +89,27 @@ def build_comparison_matrices(workspace: LiteratureWorkspace) -> ComparisonMatri
                 has_dataset=bool(datasets),
                 has_task=bool(tasks),
             )
-            for cell in cells
+            for cell in normalized_cells
         ]
         rows = sorted(rows, key=_row_sort_key(metric))
         matrices.append(ComparisonMatrix(metric=metric, rows=rows, warnings=matrix_warnings))
         report_warnings.extend(matrix_warnings)
 
     return ComparisonMatrixReport(matrices=matrices, warnings=report_warnings)
+
+
+def _normalized_cell(cell: PerformanceCell) -> PerformanceCell:
+    value, unit, warning = normalize_metric_unit(cell.metric, cell.value, cell.unit)
+    if warning is None:
+        return cell
+    update = cell.model_dump()
+    update["value"] = value
+    update["unit"] = unit
+    evidence = dict(update["evidence"])
+    snippet = evidence.get("snippet") or ""
+    evidence["snippet"] = f"{snippet} [{warning}]".strip()
+    update["evidence"] = evidence
+    return PerformanceCell.model_validate(update)
 
 
 def _cells_from_sections(paper_id: str, parsed: dict[str, object]) -> list[PerformanceCell]:

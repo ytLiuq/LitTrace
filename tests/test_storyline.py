@@ -5,6 +5,7 @@ from littrace.models import LiteratureWorkspace
 from littrace.storyline import (
     build_storyline_from_workspace,
     build_storyline_preview,
+    render_structured_storyline_report,
     verify_storyline_preview,
 )
 
@@ -110,3 +111,33 @@ def test_storyline_builds_conservative_chain_across_parsed_papers():
     assert chain
     assert "不应扩展为未验证的领域共识" in chain[0].claim
     assert check_storyline_claims(chain).passed
+
+
+def test_structured_storyline_report_includes_references():
+    workspace = add_papers(
+        LiteratureWorkspace(
+            parsed_papers={
+                "p1": {
+                    "sections": [
+                        {
+                            "name": "Methods",
+                            "text": "The fabrication method defines the sensing film.",
+                            "evidence": {"page": 2, "parser": "docling"},
+                        },
+                        {
+                            "name": "Limitations",
+                            "text": "A limitation is cycling drift.",
+                            "evidence": {"page": 7, "parser": "docling"},
+                        },
+                    ]
+                }
+            }
+        ),
+        [PaperMetadata(paper_id="p1", title="Paper", year=2026, doi="10.1000/story")],
+    )
+
+    report = render_structured_storyline_report(workspace)
+
+    assert "前人解决了什么" in report
+    assert "引用与访问链接" in report
+    assert "https://doi.org/10.1000/story" in report

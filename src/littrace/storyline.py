@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from littrace.harnesses import HarnessResult, check_storyline_claims
+from littrace.citations import citation_records_for_papers
 from littrace.models import EvidenceSpan, LiteratureWorkspace, PaperMetadata, StorylineClaim
 
 
@@ -57,6 +58,43 @@ def build_storyline_from_workspace(workspace: LiteratureWorkspace) -> list[Story
         return parsed_claims
     papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
     return build_storyline_preview(papers)
+
+
+def render_structured_storyline_report(workspace: LiteratureWorkspace) -> str:
+    claims = build_storyline_from_workspace(workspace)
+    if not claims:
+        return "当前证据不足以生成结构化发展脉络。"
+
+    sections = {
+        "前人解决了什么": [claim for claim in claims if claim.claim_type == "prior_solution"],
+        "留下了什么局限": [claim for claim in claims if claim.claim_type == "remaining_limitation"],
+        "后续论文如何回应": [
+            claim
+            for claim in claims
+            if claim.claim_type in {"later_response", "solution_limit_response_chain"}
+        ],
+    }
+    lines: list[str] = ["# LitTrace 发展脉络报告"]
+    for title, selected in sections.items():
+        lines.append("")
+        lines.append(f"## {title}")
+        if not selected:
+            lines.append("当前上下文没有足够证据。")
+            continue
+        for claim in selected:
+            evidence_ids = ", ".join(sorted({item.paper_id for item in claim.evidence}))
+            lines.append(f"- {claim.claim} 证据：{evidence_ids}")
+            for evidence in claim.evidence[:3]:
+                location = f"p.{evidence.page}" if evidence.page is not None else evidence.section or "evidence"
+                snippet = evidence.snippet or ""
+                lines.append(f"  - [{evidence.paper_id}] {location}: {snippet[:180]}")
+
+    papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
+    lines.append("")
+    lines.append("## 引用与访问链接")
+    for record in citation_records_for_papers(papers):
+        lines.append(f"- {record.citation_text} {record.access_url}")
+    return "\n".join(lines)
 
 
 def _claims_from_parsed_papers(workspace: LiteratureWorkspace) -> list[StorylineClaim]:

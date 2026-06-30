@@ -133,8 +133,9 @@ def test_build_comparison_matrices_marks_mixed_units_not_comparable():
 
     report = build_comparison_matrices(workspace)
 
-    assert "Mixed units" in report.matrices[0].warnings[0]
-    assert not report.matrices[0].rows[0].comparable
+    assert not any("Mixed units" in warning for warning in report.matrices[0].warnings)
+    assert report.matrices[0].rows[0].unit == "ms"
+    assert report.matrices[0].rows[1].value == 1000.0
 
 
 def test_extract_materials_chemistry_metrics():
@@ -165,3 +166,32 @@ def test_extract_materials_chemistry_metrics():
     metrics = {cell.metric for cell in workspace.performance_cells}
     assert harness.passed
     assert {"conductivity", "specific capacitance", "cycle retention", "tensile strength"} <= metrics
+
+
+def test_conductivity_units_are_normalized_for_comparison():
+    workspace = LiteratureWorkspace(
+        performance_cells=[
+            {
+                "paper_id": "p1",
+                "metric": "conductivity",
+                "value": 1.0,
+                "unit": "S/cm",
+                "higher_is_better": True,
+                "evidence": {"paper_id": "p1", "snippet": "conductivity 1 S/cm", "confidence": 0.8},
+            },
+            {
+                "paper_id": "p2",
+                "metric": "conductivity",
+                "value": 80.0,
+                "unit": "S/m",
+                "higher_is_better": True,
+                "evidence": {"paper_id": "p2", "snippet": "conductivity 80 S/m", "confidence": 0.8},
+            },
+        ]
+    )
+
+    report = build_comparison_matrices(workspace)
+
+    assert not any("Mixed units" in warning for warning in report.matrices[0].warnings)
+    assert report.matrices[0].rows[0].value == 100.0
+    assert report.matrices[0].rows[0].unit == "S/m"
