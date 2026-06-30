@@ -66,6 +66,8 @@ class LiteratureWorkspace(BaseModel):
     papers: dict[str, PaperMetadata] = Field(default_factory=dict)
     parsed_papers: dict[str, dict[str, object]] = Field(default_factory=dict)
     performance_cells: list["PerformanceCell"] = Field(default_factory=list)
+    supplementary_links: dict[str, list[str]] = Field(default_factory=dict)
+    guard_reports: list[dict[str, object]] = Field(default_factory=list)
 
 
 class ContextUpdate(BaseModel):

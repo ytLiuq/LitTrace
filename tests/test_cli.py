@@ -3,6 +3,7 @@ from littrace.cli import (
     _paper_id_for_index,
     _parse_attach_args,
     _parse_index_arg,
+    _parse_publisher_retrieve_args,
     format_context_panel,
     format_dashboard,
 )
@@ -50,6 +51,10 @@ def test_cli_index_helpers():
 
     assert _parse_index_arg("/login 1") == 1
     assert _parse_attach_args("/attach 1 /tmp/a.pdf") == (1, "/tmp/a.pdf")
+    assert _parse_publisher_retrieve_args("/publisher-retrieve acs MXene sensor") == (
+        "acs",
+        "MXene sensor",
+    )
     assert _paper_id_for_index(workspace, 1) == "p1"
     assert _paper_id_for_index(workspace, 2) is None
 

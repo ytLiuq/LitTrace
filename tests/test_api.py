@@ -68,7 +68,10 @@ def test_search_context_and_download_plan_api():
 
     response = client.post(
         "/publishers/enrich-html",
-        params={"html": "<meta name='keywords' content='MXene'><section class='abstract'>Long enough abstract text for parser to accept this content.</section>"},
+        params={
+            "html": "<meta name='keywords' content='MXene'><section class='abstract'>Long enough abstract text for parser to accept this content.</section><a href='https://example.org/supporting.pdf'>SI</a>",
+            "paper_id": "mxene-flexible-sensor-acs-2025",
+        },
     )
     assert response.status_code == 200
     assert response.json()["keywords"] == ["MXene"]
@@ -134,6 +137,10 @@ def test_search_context_and_download_plan_api():
     response = client.get("/storyline/report")
     assert response.status_code == 200
     assert "markdown" in response.json()
+
+    response = client.get("/storyline/review")
+    assert response.status_code == 200
+    assert "claim_count" in response.json()
 
     response = client.get("/eval/golden")
     assert response.status_code == 200

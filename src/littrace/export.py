@@ -14,10 +14,16 @@ def export_session_bundle(session: ChatSession, workspace: LiteratureWorkspace) 
     session.artifacts_dir.mkdir(parents=True, exist_ok=True)
     markdown_path = session.artifacts_dir / "research_brief.md"
     bibtex_path = session.artifacts_dir / "references.bib"
+    ris_path = session.artifacts_dir / "references.ris"
+    acs_path = session.artifacts_dir / "references_acs.txt"
+    nature_path = session.artifacts_dir / "references_nature.txt"
     json_path = session.artifacts_dir / "workspace_export.json"
 
     markdown_path.write_text(render_markdown_brief(workspace), encoding="utf-8")
     bibtex_path.write_text(render_bibtex(workspace), encoding="utf-8")
+    ris_path.write_text(render_ris(workspace), encoding="utf-8")
+    acs_path.write_text(render_numbered_references(workspace, style="acs"), encoding="utf-8")
+    nature_path.write_text(render_numbered_references(workspace, style="nature"), encoding="utf-8")
     json_path.write_text(
         json.dumps(workspace.model_dump(mode="json"), ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -26,6 +32,9 @@ def export_session_bundle(session: ChatSession, workspace: LiteratureWorkspace) 
     return {
         "markdown": str(markdown_path),
         "bibtex": str(bibtex_path),
+        "ris": str(ris_path),
+        "acs": str(acs_path),
+        "nature": str(nature_path),
         "json": str(json_path),
     }
 
@@ -99,6 +108,41 @@ def render_bibtex(workspace: LiteratureWorkspace) -> str:
         )
         entries.append(f"@article{{{key},\n{body}\n}}")
     return "\n\n".join(entries) + ("\n" if entries else "")
+
+
+def render_ris(workspace: LiteratureWorkspace) -> str:
+    entries: list[str] = []
+    for paper_id in workspace.context.active_papers:
+        paper = workspace.papers[paper_id]
+        lines = ["TY  - JOUR"]
+        for author in paper.authors:
+            lines.append(f"AU  - {author}")
+        lines.append(f"TI  - {paper.title}")
+        if paper.journal:
+            lines.append(f"JO  - {paper.journal}")
+        if paper.year:
+            lines.append(f"PY  - {paper.year}")
+        if paper.doi:
+            lines.append(f"DO  - {paper.doi}")
+        if paper.source_urls:
+            lines.append(f"UR  - {paper.source_urls[0]}")
+        lines.append("ER  -")
+        entries.append("\n".join(lines))
+    return "\n\n".join(entries) + ("\n" if entries else "")
+
+
+def render_numbered_references(workspace: LiteratureWorkspace, style: str) -> str:
+    lines: list[str] = []
+    for index, paper_id in enumerate(workspace.context.active_papers, start=1):
+        paper = workspace.papers[paper_id]
+        authors = ", ".join(paper.authors) if paper.authors else "Unknown author"
+        source = paper.journal or paper.publisher or ""
+        doi = f" DOI: {paper.doi}." if paper.doi else ""
+        if style == "nature":
+            lines.append(f"{index}. {authors}. {paper.title}. {source} ({paper.year or 'n.d.'}).{doi}")
+        else:
+            lines.append(f"({index}) {authors}. {paper.title}. {source} {paper.year or 'n.d.'}.{doi}")
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def _bibtex_key(author: str, year: int | None, title: str) -> str:

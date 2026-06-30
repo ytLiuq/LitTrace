@@ -54,6 +54,7 @@ from littrace.publisher_retrieval import (
     PublisherRetrievalResult,
     build_browser_retrieval_plan,
     fetch_publisher_search_results,
+    merge_retrieval_result_into_workspace,
     parse_publisher_article_html,
 )
 from littrace.session import (
@@ -64,6 +65,12 @@ from littrace.session import (
 )
 from littrace.tables import build_comparison_matrices, extract_performance_cells
 from littrace.storyline import render_structured_storyline_report
+from littrace.storyline_review import StorylineReviewReport, review_storyline
+from littrace.supplementary import (
+    SupplementaryAttachResult,
+    attach_supplementary_file,
+    register_supplementary_links,
+)
 from littrace.source_router import route_sources
 from littrace.workflow import run_research_graph, run_search_preview
 
@@ -170,11 +177,19 @@ def publisher_search_plan(topic: str) -> PublisherSearchPlanReport:
 
 
 @app.post("/publishers/retrieve", response_model=PublisherRetrievalResult)
-async def publisher_retrieve(topic: str, family: str = "acs") -> PublisherRetrievalResult:
+async def publisher_retrieve(
+    topic: str,
+    family: str = "acs",
+    merge: bool = False,
+) -> PublisherRetrievalResult:
+    global WORKSPACE
     plan_report = build_publisher_search_plan(topic, families=[family])
     if not plan_report.plans:
         raise KeyError(f"No publisher search plan for {family}")
-    return await fetch_publisher_search_results(load_config(), plan_report.plans[0])
+    result = await fetch_publisher_search_results(load_config(), plan_report.plans[0])
+    if merge:
+        WORKSPACE = merge_retrieval_result_into_workspace(WORKSPACE, result)
+    return result
 
 
 @app.get("/publishers/browser-plan", response_model=BrowserRetrievalPlan)
@@ -186,8 +201,16 @@ def publisher_browser_plan(topic: str, family: str = "acs") -> BrowserRetrievalP
 
 
 @app.post("/publishers/enrich-html", response_model=PublisherEnrichment)
-def publisher_enrich_html(html: str) -> PublisherEnrichment:
-    return parse_publisher_article_html(html)
+def publisher_enrich_html(html: str, paper_id: str | None = None) -> PublisherEnrichment:
+    global WORKSPACE
+    enrichment = parse_publisher_article_html(html)
+    if paper_id and enrichment.supplementary_links:
+        WORKSPACE = register_supplementary_links(
+            WORKSPACE,
+            paper_id,
+            [str(link) for link in enrichment.supplementary_links],
+        )
+    return enrichment
 
 
 @app.post("/downloads/execute", response_model=DownloadExecutionResult)
@@ -225,6 +248,16 @@ def attach_pdf(paper_id: str, source_path: str) -> AttachmentResult:
     return attach_pdf_to_paper(load_config(), WORKSPACE, paper_id, source_path)
 
 
+@app.post("/papers/{paper_id}/attach-si", response_model=SupplementaryAttachResult)
+def attach_si(paper_id: str, source_path: str, session_id: str | None = None) -> SupplementaryAttachResult:
+    global WORKSPACE
+    config = load_config()
+    session = load_or_create_session(config, session_id)
+    result = attach_supplementary_file(WORKSPACE, session, paper_id, source_path)
+    save_workspace(session, WORKSPACE)
+    return result
+
+
 @app.post("/parse/context", response_model=LiteratureWorkspace)
 def parse_context() -> LiteratureWorkspace:
     global WORKSPACE
@@ -251,6 +284,11 @@ def tables_matrix() -> ComparisonMatrixReport:
 @app.get("/storyline/report")
 def storyline_report() -> dict[str, str]:
     return {"markdown": render_structured_storyline_report(WORKSPACE)}
+
+
+@app.get("/storyline/review", response_model=StorylineReviewReport)
+def storyline_review() -> StorylineReviewReport:
+    return review_storyline(WORKSPACE)
 
 
 @app.get("/citations/context", response_model=list[CitationRecord])

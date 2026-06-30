@@ -6,8 +6,10 @@ from html import unescape
 import httpx
 from pydantic import BaseModel, Field, HttpUrl
 
+from littrace.cache import cache_key, read_text_cache, write_text_cache
 from littrace.config import LitTraceConfig
-from littrace.models import AccessType, PaperMetadata
+from littrace.context import add_papers
+from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata
 from littrace.publisher_connectors import PublisherSearchPlan
 
 
@@ -61,6 +63,11 @@ async def fetch_publisher_search_results(
     config: LitTraceConfig,
     plan: PublisherSearchPlan,
 ) -> PublisherRetrievalResult:
+    key = cache_key(str(plan.query_url))
+    cached = read_text_cache(config, "publisher_search", key)
+    if cached is not None:
+        return parse_publisher_search_html(plan, cached)
+
     timeout = httpx.Timeout(config.api.request_timeout_seconds)
     headers = {"User-Agent": config.api.user_agent}
     try:
@@ -74,6 +81,7 @@ async def fetch_publisher_search_results(
             warnings=[f"{exc.__class__.__name__}: {exc}"],
         )
 
+    write_text_cache(config, "publisher_search", key, response.text)
     return parse_publisher_search_html(plan, response.text)
 
 
@@ -104,6 +112,25 @@ def parse_publisher_search_html(
         papers=papers,
         warnings=warnings,
     )
+
+
+def merge_retrieval_result_into_workspace(
+    workspace: LiteratureWorkspace,
+    result: PublisherRetrievalResult,
+) -> LiteratureWorkspace:
+    workspace = add_papers(workspace, result.papers)
+    workspace.context.filters.setdefault("publisher_retrievals", [])
+    retrievals = workspace.context.filters["publisher_retrievals"]
+    if isinstance(retrievals, list):
+        retrievals.append(
+            {
+                "publisher_family": result.publisher_family,
+                "query_url": str(result.query_url),
+                "paper_count": len(result.papers),
+                "warnings": result.warnings,
+            }
+        )
+    return workspace
 
 
 def parse_publisher_article_html(html: str) -> PublisherEnrichment:

@@ -12,8 +12,15 @@ from littrace.golden_eval import run_golden_eval
 from littrace.login_flow import launch_login_for_paper
 from littrace.models import ChatRequest, LiteratureWorkspace
 from littrace.pdf_benchmark import benchmark_pdf_parsing
+from littrace.publisher_connectors import build_publisher_search_plan
+from littrace.publisher_retrieval import (
+    fetch_publisher_search_results,
+    merge_retrieval_result_into_workspace,
+)
 from littrace.session import append_message, create_chat_session, save_workspace
 from littrace.storyline import render_structured_storyline_report
+from littrace.storyline_review import review_storyline
+from littrace.supplementary import attach_supplementary_file
 
 
 @dataclass
@@ -39,8 +46,8 @@ async def run_shell() -> None:
     print("LitTrace agent shell")
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
-        "/login N /attach N path.pdf /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /storyline-report /benchmark /golden-eval /export /quit"
+        "/login N /attach N path.pdf /attach-si N path /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
+        "/dashboard /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -85,6 +92,15 @@ async def run_shell() -> None:
         if message == "/storyline-report":
             print(render_structured_storyline_report(state.workspace))
             continue
+        if message == "/storyline-review":
+            report = review_storyline(state.workspace)
+            print(
+                f"Storyline review: {'passed' if report.passed else 'needs work'} "
+                f"({report.claim_count} claims)"
+            )
+            for warning in report.warnings:
+                print(f"- {warning}")
+            continue
         if message.startswith("/login "):
             index = _parse_index_arg(message)
             paper_id = _paper_id_for_index(state.workspace, index) if index else None
@@ -116,6 +132,41 @@ async def run_shell() -> None:
             if result.error:
                 print(f"错误: {result.error}")
             save_workspace(session, state.workspace)
+            continue
+        if message.startswith("/attach-si "):
+            parsed = _parse_attach_args(message.replace("/attach-si", "/attach", 1))
+            if not parsed:
+                print("用法：/attach-si N /path/to/supporting-info.pdf")
+                continue
+            index, source_path = parsed
+            paper_id = _paper_id_for_index(state.workspace, index)
+            if not paper_id:
+                print("没有找到这个编号的文献。")
+                continue
+            result = attach_supplementary_file(state.workspace, session, paper_id, source_path)
+            print(f"SI 绑定: {'成功' if result.attached else '失败'}")
+            if result.target_path:
+                print(f"目标路径: {result.target_path}")
+            if result.error:
+                print(f"错误: {result.error}")
+            save_workspace(session, state.workspace)
+            continue
+        if message.startswith("/publisher-retrieve "):
+            parsed = _parse_publisher_retrieve_args(message)
+            if not parsed:
+                print("用法：/publisher-retrieve acs MXene sensor")
+                continue
+            family, topic = parsed
+            plan_report = build_publisher_search_plan(topic, families=[family])
+            if not plan_report.plans:
+                print(f"没有 {family} 的 publisher 检索计划。")
+                continue
+            result = await fetch_publisher_search_results(config, plan_report.plans[0])
+            state.workspace = merge_retrieval_result_into_workspace(state.workspace, result)
+            save_workspace(session, state.workspace)
+            print(f"Publisher retrieval: {family}, 新增/合并 {len(result.papers)} 篇。")
+            if result.warnings:
+                print("注意：" + "；".join(result.warnings))
             continue
         if message == "/check-downloads":
             report = check_download_presence(config, state.workspace)
@@ -238,7 +289,8 @@ def format_dashboard(state: ShellState) -> str:
         f"folder:  {state.session_root}",
         f"context: {active} papers, panel={visible}, selected_downloads={selected}",
         f"parsing: {parsed} parsed records, performance_cells={cells}",
-        "commands: /context /login N /attach N path.pdf /check-downloads /parse /table /storyline-report /benchmark /export",
+        "commands: /context /login N /attach N path.pdf /attach-si N path /check-downloads "
+        "/resume-downloads /parse /table /storyline-report /storyline-review /benchmark /export",
     ]
     return "\n".join(lines)
 
@@ -261,6 +313,13 @@ def _parse_attach_args(message: str) -> tuple[int, str] | None:
         return int(parts[1]), parts[2]
     except ValueError:
         return None
+
+
+def _parse_publisher_retrieve_args(message: str) -> tuple[str, str] | None:
+    parts = message.split(maxsplit=2)
+    if len(parts) != 3:
+        return None
+    return parts[1], parts[2]
 
 
 def _paper_id_for_index(workspace: LiteratureWorkspace, index: int | None) -> str | None:

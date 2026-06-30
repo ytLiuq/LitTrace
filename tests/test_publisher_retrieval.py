@@ -1,9 +1,11 @@
 from littrace.publisher_connectors import build_publisher_search_plan
 from littrace.publisher_retrieval import (
     build_browser_retrieval_plan,
+    merge_retrieval_result_into_workspace,
     parse_publisher_article_html,
     parse_publisher_search_html,
 )
+from littrace.models import LiteratureWorkspace
 
 
 def test_parse_publisher_search_html_extracts_doi_records():
@@ -20,6 +22,10 @@ def test_parse_publisher_search_html_extracts_doi_records():
     assert result.publisher_family == "acs"
     assert result.papers[0].doi == "10.1021/acsnano.6b00001"
     assert "MXene flexible pressure sensor" in result.papers[0].title
+
+    workspace = merge_retrieval_result_into_workspace(LiteratureWorkspace(), result)
+    assert result.papers[0].paper_id in workspace.context.active_papers
+    assert workspace.context.filters["publisher_retrievals"][0]["paper_count"] == 1
 
 
 def test_browser_retrieval_plan_describes_safe_steps():

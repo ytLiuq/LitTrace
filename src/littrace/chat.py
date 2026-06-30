@@ -82,6 +82,7 @@ async def handle_chat(
     if llm_reply.used_llm:
         guard = guard_citations(llm_reply.text, workspace)
         reply_text = remove_unsupported_sentences(llm_reply.text, guard)
+        workspace.guard_reports.append(guard.model_dump())
         return (
             ChatResponse(
                 reply=reply_text,
@@ -172,6 +173,7 @@ async def _run_composite_intent(
             narrative = await write_storyline_narrative(config, workspace)
             if narrative.used_llm:
                 guard = guard_citations(narrative.text, workspace)
+                workspace.guard_reports.append(guard.model_dump())
                 replies.append(remove_unsupported_sentences(narrative.text, guard))
                 warnings.extend(guard.warnings)
                 warnings.extend(guard.unsupported_sentences[:3])
