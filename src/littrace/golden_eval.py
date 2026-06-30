@@ -28,6 +28,7 @@ def run_golden_eval(config: LitTraceConfig) -> GoldenEvalReport:
         "has_expected_doi_rate": _rate(cases, "expected_dois"),
         "has_expected_metrics_rate": _rate(cases, "expected_metrics"),
         "has_expected_storyline_rate": _rate(cases, "expected_storyline_claims"),
+        "has_expected_pdf_features_rate": _rate(cases, "expected_pdf_features"),
     }
     return GoldenEvalReport(
         golden_set_dir=str(root),

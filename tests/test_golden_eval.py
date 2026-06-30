@@ -15,3 +15,4 @@ def test_golden_eval_reads_jsonl_cases(tmp_path):
     assert report.case_count == 1
     assert report.metrics["has_expected_doi_rate"] == 1.0
     assert report.metrics["has_expected_metrics_rate"] == 1.0
+    assert "has_expected_pdf_features_rate" in report.metrics

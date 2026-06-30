@@ -30,3 +30,5 @@ def test_pdf_benchmark_reports_missing_local_pdfs_and_confidence():
     assert report.parsed_count == 1
     assert report.parsed_with_page_evidence == 1
     assert report.average_evidence_confidence == 0.8
+    assert report.local_pdf_rate == 0.0
+    assert report.parsed_rate == 1.0

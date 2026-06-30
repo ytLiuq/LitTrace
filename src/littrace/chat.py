@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from littrace.access import build_download_plan
 from littrace.agents import agent_runtime_statuses
-from littrace.citation_guard import guard_citations
+from littrace.citation_guard import guard_citations, remove_unsupported_sentences
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
 from littrace.context import apply_context_update
@@ -81,9 +81,10 @@ async def handle_chat(
     llm_reply = await write_evidence_grounded_answer(config, message, workspace)
     if llm_reply.used_llm:
         guard = guard_citations(llm_reply.text, workspace)
+        reply_text = remove_unsupported_sentences(llm_reply.text, guard)
         return (
             ChatResponse(
-                reply=llm_reply.text,
+                reply=reply_text,
                 action="llm_chat",
                 workspace=workspace,
                 citations=_active_citations(workspace),
@@ -170,8 +171,8 @@ async def _run_composite_intent(
         else:
             narrative = await write_storyline_narrative(config, workspace)
             if narrative.used_llm:
-                replies.append(narrative.text)
                 guard = guard_citations(narrative.text, workspace)
+                replies.append(remove_unsupported_sentences(narrative.text, guard))
                 warnings.extend(guard.warnings)
                 warnings.extend(guard.unsupported_sentences[:3])
             else:

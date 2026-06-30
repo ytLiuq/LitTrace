@@ -65,6 +65,35 @@ def guard_citations(text: str, workspace: LiteratureWorkspace) -> CitationGuardR
     )
 
 
+def remove_unsupported_sentences(text: str, report: CitationGuardReport) -> str:
+    if report.passed:
+        return text
+    repaired = text
+    for sentence in report.unsupported_sentences:
+        repaired = repaired.replace(sentence, "")
+    repaired = re.sub(r"\s+\n", "\n", repaired)
+    repaired = re.sub(r"\n{3,}", "\n\n", repaired)
+    repaired = re.sub(r" {2,}", " ", repaired)
+    repaired = repaired.strip()
+    if not repaired:
+        return "生成内容因缺少句子级引用证据已被移除。请先解析更多全文或放宽问题范围。"
+    return repaired
+
+
 def _split_sentences(text: str) -> list[str]:
-    parts = re.split(r"(?<=[。！？.!?])\s+", text.replace("\n", " "))
-    return [part.strip() for part in parts if part.strip()]
+    normalized = text.replace("\n", " ")
+    sentences: list[str] = []
+    start = 0
+    for index, char in enumerate(normalized):
+        if char in "。！？!?":
+            sentences.append(normalized[start : index + 1].strip())
+            start = index + 1
+        elif char == ".":
+            previous_is_digit = index > 0 and normalized[index - 1].isdigit()
+            next_is_digit = index + 1 < len(normalized) and normalized[index + 1].isdigit()
+            if not (previous_is_digit and next_is_digit):
+                sentences.append(normalized[start : index + 1].strip())
+                start = index + 1
+    if start < len(normalized):
+        sentences.append(normalized[start:].strip())
+    return [sentence for sentence in sentences if sentence]

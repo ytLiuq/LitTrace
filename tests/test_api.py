@@ -62,6 +62,17 @@ def test_search_context_and_download_plan_api():
     assert response.status_code == 200
     assert response.json()["plans"]
 
+    response = client.get("/publishers/browser-plan", params={"topic": "MXene sensor", "family": "acs"})
+    assert response.status_code == 200
+    assert response.json()["extract_selectors"]
+
+    response = client.post(
+        "/publishers/enrich-html",
+        params={"html": "<meta name='keywords' content='MXene'><section class='abstract'>Long enough abstract text for parser to accept this content.</section>"},
+    )
+    assert response.status_code == 200
+    assert response.json()["keywords"] == ["MXene"]
+
     response = client.post(
         "/downloads/login/mxene-flexible-sensor-wiley-2026",
         params={"dry_run": True},
@@ -72,6 +83,10 @@ def test_search_context_and_download_plan_api():
     response = client.post("/downloads/check")
     assert response.status_code == 200
     assert "ready_to_parse_count" in response.json()
+
+    response = client.post("/downloads/resume")
+    assert response.status_code == 200
+    assert "performance_cell_count" in response.json()
 
     response = client.post("/downloads/execute", json={"paper_ids": [], "dry_run": True})
     assert response.status_code == 200

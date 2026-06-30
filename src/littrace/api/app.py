@@ -16,6 +16,7 @@ from littrace.attachments import (
     attach_pdf_to_paper,
     check_download_presence,
 )
+from littrace.auto_resume import AutoResumeResult, auto_resume_downloaded_pdfs
 from littrace.citations import audit_citation_links, citation_records_for_papers
 from littrace.chat import handle_chat
 from littrace.config import load_config
@@ -47,7 +48,14 @@ from littrace.publisher_connectors import (
     build_publisher_search_plan,
     publisher_routes_for_workspace,
 )
-from littrace.publisher_retrieval import PublisherRetrievalResult, fetch_publisher_search_results
+from littrace.publisher_retrieval import (
+    BrowserRetrievalPlan,
+    PublisherEnrichment,
+    PublisherRetrievalResult,
+    build_browser_retrieval_plan,
+    fetch_publisher_search_results,
+    parse_publisher_article_html,
+)
 from littrace.session import (
     append_message,
     load_or_create_session,
@@ -169,6 +177,19 @@ async def publisher_retrieve(topic: str, family: str = "acs") -> PublisherRetrie
     return await fetch_publisher_search_results(load_config(), plan_report.plans[0])
 
 
+@app.get("/publishers/browser-plan", response_model=BrowserRetrievalPlan)
+def publisher_browser_plan(topic: str, family: str = "acs") -> BrowserRetrievalPlan:
+    plan_report = build_publisher_search_plan(topic, families=[family])
+    if not plan_report.plans:
+        raise KeyError(f"No publisher search plan for {family}")
+    return build_browser_retrieval_plan(plan_report.plans[0])
+
+
+@app.post("/publishers/enrich-html", response_model=PublisherEnrichment)
+def publisher_enrich_html(html: str) -> PublisherEnrichment:
+    return parse_publisher_article_html(html)
+
+
 @app.post("/downloads/execute", response_model=DownloadExecutionResult)
 async def downloads_execute(request: DownloadExecutionRequest) -> DownloadExecutionResult:
     config = load_config()
@@ -186,6 +207,17 @@ def downloads_login(paper_id: str, dry_run: bool = False) -> LoginLaunchResult:
 @app.post("/downloads/check", response_model=DownloadPresenceReport)
 def downloads_check() -> DownloadPresenceReport:
     return check_download_presence(load_config(), WORKSPACE)
+
+
+@app.post("/downloads/resume", response_model=AutoResumeResult)
+def downloads_resume(session_id: str | None = None) -> AutoResumeResult:
+    global WORKSPACE
+    config = load_config()
+    session = load_or_create_session(config, session_id) if session_id else None
+    WORKSPACE, result = auto_resume_downloaded_pdfs(config, WORKSPACE, session)
+    if session:
+        save_workspace(session, WORKSPACE)
+    return result
 
 
 @app.post("/papers/{paper_id}/attach-pdf", response_model=AttachmentResult)

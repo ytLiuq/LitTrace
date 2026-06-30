@@ -197,6 +197,9 @@ class PerformanceCell(BaseModel):
     dataset: str | None = None
     metric: str
     value: float | str
+    value_min: float | None = None
+    value_max: float | None = None
+    uncertainty: float | None = None
     unit: str | None = None
     higher_is_better: bool | None = None
     method_name: str | None = None

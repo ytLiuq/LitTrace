@@ -45,6 +45,8 @@ METRIC_PATTERN = re.compile(
     r"conductivity|capacity|retention|selectivity|accuracy|f1|auc|mse|mae|rmse|lod|gf)"
     r"[^0-9+\-.]{0,40}"
     r"(?P<value>[+-]?\d+(?:\.\d+)?)"
+    r"(?:\s*(?:±|\+/-)\s*(?P<uncertainty>\d+(?:\.\d+)?))?"
+    r"(?:\s*[-–]\s*(?P<value_max>\d+(?:\.\d+)?))?"
     r"\s*(?P<unit>%|ms|s|S/m|S cm-1|S/cm|mS/cm|F/g|mF/cm2|mAh/g|mAh g-1|"
     r"kPa-1|Pa-1|ppm|GPa|MPa|kPa|Pa|cycles|)?",
     re.IGNORECASE,
@@ -133,6 +135,11 @@ def _cells_from_sections(paper_id: str, parsed: dict[str, object]) -> list[Perfo
                     dataset=_guess_dataset(snippet),
                     metric=metric,
                     value=float(match.group("value")),
+                    value_min=float(match.group("value")) if match.group("value_max") else None,
+                    value_max=float(match.group("value_max")) if match.group("value_max") else None,
+                    uncertainty=float(match.group("uncertainty"))
+                    if match.group("uncertainty")
+                    else None,
                     unit=match.group("unit") or None,
                     higher_is_better=METRIC_DIRECTIONS.get(metric),
                     evidence=EvidenceSpan(
@@ -173,6 +180,11 @@ def _cells_from_tables(paper_id: str, parsed: dict[str, object]) -> list[Perform
                         dataset=_guess_dataset(f"{caption} {text}"),
                         metric=metric,
                         value=float(match.group("value")),
+                        value_min=float(match.group("value")) if match.group("value_max") else None,
+                        value_max=float(match.group("value_max")) if match.group("value_max") else None,
+                        uncertainty=float(match.group("uncertainty"))
+                        if match.group("uncertainty")
+                        else None,
                         unit=match.group("unit") or None,
                         higher_is_better=METRIC_DIRECTIONS.get(metric),
                         evidence=EvidenceSpan(

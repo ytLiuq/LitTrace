@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 
 from littrace.attachments import attach_pdf_to_paper, check_download_presence
+from littrace.auto_resume import auto_resume_downloaded_pdfs
 from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.export import export_session_bundle
@@ -38,7 +39,7 @@ async def run_shell() -> None:
     print("LitTrace agent shell")
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
-        "/login N /attach N path.pdf /check-downloads /parse /table /storyline "
+        "/login N /attach N path.pdf /check-downloads /resume-downloads /parse /table /storyline "
         "/dashboard /storyline-report /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
@@ -72,7 +73,7 @@ async def run_shell() -> None:
         if message in {"/context", "/papers"}:
             print(format_context_panel(state.workspace))
             continue
-        if message == "/dashboard":
+        if message in {"/dashboard", "/tui"}:
             print(format_dashboard(state))
             continue
         if message == "/parse":
@@ -125,6 +126,20 @@ async def run_shell() -> None:
             for item in report.items[:12]:
                 marker = "ok" if item.exists else "missing"
                 print(f"- [{marker}] {item.title}: {item.expected_path}")
+            if report.ready_to_parse_count:
+                print("可运行 /resume-downloads 自动解析已就绪 PDF 并写入 artifacts。")
+            continue
+        if message == "/resume-downloads":
+            state.workspace, result = auto_resume_downloaded_pdfs(config, state.workspace, session)
+            save_workspace(session, state.workspace)
+            print(
+                f"自动恢复：ready={result.ready_to_parse_count}, parsed={result.parsed_count}, "
+                f"performance_cells={result.performance_cell_count}"
+            )
+            if result.artifact_paths:
+                print("Artifacts:")
+                for name, path in result.artifact_paths.items():
+                    print(f"- {name}: {path}")
             continue
         if message == "/benchmark":
             report = benchmark_pdf_parsing(state.workspace, config)

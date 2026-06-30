@@ -195,3 +195,27 @@ def test_conductivity_units_are_normalized_for_comparison():
     assert not any("Mixed units" in warning for warning in report.matrices[0].warnings)
     assert report.matrices[0].rows[0].value == 100.0
     assert report.matrices[0].rows[0].unit == "S/m"
+
+
+def test_extracts_uncertainty_and_range_values():
+    workspace = LiteratureWorkspace(
+        parsed_papers={
+            "p1": {
+                "sections": [
+                    {
+                        "name": "Results",
+                        "text": "The sensor reached sensitivity 2.3 ± 0.1 kPa-1 and retention 90-95 %.",
+                        "evidence": {"page": 3, "confidence": 0.8},
+                    }
+                ]
+            }
+        }
+    )
+
+    workspace, _ = extract_performance_cells(workspace)
+
+    sensitivity = next(cell for cell in workspace.performance_cells if cell.metric == "sensitivity")
+    retention = next(cell for cell in workspace.performance_cells if cell.metric == "retention")
+    assert sensitivity.uncertainty == 0.1
+    assert retention.value_min == 90.0
+    assert retention.value_max == 95.0

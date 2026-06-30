@@ -14,6 +14,8 @@ class PDFBenchmarkReport(BaseModel):
     metadata_only_count: int
     parsed_with_page_evidence: int
     average_evidence_confidence: float
+    local_pdf_rate: float = 0.0
+    parsed_rate: float = 0.0
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -66,5 +68,7 @@ def benchmark_pdf_parsing(
         metadata_only_count=metadata_only_count,
         parsed_with_page_evidence=parsed_with_page_evidence,
         average_evidence_confidence=round(average, 3),
+        local_pdf_rate=round(local_pdf_count / len(active_ids), 3) if active_ids else 0.0,
+        parsed_rate=round(parsed_count / len(active_ids), 3) if active_ids else 0.0,
         warnings=warnings,
     )
