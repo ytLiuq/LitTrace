@@ -95,6 +95,11 @@ Shell commands:
 /quit
 ```
 
+`/golden-eval` reads real materials/chemistry tasks from `eval/golden`.
+When the current chat has literature context, it also scores DOI recall,
+recent-paper ratio, publisher coverage, table-metric recall, storyline evidence
+coverage, citation coverage, and agent handoff progress.
+
 Conversation examples:
 
 ```text
@@ -204,6 +209,7 @@ curl http://127.0.0.1:8000/agents/strength
 curl http://127.0.0.1:8000/agents/audits
 curl http://127.0.0.1:8000/agents/interactions
 curl "http://127.0.0.1:8000/agents/plan?topic=MXene%20sensor"
+curl http://127.0.0.1:8000/eval/golden
 curl http://127.0.0.1:8000/publishers/routes
 curl "http://127.0.0.1:8000/publishers/search-plan?topic=MXene%20sensor"
 curl -X POST "http://127.0.0.1:8000/publishers/retrieve?topic=MXene%20sensor&family=acs"

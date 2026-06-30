@@ -378,7 +378,7 @@ def eval_end_to_end(topic: str | None = None) -> EvalMetricReport:
 
 @app.get("/eval/golden", response_model=GoldenEvalReport)
 def eval_golden() -> GoldenEvalReport:
-    return run_golden_eval(load_config())
+    return run_golden_eval(load_config(), WORKSPACE)
 
 
 @app.get("/quality", response_model=QualityReport)

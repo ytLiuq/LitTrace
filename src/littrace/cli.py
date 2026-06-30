@@ -264,10 +264,12 @@ async def run_shell() -> None:
                 print("注意：" + "；".join(report.warnings))
             continue
         if message == "/golden-eval":
-            report = run_golden_eval(config)
+            report = run_golden_eval(config, state.workspace)
             print(f"Golden eval: cases={report.case_count}, dir={report.golden_set_dir}")
             for name, value in report.metrics.items():
                 print(f"- {name}: {value}")
+            for failure in report.failures[:8]:
+                print(f"- missing[{failure['agent']}:{failure['field']}]: {failure['missing']}")
             if report.warnings:
                 print("注意：" + "；".join(report.warnings))
             continue
