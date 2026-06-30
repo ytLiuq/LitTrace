@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass
 
 from littrace.attachments import attach_pdf_to_paper, check_download_presence
+from littrace.agent_audits import audit_parser_agent, audit_storyline_agent, audit_table_agent
+from littrace.agent_strength import build_agent_portfolio_report
 from littrace.auto_resume import auto_resume_downloaded_pdfs
 from littrace.chat import handle_chat
 from littrace.config import load_config
@@ -19,6 +21,7 @@ from littrace.publisher_retrieval import (
     merge_retrieval_result_into_workspace,
 )
 from littrace.quality_report import build_quality_report
+from littrace.research_planner import build_research_plan
 from littrace.session import append_message, create_chat_session, save_workspace
 from littrace.storyline import render_structured_storyline_report
 from littrace.storyline_review import review_storyline
@@ -49,7 +52,7 @@ async def run_shell() -> None:
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /attach N path.pdf /attach-si N path /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /quality /init-config /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
+        "/dashboard /quality /agents /agent-audits /plan topic /init-config /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -92,6 +95,33 @@ async def run_shell() -> None:
                 print(f"- {name}: {value}")
             if report.warnings:
                 print("注意：" + "；".join(report.warnings[:8]))
+            continue
+        if message == "/agents":
+            report = build_agent_portfolio_report(config, state.workspace)
+            print(f"Agent portfolio average: {report.average_score}")
+            for agent in report.agents:
+                print(f"- {agent.name}: {agent.level} ({agent.score})")
+            if report.recommendations:
+                print("建议：" + "；".join(report.recommendations))
+            continue
+        if message == "/agent-audits":
+            for report in [
+                audit_parser_agent(config, state.workspace),
+                audit_table_agent(state.workspace),
+                audit_storyline_agent(state.workspace),
+            ]:
+                print(f"- {report.agent}: {'passed' if report.passed else 'needs work'} ({report.score})")
+                for finding in report.findings[:3]:
+                    print(f"  - {finding}")
+            continue
+        if message.startswith("/plan "):
+            topic = message.removeprefix("/plan ").strip()
+            plan = build_research_plan(topic, state.workspace)
+            print(f"Research plan: {plan.topic}")
+            for index, step in enumerate(plan.steps, start=1):
+                print(f"{index}. [{step.agent}] {step.action} -> {step.expected_output}")
+            if plan.warnings:
+                print("注意：" + "；".join(plan.warnings))
             continue
         if message == "/init-config":
             result = write_config_template()

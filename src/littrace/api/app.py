@@ -10,6 +10,8 @@ from littrace.eval_api import (
 )
 from littrace.access import build_download_plan
 from littrace.agents import AgentRoleSpec, AgentRuntimeStatus, agent_runtime_statuses, crew_role_specs
+from littrace.agent_audits import AgentAuditReport, audit_parser_agent, audit_storyline_agent, audit_table_agent
+from littrace.agent_strength import AgentPortfolioReport, build_agent_portfolio_report
 from littrace.attachments import (
     AttachmentResult,
     DownloadPresenceReport,
@@ -59,6 +61,7 @@ from littrace.publisher_retrieval import (
     parse_publisher_article_html,
 )
 from littrace.quality_report import QualityReport, build_quality_report
+from littrace.research_planner import ResearchPlan, build_research_plan
 from littrace.session import (
     append_message,
     load_or_create_session,
@@ -105,6 +108,26 @@ def agents_crew() -> list[AgentRoleSpec]:
 @app.get("/agents/status", response_model=list[AgentRuntimeStatus])
 def agents_status() -> list[AgentRuntimeStatus]:
     return agent_runtime_statuses()
+
+
+@app.get("/agents/strength", response_model=AgentPortfolioReport)
+def agents_strength() -> AgentPortfolioReport:
+    return build_agent_portfolio_report(load_config(), WORKSPACE)
+
+
+@app.get("/agents/audits", response_model=list[AgentAuditReport])
+def agents_audits() -> list[AgentAuditReport]:
+    config = load_config()
+    return [
+        audit_parser_agent(config, WORKSPACE),
+        audit_table_agent(WORKSPACE),
+        audit_storyline_agent(WORKSPACE),
+    ]
+
+
+@app.get("/agents/plan", response_model=ResearchPlan)
+def agents_plan(topic: str) -> ResearchPlan:
+    return build_research_plan(topic, WORKSPACE)
 
 
 @app.post("/search/preview", response_model=LiteratureWorkspace)

@@ -73,6 +73,9 @@ Shell commands:
 /papers
 /dashboard
 /quality
+/agents
+/agent-audits
+/plan MXene sensor
 /init-config
 /login N
 /attach N /path/to/paper.pdf
@@ -159,6 +162,10 @@ page and stores page-aware evidence spans.
   Nature, MDPI, RSC, and Elsevier, then emits DOI/publisher access routes.
 - `PDF/OCR Parser` exposes metadata-only, Docling, and PaddleOCR tools.
 - `Table Agent` extracts performance cells into evidence-preserving matrices.
+- `Research Planner` turns a question into a retrieval/parse/table/storyline
+  plan using the current context.
+- `Research Writer` produces evidence-grounded answers behind citation guard.
+- `Eval Auditor` reports agent strength, quality metrics, and golden-set status.
 - `Research Storyline Agent` builds conservative solution-limit-response chains
   from parsed evidence and refuses unsupported broad narratives.
 - `Dialogue Agent` is the primary product surface: a local shell with a
@@ -192,6 +199,9 @@ curl -X POST http://127.0.0.1:8000/tables/extract
 curl http://127.0.0.1:8000/tables/matrix
 curl http://127.0.0.1:8000/agents/crew
 curl http://127.0.0.1:8000/agents/status
+curl http://127.0.0.1:8000/agents/strength
+curl http://127.0.0.1:8000/agents/audits
+curl "http://127.0.0.1:8000/agents/plan?topic=MXene%20sensor"
 curl http://127.0.0.1:8000/publishers/routes
 curl "http://127.0.0.1:8000/publishers/search-plan?topic=MXene%20sensor"
 curl -X POST "http://127.0.0.1:8000/publishers/retrieve?topic=MXene%20sensor&family=acs"

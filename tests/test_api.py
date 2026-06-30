@@ -52,6 +52,18 @@ def test_search_context_and_download_plan_api():
     statuses = response.json()
     assert any(status["workflow_node"] == "route_publishers" for status in statuses)
 
+    response = client.get("/agents/strength")
+    assert response.status_code == 200
+    assert response.json()["agents"]
+
+    response = client.get("/agents/audits")
+    assert response.status_code == 200
+    assert response.json()
+
+    response = client.get("/agents/plan", params={"topic": "MXene sensor"})
+    assert response.status_code == 200
+    assert response.json()["steps"]
+
     response = client.get("/quality")
     assert response.status_code == 200
     assert "metrics" in response.json()
