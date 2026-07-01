@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from littrace.harnesses import HarnessResult, check_performance_cells
+from littrace.harnesses import HarnessResult, check_performance_cells, check_structured_artifacts
 from littrace.models import (
     ComparisonMatrix,
     ComparisonMatrixReport,
@@ -10,6 +10,7 @@ from littrace.models import (
     EvidenceSpan,
     LiteratureWorkspace,
     PerformanceCell,
+    StructuredArtifact,
 )
 from littrace.units import normalize_metric_unit
 
@@ -55,12 +56,27 @@ METRIC_PATTERN = re.compile(
 
 def extract_performance_cells(workspace: LiteratureWorkspace) -> tuple[LiteratureWorkspace, HarnessResult]:
     cells: list[PerformanceCell] = []
+    artifacts: list[StructuredArtifact] = []
     for paper_id, parsed in workspace.parsed_papers.items():
         cells.extend(_cells_from_sections(paper_id, parsed))
         cells.extend(_cells_from_tables(paper_id, parsed))
+        artifacts.extend(_structured_artifacts_from_parsed(paper_id, parsed))
 
     workspace.performance_cells = cells
-    return workspace, check_performance_cells(cells)
+    _store_structured_artifacts(workspace, artifacts)
+    return workspace, _combine_harnesses(
+        performance=check_performance_cells(cells),
+        artifacts=check_structured_artifacts(artifacts),
+        artifact_count=len(artifacts),
+    )
+
+
+def extract_structured_artifacts(workspace: LiteratureWorkspace) -> tuple[LiteratureWorkspace, HarnessResult]:
+    artifacts: list[StructuredArtifact] = []
+    for paper_id, parsed in workspace.parsed_papers.items():
+        artifacts.extend(_structured_artifacts_from_parsed(paper_id, parsed))
+    _store_structured_artifacts(workspace, artifacts)
+    return workspace, check_structured_artifacts(artifacts)
 
 
 def build_comparison_matrices(workspace: LiteratureWorkspace) -> ComparisonMatrixReport:
@@ -199,6 +215,183 @@ def _cells_from_tables(paper_id: str, parsed: dict[str, object]) -> list[Perform
                     )
                 )
     return cells
+
+
+def _structured_artifacts_from_parsed(
+    paper_id: str,
+    parsed: dict[str, object],
+) -> list[StructuredArtifact]:
+    artifacts: list[StructuredArtifact] = []
+    artifacts.extend(_artifacts_from_table_objects(paper_id, parsed))
+    artifacts.extend(_artifacts_from_sections(paper_id, parsed))
+    return artifacts
+
+
+def _artifacts_from_table_objects(
+    paper_id: str,
+    parsed: dict[str, object],
+) -> list[StructuredArtifact]:
+    artifacts: list[StructuredArtifact] = []
+    tables = parsed.get("tables") or []
+    if not isinstance(tables, list):
+        return artifacts
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        evidence = table.get("evidence") or {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        label = str(table.get("table_id") or "") or None
+        caption = str(table.get("caption") or "")
+        cells = table.get("cells") or []
+        text = caption
+        if cells:
+            text = f"{caption}\n{cells}".strip()
+        artifacts.append(
+            StructuredArtifact(
+                paper_id=paper_id,
+                artifact_type="table",
+                label=label,
+                text=text,
+                evidence=EvidenceSpan(
+                    paper_id=paper_id,
+                    table_id=label,
+                    snippet=text[:500],
+                    parser=evidence.get("parser"),
+                    confidence=float(evidence.get("confidence") or 0.75),
+                ),
+                confidence=float(evidence.get("confidence") or 0.75),
+            )
+        )
+    return artifacts
+
+
+def _artifacts_from_sections(paper_id: str, parsed: dict[str, object]) -> list[StructuredArtifact]:
+    artifacts: list[StructuredArtifact] = []
+    sections = parsed.get("sections") or []
+    if not isinstance(sections, list):
+        return artifacts
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        text = str(section.get("text") or "")
+        evidence = section.get("evidence") or {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        artifacts.extend(_caption_artifacts(paper_id, text, evidence, "figure", FIGURE_PATTERN))
+        artifacts.extend(_caption_artifacts(paper_id, text, evidence, "table", TABLE_PATTERN))
+        artifacts.extend(_equation_artifacts(paper_id, text, evidence))
+    return artifacts
+
+
+FIGURE_PATTERN = re.compile(
+    r"(?P<label>(?:Fig\.?|Figure)\s*\d+[A-Za-z]?)\s*[:.\-]?\s*(?P<caption>.{20,500}?)(?=\n\s*(?:Fig\.?|Figure|Table|Eq\.?|Equation)\s*\d+|\n\s*\n|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+TABLE_PATTERN = re.compile(
+    r"(?P<label>Table\s*\d+[A-Za-z]?)\s*[:.\-]?\s*(?P<caption>.{20,700}?)(?=\n\s*(?:Fig\.?|Figure|Table|Eq\.?|Equation)\s*\d+|\n\s*\n|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+EQUATION_PATTERN = re.compile(
+    r"(?P<label>(?:Eq\.?|Equation)\s*\(?\d+[A-Za-z]?\)?)\s*[:.\-]?\s*(?P<body>.{3,240}?)(?=\n|$)",
+    re.IGNORECASE,
+)
+FORMULA_HINT_PATTERN = re.compile(
+    r"(?P<formula>[A-Za-z][A-Za-z0-9_{}^+\-*/=().\s]{0,80}=\s*[A-Za-z0-9_{}^+\-*/=().\s]{1,120})"
+)
+
+
+def _caption_artifacts(
+    paper_id: str,
+    text: str,
+    evidence: dict[str, object],
+    artifact_type: str,
+    pattern: re.Pattern[str],
+) -> list[StructuredArtifact]:
+    artifacts = []
+    for match in pattern.finditer(text):
+        label = " ".join(match.group("label").split())
+        artifact_text = " ".join(match.group("caption").split())
+        artifacts.append(
+            StructuredArtifact(
+                paper_id=paper_id,
+                artifact_type=artifact_type,
+                label=label,
+                text=artifact_text,
+                evidence=EvidenceSpan(
+                    paper_id=paper_id,
+                    section=str(evidence.get("section") or "section"),
+                    page=evidence.get("page"),
+                    snippet=artifact_text[:500],
+                    parser=evidence.get("parser"),
+                    confidence=float(evidence.get("confidence") or 0.68),
+                ),
+                confidence=float(evidence.get("confidence") or 0.68),
+            )
+        )
+    return artifacts
+
+
+def _equation_artifacts(
+    paper_id: str,
+    text: str,
+    evidence: dict[str, object],
+) -> list[StructuredArtifact]:
+    artifacts = []
+    for pattern in (EQUATION_PATTERN, FORMULA_HINT_PATTERN):
+        for match in pattern.finditer(text):
+            label_value = match.groupdict().get("label") or "formula"
+            label = " ".join(label_value.split()) or "formula"
+            artifact_text = " ".join((match.groupdict().get("body") or match.group(0)).split())
+            if len(artifact_text) < 3:
+                continue
+            artifacts.append(
+                StructuredArtifact(
+                    paper_id=paper_id,
+                    artifact_type="equation" if label.lower().startswith(("eq", "equation")) else "formula",
+                    label=label,
+                    text=artifact_text,
+                    evidence=EvidenceSpan(
+                        paper_id=paper_id,
+                        section=str(evidence.get("section") or "section"),
+                        page=evidence.get("page"),
+                        snippet=artifact_text[:500],
+                        parser=evidence.get("parser"),
+                        confidence=float(evidence.get("confidence") or 0.62),
+                    ),
+                    confidence=float(evidence.get("confidence") or 0.62),
+                )
+            )
+    return artifacts
+
+
+def _store_structured_artifacts(
+    workspace: LiteratureWorkspace,
+    artifacts: list[StructuredArtifact],
+) -> None:
+    workspace.context.filters["structured_artifacts"] = [
+        artifact.model_dump(mode="json") for artifact in artifacts
+    ]
+
+
+def _combine_harnesses(
+    performance: HarnessResult,
+    artifacts: HarnessResult,
+    artifact_count: int,
+) -> HarnessResult:
+    score = (performance.score + artifacts.score) / 2
+    warnings = [
+        *performance.warnings,
+        *artifacts.warnings,
+    ]
+    if artifact_count == 0:
+        warnings.append("No table, figure, formula, or equation artifacts were extracted.")
+    return HarnessResult(
+        passed=performance.passed and artifacts.passed,
+        score=score,
+        errors=[*performance.errors, *artifacts.errors],
+        warnings=warnings,
+    )
 
 
 def _normalize_metric(metric: str) -> str:

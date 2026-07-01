@@ -57,24 +57,12 @@ class PaddleOCRTool:
                     scale=self.config.pdf_render_scale,
                     max_pages=self.config.max_pages,
                 )
-                sections: list[dict[str, object]] = []
-                reports: list[dict[str, object]] = []
-                for page_number, image_path in page_images:
-                    parsed_page = self.parse_image(
-                        image_path,
-                        mode=mode,
-                        preferred_engines=preferred_engines,
-                    )
-                    reports.extend(parsed_page.parser_reports)
-                    for section in parsed_page.sections:
-                        section = dict(section)
-                        section["name"] = f"page_{page_number}_ocr_text"
-                        evidence = dict(section.get("evidence") or {})
-                        evidence["paper_id"] = pdf_path.stem
-                        evidence["page"] = page_number
-                        evidence["section"] = section["name"]
-                        section["evidence"] = evidence
-                        sections.append(section)
+                sections, reports = self._parse_page_images(
+                    pdf_path,
+                    page_images,
+                    mode=mode,
+                    preferred_engines=preferred_engines,
+                )
                 return ParsedPaper(
                     pdf_path=pdf_path,
                     sections=sections,
@@ -85,6 +73,7 @@ class PaddleOCRTool:
                             "preferred_engines": preferred_engines or [],
                             "pdf_pages_rendered": len(page_images),
                             "pdf_render_scale": self.config.pdf_render_scale,
+                            "ocr_batch_size": self.config.ocr_batch_size,
                         },
                         *reports,
                     ],
@@ -119,6 +108,87 @@ class PaddleOCRTool:
                 parsed=False,
                 error=f"{exc.__class__.__name__}: {exc}",
             )
+
+    def _parse_page_images(
+        self,
+        pdf_path: Path,
+        page_images: list[tuple[int, Path]],
+        mode: OCRMode,
+        preferred_engines: list[str] | None,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        sections: list[dict[str, object]] = []
+        reports: list[dict[str, object]] = []
+        try:
+            batch_results = self.parse_images_batch(
+                [image_path for _, image_path in page_images],
+                mode=mode,
+                preferred_engines=preferred_engines,
+            )
+        except Exception as exc:
+            batch_results = []
+            reports.append(
+                {
+                    "parser": self.name,
+                    "mode": mode,
+                    "preferred_engines": preferred_engines or [],
+                    "batch_error": f"{exc.__class__.__name__}: {exc}",
+                    "fallback": "sequential_parse_image",
+                }
+            )
+            for _, image_path in page_images:
+                batch_results.append(self.parse_image(image_path, mode, preferred_engines))
+
+        for (page_number, _), parsed_page in zip(page_images, batch_results, strict=False):
+            reports.extend(parsed_page.parser_reports)
+            for section in parsed_page.sections:
+                section = dict(section)
+                section["name"] = f"page_{page_number}_ocr_text"
+                evidence = dict(section.get("evidence") or {})
+                evidence["paper_id"] = pdf_path.stem
+                evidence["page"] = page_number
+                evidence["section"] = section["name"]
+                section["evidence"] = evidence
+                sections.append(section)
+        return sections, reports
+
+    def parse_images_batch(
+        self,
+        image_paths: list[Path],
+        mode: OCRMode = OCRMode.ACCURATE,
+        preferred_engines: list[str] | None = None,
+    ) -> list[ParsedPaper]:
+        valid_paths = [path for path in image_paths if path.suffix.lower() in IMAGE_SUFFIXES]
+        if len(valid_paths) != len(image_paths):
+            return [self.parse_image(path, mode, preferred_engines) for path in image_paths]
+
+        try:
+            from paddleocr import PaddleOCR
+        except ImportError:
+            return [self.parse_image(path, mode, preferred_engines) for path in image_paths]
+
+        ocr = self._get_ocr_engine(PaddleOCR)
+        if not hasattr(ocr, "predict"):
+            return [self.parse_image(path, mode, preferred_engines) for path in image_paths]
+
+        parsed_pages: list[ParsedPaper] = []
+        for batch in _chunks(image_paths, max(self.config.ocr_batch_size, 1)):
+            raw_results = ocr.predict(
+                [str(path) for path in batch],
+                use_textline_orientation=self.config.use_angle_cls,
+            )
+            raw_pages = _align_batch_results(raw_results, len(batch))
+            for image_path, raw_page in zip(batch, raw_pages, strict=False):
+                parsed_pages.append(
+                    _parsed_paper_from_lines(
+                        image_path,
+                        normalize_paddleocr_result(raw_page),
+                        mode,
+                        preferred_engines,
+                        self.name,
+                        batched=True,
+                    )
+                )
+        return parsed_pages
 
     def parse_image(
         self,
@@ -182,31 +252,13 @@ class PaddleOCRTool:
             else:
                 raw_result = ocr.ocr(str(image_path), cls=self.config.use_angle_cls)
             lines = normalize_paddleocr_result(raw_result)
-            text = "\n".join(line["text"] for line in lines)
-            return ParsedPaper(
-                pdf_path=image_path,
-                sections=[
-                    {
-                        "name": "ocr_text",
-                        "text": text,
-                        "evidence": EvidenceSpan(
-                            paper_id=image_path.stem,
-                            section="ocr_text",
-                            snippet=text[:500],
-                            parser=self.name,
-                            confidence=_average_confidence(lines),
-                        ).model_dump(),
-                    }
-                ],
-                parser_reports=[
-                    {
-                        "parser": self.name,
-                        "mode": mode,
-                        "preferred_engines": preferred_engines or [],
-                        "line_count": len(lines),
-                    }
-                ],
-                parsed=True,
+            return _parsed_paper_from_lines(
+                image_path,
+                lines,
+                mode,
+                preferred_engines,
+                self.name,
+                batched=False,
             )
         except Exception as exc:
             return ParsedPaper(
@@ -252,6 +304,58 @@ def normalize_paddleocr_result(raw_result: Any) -> list[dict[str, object]]:
             confidence = float(payload[1]) if len(payload) > 1 else 0.0
             lines.append({"text": text, "confidence": confidence, "bbox": bbox})
     return lines
+
+
+def _parsed_paper_from_lines(
+    image_path: Path,
+    lines: list[dict[str, object]],
+    mode: OCRMode,
+    preferred_engines: list[str] | None,
+    parser_name: str,
+    batched: bool,
+) -> ParsedPaper:
+    text = "\n".join(line["text"] for line in lines)
+    return ParsedPaper(
+        pdf_path=image_path,
+        sections=[
+            {
+                "name": "ocr_text",
+                "text": text,
+                "evidence": EvidenceSpan(
+                    paper_id=image_path.stem,
+                    section="ocr_text",
+                    snippet=text[:500],
+                    parser=parser_name,
+                    confidence=_average_confidence(lines),
+                ).model_dump(),
+            }
+        ]
+        if text
+        else [],
+        parser_reports=[
+            {
+                "parser": parser_name,
+                "mode": mode,
+                "preferred_engines": preferred_engines or [],
+                "line_count": len(lines),
+                "batched": batched,
+            }
+        ],
+        parsed=bool(text),
+        error=None if text else "No OCR text was extracted.",
+    )
+
+
+def _chunks(values: list[Path], size: int) -> list[list[Path]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _align_batch_results(raw_results: Any, expected: int) -> list[Any]:
+    if isinstance(raw_results, list) and len(raw_results) == expected:
+        return raw_results
+    if expected == 1:
+        return [raw_results]
+    return list(raw_results) if isinstance(raw_results, list) else [raw_results]
 
 
 def _normalize_paddleocr_v3_page(page: dict[str, Any]) -> list[dict[str, object]]:

@@ -20,7 +20,7 @@ paper_download:
   allow_requires_login_download: true
 
 parsing:
-  default_parser: "metadata_only"
+  default_parser: "paddleocr"
   preferred_engines:
     - "docling"
     - "paddleocr"
@@ -35,6 +35,7 @@ parsing:
     use_angle_cls: true
     pdf_render_scale: 2.0
     max_pages: null
+    ocr_batch_size: 4
 
 literature_context:
   visible_to_user: true

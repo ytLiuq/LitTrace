@@ -1,5 +1,9 @@
 from littrace.config import LitTraceConfig
-from littrace.login_flow import launch_login_for_paper, login_action_for_paper
+from littrace.login_flow import (
+    browser_login_session_for_paper,
+    launch_login_for_paper,
+    login_action_for_paper,
+)
 from littrace.models import AccessType, FullTextCandidate, FullTextResolutionReport, PaperMetadata
 
 
@@ -56,3 +60,19 @@ def test_login_action_prefers_full_text_landing_candidate():
     action = login_action_for_paper(LitTraceConfig(), paper, report)
 
     assert str(action.login_url) == "https://publisher.example.org/article"
+
+
+def test_browser_login_session_plan_contains_download_handoff():
+    paper = PaperMetadata(
+        paper_id="p1",
+        title="Gated",
+        access_type=AccessType.REQUIRES_LOGIN,
+        source_urls=["https://example.org/gated"],
+    )
+
+    plan = browser_login_session_for_paper(LitTraceConfig(), paper, browser_profile="test-profile")
+
+    assert str(plan.login_url) == "https://example.org/gated"
+    assert plan.browser_profile == "test-profile"
+    assert plan.target_path.endswith("paper.pdf")
+    assert "--download-dir" in plan.browser_act_command

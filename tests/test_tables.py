@@ -1,5 +1,9 @@
 from littrace.models import LiteratureWorkspace, PaperMetadata
-from littrace.tables import build_comparison_matrices, extract_performance_cells
+from littrace.tables import (
+    build_comparison_matrices,
+    extract_performance_cells,
+    extract_structured_artifacts,
+)
 
 
 def test_extract_performance_cells_from_parsed_sections():
@@ -219,3 +223,36 @@ def test_extracts_uncertainty_and_range_values():
     assert sensitivity.uncertainty == 0.1
     assert retention.value_min == 90.0
     assert retention.value_max == 95.0
+
+
+def test_extract_structured_artifacts_with_evidence():
+    workspace = LiteratureWorkspace(
+        parsed_papers={
+            "p1": {
+                "sections": [
+                    {
+                        "name": "Results",
+                        "text": (
+                            "Figure 2. SEM image showing porous MXene network and crack bridging.\n\n"
+                            "Table 1. Performance comparison of sensitivity and response time.\n\n"
+                            "Equation (1): S = delta R / R0 / delta P"
+                        ),
+                        "evidence": {
+                            "paper_id": "p1",
+                            "section": "Results",
+                            "page": 4,
+                            "parser": "paddleocr",
+                            "confidence": 0.82,
+                        },
+                    }
+                ]
+            }
+        }
+    )
+
+    workspace, harness = extract_structured_artifacts(workspace)
+    artifacts = workspace.context.filters["structured_artifacts"]
+
+    assert harness.passed
+    assert {artifact["artifact_type"] for artifact in artifacts} >= {"figure", "table", "equation"}
+    assert all(artifact["evidence"]["page"] == 4 for artifact in artifacts)

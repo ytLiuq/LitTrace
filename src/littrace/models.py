@@ -242,6 +242,15 @@ class PerformanceCell(BaseModel):
     evidence: EvidenceSpan
 
 
+class StructuredArtifact(BaseModel):
+    paper_id: str
+    artifact_type: str
+    label: str | None = None
+    text: str
+    evidence: EvidenceSpan
+    confidence: float = 0.0
+
+
 class ComparisonMatrixRow(BaseModel):
     paper_id: str
     title: str | None = None

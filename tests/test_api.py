@@ -113,6 +113,10 @@ def test_search_context_and_download_plan_api(monkeypatch):
     assert response.status_code == 200
     assert response.json()["target_path"].endswith("paper.pdf")
 
+    response = client.post("/downloads/browser-session/mxene-flexible-sensor-wiley-2026")
+    assert response.status_code == 200
+    assert response.json()["browser_act_command"]
+
     response = client.post("/downloads/check")
     assert response.status_code == 200
     assert "ready_to_parse_count" in response.json()

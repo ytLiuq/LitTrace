@@ -30,7 +30,12 @@ from littrace.downloads import execute_downloads
 from littrace.export import export_session_bundle
 from littrace.full_text import backfill_workspace_by_dois, resolve_workspace_full_text
 from littrace.golden_eval import GoldenEvalReport, run_golden_eval
-from littrace.login_flow import LoginLaunchResult, launch_login_for_paper
+from littrace.login_flow import (
+    BrowserLoginSessionPlan,
+    LoginLaunchResult,
+    browser_login_session_for_paper,
+    launch_login_for_paper,
+)
 from littrace.models import (
     ChatRequest,
     ChatResponse,
@@ -287,6 +292,21 @@ def downloads_login(paper_id: str, dry_run: bool = False) -> LoginLaunchResult:
         paper,
         WORKSPACE.full_text_reports.get(paper_id),
         dry_run=dry_run,
+    )
+
+
+@app.post("/downloads/browser-session/{paper_id}", response_model=BrowserLoginSessionPlan)
+def downloads_browser_session(
+    paper_id: str,
+    browser_profile: str = "littrace-auth",
+) -> BrowserLoginSessionPlan:
+    config = load_config()
+    paper = WORKSPACE.papers[paper_id]
+    return browser_login_session_for_paper(
+        config,
+        paper,
+        WORKSPACE.full_text_reports.get(paper_id),
+        browser_profile=browser_profile,
     )
 
 

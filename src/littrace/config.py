@@ -42,6 +42,7 @@ class PaddleOCRParserConfig(BaseModel):
     use_angle_cls: bool = True
     pdf_render_scale: float = 2.0
     max_pages: int | None = None
+    ocr_batch_size: int = 4
 
 
 class ParsingConfig(BaseModel):

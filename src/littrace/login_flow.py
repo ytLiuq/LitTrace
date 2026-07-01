@@ -24,6 +24,19 @@ class LoginLaunchResult(BaseModel):
     error: str | None = None
 
 
+class BrowserLoginSessionPlan(BaseModel):
+    paper_id: str
+    login_url: HttpUrl | None = None
+    target_path: str
+    download_dir: str
+    browser_profile: str = "littrace-auth"
+    automation_steps: list[str] = Field(default_factory=list)
+    browser_act_command: list[str] = Field(default_factory=list)
+    instructions: list[str] = Field(default_factory=list)
+    requires_user_login: bool = True
+    error: str | None = None
+
+
 def login_action_for_paper(
     config: LitTraceConfig,
     paper: PaperMetadata,
@@ -68,6 +81,44 @@ def launch_login_for_paper(
         login_url=action.login_url,
         target_path=action.target_path,
         instructions=action.login_instructions,
+    )
+
+
+def browser_login_session_for_paper(
+    config: LitTraceConfig,
+    paper: PaperMetadata,
+    full_text_report: FullTextResolutionReport | None = None,
+    browser_profile: str = "littrace-auth",
+) -> BrowserLoginSessionPlan:
+    action = login_action_for_paper(config, paper, full_text_report)
+    target = Path(action.target_path or target_pdf_path(config, paper))
+    login_url = action.login_url
+    steps = [
+        "Open the publisher landing or PDF page in a persistent browser session.",
+        "Let the user complete institutional, society, or publisher login.",
+        "Wait for the user-authorized PDF response or browser download.",
+        f"Save or move the resulting PDF to {target}.",
+        "Return control to LitTrace for /check-downloads and parsing.",
+    ]
+    command = [
+        "browser-act",
+        "open",
+        "--profile",
+        browser_profile,
+        str(login_url or ""),
+        "--download-dir",
+        str(target.parent),
+    ]
+    return BrowserLoginSessionPlan(
+        paper_id=paper.paper_id,
+        login_url=login_url,
+        target_path=str(target),
+        download_dir=str(target.parent),
+        browser_profile=browser_profile,
+        automation_steps=steps,
+        browser_act_command=command if login_url else [],
+        instructions=login_instructions(target),
+        error=action.error,
     )
 
 

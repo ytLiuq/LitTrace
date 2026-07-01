@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from littrace.models import CitationRecord, LinkStatus, PerformanceCell, StorylineClaim
+from littrace.models import CitationRecord, LinkStatus, PerformanceCell, StorylineClaim, StructuredArtifact
 
 
 class HarnessResult(BaseModel):
@@ -36,6 +36,24 @@ def check_performance_cells(cells: list[PerformanceCell]) -> HarnessResult:
         if evidence.confidence < 0.65:
             warnings.append(f"{cell.paper_id}: low extraction confidence for {cell.metric}")
     total = max(len(cells), 1)
+    score = (total - len(errors)) / total
+    return HarnessResult(passed=not errors, score=score, errors=errors, warnings=warnings)
+
+
+def check_structured_artifacts(artifacts: list[StructuredArtifact]) -> HarnessResult:
+    errors: list[str] = []
+    warnings: list[str] = []
+    allowed_types = {"table", "figure", "equation", "formula"}
+    for artifact in artifacts:
+        if artifact.artifact_type not in allowed_types:
+            errors.append(f"{artifact.paper_id}: unsupported artifact type {artifact.artifact_type}")
+        if not artifact.text.strip():
+            errors.append(f"{artifact.paper_id}: empty {artifact.artifact_type} artifact")
+        if artifact.evidence.page is None and artifact.evidence.snippet is None:
+            errors.append(f"{artifact.paper_id}: {artifact.artifact_type} lacks evidence")
+        if artifact.confidence < 0.6:
+            warnings.append(f"{artifact.paper_id}: low-confidence {artifact.artifact_type} artifact")
+    total = max(len(artifacts), 1)
     score = (total - len(errors)) / total
     return HarnessResult(passed=not errors, score=score, errors=errors, warnings=warnings)
 

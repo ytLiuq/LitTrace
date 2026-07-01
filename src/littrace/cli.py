@@ -18,7 +18,7 @@ from littrace.full_text import (
     resolve_workspace_full_text,
 )
 from littrace.golden_eval import run_golden_eval
-from littrace.login_flow import launch_login_for_paper
+from littrace.login_flow import browser_login_session_for_paper, launch_login_for_paper
 from littrace.models import ChatRequest, LiteratureWorkspace
 from littrace.pdf_benchmark import benchmark_pdf_parsing
 from littrace.publisher_connectors import build_publisher_search_plan
@@ -57,7 +57,7 @@ async def run_shell() -> None:
     print("LitTrace agent shell")
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
-        "/login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
+        "/login N /browser-login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
         "/dashboard /quality /agents /agent-flow /agent-audits /plan topic /init-config /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
@@ -214,6 +214,29 @@ async def run_shell() -> None:
                 print(f"- {instruction}")
             if result.error:
                 print(f"错误: {result.error}")
+            continue
+        if message.startswith("/browser-login "):
+            index = _parse_index_arg(message.replace("/browser-login", "/login", 1))
+            paper_id = _paper_id_for_index(state.workspace, index) if index else None
+            if not paper_id:
+                print("没有找到这个编号的文献。")
+                continue
+            paper = state.workspace.papers[paper_id]
+            plan = browser_login_session_for_paper(
+                config,
+                paper,
+                state.workspace.full_text_reports.get(paper_id),
+            )
+            print(f"浏览器会话: {plan.login_url or '无'}")
+            print(f"下载目录: {plan.download_dir}")
+            print(f"目标 PDF: {plan.target_path}")
+            if plan.browser_act_command:
+                print("browser-act 命令:")
+                print(" ".join(plan.browser_act_command))
+            for step in plan.automation_steps:
+                print(f"- {step}")
+            if plan.error:
+                print(f"错误: {plan.error}")
             continue
         if message.startswith("/attach "):
             parsed = _parse_attach_args(message)

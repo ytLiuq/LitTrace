@@ -111,6 +111,28 @@ def test_paddleocr_tool_reuses_engine_for_multiple_images():
     assert created == 1
 
 
+def test_paddleocr_batch_predict_maps_pages(monkeypatch, tmp_path):
+    image1 = tmp_path / "page_1.png"
+    image2 = tmp_path / "page_2.png"
+    image1.write_bytes(b"png")
+    image2.write_bytes(b"png")
+
+    class FakeOCR:
+        def predict(self, paths, **kwargs):
+            return [
+                {"rec_texts": ["First page"], "rec_scores": [0.9], "rec_boxes": [[0, 0, 1, 1]]},
+                {"rec_texts": ["Second page"], "rec_scores": [0.8], "rec_boxes": [[0, 0, 1, 1]]},
+            ]
+
+    tool = PaddleOCRTool(PaddleOCRParserConfig(ocr_batch_size=2))
+    monkeypatch.setattr(tool, "_get_ocr_engine", lambda cls: FakeOCR())
+
+    parsed = tool.parse_images_batch([image1, image2])
+
+    assert [page.sections[0]["text"] for page in parsed] == ["First page", "Second page"]
+    assert parsed[0].parser_reports[0]["batched"]
+
+
 def test_render_pdf_pages_to_images_requires_pypdfium2_when_missing(monkeypatch, tmp_path):
     from littrace.ocr import paddleocr_adapter
 
