@@ -39,6 +39,10 @@ def test_search_context_and_download_plan_api():
     assert response.status_code == 200
     assert response.json()
 
+    response = client.get("/eval/full-text")
+    assert response.status_code == 200
+    assert "full_text_resolved_rate" in response.json()["metrics"]
+
     response = client.get("/citations/context")
     assert response.status_code == 200
     citations = response.json()

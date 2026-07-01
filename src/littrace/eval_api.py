@@ -34,3 +34,32 @@ def storyline_metrics() -> dict[str, float]:
         "citation_coverage": 0.0,
         "unsupported_claim_rate": 0.0,
     }
+
+
+def full_text_metrics_from_workspace(workspace) -> dict[str, float]:
+    active_ids = workspace.context.active_papers
+    active_count = len(active_ids)
+    reports = [
+        workspace.full_text_reports[paper_id]
+        for paper_id in active_ids
+        if paper_id in workspace.full_text_reports
+    ]
+    if active_count == 0:
+        return {
+            "full_text_resolved_rate": 0.0,
+            "verified_candidate_rate": 0.0,
+            "oa_pdf_candidate_rate": 0.0,
+            "login_handoff_ready_rate": 0.0,
+            "parsed_full_text_rate": 0.0,
+        }
+    verified = sum(report.verified_candidate_count > 0 for report in reports)
+    oa_pdf = sum(bool(report.best_pdf_url) for report in reports)
+    login_ready = sum(report.login_required_candidate_count > 0 for report in reports)
+    parsed = sum(paper_id in workspace.parsed_papers for paper_id in active_ids)
+    return {
+        "full_text_resolved_rate": len(reports) / active_count,
+        "verified_candidate_rate": verified / active_count,
+        "oa_pdf_candidate_rate": oa_pdf / active_count,
+        "login_handoff_ready_rate": login_ready / active_count,
+        "parsed_full_text_rate": parsed / active_count,
+    }

@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from littrace.eval_api import (
     EvalMetricReport,
+    full_text_metrics_from_workspace,
     parsing_metrics,
     retrieval_metrics,
     storyline_metrics,
@@ -27,7 +28,7 @@ from littrace.config_wizard import ConfigWizardResult, write_config_template
 from littrace.context import apply_context_update
 from littrace.downloads import execute_downloads
 from littrace.export import export_session_bundle
-from littrace.full_text import resolve_workspace_full_text
+from littrace.full_text import backfill_workspace_by_dois, resolve_workspace_full_text
 from littrace.golden_eval import GoldenEvalReport, run_golden_eval
 from littrace.login_flow import LoginLaunchResult, launch_login_for_paper
 from littrace.models import (
@@ -40,6 +41,7 @@ from littrace.models import (
     DownloadExecutionRequest,
     DownloadExecutionResult,
     DownloadPlan,
+    DOIBackfillRequest,
     FullTextResolutionReport,
     LiteratureWorkspace,
     PaperSearchRequest,
@@ -215,6 +217,13 @@ async def full_text_resolve() -> dict[str, FullTextResolutionReport]:
     return WORKSPACE.full_text_reports
 
 
+@app.post("/papers/backfill-dois", response_model=LiteratureWorkspace)
+async def papers_backfill_dois(request: DOIBackfillRequest) -> LiteratureWorkspace:
+    global WORKSPACE
+    WORKSPACE = await backfill_workspace_by_dois(WORKSPACE, request.dois, load_config())
+    return WORKSPACE
+
+
 @app.get("/publishers/routes", response_model=PublisherRouteReport)
 def publisher_routes() -> PublisherRouteReport:
     return publisher_routes_for_workspace(WORKSPACE)
@@ -273,7 +282,12 @@ async def downloads_execute(request: DownloadExecutionRequest) -> DownloadExecut
 def downloads_login(paper_id: str, dry_run: bool = False) -> LoginLaunchResult:
     config = load_config()
     paper = WORKSPACE.papers[paper_id]
-    return launch_login_for_paper(config, paper, dry_run=dry_run)
+    return launch_login_for_paper(
+        config,
+        paper,
+        WORKSPACE.full_text_reports.get(paper_id),
+        dry_run=dry_run,
+    )
 
 
 @app.post("/downloads/check", response_model=DownloadPresenceReport)
@@ -367,6 +381,14 @@ def eval_pdf_parsing(topic: str | None = None) -> EvalMetricReport:
 @app.get("/eval/pdf-benchmark", response_model=PDFBenchmarkReport)
 def eval_pdf_benchmark() -> PDFBenchmarkReport:
     return benchmark_pdf_parsing(WORKSPACE, load_config())
+
+
+@app.get("/eval/full-text", response_model=EvalMetricReport)
+def eval_full_text() -> EvalMetricReport:
+    return EvalMetricReport(
+        run_id="preview",
+        metrics=full_text_metrics_from_workspace(WORKSPACE),
+    )
 
 
 @app.post("/eval/storyline", response_model=EvalMetricReport)

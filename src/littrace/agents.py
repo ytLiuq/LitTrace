@@ -43,7 +43,12 @@ LITTRACE_CREW_ROLES = [
         name="FullText Resolver",
         goal="Resolve DOI-level full-text candidates before download or login handoff.",
         backstory="A DOI-first resolver that combines Crossref, Unpaywall, publisher links, and safe login routes.",
-        tools=["resolve_full_text_for_papers", "resolve_workspace_full_text"],
+        tools=[
+            "backfill_workspace_by_dois",
+            "resolve_full_text_for_papers",
+            "verify_full_text_candidates",
+            "resolve_workspace_full_text",
+        ],
     ),
     AgentRoleSpec(
         name="Publisher Connector",
@@ -129,7 +134,12 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             runtime="Local async resolver",
             implemented=True,
             workflow_node=None,
-            callable_tools=["resolve_full_text_for_papers", "resolve_workspace_full_text"],
+            callable_tools=[
+                "backfill_workspace_by_dois",
+                "resolve_full_text_for_papers",
+                "verify_full_text_candidates",
+                "resolve_workspace_full_text",
+            ],
             remaining_work=["Add provider-level backoff metrics and institution login redirect classification."],
         ),
         AgentRuntimeStatus(

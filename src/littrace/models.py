@@ -48,6 +48,9 @@ class FullTextCandidate(BaseModel):
     is_pdf: bool = False
     is_xml: bool = False
     confidence: float = 0.0
+    verified: bool = False
+    status_code: int | None = None
+    checked_content_type: str | None = None
     note: str | None = None
 
 
@@ -59,6 +62,7 @@ class FullTextResolutionReport(BaseModel):
     best_landing_url: HttpUrl | None = None
     open_access_candidate_count: int = 0
     login_required_candidate_count: int = 0
+    verified_candidate_count: int = 0
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -74,6 +78,10 @@ class PaperSearchRequest(BaseModel):
 class PaperSearchResult(BaseModel):
     request: PaperSearchRequest
     papers: list[PaperMetadata]
+
+
+class DOIBackfillRequest(BaseModel):
+    dois: list[str] = Field(default_factory=list)
 
 
 class LiteratureContext(BaseModel):

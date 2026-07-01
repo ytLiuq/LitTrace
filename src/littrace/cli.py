@@ -12,7 +12,11 @@ from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.config_wizard import write_config_template
 from littrace.export import export_session_bundle
-from littrace.full_text import resolve_workspace_full_text
+from littrace.full_text import (
+    backfill_workspace_by_dois,
+    full_text_config_warnings,
+    resolve_workspace_full_text,
+)
 from littrace.golden_eval import run_golden_eval
 from littrace.login_flow import launch_login_for_paper
 from littrace.models import ChatRequest, LiteratureWorkspace
@@ -129,6 +133,8 @@ async def run_shell() -> None:
                     print(f"  - {finding}")
             continue
         if message == "/full-text":
+            for warning in full_text_config_warnings(config):
+                print(f"配置建议: {warning}")
             state.workspace = await resolve_workspace_full_text(state.workspace, config)
             save_workspace(session, state.workspace)
             print(f"Full-text reports: {len(state.workspace.full_text_reports)}")
@@ -147,6 +153,15 @@ async def run_shell() -> None:
                     print(f"  landing: {report.best_landing_url}")
                 for warning in report.warnings[:2]:
                     print(f"  warning: {warning}")
+            continue
+        if message.startswith("/backfill-dois "):
+            raw = message.removeprefix("/backfill-dois ").strip()
+            dois = [item.strip() for item in raw.replace(",", " ").split() if item.strip()]
+            before = len(state.workspace.context.active_papers)
+            state.workspace = await backfill_workspace_by_dois(state.workspace, dois, config)
+            save_workspace(session, state.workspace)
+            added = len(state.workspace.context.active_papers) - before
+            print(f"DOI backfill: added {added} papers.")
             continue
         if message.startswith("/plan "):
             topic = message.removeprefix("/plan ").strip()
@@ -188,7 +203,11 @@ async def run_shell() -> None:
                 print("没有找到这个编号的文献。")
                 continue
             paper = state.workspace.papers[paper_id]
-            result = launch_login_for_paper(config, paper)
+            result = launch_login_for_paper(
+                config,
+                paper,
+                state.workspace.full_text_reports.get(paper_id),
+            )
             print(f"登录页: {result.login_url or '无'}")
             print(f"目标路径: {result.target_path or '无'}")
             for instruction in result.instructions:

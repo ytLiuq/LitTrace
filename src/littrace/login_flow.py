@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, HttpUrl
 
 from littrace.access import target_pdf_path
 from littrace.config import LitTraceConfig
-from littrace.models import DownloadExecutionItem, PaperMetadata
+from littrace.models import DownloadExecutionItem, FullTextResolutionReport, PaperMetadata
 
 
 class LoginLaunchRequest(BaseModel):
@@ -24,9 +24,13 @@ class LoginLaunchResult(BaseModel):
     error: str | None = None
 
 
-def login_action_for_paper(config: LitTraceConfig, paper: PaperMetadata) -> DownloadExecutionItem:
+def login_action_for_paper(
+    config: LitTraceConfig,
+    paper: PaperMetadata,
+    full_text_report: FullTextResolutionReport | None = None,
+) -> DownloadExecutionItem:
     pdf_path = target_pdf_path(config, paper)
-    login_url = paper.pdf_url or (paper.source_urls[0] if paper.source_urls else None)
+    login_url = _login_url_for_paper(paper, full_text_report)
     return DownloadExecutionItem(
         paper_id=paper.paper_id,
         action="open_login_popup",
@@ -41,9 +45,10 @@ def login_action_for_paper(config: LitTraceConfig, paper: PaperMetadata) -> Down
 def launch_login_for_paper(
     config: LitTraceConfig,
     paper: PaperMetadata,
+    full_text_report: FullTextResolutionReport | None = None,
     dry_run: bool = False,
 ) -> LoginLaunchResult:
-    action = login_action_for_paper(config, paper)
+    action = login_action_for_paper(config, paper, full_text_report)
     if not action.login_url:
         return LoginLaunchResult(
             paper_id=paper.paper_id,
@@ -73,3 +78,22 @@ def login_instructions(target_path: Path) -> list[str]:
         f"Download the PDF manually to: {target_path}",
         "Return to LitTrace and run parsing after the PDF is present.",
     ]
+
+
+def _login_url_for_paper(
+    paper: PaperMetadata,
+    full_text_report: FullTextResolutionReport | None,
+) -> str | None:
+    if full_text_report is not None:
+        login_candidates = [
+            candidate
+            for candidate in full_text_report.candidates
+            if candidate.requires_login and not candidate.is_pdf
+        ]
+        if login_candidates:
+            return str(login_candidates[0].url)
+        if full_text_report.best_landing_url:
+            return str(full_text_report.best_landing_url)
+    if paper.pdf_url:
+        return str(paper.pdf_url)
+    return str(paper.source_urls[0]) if paper.source_urls else None

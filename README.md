@@ -82,6 +82,7 @@ Shell commands:
 /attach N /path/to/paper.pdf
 /attach-si N /path/to/si.pdf
 /full-text
+/backfill-dois 10.1021/acs.nanolett.5c01464
 /publisher-retrieve acs MXene sensor
 /check-downloads
 /resume-downloads
@@ -123,7 +124,8 @@ into the active context, and `/attach-si N path` stores supplementary files
 under the current session artifacts.
 `/full-text` resolves DOI-level full-text candidates from Crossref links,
 Unpaywall OA locations when configured, publisher landing pages, and existing
-PDF URLs before download or login handoff.
+PDF URLs before download or login handoff. `/backfill-dois` adds exact DOI
+metadata to the current context when keyword search misses a known target paper.
 
 Each shell run creates a folder under `storage.sessions_dir` (default:
 `./sessions/<timestamp-id>/`) containing:
@@ -199,6 +201,10 @@ curl http://127.0.0.1:8000/citations/context
 curl -X POST http://127.0.0.1:8000/citations/audit
 curl -X POST http://127.0.0.1:8000/downloads/plan
 curl -X POST http://127.0.0.1:8000/full-text/resolve
+curl -X POST http://127.0.0.1:8000/papers/backfill-dois \
+  -H "Content-Type: application/json" \
+  -d '{"dois":["10.1021/acs.nanolett.5c01464"]}'
+curl http://127.0.0.1:8000/eval/full-text
 curl -X POST http://127.0.0.1:8000/downloads/execute \
   -H "Content-Type: application/json" \
   -d '{"paper_ids":[],"dry_run":true}'

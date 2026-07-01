@@ -11,6 +11,25 @@ from littrace.models import (
     LiteratureWorkspace,
     PaperMetadata,
 )
+from littrace.search import (
+    _crossref_authors,
+    _crossref_year,
+    _first,
+    _normalize_doi,
+    _paper_id,
+    _strip_crossref_abstract,
+)
+
+
+def full_text_config_warnings(config: LitTraceConfig) -> list[str]:
+    warnings = []
+    if not config.api.unpaywall_email:
+        warnings.append("Set api.unpaywall_email to improve OA full-text PDF discovery.")
+    if not config.api.crossref_mailto:
+        warnings.append("Set api.crossref_mailto for more reliable Crossref polite-pool access.")
+    if "mailto:" not in config.api.user_agent.lower():
+        warnings.append("Add mailto:your-email@example.com to api.user_agent for API etiquette.")
+    return warnings
 
 
 async def resolve_workspace_full_text(
@@ -59,7 +78,69 @@ async def resolve_full_text_for_paper(
             candidates.extend(unpaywall_candidates)
             warnings.extend(unpaywall_warnings)
     candidates = _dedupe_candidates(candidates)
+    candidates, verify_warnings = await verify_full_text_candidates(client, candidates)
+    warnings.extend(verify_warnings)
     return _build_report(paper, candidates, warnings)
+
+
+async def backfill_workspace_by_dois(
+    workspace: LiteratureWorkspace,
+    dois: list[str],
+    config: LitTraceConfig,
+) -> LiteratureWorkspace:
+    existing = {paper.doi.lower() for paper in workspace.papers.values() if paper.doi}
+    missing = [doi for doi in dois if doi.lower() not in existing]
+    timeout = httpx.Timeout(config.api.request_timeout_seconds)
+    headers = {"User-Agent": config.api.user_agent}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        for doi in missing:
+            paper = await fetch_crossref_paper_by_doi(client, doi)
+            if paper is None:
+                continue
+            workspace.papers[paper.paper_id] = paper
+            if paper.paper_id not in workspace.context.active_papers:
+                workspace.context.active_papers.append(paper.paper_id)
+    return workspace
+
+
+async def fetch_crossref_paper_by_doi(
+    client: httpx.AsyncClient,
+    doi: str,
+) -> PaperMetadata | None:
+    try:
+        response = await client.get(f"https://api.crossref.org/works/{doi}")
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    item = response.json().get("message", {})
+    title = _first(item.get("title"))
+    if not title:
+        return None
+    normalized_doi = _normalize_doi(item.get("DOI") or doi)
+    source_urls = [item.get("URL")] if item.get("URL") else [f"https://doi.org/{normalized_doi}"]
+    probe = PaperMetadata(
+        paper_id="probe",
+        title=title,
+        publisher=item.get("publisher"),
+        journal=_first(item.get("container-title")),
+    )
+    return PaperMetadata(
+        paper_id=_paper_id(normalized_doi, title),
+        title=title,
+        authors=_crossref_authors(item),
+        year=_crossref_year(item),
+        journal=_first(item.get("container-title")),
+        publisher=item.get("publisher"),
+        doi=normalized_doi,
+        abstract=_strip_crossref_abstract(item.get("abstract")),
+        citation_count=item.get("is-referenced-by-count"),
+        source_urls=source_urls,
+        access_type=AccessType.REQUIRES_LOGIN
+        if _looks_gated(str(source_urls[0]), probe)
+        else AccessType.METADATA_ONLY,
+    )
 
 
 def _seed_candidates(paper: PaperMetadata) -> list[FullTextCandidate]:
@@ -221,6 +302,51 @@ def _dedupe_candidates(candidates: list[FullTextCandidate]) -> list[FullTextCand
     return sorted(by_url.values(), key=lambda item: item.confidence, reverse=True)
 
 
+async def verify_full_text_candidates(
+    client: httpx.AsyncClient,
+    candidates: list[FullTextCandidate],
+    max_candidates: int = 8,
+) -> tuple[list[FullTextCandidate], list[str]]:
+    verified: list[FullTextCandidate] = []
+    warnings: list[str] = []
+    for index, candidate in enumerate(candidates):
+        if index >= max_candidates:
+            verified.append(candidate)
+            continue
+        try:
+            verified.append(await _verify_candidate(client, candidate))
+        except httpx.HTTPError as exc:
+            update = candidate.model_dump()
+            update["note"] = f"verify_failed: {exc.__class__.__name__}"
+            verified.append(FullTextCandidate.model_validate(update))
+            warnings.append(f"verify_candidate: {exc.__class__.__name__}: {candidate.url}")
+    return verified, warnings
+
+
+async def _verify_candidate(
+    client: httpx.AsyncClient,
+    candidate: FullTextCandidate,
+) -> FullTextCandidate:
+    response = await client.head(str(candidate.url), follow_redirects=True)
+    if response.status_code == 405:
+        response = await client.get(str(candidate.url), follow_redirects=True)
+    content_type = response.headers.get("content-type", "")
+    update = candidate.model_dump()
+    update["status_code"] = response.status_code
+    update["checked_content_type"] = content_type
+    update["verified"] = 200 <= response.status_code < 400
+    if "pdf" in content_type.lower():
+        update["is_pdf"] = True
+        update["content_type"] = content_type
+    if "xml" in content_type.lower():
+        update["is_xml"] = True
+        update["content_type"] = content_type
+    if response.status_code in {401, 402, 403}:
+        update["requires_login"] = True
+        update["access_type"] = AccessType.REQUIRES_LOGIN
+    return FullTextCandidate.model_validate(update)
+
+
 def _build_report(
     paper: PaperMetadata,
     candidates: list[FullTextCandidate],
@@ -242,6 +368,7 @@ def _build_report(
             candidate.access_type == AccessType.OPEN_ACCESS for candidate in candidates
         ),
         login_required_candidate_count=sum(candidate.requires_login for candidate in candidates),
+        verified_candidate_count=sum(candidate.verified for candidate in candidates),
         warnings=warnings,
     )
 

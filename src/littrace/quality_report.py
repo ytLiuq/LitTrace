@@ -36,6 +36,7 @@ def build_quality_report(config: LitTraceConfig, workspace: LiteratureWorkspace)
     active_count = len(papers)
     full_text_resolved = len(full_text_reports)
     oa_pdf_count = sum(bool(report.best_pdf_url) for report in full_text_reports)
+    verified_count = sum(report.verified_candidate_count > 0 for report in full_text_reports)
     login_required_count = sum(
         report.login_required_candidate_count > 0 for report in full_text_reports
     )
@@ -43,6 +44,7 @@ def build_quality_report(config: LitTraceConfig, workspace: LiteratureWorkspace)
         "active_paper_count": float(active_count),
         "selected_download_count": float(len(workspace.context.selected_for_download)),
         "full_text_resolved_rate": full_text_resolved / active_count if active_count else 0.0,
+        "verified_full_text_candidate_rate": verified_count / active_count if active_count else 0.0,
         "oa_pdf_candidate_rate": oa_pdf_count / active_count if active_count else 0.0,
         "login_required_candidate_rate": login_required_count / active_count if active_count else 0.0,
         "local_pdf_rate": pdf_report.local_pdf_rate,
