@@ -104,3 +104,21 @@ async def test_chat_reports_agent_status():
 
     assert response.action == "agent_status"
     assert "Publisher Connector" in response.reply
+
+
+@pytest.mark.anyio
+async def test_chat_runs_autonomous_review_loop():
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [PaperMetadata(paper_id="p1", title="Traceable Paper", year=2026, doi="10.1000/example")],
+    )
+
+    response, workspace = await handle_chat(
+        ChatRequest(message="请多轮反驳并修订当前结论"),
+        workspace,
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
+    )
+
+    assert response.action == "autonomous_review"
+    assert "多 agent 审稿" in response.reply
+    assert "autonomous_loop_report" in workspace.context.filters

@@ -34,6 +34,8 @@ def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInter
     has_cells = bool(workspace.performance_cells)
     has_storyline = bool(build_storyline_from_workspace(workspace))
     has_guard_reports = bool(workspace.guard_reports)
+    has_document = bool(workspace.context.filters.get("document_report"))
+    has_autonomous_loop = bool(workspace.context.filters.get("autonomous_loop_report"))
 
     handoffs = [
         AgentHandoff(
@@ -120,6 +122,43 @@ def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInter
             required_inputs=["draft text", "active citations"],
             quality_gate="Final answer includes citation records and accessible links for literature claims.",
             status="complete" if has_guard_reports else ("ready" if has_papers else "blocked"),
+        ),
+        AgentHandoff(
+            from_agent="Storyline Verifier",
+            to_agent="Document Composer",
+            artifact="storyline claims, matrices, structured artifacts, and citations",
+            required_inputs=["active papers", "citation records", "quality metrics"],
+            quality_gate="Report sections must cite active papers and surface harness warnings.",
+            status="complete" if has_document else ("ready" if has_papers else "blocked"),
+            blocking_if_missing=False,
+            notes=[] if has_storyline else ["Document Composer can draft context reports, but full-text storyline evidence improves it."],
+        ),
+        AgentHandoff(
+            from_agent="Document Composer",
+            to_agent="Eval Auditor",
+            artifact="auditable research report",
+            required_inputs=["markdown report", "evidence spans", "citation records"],
+            quality_gate="Report exposes citation/storyline warnings instead of hiding evidence gaps.",
+            status="ready" if has_document else "blocked",
+            blocking_if_missing=False,
+        ),
+        AgentHandoff(
+            from_agent="Research Writer",
+            to_agent="Autonomous Review Council",
+            artifact="draft answer or research report",
+            required_inputs=["draft text", "active workspace", "quality metrics"],
+            quality_gate="Reviewer council must surface citation, storyline, and table objections before finalizing.",
+            status="complete" if has_autonomous_loop else ("ready" if has_papers else "blocked"),
+            blocking_if_missing=False,
+        ),
+        AgentHandoff(
+            from_agent="Autonomous Review Council",
+            to_agent="Research Planner",
+            artifact="replan actions from failed review gates",
+            required_inputs=["critique list", "failed harnesses", "workspace state"],
+            quality_gate="Failed review rounds produce explicit recovery actions such as parse_full_text or extract_tables.",
+            status="ready" if has_autonomous_loop else "blocked",
+            blocking_if_missing=False,
         ),
         AgentHandoff(
             from_agent="Eval Auditor",

@@ -64,6 +64,9 @@ def test_export_session_bundle_writes_artifacts(tmp_path):
 
     assert set(paths) == {
         "markdown",
+        "research_report",
+        "research_report_json",
+        "autonomous_review",
         "bibtex",
         "ris",
         "acs",

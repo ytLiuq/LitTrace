@@ -14,6 +14,7 @@ from littrace.agent_interactions import AgentInteractionReport, build_agent_inte
 from littrace.agents import AgentRoleSpec, AgentRuntimeStatus, agent_runtime_statuses, crew_role_specs
 from littrace.agent_audits import AgentAuditReport, audit_parser_agent, audit_storyline_agent, audit_table_agent
 from littrace.agent_strength import AgentPortfolioReport, build_agent_portfolio_report
+from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.attachments import (
     AttachmentResult,
     DownloadPresenceReport,
@@ -26,6 +27,7 @@ from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.config_wizard import ConfigWizardResult, write_config_template
 from littrace.context import apply_context_update
+from littrace.document_composer import build_research_document_report
 from littrace.downloads import execute_downloads
 from littrace.export import export_session_bundle
 from littrace.full_text import backfill_workspace_by_dois, resolve_workspace_full_text
@@ -49,7 +51,9 @@ from littrace.models import (
     DOIBackfillRequest,
     FullTextResolutionReport,
     LiteratureWorkspace,
+    AutonomousResearchLoopReport,
     PaperSearchRequest,
+    ResearchDocumentReport,
     ResearchRunRequest,
     ResearchRunResult,
 )
@@ -145,6 +149,17 @@ def agents_interactions() -> AgentInteractionReport:
     return build_agent_interaction_report(WORKSPACE)
 
 
+@app.post("/agents/autonomous-loop", response_model=AutonomousResearchLoopReport)
+async def agents_autonomous_loop(
+    objective: str,
+    max_rounds: int = 2,
+) -> AutonomousResearchLoopReport:
+    global WORKSPACE
+    report = await run_autonomous_research_loop(load_config(), objective, WORKSPACE, max_rounds=max_rounds)
+    WORKSPACE.context.filters["autonomous_loop_report"] = report.model_dump(mode="json")
+    return report
+
+
 @app.post("/search/preview", response_model=LiteratureWorkspace)
 async def search_preview(request: PaperSearchRequest) -> LiteratureWorkspace:
     global WORKSPACE
@@ -166,6 +181,8 @@ async def workflow_research(request: ResearchRunRequest) -> ResearchRunResult:
         parse_full_text_enabled=request.parse_full_text,
         extract_tables_enabled=request.extract_tables,
         build_storyline_enabled=request.build_storyline,
+        compose_document_enabled=request.compose_document,
+        autonomous_review_enabled=request.autonomous_review,
     )
     WORKSPACE = result.workspace
     return result
@@ -368,6 +385,14 @@ def tables_matrix() -> ComparisonMatrixReport:
 @app.get("/storyline/report")
 def storyline_report() -> dict[str, str]:
     return {"markdown": render_structured_storyline_report(WORKSPACE)}
+
+
+@app.get("/reports/research", response_model=ResearchDocumentReport)
+def research_report(title: str | None = None) -> ResearchDocumentReport:
+    global WORKSPACE
+    report = build_research_document_report(WORKSPACE, load_config(), title=title)
+    WORKSPACE.context.filters["document_report"] = report.model_dump(mode="json")
+    return report
 
 
 @app.get("/storyline/review", response_model=StorylineReviewReport)

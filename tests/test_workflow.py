@@ -1,6 +1,6 @@
 import pytest
 
-from littrace.config import LitTraceConfig
+from littrace.config import LLMConfig, LitTraceConfig
 from littrace.models import PaperSearchRequest
 from littrace.workflow import run_research_graph
 
@@ -50,3 +50,18 @@ async def test_run_research_graph_can_build_storyline_preview():
     assert result.table_harness is not None
     assert result.comparison_matrix is not None
     assert result.workspace.parsed_papers
+
+
+@pytest.mark.anyio
+async def test_run_research_graph_can_run_autonomous_review():
+    result = await run_research_graph(
+        PaperSearchRequest(topic="MXene flexible sensor", live=False),
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
+        audit_citations_enabled=False,
+        plan_downloads_enabled=False,
+        route_publishers_enabled=False,
+        autonomous_review_enabled=True,
+    )
+
+    assert result.autonomous_loop_report is not None
+    assert "autonomous_loop_report" in result.workspace.context.filters

@@ -81,6 +81,18 @@ LITTRACE_CREW_ROLES = [
         tools=["write_evidence_grounded_answer", "guard_citations", "remove_unsupported_sentences"],
     ),
     AgentRoleSpec(
+        name="Document Composer",
+        goal="Turn the active chat context into an auditable research report with citations and evidence tables.",
+        backstory="An OpenDraft-inspired report builder that composes only from verified LitTrace artifacts.",
+        tools=["build_research_document_report", "export_session_bundle"],
+    ),
+    AgentRoleSpec(
+        name="Autonomous Review Council",
+        goal="Run bounded writer-reviewer-reviser-replanner loops over research answers.",
+        backstory="A skeptical multi-agent council that debates evidence, removes unsupported claims, and proposes recovery actions.",
+        tools=["run_autonomous_research_loop", "guard_citations", "check_storyline_claims", "check_performance_cells"],
+    ),
+    AgentRoleSpec(
         name="Eval Auditor",
         goal="Measure retrieval, parsing, table, storyline, and citation quality.",
         backstory="A quality engineer for research workflows and golden-set regression tests.",
@@ -186,6 +198,29 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             workflow_node=None,
             callable_tools=["write_evidence_grounded_answer", "guard_citations"],
             remaining_work=["Add paragraph-level revision loops when citation guard fails."],
+        ),
+        AgentRuntimeStatus(
+            name="Document Composer",
+            role_layer="CrewAI role + callable tool",
+            runtime="Local deterministic report composer",
+            implemented=True,
+            workflow_node="compose_document",
+            callable_tools=["build_research_document_report", "export_session_bundle"],
+            remaining_work=["Add DOCX/PDF export engines and section-level revision loops."],
+        ),
+        AgentRuntimeStatus(
+            name="Autonomous Review Council",
+            role_layer="CrewAI role cluster + callable loop",
+            runtime="Local bounded autonomous loop",
+            implemented=True,
+            workflow_node="autonomous_review",
+            callable_tools=[
+                "run_autonomous_research_loop",
+                "guard_citations",
+                "check_storyline_claims",
+                "check_performance_cells",
+            ],
+            remaining_work=["Add optional LLM-based reviewer personas after deterministic gates pass."],
         ),
         AgentRuntimeStatus(
             name="Eval Auditor",

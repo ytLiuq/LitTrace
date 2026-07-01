@@ -56,6 +56,22 @@ def parse_chat_intent(message: str) -> ChatIntent:
         intent.actions.append("table")
     if any(token in lowered for token in ["故事", "脉络", "发展", "storyline", "narrative"]):
         intent.actions.append("storyline")
+    if any(token in lowered for token in ["报告", "文档", "综述", "research report", "document", "brief"]):
+        intent.actions.append("document")
+    if any(
+        token in lowered
+        for token in [
+            "辩论",
+            "反驳",
+            "多轮",
+            "修订",
+            "reviewer loop",
+            "autonomous",
+            "debate",
+            "revise",
+        ]
+    ):
+        intent.actions.append("autonomous_review")
     if any(token in lowered for token in ["当前文献", "参考了哪些", "context"]):
         intent.actions.append("list_context")
     if any(token in lowered for token in ["agent状态", "agent 进度", "agents status", "agent status"]):

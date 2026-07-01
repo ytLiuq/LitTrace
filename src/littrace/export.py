@@ -5,6 +5,7 @@ import re
 
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig, load_config
+from littrace.document_composer import build_research_document_report
 from littrace.models import LiteratureWorkspace
 from littrace.quality_report import build_quality_report
 from littrace.session import ChatSession
@@ -20,6 +21,9 @@ def export_session_bundle(
     config = config or load_config()
     session.artifacts_dir.mkdir(parents=True, exist_ok=True)
     markdown_path = session.artifacts_dir / "research_brief.md"
+    report_path = session.artifacts_dir / "research_report.md"
+    report_json_path = session.artifacts_dir / "research_report.json"
+    autonomous_path = session.artifacts_dir / "autonomous_review.json"
     bibtex_path = session.artifacts_dir / "references.bib"
     ris_path = session.artifacts_dir / "references.ris"
     acs_path = session.artifacts_dir / "references_acs.txt"
@@ -29,6 +33,17 @@ def export_session_bundle(
     json_path = session.artifacts_dir / "workspace_export.json"
 
     markdown_path.write_text(render_markdown_brief(workspace), encoding="utf-8")
+    report = build_research_document_report(workspace, config)
+    report_path.write_text(report.markdown, encoding="utf-8")
+    report_json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    autonomous_path.write_text(
+        json.dumps(
+            workspace.context.filters.get("autonomous_loop_report", {}),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     bibtex_path.write_text(render_bibtex(workspace), encoding="utf-8")
     ris_path.write_text(render_ris(workspace), encoding="utf-8")
     acs_path.write_text(render_numbered_references(workspace, style="acs"), encoding="utf-8")
@@ -48,6 +63,9 @@ def export_session_bundle(
 
     return {
         "markdown": str(markdown_path),
+        "research_report": str(report_path),
+        "research_report_json": str(report_json_path),
+        "autonomous_review": str(autonomous_path),
         "bibtex": str(bibtex_path),
         "ris": str(ris_path),
         "acs": str(acs_path),

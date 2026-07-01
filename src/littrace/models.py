@@ -181,6 +181,8 @@ class ResearchRunRequest(BaseModel):
     parse_full_text: bool = False
     extract_tables: bool = False
     build_storyline: bool = False
+    compose_document: bool = False
+    autonomous_review: bool = False
 
 
 class ResearchRunResult(BaseModel):
@@ -193,6 +195,8 @@ class ResearchRunResult(BaseModel):
     table_harness: dict[str, object] | None = None
     comparison_matrix: "ComparisonMatrixReport | None" = None
     storyline: list["StorylineClaim"] | None = None
+    document_report: "ResearchDocumentReport | None" = None
+    autonomous_loop_report: "AutonomousResearchLoopReport | None" = None
 
 
 class ChatRequest(BaseModel):
@@ -275,6 +279,50 @@ class ComparisonMatrix(BaseModel):
 
 class ComparisonMatrixReport(BaseModel):
     matrices: list[ComparisonMatrix]
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ResearchDocumentSection(BaseModel):
+    title: str
+    body: str
+    evidence: list[EvidenceSpan] = Field(default_factory=list)
+
+
+class ResearchDocumentReport(BaseModel):
+    title: str
+    markdown: str
+    sections: list[ResearchDocumentSection] = Field(default_factory=list)
+    citation_records: list[CitationRecord] = Field(default_factory=list)
+    evidence_count: int = 0
+    quality_metrics: dict[str, float] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class AgentCritique(BaseModel):
+    reviewer: str
+    severity: str = "info"
+    finding: str
+    evidence: list[EvidenceSpan] = Field(default_factory=list)
+    suggested_fix: str | None = None
+
+
+class AgentDebateRound(BaseModel):
+    round_index: int
+    writer_draft: str
+    critiques: list[AgentCritique] = Field(default_factory=list)
+    revised_draft: str
+    passed: bool
+    score: float
+    replan_actions: list[str] = Field(default_factory=list)
+
+
+class AutonomousResearchLoopReport(BaseModel):
+    objective: str
+    final_answer: str
+    rounds: list[AgentDebateRound] = Field(default_factory=list)
+    passed: bool
+    score: float
+    replan_actions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 

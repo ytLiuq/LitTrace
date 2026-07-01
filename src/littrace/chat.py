@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from littrace.access import build_download_plan
 from littrace.agents import agent_runtime_statuses
+from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.citation_guard import guard_citations, remove_unsupported_sentences
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
 from littrace.context import apply_context_update
+from littrace.document_composer import build_research_document_report
 from littrace.intent import ChatIntent, parse_chat_intent
 from littrace.models import (
     ChatRequest,
@@ -193,6 +195,32 @@ async def _run_composite_intent(
         research_result = result
         action = "build_storyline" if action == "composite" else action
 
+    if "document" in intent.actions:
+        report = build_research_document_report(workspace, config)
+        workspace.context.filters["document_report"] = report.model_dump(mode="json")
+        replies.append(
+            f"已生成可审计研究报告：{len(report.sections)} 个章节，"
+            f"{report.evidence_count} 条证据锚点，{len(report.citation_records)} 条引用。"
+        )
+        if report.warnings:
+            warnings.extend(report.warnings[:5])
+        action = "compose_document" if action == "composite" else action
+
+    if "autonomous_review" in intent.actions:
+        loop_report = await run_autonomous_research_loop(
+            config,
+            intent.topic or request.message,
+            workspace,
+        )
+        workspace.context.filters["autonomous_loop_report"] = loop_report.model_dump(mode="json")
+        replies.append(
+            f"已完成多 agent 审稿/反驳/修订循环：{len(loop_report.rounds)} 轮，"
+            f"score={loop_report.score:.3f}，passed={loop_report.passed}。"
+        )
+        replies.append(loop_report.final_answer)
+        warnings.extend(loop_report.warnings[:5])
+        action = "autonomous_review" if action == "composite" else action
+
     if "download" in intent.actions and not intent.skip_download:
         papers = _active_papers(workspace)
         download_plan = build_download_plan(config, papers, set(workspace.context.selected_for_download))
@@ -318,10 +346,16 @@ def _format_current_papers(workspace: LiteratureWorkspace) -> str:
 
 
 def _should_run_composite(intent: ChatIntent) -> bool:
-    return any(
-        action in intent.actions
-        for action in ["search", "download", "parse", "table", "storyline"]
-    )
+    composite_actions = {
+        "search",
+        "download",
+        "parse",
+        "table",
+        "storyline",
+        "document",
+        "autonomous_review",
+    }
+    return any(action in composite_actions for action in intent.actions)
 
 
 def _paper_id_for_index(active_ids: list[str], index: int) -> str | None:

@@ -4,9 +4,11 @@ from typing import TypedDict
 
 from littrace.access import build_download_plan
 from littrace.agent_interactions import build_agent_interaction_report
+from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.citations import audit_citation_links
 from littrace.context import add_papers
 from littrace.config import LitTraceConfig, load_config
+from littrace.document_composer import build_research_document_report
 from littrace.models import LiteratureWorkspace, PaperSearchRequest, ResearchRunResult
 from littrace.parsing import parse_workspace_papers
 from littrace.publisher_connectors import build_publisher_route_report, build_publisher_search_plan
@@ -25,6 +27,8 @@ class ResearchWorkflowState(TypedDict, total=False):
     parse_full_text_enabled: bool
     extract_tables_enabled: bool
     build_storyline_enabled: bool
+    compose_document_enabled: bool
+    autonomous_review_enabled: bool
     routes: list[SourceRoute]
     workspace: LiteratureWorkspace
     citation_audit: object
@@ -35,6 +39,8 @@ class ResearchWorkflowState(TypedDict, total=False):
     comparison_matrix: object
     storyline: object
     storyline_harness: object
+    document_report: object
+    autonomous_loop_report: object
     agent_interactions: object
 
 
@@ -138,6 +144,21 @@ def build_littrace_graph():
         state["storyline_harness"] = verify_storyline_preview(claims)
         return state
 
+    async def compose_document(state: ResearchWorkflowState) -> ResearchWorkflowState:
+        config = state.get("config") or load_config()
+        report = build_research_document_report(state["workspace"], config)
+        state["workspace"].context.filters["document_report"] = report.model_dump(mode="json")
+        state["document_report"] = report
+        return state
+
+    async def autonomous_review(state: ResearchWorkflowState) -> ResearchWorkflowState:
+        config = state.get("config") or load_config()
+        objective = state["request"].topic
+        report = await run_autonomous_research_loop(config, objective, state["workspace"])
+        state["workspace"].context.filters["autonomous_loop_report"] = report.model_dump(mode="json")
+        state["autonomous_loop_report"] = report
+        return state
+
     async def parse_full_text(state: ResearchWorkflowState) -> ResearchWorkflowState:
         config = state.get("config") or load_config()
         workspace, report = parse_workspace_papers(state["workspace"], config)
@@ -165,6 +186,10 @@ def build_littrace_graph():
             return "extract_tables"
         if state.get("build_storyline_enabled", False):
             return "build_storyline"
+        if state.get("compose_document_enabled", False):
+            return "compose_document"
+        if state.get("autonomous_review_enabled", False):
+            return "autonomous_review"
         return END
 
     def after_audit(state: ResearchWorkflowState) -> str:
@@ -178,6 +203,10 @@ def build_littrace_graph():
             return "extract_tables"
         if state.get("build_storyline_enabled", False):
             return "build_storyline"
+        if state.get("compose_document_enabled", False):
+            return "compose_document"
+        if state.get("autonomous_review_enabled", False):
+            return "autonomous_review"
         return END
 
     def after_download_plan(state: ResearchWorkflowState) -> str:
@@ -185,6 +214,10 @@ def build_littrace_graph():
             return "route_publishers"
         if state.get("parse_full_text_enabled", False):
             return "parse_full_text"
+        if state.get("compose_document_enabled", False):
+            return "compose_document"
+        if state.get("autonomous_review_enabled", False):
+            return "autonomous_review"
         return END
 
     def after_publisher_routes(state: ResearchWorkflowState) -> str:
@@ -194,6 +227,10 @@ def build_littrace_graph():
             return "extract_tables"
         if state.get("build_storyline_enabled", False):
             return "build_storyline"
+        if state.get("compose_document_enabled", False):
+            return "compose_document"
+        if state.get("autonomous_review_enabled", False):
+            return "autonomous_review"
         return END
 
     def after_parse(state: ResearchWorkflowState) -> str:
@@ -201,11 +238,31 @@ def build_littrace_graph():
             return "extract_tables"
         if state.get("build_storyline_enabled", False):
             return "build_storyline"
+        if state.get("compose_document_enabled", False):
+            return "compose_document"
+        if state.get("autonomous_review_enabled", False):
+            return "autonomous_review"
         return END
 
     def after_extract_tables(state: ResearchWorkflowState) -> str:
         if state.get("build_storyline_enabled", False):
             return "build_storyline"
+        if state.get("compose_document_enabled", False):
+            return "compose_document"
+        if state.get("autonomous_review_enabled", False):
+            return "autonomous_review"
+        return END
+
+    def after_storyline(state: ResearchWorkflowState) -> str:
+        if state.get("compose_document_enabled", False):
+            return "compose_document"
+        if state.get("autonomous_review_enabled", False):
+            return "autonomous_review"
+        return END
+
+    def after_document(state: ResearchWorkflowState) -> str:
+        if state.get("autonomous_review_enabled", False):
+            return "autonomous_review"
         return END
 
     graph = StateGraph(ResearchWorkflowState)
@@ -217,6 +274,8 @@ def build_littrace_graph():
     graph.add_node("parse_full_text", parse_full_text)
     graph.add_node("extract_tables", extract_tables)
     graph.add_node("build_storyline", build_storyline)
+    graph.add_node("compose_document", compose_document)
+    graph.add_node("autonomous_review", autonomous_review)
     graph.set_entry_point("plan_sources")
     graph.add_edge("plan_sources", "search_papers")
     graph.add_conditional_edges("search_papers", after_search)
@@ -225,7 +284,9 @@ def build_littrace_graph():
     graph.add_conditional_edges("route_publishers", after_publisher_routes)
     graph.add_conditional_edges("parse_full_text", after_parse)
     graph.add_conditional_edges("extract_tables", after_extract_tables)
-    graph.add_edge("build_storyline", END)
+    graph.add_conditional_edges("build_storyline", after_storyline)
+    graph.add_conditional_edges("compose_document", after_document)
+    graph.add_edge("autonomous_review", END)
     return graph.compile()
 
 
@@ -238,6 +299,8 @@ async def run_research_graph(
     parse_full_text_enabled: bool = False,
     extract_tables_enabled: bool = False,
     build_storyline_enabled: bool = False,
+    compose_document_enabled: bool = False,
+    autonomous_review_enabled: bool = False,
 ) -> ResearchRunResult:
     config = config or load_config()
     graph = build_littrace_graph()
@@ -269,6 +332,14 @@ async def run_research_graph(
         storyline = (
             build_storyline_from_workspace(workspace) if build_storyline_enabled else None
         )
+        document_report = None
+        if compose_document_enabled:
+            document_report = build_research_document_report(workspace, config)
+            workspace.context.filters["document_report"] = document_report.model_dump(mode="json")
+        autonomous_loop_report = None
+        if autonomous_review_enabled:
+            autonomous_loop_report = await run_autonomous_research_loop(config, request.topic, workspace)
+            workspace.context.filters["autonomous_loop_report"] = autonomous_loop_report.model_dump(mode="json")
         return ResearchRunResult(
             workspace=workspace,
             citation_audit=citation_audit,
@@ -279,6 +350,8 @@ async def run_research_graph(
             table_harness=table_harness,
             comparison_matrix=comparison_matrix,
             storyline=storyline,
+            document_report=document_report,
+            autonomous_loop_report=autonomous_loop_report,
         )
 
     state = await graph.ainvoke(
@@ -291,6 +364,8 @@ async def run_research_graph(
             "parse_full_text_enabled": parse_full_text_enabled,
             "extract_tables_enabled": extract_tables_enabled,
             "build_storyline_enabled": build_storyline_enabled,
+            "compose_document_enabled": compose_document_enabled,
+            "autonomous_review_enabled": autonomous_review_enabled,
         }
     )
     return ResearchRunResult(
@@ -303,4 +378,6 @@ async def run_research_graph(
         table_harness=state.get("table_harness"),
         comparison_matrix=state.get("comparison_matrix"),
         storyline=state.get("storyline"),
+        document_report=state.get("document_report"),
+        autonomous_loop_report=state.get("autonomous_loop_report"),
     )
