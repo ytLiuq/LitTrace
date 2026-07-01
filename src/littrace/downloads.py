@@ -6,6 +6,7 @@ import httpx
 
 from littrace.access import build_download_plan, target_pdf_path
 from littrace.config import LitTraceConfig
+from littrace.full_text import resolve_full_text_for_paper
 from littrace.models import (
     AccessType,
     DownloadExecutionItem,
@@ -50,7 +51,11 @@ async def _execute_one(
         from littrace.login_flow import login_action_for_paper
 
         return login_action_for_paper(config, paper)
-    if paper.access_type != AccessType.OPEN_ACCESS or not paper.pdf_url:
+    pdf_url = paper.pdf_url
+    if paper.access_type == AccessType.OPEN_ACCESS and not pdf_url:
+        report = await resolve_full_text_for_paper(client, paper, config)
+        pdf_url = report.best_pdf_url
+    if paper.access_type != AccessType.OPEN_ACCESS or not pdf_url:
         return DownloadExecutionItem(
             paper_id=paper.paper_id,
             action="skip",
@@ -68,10 +73,10 @@ async def _execute_one(
         )
 
     try:
-        response = await client.get(str(paper.pdf_url))
+        response = await client.get(str(pdf_url))
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
-        if "pdf" not in content_type.lower() and not str(paper.pdf_url).lower().endswith(".pdf"):
+        if "pdf" not in content_type.lower() and not str(pdf_url).lower().endswith(".pdf"):
             return DownloadExecutionItem(
                 paper_id=paper.paper_id,
                 action="download",

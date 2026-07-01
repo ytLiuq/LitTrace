@@ -27,6 +27,7 @@ from littrace.config_wizard import ConfigWizardResult, write_config_template
 from littrace.context import apply_context_update
 from littrace.downloads import execute_downloads
 from littrace.export import export_session_bundle
+from littrace.full_text import resolve_workspace_full_text
 from littrace.golden_eval import GoldenEvalReport, run_golden_eval
 from littrace.login_flow import LoginLaunchResult, launch_login_for_paper
 from littrace.models import (
@@ -39,6 +40,7 @@ from littrace.models import (
     DownloadExecutionRequest,
     DownloadExecutionResult,
     DownloadPlan,
+    FullTextResolutionReport,
     LiteratureWorkspace,
     PaperSearchRequest,
     ResearchRunRequest,
@@ -204,6 +206,13 @@ def download_plan() -> DownloadPlan:
     selected_ids = set(WORKSPACE.context.selected_for_download)
     papers = [WORKSPACE.papers[paper_id] for paper_id in WORKSPACE.context.active_papers]
     return build_download_plan(config, papers, selected_ids)
+
+
+@app.post("/full-text/resolve", response_model=dict[str, FullTextResolutionReport])
+async def full_text_resolve() -> dict[str, FullTextResolutionReport]:
+    global WORKSPACE
+    WORKSPACE = await resolve_workspace_full_text(WORKSPACE, load_config())
+    return WORKSPACE.full_text_reports
 
 
 @app.get("/publishers/routes", response_model=PublisherRouteReport)

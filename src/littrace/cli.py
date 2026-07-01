@@ -12,6 +12,7 @@ from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.config_wizard import write_config_template
 from littrace.export import export_session_bundle
+from littrace.full_text import resolve_workspace_full_text
 from littrace.golden_eval import run_golden_eval
 from littrace.login_flow import launch_login_for_paper
 from littrace.models import ChatRequest, LiteratureWorkspace
@@ -52,7 +53,7 @@ async def run_shell() -> None:
     print("LitTrace agent shell")
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
-        "/login N /attach N path.pdf /attach-si N path /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
+        "/login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
         "/dashboard /quality /agents /agent-flow /agent-audits /plan topic /init-config /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
@@ -126,6 +127,26 @@ async def run_shell() -> None:
                 print(f"- {report.agent}: {'passed' if report.passed else 'needs work'} ({report.score})")
                 for finding in report.findings[:3]:
                     print(f"  - {finding}")
+            continue
+        if message == "/full-text":
+            state.workspace = await resolve_workspace_full_text(state.workspace, config)
+            save_workspace(session, state.workspace)
+            print(f"Full-text reports: {len(state.workspace.full_text_reports)}")
+            for paper_id in state.workspace.context.active_papers[:12]:
+                report = state.workspace.full_text_reports.get(paper_id)
+                if not report:
+                    continue
+                print(
+                    f"- {paper_id}: candidates={len(report.candidates)}, "
+                    f"oa={report.open_access_candidate_count}, "
+                    f"login={report.login_required_candidate_count}"
+                )
+                if report.best_pdf_url:
+                    print(f"  pdf: {report.best_pdf_url}")
+                elif report.best_landing_url:
+                    print(f"  landing: {report.best_landing_url}")
+                for warning in report.warnings[:2]:
+                    print(f"  warning: {warning}")
             continue
         if message.startswith("/plan "):
             topic = message.removeprefix("/plan ").strip()

@@ -29,6 +29,7 @@ def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInter
     has_routes = bool(workspace.context.filters.get("source_routes"))
     has_papers = bool(workspace.context.active_papers)
     has_download_selection = bool(workspace.context.selected_for_download)
+    has_full_text_reports = bool(workspace.full_text_reports)
     has_parsed = bool(workspace.parsed_papers)
     has_cells = bool(workspace.performance_cells)
     has_storyline = bool(build_storyline_from_workspace(workspace))
@@ -62,11 +63,19 @@ def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInter
         ),
         AgentHandoff(
             from_agent="Citation Verifier",
-            to_agent="Access Manager",
+            to_agent="FullText Resolver",
             artifact="citation records with access URLs",
-            required_inputs=["active papers", "access URLs", "selected download IDs"],
-            quality_gate="Open PDFs may be downloaded; login-required papers use user handoff only.",
+            required_inputs=["active papers", "DOI", "access URLs"],
+            quality_gate="Resolver should produce OA PDF/XML, publisher landing, or login-required candidates.",
             status="ready" if has_papers else "blocked",
+        ),
+        AgentHandoff(
+            from_agent="FullText Resolver",
+            to_agent="Access Manager",
+            artifact="full-text candidate report",
+            required_inputs=["full-text candidates", "selected download IDs"],
+            quality_gate="Open PDFs may be downloaded; login-required papers use user handoff only.",
+            status="complete" if has_full_text_reports else ("ready" if has_papers else "blocked"),
             notes=[] if has_download_selection else ["No papers selected for download yet."],
         ),
         AgentHandoff(

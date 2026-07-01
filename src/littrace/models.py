@@ -38,6 +38,30 @@ class PaperMetadata(BaseModel):
     recency_score: float | None = None
 
 
+class FullTextCandidate(BaseModel):
+    paper_id: str
+    url: HttpUrl
+    source: str
+    content_type: str = "landing_page"
+    access_type: AccessType = AccessType.METADATA_ONLY
+    requires_login: bool = False
+    is_pdf: bool = False
+    is_xml: bool = False
+    confidence: float = 0.0
+    note: str | None = None
+
+
+class FullTextResolutionReport(BaseModel):
+    paper_id: str
+    doi: str | None = None
+    candidates: list[FullTextCandidate] = Field(default_factory=list)
+    best_pdf_url: HttpUrl | None = None
+    best_landing_url: HttpUrl | None = None
+    open_access_candidate_count: int = 0
+    login_required_candidate_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
 class PaperSearchRequest(BaseModel):
     topic: str
     discipline: str = "materials chemistry"
@@ -68,6 +92,7 @@ class LiteratureWorkspace(BaseModel):
     performance_cells: list["PerformanceCell"] = Field(default_factory=list)
     supplementary_links: dict[str, list[str]] = Field(default_factory=dict)
     guard_reports: list[dict[str, object]] = Field(default_factory=list)
+    full_text_reports: dict[str, FullTextResolutionReport] = Field(default_factory=dict)
 
 
 class ContextUpdate(BaseModel):

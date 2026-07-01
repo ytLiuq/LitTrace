@@ -14,5 +14,6 @@ def test_quality_report_summarizes_workspace():
     report = build_quality_report(LitTraceConfig(), workspace)
 
     assert report.metrics["active_paper_count"] == 1.0
+    assert "full_text_resolved_rate" in report.metrics
     assert report.metrics["supplementary_link_count"] == 1.0
     assert "citation_guard_pass" in report.metrics

@@ -81,6 +81,7 @@ Shell commands:
 /login N
 /attach N /path/to/paper.pdf
 /attach-si N /path/to/si.pdf
+/full-text
 /publisher-retrieve acs MXene sensor
 /check-downloads
 /resume-downloads
@@ -120,6 +121,9 @@ parses ready PDFs, extracts tables, and writes session artifacts.
 `/publisher-retrieve family topic` merges DOI-level publisher search results
 into the active context, and `/attach-si N path` stores supplementary files
 under the current session artifacts.
+`/full-text` resolves DOI-level full-text candidates from Crossref links,
+Unpaywall OA locations when configured, publisher landing pages, and existing
+PDF URLs before download or login handoff.
 
 Each shell run creates a folder under `storage.sessions_dir` (default:
 `./sessions/<timestamp-id>/`) containing:
@@ -194,6 +198,7 @@ curl http://127.0.0.1:8000/quality
 curl http://127.0.0.1:8000/citations/context
 curl -X POST http://127.0.0.1:8000/citations/audit
 curl -X POST http://127.0.0.1:8000/downloads/plan
+curl -X POST http://127.0.0.1:8000/full-text/resolve
 curl -X POST http://127.0.0.1:8000/downloads/execute \
   -H "Content-Type: application/json" \
   -d '{"paper_ids":[],"dry_run":true}'

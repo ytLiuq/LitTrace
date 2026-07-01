@@ -52,9 +52,20 @@ def build_research_plan(topic: str, workspace: LiteratureWorkspace) -> ResearchP
                 action="Audit citations and access links",
                 rationale="Every paper-specific answer needs citation text and a usable access URL.",
                 expected_output="Citation audit with cached link status.",
-                handoff_to="Access Manager",
+                handoff_to="FullText Resolver",
                 requires=["active papers", "DOI or source URL"],
                 quality_gate="Citation records include access URLs and link status.",
+            )
+        )
+        steps.append(
+            ResearchPlanStep(
+                agent="FullText Resolver",
+                action="Resolve DOI-level PDF, XML, landing-page, and login-required candidates",
+                rationale="Full text should be resolved from DOI metadata, OA locations, and publisher links before download.",
+                expected_output="Full-text candidate reports with best OA PDF or authorized landing page.",
+                handoff_to="Access Manager",
+                requires=["active papers", "DOI", "citation records"],
+                quality_gate="Each paper has OA candidates, a publisher landing page, or login-required handoff.",
             )
         )
         steps.append(

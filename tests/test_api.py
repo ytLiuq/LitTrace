@@ -35,6 +35,10 @@ def test_search_context_and_download_plan_api():
     assert plan["requires_login_count"] == 2
     assert any(item["can_download"] for item in plan["items"])
 
+    response = client.post("/full-text/resolve")
+    assert response.status_code == 200
+    assert response.json()
+
     response = client.get("/citations/context")
     assert response.status_code == 200
     citations = response.json()

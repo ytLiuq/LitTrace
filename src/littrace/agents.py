@@ -40,6 +40,12 @@ LITTRACE_CREW_ROLES = [
         tools=["build_download_plan", "execute_downloads"],
     ),
     AgentRoleSpec(
+        name="FullText Resolver",
+        goal="Resolve DOI-level full-text candidates before download or login handoff.",
+        backstory="A DOI-first resolver that combines Crossref, Unpaywall, publisher links, and safe login routes.",
+        tools=["resolve_full_text_for_papers", "resolve_workspace_full_text"],
+    ),
+    AgentRoleSpec(
         name="Publisher Connector",
         goal="Map papers to publisher families and authorized access routes.",
         backstory="A source-aware connector that prefers DOI landing pages and known OA PDFs.",
@@ -116,6 +122,15 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             workflow_node="plan_downloads",
             callable_tools=["build_download_plan", "execute_downloads"],
             remaining_work=["Detect when the manually downloaded PDF has appeared and resume parsing."],
+        ),
+        AgentRuntimeStatus(
+            name="FullText Resolver",
+            role_layer="CrewAI role + callable tool",
+            runtime="Local async resolver",
+            implemented=True,
+            workflow_node=None,
+            callable_tools=["resolve_full_text_for_papers", "resolve_workspace_full_text"],
+            remaining_work=["Add provider-level backoff metrics and institution login redirect classification."],
         ),
         AgentRuntimeStatus(
             name="Publisher Connector",
