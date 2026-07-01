@@ -342,8 +342,16 @@ async def _verify_candidate(
         update["is_xml"] = True
         update["content_type"] = content_type
     if response.status_code in {401, 402, 403}:
-        update["requires_login"] = True
-        update["access_type"] = AccessType.REQUIRES_LOGIN
+        if _has_open_access_evidence(candidate):
+            update["requires_login"] = False
+            update["access_type"] = AccessType.OPEN_ACCESS
+            update["note"] = "oa_evidence_but_http_forbidden"
+        elif _is_doi_resolver_candidate(candidate):
+            update["requires_login"] = False
+            update["note"] = "doi_resolver_http_forbidden"
+        else:
+            update["requires_login"] = True
+            update["access_type"] = AccessType.REQUIRES_LOGIN
     return FullTextCandidate.model_validate(update)
 
 
@@ -380,6 +388,27 @@ def _content_type_from_url(url: str) -> str:
     if lowered.endswith(".xml") or "full-xml" in lowered:
         return "xml"
     return "landing_page"
+
+
+def _has_open_access_evidence(candidate: FullTextCandidate) -> bool:
+    if candidate.access_type == AccessType.OPEN_ACCESS and candidate.source.startswith("unpaywall"):
+        return True
+    if candidate.source.startswith("unpaywall"):
+        return True
+    lowered = str(candidate.url).lower()
+    oa_hosts = [
+        "mdpi.com",
+        "pubs.rsc.org",
+        "link.springer.com/content/pdf",
+        "frontiersin.org",
+        "plos.org",
+        "arxiv.org/pdf",
+    ]
+    return candidate.access_type == AccessType.OPEN_ACCESS and any(host in lowered for host in oa_hosts)
+
+
+def _is_doi_resolver_candidate(candidate: FullTextCandidate) -> bool:
+    return candidate.source == "doi" and "doi.org/" in str(candidate.url).lower()
 
 
 def _looks_gated(url: str, paper: PaperMetadata) -> bool:

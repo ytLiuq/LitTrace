@@ -1,9 +1,11 @@
 from fastapi.testclient import TestClient
 
+from littrace.config import LitTraceConfig
 from littrace.api.app import app
 
 
-def test_search_context_and_download_plan_api():
+def test_search_context_and_download_plan_api(monkeypatch):
+    monkeypatch.setattr("littrace.api.app.load_config", lambda: LitTraceConfig())
     client = TestClient(app)
 
     response = client.post(

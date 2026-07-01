@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 import re
@@ -132,7 +133,13 @@ class LiveSearchClient:
         if self.config.api.openalex_api_key:
             params["api_key"] = self.config.api.openalex_api_key
 
-        response = await client.get("https://api.openalex.org/works", params=params)
+        response = await _get_with_retries(
+            client,
+            "https://api.openalex.org/works",
+            params=params,
+            source="openalex",
+            diagnostics=self.diagnostics,
+        )
         response.raise_for_status()
         data = response.json()
         papers = []
@@ -312,6 +319,35 @@ async def _crossref_items(client: httpx.AsyncClient, params: dict[str, str | int
     response = await client.get("https://api.crossref.org/works", params=params)
     response.raise_for_status()
     return response.json().get("message", {}).get("items", [])
+
+
+async def _get_with_retries(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict[str, str | int],
+    source: str,
+    diagnostics: SearchDiagnostics,
+    attempts: int = 3,
+) -> httpx.Response:
+    retry_statuses = {429, 500, 502, 503, 504}
+    last_exc: httpx.HTTPError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = await client.get(url, params=params)
+            if response.status_code not in retry_statuses:
+                return response
+            if attempt == attempts:
+                response.raise_for_status()
+            diagnostics.errors.append(f"{source}_retry_{attempt}: HTTP {response.status_code}")
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            if attempt == attempts:
+                raise
+            diagnostics.errors.append(f"{source}_retry_{attempt}: {exc.__class__.__name__}: {exc}")
+        await asyncio.sleep(0.4 * attempt)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{source} retry loop exited unexpectedly")
 
 
 def merge_papers(papers: list[PaperMetadata]) -> list[PaperMetadata]:

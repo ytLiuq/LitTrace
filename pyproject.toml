@@ -24,6 +24,7 @@ agents = [
 parsers = [
   "docling>=2.70",
   "paddleocr>=2.8",
+  "paddlepaddle>=3.3",
   "pypdfium2>=4.30",
 ]
 dev = [

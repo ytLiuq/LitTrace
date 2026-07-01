@@ -20,6 +20,23 @@ def test_normalize_paddleocr_result_extracts_lines():
     ]
 
 
+def test_normalize_paddleocr_v3_result_extracts_lines():
+    raw = [
+        {
+            "rec_texts": ["Hello", "World"],
+            "rec_scores": [0.98, 0.95],
+            "rec_boxes": [[0, 0, 10, 10], [0, 12, 10, 22]],
+        }
+    ]
+
+    lines = normalize_paddleocr_result(raw)
+
+    assert lines == [
+        {"text": "Hello", "confidence": 0.98, "bbox": [0, 0, 10, 10]},
+        {"text": "World", "confidence": 0.95, "bbox": [0, 12, 10, 22]},
+    ]
+
+
 def test_paddleocr_tool_reports_missing_pdf_before_rendering():
     parsed = PaddleOCRTool().parse_pdf(Path("paper.pdf"))
 
@@ -78,6 +95,20 @@ def test_paddleocr_pdf_parser_marks_page_evidence(monkeypatch, tmp_path):
     assert parsed.parsed
     assert parsed.sections[0]["evidence"]["page"] == 1
     assert parsed.parser_reports[0]["pdf_pages_rendered"] == 1
+
+
+def test_paddleocr_tool_reuses_engine_for_multiple_images():
+    created = 0
+
+    class FakeOCR:
+        def __init__(self, **kwargs):
+            nonlocal created
+            created += 1
+
+    tool = PaddleOCRTool()
+
+    assert tool._get_ocr_engine(FakeOCR) is tool._get_ocr_engine(FakeOCR)
+    assert created == 1
 
 
 def test_render_pdf_pages_to_images_requires_pypdfium2_when_missing(monkeypatch, tmp_path):

@@ -17,6 +17,7 @@ class PaddleOCRTool:
 
     def __init__(self, config: PaddleOCRParserConfig | None = None):
         self.config = config or PaddleOCRParserConfig()
+        self._ocr_engine: Any | None = None
 
     def parse_pdf(
         self,
@@ -172,11 +173,14 @@ class PaddleOCRTool:
             )
 
         try:
-            ocr = PaddleOCR(
-                use_angle_cls=self.config.use_angle_cls,
-                lang=self.config.lang,
-            )
-            raw_result = ocr.ocr(str(image_path), cls=self.config.use_angle_cls)
+            ocr = self._get_ocr_engine(PaddleOCR)
+            if hasattr(ocr, "predict"):
+                raw_result = ocr.predict(
+                    str(image_path),
+                    use_textline_orientation=self.config.use_angle_cls,
+                )
+            else:
+                raw_result = ocr.ocr(str(image_path), cls=self.config.use_angle_cls)
             lines = normalize_paddleocr_result(raw_result)
             text = "\n".join(line["text"] for line in lines)
             return ParsedPaper(
@@ -219,11 +223,22 @@ class PaddleOCRTool:
                 error=f"{exc.__class__.__name__}: {exc}",
             )
 
+    def _get_ocr_engine(self, paddleocr_cls: Any) -> Any:
+        if self._ocr_engine is None:
+            self._ocr_engine = paddleocr_cls(
+                use_textline_orientation=self.config.use_angle_cls,
+                lang=self.config.lang,
+            )
+        return self._ocr_engine
+
 
 def normalize_paddleocr_result(raw_result: Any) -> list[dict[str, object]]:
     lines: list[dict[str, object]] = []
     pages = _as_pages(raw_result)
     for page in pages:
+        if isinstance(page, dict):
+            lines.extend(_normalize_paddleocr_v3_page(page))
+            continue
         if not isinstance(page, list):
             continue
         for item in page:
@@ -236,6 +251,26 @@ def normalize_paddleocr_result(raw_result: Any) -> list[dict[str, object]]:
             text = str(payload[0])
             confidence = float(payload[1]) if len(payload) > 1 else 0.0
             lines.append({"text": text, "confidence": confidence, "bbox": bbox})
+    return lines
+
+
+def _normalize_paddleocr_v3_page(page: dict[str, Any]) -> list[dict[str, object]]:
+    texts = page.get("rec_texts") or []
+    scores = page.get("rec_scores") or []
+    boxes = page.get("rec_polys") or page.get("rec_boxes") or []
+    lines: list[dict[str, object]] = []
+    for index, text in enumerate(texts):
+        if text is None:
+            continue
+        confidence = scores[index] if index < len(scores) else 0.0
+        bbox = boxes[index] if index < len(boxes) else None
+        lines.append(
+            {
+                "text": str(text),
+                "confidence": float(confidence or 0.0),
+                "bbox": _jsonable_bbox(bbox),
+            }
+        )
     return lines
 
 
@@ -285,6 +320,12 @@ def _looks_like_ocr_item(value: Any) -> bool:
         and bool(value[1])
         and isinstance(value[1][0], str)
     )
+
+
+def _jsonable_bbox(value: Any) -> object:
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
 
 
 def _average_confidence(lines: list[dict[str, object]]) -> float:

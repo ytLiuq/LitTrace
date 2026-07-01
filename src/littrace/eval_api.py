@@ -55,7 +55,10 @@ def full_text_metrics_from_workspace(workspace) -> dict[str, float]:
     verified = sum(report.verified_candidate_count > 0 for report in reports)
     oa_pdf = sum(bool(report.best_pdf_url) for report in reports)
     login_ready = sum(report.login_required_candidate_count > 0 for report in reports)
-    parsed = sum(paper_id in workspace.parsed_papers for paper_id in active_ids)
+    parsed = sum(
+        bool(workspace.parsed_papers.get(paper_id, {}).get("parsed"))
+        for paper_id in active_ids
+    )
     return {
         "full_text_resolved_rate": len(reports) / active_count,
         "verified_candidate_rate": verified / active_count,
