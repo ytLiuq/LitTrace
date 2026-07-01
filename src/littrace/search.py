@@ -24,6 +24,7 @@ class SearchDiagnostics:
     live_attempted: bool = False
     used_fallback: bool = False
     source_counts: dict[str, int] = field(default_factory=dict)
+    filtered_counts: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
 
@@ -103,7 +104,8 @@ class LiveSearchClient:
             self.diagnostics.source_counts["openalex"] = len(openalex)
             self.diagnostics.source_counts["crossref"] = len(crossref)
 
-            merged = merge_papers([*openalex, *crossref])
+            merged = filter_search_results(merge_papers([*openalex, *crossref]), request)
+            self.diagnostics.filtered_counts["merged"] = len(openalex) + len(crossref) - len(merged)
             if self.config.api.unpaywall_email:
                 merged = await self._enrich_unpaywall(client, merged)
                 self.diagnostics.source_counts["unpaywall_enriched"] = len(
@@ -171,29 +173,33 @@ class LiveSearchClient:
         client: httpx.AsyncClient,
         request: PaperSearchRequest,
     ) -> list[PaperMetadata]:
-        params: dict[str, str | int] = {
-            "query.bibliographic": request.topic,
-            "rows": min(max(request.limit, 10), 50),
-            "sort": "published" if request.wants_recent else "relevance",
-            "order": "desc",
-        }
-        filters = []
-        if request.year_min is not None:
-            filters.append(f"from-pub-date:{request.year_min}-01-01")
-        if filters:
-            params["filter"] = ",".join(filters)
-        if self.config.api.crossref_mailto:
-            params["mailto"] = self.config.api.crossref_mailto
-
-        response = await client.get("https://api.crossref.org/works", params=params)
-        response.raise_for_status()
-        items = response.json().get("message", {}).get("items", [])
+        attempts = _crossref_attempt_params(request)
+        for params in attempts:
+            if request.year_min is not None:
+                params["filter"] = f"from-pub-date:{request.year_min}-01-01"
+            if self.config.api.crossref_mailto:
+                params["mailto"] = self.config.api.crossref_mailto
+        items: list[dict] = []
+        for index, params in enumerate(attempts, start=1):
+            try:
+                items = await _crossref_items(client, params)
+            except httpx.HTTPError as exc:
+                self.diagnostics.errors.append(
+                    f"crossref_attempt_{index}: {exc.__class__.__name__}: {exc}"
+                )
+                continue
+            if items:
+                if index > 1:
+                    self.diagnostics.errors.append(f"crossref_retry_succeeded:{index}")
+                break
         papers = []
         for item in items:
             title = _first(item.get("title"))
             if not title:
                 continue
             doi = _normalize_doi(item.get("DOI"))
+            if _is_crossref_noise_record(title, doi, item):
+                continue
             year = _crossref_year(item)
             source_urls = [item.get("URL")] if item.get("URL") else []
             papers.append(
@@ -256,6 +262,58 @@ async def _gather_named(
     return results
 
 
+def _crossref_attempt_params(request: PaperSearchRequest) -> list[dict[str, str | int]]:
+    compact_topic = _compact_crossref_topic(request.topic)
+    attempts = [
+        _crossref_params("query.title", request.topic, request),
+    ]
+    if compact_topic != request.topic:
+        attempts.append(_crossref_params("query.title", compact_topic, request, rows=12))
+    attempts.append(_crossref_params("query.bibliographic", compact_topic, request, rows=12))
+    return attempts
+
+
+def _crossref_params(
+    query_key: str,
+    query: str,
+    request: PaperSearchRequest,
+    rows: int | None = None,
+) -> dict[str, str | int]:
+    return {
+        query_key: query,
+        "rows": rows or min(max(request.limit, 10), 25),
+        "sort": "relevance",
+        "order": "desc",
+    }
+
+
+def _compact_crossref_topic(topic: str) -> str:
+    tokens = [
+        token
+        for token in re.split(r"[^A-Za-z0-9]+", topic)
+        if token
+        and token.lower()
+        not in {
+            "review",
+            "materials",
+            "material",
+            "recent",
+            "study",
+            "paper",
+            "papers",
+            "wearable",
+            "flexible",
+        }
+    ]
+    return " ".join(tokens[:7]) or topic
+
+
+async def _crossref_items(client: httpx.AsyncClient, params: dict[str, str | int]) -> list[dict]:
+    response = await client.get("https://api.crossref.org/works", params=params)
+    response.raise_for_status()
+    return response.json().get("message", {}).get("items", [])
+
+
 def merge_papers(papers: list[PaperMetadata]) -> list[PaperMetadata]:
     merged: dict[str, PaperMetadata] = {}
     for paper in papers:
@@ -296,11 +354,18 @@ def rank_papers(papers: list[PaperMetadata], request: PaperSearchRequest) -> lis
     for paper in papers:
         paper.recency_score = _recency_score(paper.year, current_year)
         citation_score = math.log1p(paper.citation_count or 0) / 10
-        relevance = paper.relevance_score or 0.5
+        lexical_score = _lexical_relevance_score(request.topic, paper)
+        venue_score = _materials_venue_score(paper)
+        relevance = paper.relevance_score or lexical_score
         access = 1.0 if paper.access_type == AccessType.OPEN_ACCESS else 0.4
         paper.relevance_score = min(
             1.0,
-            0.35 * relevance + 0.35 * paper.recency_score + 0.2 * citation_score + 0.1 * access,
+            0.24 * relevance
+            + 0.28 * lexical_score
+            + 0.2 * paper.recency_score
+            + 0.14 * venue_score
+            + 0.09 * citation_score
+            + 0.05 * access,
         )
     return sorted(
         papers,
@@ -311,6 +376,36 @@ def rank_papers(papers: list[PaperMetadata], request: PaperSearchRequest) -> lis
         ),
         reverse=True,
     )
+
+
+def filter_search_results(
+    papers: list[PaperMetadata],
+    request: PaperSearchRequest,
+    current_year: int = 2026,
+) -> list[PaperMetadata]:
+    filtered: list[PaperMetadata] = []
+    for paper in papers:
+        if _is_noise_paper(paper):
+            continue
+        if paper.year is not None:
+            if paper.year > current_year:
+                continue
+            if request.year_min is not None and paper.year < request.year_min:
+                continue
+        lexical = _lexical_relevance_score(request.topic, paper)
+        venue = _materials_venue_score(paper)
+        if lexical < 0.18 and venue < 0.4:
+            continue
+        filtered.append(paper)
+    return filtered
+
+
+def _is_noise_paper(paper: PaperMetadata) -> bool:
+    title = paper.title.lower()
+    doi = (paper.doi or "").lower()
+    if title.startswith("review for "):
+        return True
+    return any(marker in doi for marker in ["/review", "/decision", "/response"])
 
 
 def _slug(value: str) -> str:
@@ -374,6 +469,16 @@ def _strip_crossref_abstract(value: str | None) -> str | None:
     return value.replace("<jats:p>", "").replace("</jats:p>", "").strip()
 
 
+def _is_crossref_noise_record(title: str, doi: str | None, item: dict) -> bool:
+    lowered_title = title.lower()
+    lowered_doi = (doi or "").lower()
+    if lowered_title.startswith("review for "):
+        return True
+    if any(marker in lowered_doi for marker in ["/review", "/decision", "/response"]):
+        return True
+    return item.get("type") in {"peer-review", "posted-content"}
+
+
 def _bounded(value: float | int | None) -> float | None:
     if value is None:
         return None
@@ -385,12 +490,99 @@ def _title_key(title: str) -> str:
 
 
 def _title_tokens(title: str) -> set[str]:
-    stopwords = {"the", "a", "an", "of", "and", "for", "with", "by", "on", "in", "to"}
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "of",
+        "and",
+        "for",
+        "with",
+        "by",
+        "on",
+        "in",
+        "to",
+        "based",
+        "using",
+        "study",
+        "sensor",
+        "sensors",
+        "flexible",
+        "wearable",
+    }
     return {
         token
         for token in re.split(r"[^a-z0-9]+", title.lower())
         if len(token) > 2 and token not in stopwords
     }
+
+
+def _query_tokens(topic: str) -> set[str]:
+    tokens = _title_tokens(topic)
+    if "mxene" in topic.lower():
+        tokens.add("mxene")
+    if "hydrogel" in topic.lower():
+        tokens.add("hydrogel")
+    return tokens
+
+
+def _lexical_relevance_score(topic: str, paper: PaperMetadata) -> float:
+    query = _query_tokens(topic)
+    if not query:
+        return 0.0
+    text = " ".join(
+        value
+        for value in [
+            paper.title,
+            paper.abstract or "",
+            paper.journal or "",
+            paper.publisher or "",
+        ]
+        if value
+    )
+    candidate = _title_tokens(text)
+    if "mxene" in text.lower():
+        candidate.add("mxene")
+    if "hydrogel" in text.lower():
+        candidate.add("hydrogel")
+    overlap = len(query & candidate) / max(len(query), 1)
+    phrase_bonus = 0.0
+    lowered = text.lower()
+    if "mxene" in topic.lower() and "mxene" in lowered:
+        phrase_bonus += 0.2
+    if "hydrogel" in topic.lower() and "hydrogel" in lowered:
+        phrase_bonus += 0.2
+    if "pressure" in topic.lower() and "pressure" in lowered:
+        phrase_bonus += 0.1
+    if "strain" in topic.lower() and "strain" in lowered:
+        phrase_bonus += 0.1
+    return min(1.0, overlap + phrase_bonus)
+
+
+def _materials_venue_score(paper: PaperMetadata) -> float:
+    venue = f"{paper.journal or ''} {paper.publisher or ''}".lower()
+    markers = [
+        "advanced materials",
+        "advanced functional materials",
+        "advanced materials interfaces",
+        "acs nano",
+        "acs applied materials",
+        "american chemical society",
+        "nano letters",
+        "nanomaterials",
+        "nature",
+        "wiley",
+        "mdpi",
+        "materials",
+        "rsc",
+        "royal society of chemistry",
+        "journal of materials",
+        "chemical",
+        "chemistry",
+        "infomat",
+        "diamond and related materials",
+    ]
+    return 1.0 if any(marker in venue for marker in markers) else 0.0
 
 
 def _merge_paper(left: PaperMetadata, right: PaperMetadata) -> PaperMetadata:

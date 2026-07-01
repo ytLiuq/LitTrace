@@ -12,7 +12,13 @@ from littrace.models import (
     StorylineClaim,
 )
 from littrace.source_router import route_sources
-from littrace.search import SearchDiagnostics, merge_papers, rank_papers
+from littrace.search import (
+    SearchDiagnostics,
+    _crossref_attempt_params,
+    filter_search_results,
+    merge_papers,
+    rank_papers,
+)
 from littrace.models import PaperSearchRequest
 
 
@@ -138,10 +144,100 @@ def test_rank_papers_prefers_recent_papers_when_other_signals_match():
     assert papers[0].paper_id == "new"
 
 
+def test_filter_search_results_removes_future_and_irrelevant_sensor_noise():
+    papers = filter_search_results(
+        [
+            PaperMetadata(
+                paper_id="target",
+                title="Nanoscale Interlayer Engineering Enhances MXene-Based Flexible Pressure Sensor",
+                year=2025,
+                journal="Nano Letters",
+                publisher="American Chemical Society",
+                doi="10.1021/acs.nanolett.5c01464",
+            ),
+            PaperMetadata(
+                paper_id="future",
+                title="Adaptive Wireless Sensor Networks",
+                year=2028,
+                journal="International Journal of Critical Infrastructures",
+            ),
+            PaperMetadata(
+                paper_id="noise",
+                title="Battery state estimator with sensor faults",
+                year=2025,
+                journal="Automation and Control",
+            ),
+        ],
+        PaperSearchRequest(topic="MXene flexible pressure sensor", year_min=2024),
+    )
+
+    assert [paper.paper_id for paper in papers] == ["target"]
+
+
+def test_filter_search_results_removes_crossref_review_noise():
+    papers = filter_search_results(
+        [
+            PaperMetadata(
+                paper_id="article",
+                title="Research progress of flexible pressure sensor based on MXene materials",
+                year=2024,
+                journal="RSC Advances",
+                publisher="Royal Society of Chemistry",
+                doi="10.1039/d3ra07772a",
+            ),
+            PaperMetadata(
+                paper_id="review",
+                title='Review for "Research progress of flexible pressure sensor based on MXene materials"',
+                year=2024,
+                publisher="Royal Society of Chemistry",
+                doi="10.1039/d3ra07772a/v1/review2",
+            ),
+        ],
+        PaperSearchRequest(topic="MXene flexible pressure sensor", year_min=2024),
+    )
+
+    assert [paper.paper_id for paper in papers] == ["article"]
+
+
+def test_rank_papers_prefers_materials_topic_match_over_generic_sensor_paper():
+    papers = rank_papers(
+        [
+            PaperMetadata(
+                paper_id="generic",
+                title="Wireless sensor network routing protocol",
+                year=2026,
+                journal="International Journal of Critical Infrastructures",
+                citation_count=100,
+            ),
+            PaperMetadata(
+                paper_id="mxene",
+                title="Nanoscale Interlayer Engineering Enhances MXene-Based Flexible Pressure Sensor",
+                year=2025,
+                journal="Nano Letters",
+                publisher="American Chemical Society",
+                citation_count=5,
+            ),
+        ],
+        PaperSearchRequest(topic="MXene flexible pressure sensor", year_min=2024),
+    )
+
+    assert papers[0].paper_id == "mxene"
+
+
 def test_search_diagnostics_defaults_to_empty_counts():
     diagnostics = SearchDiagnostics(live_attempted=True)
     assert diagnostics.live_attempted
     assert diagnostics.source_counts == {}
+
+
+def test_crossref_attempts_include_compact_retry_for_noisy_topics():
+    attempts = _crossref_attempt_params(
+        PaperSearchRequest(topic="conductive hydrogel strain sensor review materials")
+    )
+
+    assert attempts[0]["query.title"] == "conductive hydrogel strain sensor review materials"
+    assert attempts[1]["query.title"] == "conductive hydrogel strain sensor"
+    assert attempts[2]["query.bibliographic"] == "conductive hydrogel strain sensor"
 
 
 def test_citation_uses_pdf_url_before_doi():
