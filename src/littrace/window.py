@@ -1,0 +1,1019 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+
+from littrace.chat import handle_chat
+from littrace.config import load_config
+from littrace.intent import parse_chat_intent
+from littrace.login_flow import launch_login_for_paper
+from littrace.models import ChatRequest, DownloadPlan, LiteratureWorkspace, WorkflowTrace
+from littrace.session import (
+    ChatSession,
+    append_message,
+    create_chat_session,
+    list_chat_sessions,
+    load_or_create_session,
+    load_workspace,
+    save_workspace,
+)
+from littrace.tables import decide_artifact_extraction_need
+from littrace.tui import render_context_lines
+
+
+DESIGN = {
+    "primary": "#0066cc",
+    "primary_focus": "#0071e3",
+    "primary_on_dark": "#2997ff",
+    "ink": "#1d1d1f",
+    "ink_muted": "#7a7a7a",
+    "canvas": "#ffffff",
+    "parchment": "#f5f5f7",
+    "pearl": "#fafafc",
+    "hairline": "#e0e0e0",
+    "black": "#000000",
+    "dark_tile": "#272729",
+    "on_dark": "#ffffff",
+    "body_muted": "#cccccc",
+}
+
+
+class LitTraceWindow:
+    def __init__(self) -> None:
+        self.tk, self.ttk = _load_tk()
+        self.config = load_config()
+        self.session = create_chat_session(self.config)
+        _scope_storage_to_session(self.config, self.session)
+        self.workspace = LiteratureWorkspace()
+        self.context_visible = True
+        self.last_download_plan: DownloadPlan | None = None
+        self.parse_strategy = "text_only"
+        self.context_popup = None
+        self.ocr_popup = None
+        self.login_popup = None
+
+        self.root = self.tk.Tk()
+        self.root.title("LitTrace")
+        self.root.geometry("1180x760")
+        self.root.minsize(900, 600)
+        self.root.configure(background=DESIGN["parchment"])
+
+        self._configure_styles()
+        self._build_layout()
+        self._configure_copy_bindings()
+        self._refresh_context()
+        self._refresh_ocr_buttons()
+        self._refresh_session_history()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def _configure_styles(self) -> None:
+        self.style = self.ttk.Style(self.root)
+        try:
+            self.style.theme_use("clam")
+        except self.tk.TclError:
+            pass
+        self.style.configure(".", font=_font("body"), background=DESIGN["parchment"])
+        self.style.configure("Canvas.TFrame", background=DESIGN["parchment"])
+        self.style.configure("Nav.TFrame", background=DESIGN["black"])
+        self.style.configure("Subnav.TFrame", background=DESIGN["parchment"])
+        self.style.configure("Tile.TFrame", background=DESIGN["canvas"])
+        self.style.configure("Pearl.TFrame", background=DESIGN["pearl"])
+        self.style.configure(
+            "DarkTile.TFrame",
+            background=DESIGN["dark_tile"],
+        )
+        self.style.configure(
+            "Nav.TLabel",
+            background=DESIGN["black"],
+            foreground=DESIGN["on_dark"],
+            font=_font("nav"),
+        )
+        self.style.configure(
+            "Brand.TLabel",
+            background=DESIGN["parchment"],
+            foreground=DESIGN["ink"],
+            font=_font("tagline"),
+        )
+        self.style.configure(
+            "Title.TLabel",
+            background=DESIGN["canvas"],
+            foreground=DESIGN["ink"],
+            font=_font("display"),
+        )
+        self.style.configure(
+            "TileHeader.TLabel",
+            background=DESIGN["canvas"],
+            foreground=DESIGN["ink"],
+            font=_font("body_strong"),
+        )
+        self.style.configure(
+            "Caption.TLabel",
+            background=DESIGN["canvas"],
+            foreground=DESIGN["ink_muted"],
+            font=_font("caption"),
+        )
+        self.style.configure(
+            "Status.TLabel",
+            background=DESIGN["parchment"],
+            foreground=DESIGN["ink_muted"],
+            font=_font("fine"),
+        )
+        self.style.configure(
+            "Primary.TButton",
+            background=DESIGN["primary"],
+            foreground=DESIGN["on_dark"],
+            borderwidth=0,
+            focusthickness=2,
+            focuscolor=DESIGN["primary_focus"],
+            padding=(18, 9),
+            font=_font("button"),
+        )
+        self.style.map(
+            "Primary.TButton",
+            background=[("active", DESIGN["primary_focus"]), ("pressed", DESIGN["primary"])],
+            foreground=[("disabled", DESIGN["body_muted"])],
+        )
+        self.style.configure(
+            "Secondary.TButton",
+            background=DESIGN["pearl"],
+            foreground=DESIGN["primary"],
+            bordercolor=DESIGN["hairline"],
+            lightcolor=DESIGN["pearl"],
+            darkcolor=DESIGN["hairline"],
+            padding=(15, 8),
+            font=_font("button_utility"),
+        )
+        self.style.map(
+            "Secondary.TButton",
+            background=[("active", DESIGN["canvas"]), ("pressed", DESIGN["canvas"])],
+            foreground=[("active", DESIGN["primary_focus"])],
+        )
+        self.style.configure(
+            "DarkUtility.TButton",
+            background=DESIGN["ink"],
+            foreground=DESIGN["on_dark"],
+            borderwidth=0,
+            padding=(14, 7),
+            font=_font("button_utility"),
+        )
+        self.style.configure(
+            "Slim.Vertical.TScrollbar",
+            gripcount=0,
+            background="#d2d2d7",
+            darkcolor="#d2d2d7",
+            lightcolor="#d2d2d7",
+            troughcolor=DESIGN["canvas"],
+            bordercolor=DESIGN["canvas"],
+            arrowcolor="#d2d2d7",
+            relief=self.tk.FLAT,
+            width=7,
+            arrowsize=0,
+        )
+        self.style.map(
+            "Slim.Vertical.TScrollbar",
+            background=[("active", "#b8b8bf"), ("pressed", "#a8a8af")],
+            arrowcolor=[("active", "#b8b8bf"), ("pressed", "#a8a8af")],
+        )
+
+    def _build_layout(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+
+        subnav = self.ttk.Frame(self.root, style="Subnav.TFrame", height=52)
+        subnav.grid(row=0, column=0, sticky="ew")
+        subnav.grid_propagate(False)
+        subnav.columnconfigure(0, weight=1)
+        self.ttk.Label(subnav, text="LitTrace", style="Brand.TLabel").grid(
+            row=0, column=0, padx=32, sticky="w"
+        )
+        self.ttk.Button(
+            subnav,
+            text="文献上下文",
+            style="Secondary.TButton",
+            command=self._open_context_popup,
+        ).grid(row=0, column=1, padx=(0, 8), pady=7)
+        self.ttk.Button(
+            subnav,
+            text="隐藏上下文" if self.context_visible else "显示上下文",
+            style="Secondary.TButton",
+            command=self._toggle_context,
+        ).grid(row=0, column=2, padx=(0, 8), pady=7)
+        self.ttk.Button(
+            subnav,
+            text=self._parse_strategy_button_text(),
+            style="Primary.TButton",
+            command=self._toggle_parse_strategy,
+        ).grid(row=0, column=3, padx=(0, 8), pady=7)
+        self.ttk.Button(
+            subnav,
+            text="使用说明",
+            style="Secondary.TButton",
+            command=self._open_help_popup,
+        ).grid(row=0, column=4, padx=(0, 32), pady=7)
+        self.context_toggle_button = subnav.grid_slaves(row=0, column=2)[0]
+        self.parse_strategy_button = subnav.grid_slaves(row=0, column=3)[0]
+
+        main = self.ttk.Frame(self.root, style="Canvas.TFrame", padding=(24, 28, 24, 16))
+        main.grid(row=1, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        self.pane = self.tk.PanedWindow(
+            main,
+            orient=self.tk.HORIZONTAL,
+            sashwidth=8,
+            bd=0,
+            bg=DESIGN["parchment"],
+            sashrelief=self.tk.FLAT,
+        )
+        self.pane.grid(row=0, column=0, sticky="nsew")
+
+        self.trace_frame = self.ttk.Frame(self.pane, style="Tile.TFrame", padding=(16, 18, 16, 16))
+        self.trace_frame.columnconfigure(0, weight=1)
+        self.trace_frame.rowconfigure(1, weight=3)
+        self.trace_frame.rowconfigure(3, weight=2)
+        self.pane.add(self.trace_frame, minsize=260)
+
+        self.ttk.Label(self.trace_frame, text="执行 Trace", style="TileHeader.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 12)
+        )
+        self.trace_text = self.tk.Text(
+            self.trace_frame,
+            wrap=self.tk.WORD,
+            padx=0,
+            pady=0,
+            width=32,
+            bd=0,
+            relief=self.tk.FLAT,
+            highlightthickness=0,
+            bg=DESIGN["canvas"],
+            fg=DESIGN["ink"],
+            font=_font("caption"),
+            spacing3=8,
+        )
+        self.trace_text.tag_configure("trace_node", foreground=DESIGN["ink"], font=_font("body_strong"))
+        self.trace_text.tag_configure("trace_body", foreground=DESIGN["ink_muted"], font=_font("caption"))
+        self.trace_text.grid(row=1, column=0, sticky="nsew")
+
+        self.ttk.Label(self.trace_frame, text="历史 Session", style="TileHeader.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(22, 10)
+        )
+        self.session_history_text = self.tk.Text(
+            self.trace_frame,
+            wrap=self.tk.WORD,
+            padx=0,
+            pady=0,
+            height=8,
+            bd=0,
+            relief=self.tk.FLAT,
+            highlightthickness=0,
+            bg=DESIGN["canvas"],
+            fg=DESIGN["ink_muted"],
+            font=_font("caption"),
+            spacing3=6,
+        )
+        self.session_history_text.tag_configure("session_current", background="#eef6ff")
+        self.session_history_text.grid(row=3, column=0, sticky="nsew")
+
+        chat_frame = self.ttk.Frame(self.pane, style="Tile.TFrame", padding=(20, 18, 20, 16))
+        chat_frame.columnconfigure(0, weight=1)
+        chat_frame.rowconfigure(0, weight=1)
+        self.pane.add(chat_frame, minsize=560, stretch="always")
+
+        self.chat_text = self.tk.Text(
+            chat_frame,
+            wrap=self.tk.WORD,
+            padx=0,
+            pady=0,
+            bd=0,
+            relief=self.tk.FLAT,
+            highlightthickness=0,
+            bg=DESIGN["canvas"],
+            fg=DESIGN["ink"],
+            insertbackground=DESIGN["primary"],
+            font=_font("body"),
+            spacing1=2,
+            spacing3=12,
+        )
+        self.chat_text.tag_configure("role", foreground=DESIGN["ink"], font=_font("body_strong"))
+        self.chat_text.tag_configure(
+            "bubble_user",
+            foreground=DESIGN["ink"],
+            background="#dff0ff",
+            font=_font("body"),
+            justify=self.tk.RIGHT,
+            lmargin1=170,
+            lmargin2=170,
+            rmargin=14,
+            spacing1=6,
+            spacing3=12,
+        )
+        self.chat_text.tag_configure(
+            "bubble_assistant",
+            foreground=DESIGN["ink"],
+            background=DESIGN["pearl"],
+            font=_font("body"),
+            justify=self.tk.LEFT,
+            lmargin1=14,
+            lmargin2=14,
+            rmargin=170,
+            spacing1=6,
+            spacing3=12,
+        )
+        self.chat_text.tag_configure(
+            "bubble_system",
+            foreground=DESIGN["ink_muted"],
+            background=DESIGN["canvas"],
+            font=_font("caption"),
+            justify=self.tk.CENTER,
+            lmargin1=80,
+            lmargin2=80,
+            rmargin=80,
+            spacing1=4,
+            spacing3=10,
+        )
+        self.chat_text.grid(row=0, column=0, sticky="nsew")
+        chat_scroll = self.ttk.Scrollbar(
+            chat_frame,
+            orient=self.tk.VERTICAL,
+            command=self.chat_text.yview,
+            style="Slim.Vertical.TScrollbar",
+        )
+        chat_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.chat_text.configure(yscrollcommand=chat_scroll.set)
+
+        input_frame = self.ttk.Frame(chat_frame, style="Pearl.TFrame", padding=(14, 10))
+        input_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        input_frame.columnconfigure(0, weight=1)
+        self.input_entry = self.tk.Text(
+            input_frame,
+            wrap=self.tk.WORD,
+            height=3,
+            bd=0,
+            relief=self.tk.FLAT,
+            highlightthickness=0,
+            bg=DESIGN["pearl"],
+            fg=DESIGN["ink"],
+            insertbackground=DESIGN["primary"],
+            font=_font("body"),
+        )
+        self.input_entry.grid(row=0, column=0, sticky="ew", ipady=4)
+        self.input_entry.bind("<Return>", self._send_from_event)
+        self.input_entry.bind("<Shift-Return>", lambda _event: None)
+        self.ttk.Button(input_frame, text="发送", style="Primary.TButton", command=self._send).grid(
+            row=0, column=1, padx=(12, 0)
+        )
+
+        self.context_frame = self.ttk.Frame(self.pane, style="Tile.TFrame", padding=(18, 18, 18, 16))
+        self.context_frame.columnconfigure(0, weight=1)
+        self.context_frame.rowconfigure(1, weight=1)
+        self.pane.add(self.context_frame, minsize=300)
+
+        self.ttk.Label(self.context_frame, text="当前文献上下文", style="TileHeader.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 12)
+        )
+        self.context_text = self.tk.Text(
+            self.context_frame,
+            wrap=self.tk.WORD,
+            padx=0,
+            pady=0,
+            width=36,
+            bd=0,
+            relief=self.tk.FLAT,
+            highlightthickness=0,
+            bg=DESIGN["canvas"],
+            fg=DESIGN["ink"],
+            font=_font("caption"),
+            spacing3=7,
+        )
+        self.context_text.grid(row=1, column=0, sticky="nsew")
+        self.status_var = self.tk.StringVar(value=f"Session: {self.session.session_id}")
+        self.ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w").grid(
+            row=2, column=0, sticky="ew", padx=32, pady=(0, 10)
+        )
+
+    def _configure_copy_bindings(self) -> None:
+        self.copy_menu = self.tk.Menu(self.root, tearoff=0)
+        self.copy_menu.add_command(label="复制", command=self._copy_from_focused_text)
+        self.copy_menu.add_command(label="全选", command=self._select_all_focused_text)
+        for widget in [
+            self.chat_text,
+            self.trace_text,
+            self.context_text,
+            self.session_history_text,
+        ]:
+            widget.bind("<Command-c>", self._copy_event)
+            widget.bind("<Control-c>", self._copy_event)
+            widget.bind("<Command-a>", self._select_all_event)
+            widget.bind("<Control-a>", self._select_all_event)
+            widget.bind("<Button-3>", self._show_copy_menu)
+            widget.bind("<Button-2>", self._show_copy_menu)
+            widget.bind("<Control-Button-1>", self._show_copy_menu)
+            widget.bind("<Button-1>", lambda event: event.widget.focus_set(), add="+")
+            widget.bind("<Key>", self._readonly_text_key)
+            widget.bind("<<Paste>>", self._break_event)
+            widget.bind("<<Cut>>", self._break_event)
+
+    def _copy_event(self, event) -> str:
+        self._copy_text_selection(event.widget)
+        return "break"
+
+    def _break_event(self, _event) -> str:
+        return "break"
+
+    def _readonly_text_key(self, event) -> str | None:
+        allowed = {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next"}
+        if event.keysym in allowed:
+            return None
+        if event.state & 0x0004 and event.keysym.lower() in {"c", "a"}:
+            return None
+        if event.state & 0x0008 and event.keysym.lower() in {"c", "a"}:
+            return None
+        return "break"
+
+    def _select_all_event(self, event) -> str:
+        self._select_all_text(event.widget)
+        return "break"
+
+    def _show_copy_menu(self, event) -> str:
+        event.widget.focus_set()
+        self.copy_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _copy_from_focused_text(self) -> None:
+        widget = self.root.focus_get()
+        self._copy_text_selection(widget)
+
+    def _select_all_focused_text(self) -> None:
+        widget = self.root.focus_get()
+        self._select_all_text(widget)
+
+    def _copy_text_selection(self, widget) -> None:
+        if not hasattr(widget, "get"):
+            return
+        try:
+            text = widget.get(self.tk.SEL_FIRST, self.tk.SEL_LAST)
+        except self.tk.TclError:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+
+    def _select_all_text(self, widget) -> None:
+        if not hasattr(widget, "tag_add"):
+            return
+        widget.tag_add(self.tk.SEL, "1.0", self.tk.END)
+        widget.mark_set(self.tk.INSERT, "1.0")
+        widget.see(self.tk.INSERT)
+
+    def _send(self) -> None:
+        message = self.input_entry.get("1.0", self.tk.END).strip()
+        if not message:
+            return
+        self.input_entry.delete("1.0", self.tk.END)
+        if message in {"/quit", "/exit"}:
+            self.root.destroy()
+            return
+        self._append_message("user", message)
+        self._show_execution_path(message)
+        threading.Thread(target=self._handle_message_thread, args=(message,), daemon=True).start()
+
+    def _handle_message_thread(self, message: str) -> None:
+        try:
+            response, workspace = asyncio.run(
+                handle_chat(
+                    ChatRequest(message=message, session_id=self.session.session_id),
+                    self.workspace,
+                    self.config,
+                )
+            )
+        except Exception as exc:
+            error_text = f"{exc.__class__.__name__}: {exc}"
+            self.root.after(0, lambda: self._append_message("system", error_text))
+            self.root.after(0, lambda: self.status_var.set("错误"))
+            return
+
+        def apply_response() -> None:
+            self.workspace = workspace
+            self.context_visible = workspace.context.visible_to_user
+            save_workspace(self.session, self.workspace)
+            append_message(self.session, "user", message)
+            append_message(self.session, "assistant", response)
+            if _is_user_effective_reply(response.reply):
+                self._append_message("assistant", response.reply)
+            if response.warnings:
+                self._append_message("system", "；".join(response.warnings[:4]))
+            self.last_download_plan = response.download_plan
+            if response.research_result and response.research_result.workflow_trace:
+                self._render_workflow_trace(response.research_result.workflow_trace)
+            self.status_var.set(f"Action: {response.action} | Session: {self.session.session_id}")
+            self._refresh_context()
+            self._refresh_ocr_buttons()
+            self._refresh_context_popup()
+            self._refresh_session_history()
+            if response.download_plan and response.download_plan.requires_login_count:
+                self._open_login_popup(response.download_plan)
+
+        self.root.after(0, apply_response)
+
+    def _send_from_event(self, event) -> str:
+        if event.state & 0x0001:
+            return None
+        self._send()
+        return "break"
+
+    def _append_message(self, role: str, text: str) -> None:
+        tag = _chat_bubble_tag(role)
+        self.chat_text.insert(self.tk.END, f"{text}\n\n", (tag,))
+        self.chat_text.see(self.tk.END)
+
+    def _show_execution_path(self, message: str) -> None:
+        steps = _execution_steps_for_message(message)
+        self.status_var.set("正在执行: " + " -> ".join(steps))
+        self._render_planned_trace(steps)
+
+    def _render_planned_trace(self, steps: list[str]) -> None:
+        self.trace_text.delete("1.0", self.tk.END)
+        self.trace_text.insert(self.tk.END, "计划路径\n", ("trace_node",))
+        for index, step in enumerate(steps, start=1):
+            self.trace_text.insert(self.tk.END, f"{index}. {step}\n", ("trace_body",))
+
+    def _render_workflow_trace(self, trace: WorkflowTrace) -> None:
+        self.trace_text.delete("1.0", self.tk.END)
+        if not trace.steps:
+            self.trace_text.insert(self.tk.END, "暂无真实 trace。\n", ("trace_body",))
+        for index, step in enumerate(trace.steps, start=1):
+            self.trace_text.insert(self.tk.END, f"{index}. {step.node}\n", ("trace_node",))
+            self.trace_text.insert(self.tk.END, f"状态: {step.status}\n", ("trace_body",))
+            self.trace_text.insert(self.tk.END, f"原因: {step.reason}\n", ("trace_body",))
+            if step.outputs:
+                compact = ", ".join(f"{key}={value}" for key, value in step.outputs.items())
+                self.trace_text.insert(self.tk.END, f"输出: {compact}\n", ("trace_body",))
+            if step.next_node:
+                self.trace_text.insert(self.tk.END, f"下一步: {step.next_node}\n", ("trace_body",))
+            if step.next_reason:
+                self.trace_text.insert(self.tk.END, f"选择原因: {step.next_reason}\n", ("trace_body",))
+            self.trace_text.insert(self.tk.END, "\n", ("trace_body",))
+
+    def _refresh_context(self) -> None:
+        lines = render_context_lines(self.workspace)
+        self.context_text.delete("1.0", self.tk.END)
+        self.context_text.insert(self.tk.END, "\n".join(lines))
+
+    def _refresh_ocr_buttons(self) -> None:
+        report = decide_artifact_extraction_need(self.workspace)
+        self.status_var.set(
+            f"OCR建议: {report.recommended_parse_strategy} | {self.session.session_id}"
+        )
+
+    def _toggle_context(self) -> None:
+        if self.context_visible:
+            self.pane.forget(self.context_frame)
+            self.context_visible = False
+            self.workspace.context.visible_to_user = False
+        else:
+            self.pane.add(self.context_frame, minsize=300)
+            self.context_visible = True
+            self.workspace.context.visible_to_user = True
+        self.context_toggle_button.configure(
+            text="隐藏上下文" if self.context_visible else "显示上下文"
+        )
+
+    def _toggle_parse_strategy(self) -> None:
+        next_strategy = "ocr" if self.parse_strategy == "text_only" else "text_only"
+        self._set_parse_strategy(next_strategy)
+
+    def _set_parse_strategy(self, strategy: str) -> None:
+        self.parse_strategy = strategy
+        self.config.parsing.parse_strategy = strategy
+        label = "只看文字层" if strategy == "text_only" else "使用 OCR"
+        self.status_var.set(f"解析模式: {label} | Session: {self.session.session_id}")
+        self._render_planned_trace([f"解析模式已切换为：{label}"])
+        self.parse_strategy_button.configure(text=self._parse_strategy_button_text())
+        if self.ocr_popup is not None:
+            self.ocr_popup.destroy()
+            self.ocr_popup = None
+
+    def _parse_strategy_button_text(self) -> str:
+        label = "文字层" if self.parse_strategy == "text_only" else "OCR"
+        return f"文献解析模式：{label}"
+
+    def _open_ocr_popup(self) -> None:
+        if self.ocr_popup is not None and self.ocr_popup.winfo_exists():
+            self.ocr_popup.lift()
+            return
+        self.ocr_popup = self.tk.Toplevel(self.root)
+        self.ocr_popup.title("LitTrace 解析设置")
+        self.ocr_popup.geometry("520x260")
+        self.ocr_popup.configure(background=DESIGN["parchment"])
+        self.ocr_popup.transient(self.root)
+        self.ocr_popup.protocol("WM_DELETE_WINDOW", self._close_ocr_popup)
+
+        report = decide_artifact_extraction_need(self.workspace)
+        frame = self.ttk.Frame(self.ocr_popup, style="Tile.TFrame", padding=24)
+        frame.pack(fill=self.tk.BOTH, expand=True)
+        self.ttk.Label(frame, text="选择 PDF 解析方式", style="TileHeader.TLabel").pack(anchor="w")
+        self.ttk.Label(frame, text=f"建议: {report.recommended_parse_strategy}", style="Caption.TLabel").pack(
+            anchor="w", pady=(10, 0)
+        )
+        self.ttk.Label(frame, text=report.reason, style="Caption.TLabel", wraplength=470, justify=self.tk.LEFT).pack(
+            anchor="w", pady=(4, 12)
+        )
+        button_frame = self.ttk.Frame(frame, style="Tile.TFrame")
+        button_frame.pack(fill=self.tk.X)
+        self.ttk.Button(
+            button_frame,
+            text="只看文字层",
+            style="Secondary.TButton",
+            command=lambda: self._set_parse_strategy("text_only"),
+        ).pack(side=self.tk.LEFT)
+        self.ttk.Button(
+            button_frame,
+            text="使用 OCR",
+            style="Primary.TButton",
+            command=lambda: self._set_parse_strategy("ocr"),
+        ).pack(side=self.tk.LEFT, padx=(8, 0))
+        self.ttk.Button(button_frame, text="关闭", style="Secondary.TButton", command=self._close_ocr_popup).pack(
+            side=self.tk.RIGHT
+        )
+
+    def _close_ocr_popup(self) -> None:
+        if self.ocr_popup is not None:
+            self.ocr_popup.destroy()
+            self.ocr_popup = None
+
+    def _open_context_popup(self) -> None:
+        if self.context_popup is not None and self.context_popup.winfo_exists():
+            self.context_popup.lift()
+            self._refresh_context_popup()
+            return
+        self.context_popup = self.tk.Toplevel(self.root)
+        self.context_popup.title("LitTrace 当前文献上下文")
+        self.context_popup.geometry("760x560")
+        self.context_popup.configure(background=DESIGN["parchment"])
+        self.context_popup.transient(self.root)
+        self.context_popup.protocol("WM_DELETE_WINDOW", self._close_context_popup)
+        self._refresh_context_popup()
+
+    def _close_context_popup(self) -> None:
+        if self.context_popup is not None:
+            self.context_popup.destroy()
+            self.context_popup = None
+
+    def _refresh_context_popup(self) -> None:
+        if self.context_popup is None or not self.context_popup.winfo_exists():
+            return
+        for child in self.context_popup.winfo_children():
+            child.destroy()
+
+        outer = self.ttk.Frame(self.context_popup, style="Tile.TFrame", padding=24)
+        outer.pack(fill=self.tk.BOTH, expand=True)
+        header = self.ttk.Frame(outer, style="Tile.TFrame")
+        header.pack(fill=self.tk.X)
+        self.ttk.Label(header, text="当前文献上下文", style="TileHeader.TLabel").pack(side=self.tk.LEFT)
+        self.ttk.Button(header, text="全部选择下载", style="Primary.TButton", command=self._select_all_downloads).pack(
+            side=self.tk.RIGHT
+        )
+        self.ttk.Button(header, text="清空选择", style="Secondary.TButton", command=self._clear_downloads).pack(
+            side=self.tk.RIGHT, padx=(0, 8)
+        )
+
+        if not self.workspace.context.active_papers:
+            self.ttk.Label(outer, text="当前没有文献。先在主窗口输入检索任务。", style="Caption.TLabel").pack(
+                anchor="w", pady=(16, 0)
+            )
+            return
+
+        list_frame = self.ttk.Frame(outer, style="Tile.TFrame")
+        list_frame.pack(fill=self.tk.BOTH, expand=True, pady=(12, 0))
+        canvas = self.tk.Canvas(list_frame, highlightthickness=0, bg=DESIGN["canvas"])
+        scrollbar = self.ttk.Scrollbar(
+            list_frame,
+            orient=self.tk.VERTICAL,
+            command=canvas.yview,
+            style="Slim.Vertical.TScrollbar",
+        )
+        inner = self.ttk.Frame(canvas, style="Tile.TFrame")
+        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=self.tk.LEFT, fill=self.tk.BOTH, expand=True)
+        scrollbar.pack(side=self.tk.RIGHT, fill=self.tk.Y)
+
+        selected = set(self.workspace.context.selected_for_download)
+        for index, paper_id in enumerate(self.workspace.context.active_papers, start=1):
+            paper = self.workspace.papers[paper_id]
+            var = self.tk.BooleanVar(value=paper_id in selected)
+            row = self.ttk.Frame(inner, style="Tile.TFrame", padding=(0, 6))
+            row.pack(fill=self.tk.X, anchor="w")
+            checkbox = self.ttk.Checkbutton(
+                row,
+                variable=var,
+                command=lambda pid=paper_id, value=var: self._toggle_download_selection(pid, value),
+            )
+            checkbox.pack(side=self.tk.LEFT)
+            year = paper.year or "n.d."
+            source = paper.journal or paper.publisher or "unknown"
+            text = f"{index}. {paper.title}\n{year} | {source}"
+            self.ttk.Label(row, text=text, style="Caption.TLabel", wraplength=650, justify=self.tk.LEFT).pack(
+                side=self.tk.LEFT, fill=self.tk.X, expand=True
+            )
+
+    def _toggle_download_selection(self, paper_id: str, value) -> None:
+        selected = list(self.workspace.context.selected_for_download)
+        enabled = bool(value.get())
+        if enabled and paper_id not in selected:
+            selected.append(paper_id)
+        if not enabled and paper_id in selected:
+            selected.remove(paper_id)
+        self.workspace.context.selected_for_download = selected
+        save_workspace(self.session, self.workspace)
+        self._refresh_context()
+        self.status_var.set(f"已选择下载 {len(selected)} 篇 | Session: {self.session.session_id}")
+
+    def _select_all_downloads(self) -> None:
+        self.workspace.context.selected_for_download = list(self.workspace.context.active_papers)
+        save_workspace(self.session, self.workspace)
+        self._refresh_context()
+        self._refresh_context_popup()
+
+    def _clear_downloads(self) -> None:
+        self.workspace.context.selected_for_download = []
+        save_workspace(self.session, self.workspace)
+        self._refresh_context()
+        self._refresh_context_popup()
+
+    def _open_login_popup(self, download_plan: DownloadPlan | None = None) -> None:
+        plan = download_plan or self.last_download_plan
+        if plan is None:
+            self._append_message("assistant", "当前还没有下载计划。请先说“选择第 N 篇下载”或“生成下载计划”。")
+            return
+        login_items = [item for item in plan.items if item.requires_login]
+        if not login_items:
+            self._append_message("assistant", "当前下载计划里没有需要登录的文献。")
+            return
+        if self.login_popup is not None and self.login_popup.winfo_exists():
+            self.login_popup.lift()
+            return
+        self.login_popup = self.tk.Toplevel(self.root)
+        self.login_popup.title("LitTrace 登录下载")
+        self.login_popup.geometry("760x460")
+        self.login_popup.configure(background=DESIGN["parchment"])
+        self.login_popup.transient(self.root)
+        self.login_popup.protocol("WM_DELETE_WINDOW", self._close_login_popup)
+
+        outer = self.ttk.Frame(self.login_popup, style="Tile.TFrame", padding=24)
+        outer.pack(fill=self.tk.BOTH, expand=True)
+        self.ttk.Label(outer, text="需要你授权登录后下载的文献", style="TileHeader.TLabel").pack(
+            anchor="w"
+        )
+        self.ttk.Label(
+            outer,
+            text="LitTrace 只打开授权页面，不绕过登录。登录完成后把 PDF 保存到目标路径，再回到主窗口继续解析。",
+            style="Caption.TLabel",
+            wraplength=720,
+            justify=self.tk.LEFT,
+        ).pack(anchor="w", pady=(8, 12))
+        for item in login_items:
+            paper = self.workspace.papers.get(item.paper_id)
+            row = self.ttk.Frame(outer, style="Tile.TFrame", padding=(0, 6))
+            row.pack(fill=self.tk.X, anchor="w")
+            title = paper.title if paper else item.title
+            self.ttk.Label(row, text=title, style="Caption.TLabel", wraplength=560, justify=self.tk.LEFT).pack(
+                side=self.tk.LEFT, fill=self.tk.X, expand=True
+            )
+            self.ttk.Button(
+                row,
+                text="打开登录页",
+                style="Primary.TButton",
+                command=lambda pid=item.paper_id: self._launch_login(pid),
+            ).pack(side=self.tk.RIGHT)
+
+    def _close_login_popup(self) -> None:
+        if self.login_popup is not None:
+            self.login_popup.destroy()
+            self.login_popup = None
+
+    def _launch_login(self, paper_id: str) -> None:
+        paper = self.workspace.papers.get(paper_id)
+        if paper is None:
+            self._append_message("system", "没有找到这篇文献。")
+            return
+        result = launch_login_for_paper(
+            self.config,
+            paper,
+            self.workspace.full_text_reports.get(paper_id),
+        )
+        lines = [
+            f"登录页: {result.login_url or '无'}",
+            f"目标路径: {result.target_path or '无'}",
+            *result.instructions,
+        ]
+        if result.error:
+            lines.append(f"错误: {result.error}")
+        self._append_message("system", "\n".join(lines))
+
+    def _refresh_session_history(self) -> None:
+        self.session_history_text.delete("1.0", self.tk.END)
+        summaries = list_chat_sessions(self.config, limit=8)
+        if not summaries:
+            self.session_history_text.insert(self.tk.END, "暂无历史 session。")
+        for index, item in enumerate(summaries):
+            current = "当前 " if item.session_id == self.session.session_id else ""
+            tag = f"session_{index}"
+            start = self.session_history_text.index(self.tk.INSERT)
+            self.session_history_text.insert(
+                self.tk.END,
+                f"{current}{item.topic}\n{item.updated_at} | 消息 {item.message_count} | 文献 {item.paper_count}\n{item.session_id}\n\n",
+            )
+            end = self.session_history_text.index(self.tk.INSERT)
+            self.session_history_text.tag_add(tag, start, end)
+            self.session_history_text.tag_configure(
+                tag,
+                foreground=DESIGN["primary"] if item.session_id != self.session.session_id else DESIGN["ink"],
+                background="#eef6ff" if item.session_id == self.session.session_id else DESIGN["canvas"],
+                lmargin1=3,
+                lmargin2=3,
+                rmargin=3,
+                spacing1=2,
+                spacing3=8,
+            )
+            self.session_history_text.tag_bind(
+                tag,
+                "<Button-1>",
+                lambda _event, sid=item.session_id: self._switch_session(sid),
+            )
+            self.session_history_text.tag_bind(
+                tag,
+                "<Enter>",
+                lambda _event: self.session_history_text.configure(cursor="hand2"),
+            )
+            self.session_history_text.tag_bind(
+                tag,
+                "<Leave>",
+                lambda _event: self.session_history_text.configure(cursor=""),
+            )
+
+    def _switch_session(self, session_id: str) -> None:
+        if session_id == self.session.session_id:
+            return
+        self.session = load_or_create_session(self.config, session_id)
+        _scope_storage_to_session(self.config, self.session)
+        self.workspace = load_workspace(self.session)
+        self.last_download_plan = None
+        self._render_session_messages()
+        self._refresh_context()
+        self._refresh_context_popup()
+        self._refresh_session_history()
+        self._render_planned_trace([f"已切换到历史 session：{session_id}"])
+        self.status_var.set(f"Session: {self.session.session_id}")
+
+    def _render_session_messages(self) -> None:
+        self.chat_text.delete("1.0", self.tk.END)
+        if self.session.messages_path.exists():
+            for raw_line in self.session.messages_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    record = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                role = "你" if record.get("role") == "user" else "LitTrace"
+                content = record.get("content")
+                text = _message_text(content)
+                if text and (role == "你" or _is_user_effective_reply(text)):
+                    bubble_role = "user" if role == "你" else "assistant"
+                    self.chat_text.insert(self.tk.END, f"{text}\n\n", (_chat_bubble_tag(bubble_role),))
+        self.chat_text.see(self.tk.END)
+
+    def _open_help_popup(self) -> None:
+        popup = self.tk.Toplevel(self.root)
+        popup.title("LitTrace 使用说明")
+        popup.geometry("560x360")
+        popup.configure(background=DESIGN["parchment"])
+        popup.transient(self.root)
+        frame = self.ttk.Frame(popup, style="Tile.TFrame", padding=24)
+        frame.pack(fill=self.tk.BOTH, expand=True)
+        self.ttk.Label(frame, text="使用说明", style="TileHeader.TLabel").pack(anchor="w")
+        text = self.tk.Text(
+            frame,
+            wrap=self.tk.WORD,
+            bd=0,
+            relief=self.tk.FLAT,
+            highlightthickness=0,
+            bg=DESIGN["canvas"],
+            fg=DESIGN["ink"],
+            font=_font("body"),
+            height=10,
+        )
+        text.pack(fill=self.tk.BOTH, expand=True, pady=(12, 12))
+        text.insert(
+            self.tk.END,
+            "直接输入研究任务，例如：我想了解薄膜压敏传感阵列的相关文献。\n\n"
+            "左侧显示真实 Workflow Trace 和历史 Session；点击历史 Session 可以切换上下文。\n\n"
+            "右侧显示当前文献上下文。需要选择下载文献时，点击“文献上下文”打开选择窗口。\n\n"
+            "顶部“文献解析模式”按钮会在文字层和 OCR 之间切换。",
+        )
+        text.configure(state=self.tk.DISABLED)
+        self.ttk.Button(frame, text="关闭", style="Secondary.TButton", command=popup.destroy).pack(
+            anchor="e"
+        )
+
+
+def main() -> None:
+    LitTraceWindow().run()
+
+
+def _execution_steps_for_message(message: str) -> list[str]:
+    intent = parse_chat_intent(message)
+    steps = ["识别任务意图"]
+    if "search" in intent.actions:
+        steps.extend(["提取研究主题", "检索候选文献", "更新当前文献上下文", "弹出文献选择"])
+    if "download" in intent.actions or "select_downloads" in intent.actions:
+        steps.append("准备下载选择")
+    if "parse" in intent.actions:
+        steps.append("按当前解析模式处理 PDF")
+    if "table" in intent.actions:
+        steps.append("抽取性能指标并生成对比表")
+    if "storyline" in intent.actions:
+        steps.append("梳理论文回应关系与发展脉络")
+    if "document" in intent.actions:
+        steps.append("组织学术化报告")
+    if "autonomous_review" in intent.actions:
+        steps.append("启动多 Agent 复核与修订")
+    if len(steps) == 1:
+        steps.append("基于当前上下文直接回答")
+    return steps
+
+
+def _is_user_effective_reply(reply: str) -> bool:
+    quiet_prefixes = [
+        "已切换解析模式",
+        "已隐藏当前文献上下文",
+        "已显示当前文献上下文",
+    ]
+    return bool(reply.strip()) and not any(reply.startswith(prefix) for prefix in quiet_prefixes)
+
+
+def _message_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        for key in ["message", "reply"]:
+            value = content.get(key)
+            if isinstance(value, str):
+                return value
+    return ""
+
+
+def _chat_bubble_tag(role: str) -> str:
+    if role in {"user", "你"}:
+        return "bubble_user"
+    if role in {"assistant", "LitTrace"}:
+        return "bubble_assistant"
+    return "bubble_system"
+
+
+def _font(token: str) -> tuple[str, int, str]:
+    family = "SF Pro Text"
+    display_family = "SF Pro Display"
+    fonts = {
+        "display": (display_family, 22, "bold"),
+        "tagline": (display_family, 17, "bold"),
+        "body": (family, 13, "normal"),
+        "body_strong": (family, 13, "bold"),
+        "caption": (family, 11, "normal"),
+        "button": (family, 12, "normal"),
+        "button_utility": (family, 11, "normal"),
+        "fine": (family, 10, "normal"),
+        "nav": (family, 10, "normal"),
+    }
+    return fonts.get(token, fonts["body"])
+
+
+def _scope_storage_to_session(config, session: ChatSession) -> None:
+    session_storage = session.root / "papers"
+    config.storage.paper_library_dir = session_storage
+    config.storage.metadata_dir = session.root / "metadata"
+    config.storage.cache_dir = session.root / "cache"
+    config.storage.paper_library_dir.mkdir(parents=True, exist_ok=True)
+    config.storage.metadata_dir.mkdir(parents=True, exist_ok=True)
+    config.storage.cache_dir.mkdir(parents=True, exist_ok=True)
+    if config.parsing.paddleocr.cache_dir is None:
+        config.parsing.paddleocr.cache_dir = session.root / "ocr-cache"
+
+
+def _load_tk():
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Tkinter is not available in this Python environment. "
+            "Install/use a Python build with Tk support, then run littrace-window again."
+        ) from exc
+    return tk, ttk
+
+
+if __name__ == "__main__":
+    main()

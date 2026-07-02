@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 
 from littrace.config import LitTraceConfig
+from littrace.ocr.registry import build_ocr_tool
+from littrace.ocr.tool import OCRMode
 from littrace.models import LiteratureWorkspace
 from littrace.parsing import local_pdf_path
 
@@ -17,6 +22,18 @@ class PDFBenchmarkReport(BaseModel):
     local_pdf_rate: float = 0.0
     parsed_rate: float = 0.0
     warnings: list[str] = Field(default_factory=list)
+
+
+class LivePDFBenchmarkReport(BaseModel):
+    pdf_path: str
+    parser: str
+    parsed: bool
+    elapsed_seconds: float
+    section_count: int
+    total_chars: int
+    progress_events: list[dict[str, object]] = Field(default_factory=list)
+    parser_reports: list[dict[str, object]] = Field(default_factory=list)
+    error: str | None = None
 
 
 def benchmark_pdf_parsing(
@@ -71,4 +88,34 @@ def benchmark_pdf_parsing(
         local_pdf_rate=round(local_pdf_count / len(active_ids), 3) if active_ids else 0.0,
         parsed_rate=round(parsed_count / len(active_ids), 3) if active_ids else 0.0,
         warnings=warnings,
+    )
+
+
+def benchmark_single_pdf(
+    pdf_path: Path,
+    config: LitTraceConfig,
+    mode: OCRMode = OCRMode.ACCURATE,
+    parse_strategy: str | None = None,
+) -> LivePDFBenchmarkReport:
+    if parse_strategy:
+        config = config.model_copy(deep=True)
+        config.parsing.parse_strategy = parse_strategy
+    parser = build_ocr_tool(config, {})
+    progress_events: list[dict[str, object]] = []
+    if hasattr(parser, "progress_callback"):
+        parser.progress_callback = progress_events.append
+    start = time.monotonic()
+    parsed = parser.parse_pdf(pdf_path, mode=mode)
+    elapsed = time.monotonic() - start
+    total_chars = sum(len(str(section.get("text") or "")) for section in parsed.sections)
+    return LivePDFBenchmarkReport(
+        pdf_path=str(pdf_path),
+        parser=getattr(parser, "name", parser.__class__.__name__),
+        parsed=parsed.parsed,
+        elapsed_seconds=round(elapsed, 3),
+        section_count=len(parsed.sections),
+        total_chars=total_chars,
+        progress_events=progress_events,
+        parser_reports=parsed.parser_reports,
+        error=parsed.error,
     )

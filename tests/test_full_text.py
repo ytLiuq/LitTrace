@@ -8,9 +8,10 @@ from littrace.full_text import (
     full_text_config_warnings,
     resolve_full_text_for_paper,
     resolve_workspace_full_text,
+    verify_full_text_candidates,
 )
 from littrace.eval_api import full_text_metrics_from_workspace
-from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata
+from littrace.models import AccessType, FullTextCandidate, LiteratureWorkspace, PaperMetadata
 
 
 @pytest.mark.anyio
@@ -165,3 +166,65 @@ async def test_unpaywall_oa_candidate_keeps_oa_status_when_head_forbidden():
     assert report.open_access_candidate_count >= 1
     assert report.login_required_candidate_count == 0
     assert report.candidates[0].note == "oa_evidence_but_http_forbidden"
+
+
+@pytest.mark.anyio
+async def test_crossref_full_text_retries_transient_503():
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if "api.crossref.org" in str(request.url):
+            calls += 1
+            if calls == 1:
+                return httpx.Response(503)
+            return httpx.Response(
+                200,
+                json={
+                    "message": {
+                        "link": [
+                            {
+                                "URL": "https://example.org/paper.pdf",
+                                "content-type": "application/pdf",
+                            }
+                        ]
+                    }
+                },
+            )
+        if str(request.url) == "https://example.org/paper.pdf":
+            return httpx.Response(200, headers={"content-type": "application/pdf"})
+        if str(request.url) == "https://doi.org/10.1000/retry":
+            return httpx.Response(200, headers={"content-type": "text/html"})
+        raise AssertionError(str(request.url))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        report = await resolve_full_text_for_paper(
+            client,
+            PaperMetadata(paper_id="p1", title="Retry paper", doi="10.1000/retry"),
+            LitTraceConfig(),
+        )
+
+    assert calls == 2
+    assert str(report.best_pdf_url) == "https://example.org/paper.pdf"
+
+
+@pytest.mark.anyio
+async def test_verify_candidate_marks_forbidden_as_login_required():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"content-type": "text/html"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        verified, warnings = await verify_full_text_candidates(
+            client,
+            [
+                FullTextCandidate(
+                    paper_id="p1",
+                    url="https://publisher.example/article",
+                    source="publisher",
+                )
+            ],
+        )
+
+    assert not warnings
+    assert verified[0].requires_login
+    assert verified[0].note == "http_auth_or_forbidden"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI
 
 from littrace.eval_api import (
@@ -21,7 +23,12 @@ from littrace.attachments import (
     attach_pdf_to_paper,
     check_download_presence,
 )
-from littrace.auto_resume import AutoResumeResult, auto_resume_downloaded_pdfs
+from littrace.auto_resume import (
+    AutoResumeResult,
+    DownloadWatchResult,
+    auto_resume_downloaded_pdfs,
+    watch_and_resume_downloads,
+)
 from littrace.citations import audit_citation_links, citation_records_for_papers
 from littrace.chat import handle_chat
 from littrace.config import load_config
@@ -58,7 +65,12 @@ from littrace.models import (
     ResearchRunResult,
 )
 from littrace.parsing import parse_workspace_papers
-from littrace.pdf_benchmark import PDFBenchmarkReport, benchmark_pdf_parsing
+from littrace.pdf_benchmark import (
+    LivePDFBenchmarkReport,
+    PDFBenchmarkReport,
+    benchmark_pdf_parsing,
+    benchmark_single_pdf,
+)
 from littrace.publisher_connectors import (
     PublisherRouteReport,
     PublisherSearchPlanReport,
@@ -82,7 +94,12 @@ from littrace.session import (
     load_workspace,
     save_workspace,
 )
-from littrace.tables import build_comparison_matrices, extract_performance_cells
+from littrace.tables import (
+    ArtifactNeedReport,
+    build_comparison_matrices,
+    decide_artifact_extraction_need,
+    extract_performance_cells,
+)
 from littrace.storyline import render_structured_storyline_report
 from littrace.storyline_review import StorylineReviewReport, review_storyline
 from littrace.supplementary import (
@@ -153,9 +170,16 @@ def agents_interactions() -> AgentInteractionReport:
 async def agents_autonomous_loop(
     objective: str,
     max_rounds: int = 2,
+    auto_replan: bool = False,
 ) -> AutonomousResearchLoopReport:
     global WORKSPACE
-    report = await run_autonomous_research_loop(load_config(), objective, WORKSPACE, max_rounds=max_rounds)
+    report = await run_autonomous_research_loop(
+        load_config(),
+        objective,
+        WORKSPACE,
+        max_rounds=max_rounds,
+        auto_replan=auto_replan,
+    )
     WORKSPACE.context.filters["autonomous_loop_report"] = report.model_dump(mode="json")
     return report
 
@@ -183,6 +207,7 @@ async def workflow_research(request: ResearchRunRequest) -> ResearchRunResult:
         build_storyline_enabled=request.build_storyline,
         compose_document_enabled=request.compose_document,
         autonomous_review_enabled=request.autonomous_review,
+        auto_replan_enabled=request.auto_replan,
     )
     WORKSPACE = result.workspace
     return result
@@ -344,6 +369,28 @@ def downloads_resume(session_id: str | None = None) -> AutoResumeResult:
     return result
 
 
+@app.post("/downloads/watch", response_model=DownloadWatchResult)
+def downloads_watch(
+    session_id: str | None = None,
+    timeout_seconds: float = 60.0,
+    poll_interval_seconds: float = 2.0,
+) -> DownloadWatchResult:
+    global WORKSPACE
+    config = load_config()
+    session = load_or_create_session(config, session_id) if session_id else None
+    WORKSPACE, result = watch_and_resume_downloads(
+        config,
+        WORKSPACE,
+        session,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+    if session:
+        save_workspace(session, WORKSPACE)
+    append_trace(config, "downloads_watch", result.model_dump(mode="json"))
+    return result
+
+
 @app.post("/papers/{paper_id}/attach-pdf", response_model=AttachmentResult)
 def attach_pdf(paper_id: str, source_path: str) -> AttachmentResult:
     return attach_pdf_to_paper(load_config(), WORKSPACE, paper_id, source_path)
@@ -380,6 +427,11 @@ def tables_extract() -> ResearchRunResult:
 @app.get("/tables/matrix", response_model=ComparisonMatrixReport)
 def tables_matrix() -> ComparisonMatrixReport:
     return build_comparison_matrices(WORKSPACE)
+
+
+@app.get("/artifacts/need", response_model=ArtifactNeedReport)
+def artifacts_need() -> ArtifactNeedReport:
+    return decide_artifact_extraction_need(WORKSPACE)
 
 
 @app.get("/storyline/report")
@@ -426,6 +478,14 @@ def eval_pdf_parsing(topic: str | None = None) -> EvalMetricReport:
 @app.get("/eval/pdf-benchmark", response_model=PDFBenchmarkReport)
 def eval_pdf_benchmark() -> PDFBenchmarkReport:
     return benchmark_pdf_parsing(WORKSPACE, load_config())
+
+
+@app.post("/eval/pdf-benchmark/file", response_model=LivePDFBenchmarkReport)
+def eval_pdf_benchmark_file(
+    path: str,
+    parse_strategy: str | None = None,
+) -> LivePDFBenchmarkReport:
+    return benchmark_single_pdf(Path(path), load_config(), parse_strategy=parse_strategy)
 
 
 @app.get("/eval/full-text", response_model=EvalMetricReport)

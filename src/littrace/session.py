@@ -19,6 +19,15 @@ class ChatSession(BaseModel):
     artifacts_dir: Path
 
 
+class ChatSessionSummary(BaseModel):
+    session_id: str
+    root: Path
+    updated_at: str
+    topic: str = "未命名主题"
+    message_count: int = 0
+    paper_count: int = 0
+
+
 def create_chat_session(config: LitTraceConfig) -> ChatSession:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_id = f"{timestamp}-{uuid4().hex[:8]}"
@@ -77,3 +86,78 @@ def append_message(session: ChatSession, role: str, payload: ChatRequest | ChatR
     }
     with session.messages_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSessionSummary]:
+    root = config.storage.sessions_dir
+    if not root.exists():
+        return []
+    summaries: list[ChatSessionSummary] = []
+    for session_dir in root.iterdir():
+        if not session_dir.is_dir():
+            continue
+        workspace_path = session_dir / "workspace.json"
+        messages_path = session_dir / "messages.jsonl"
+        updated_source = messages_path if messages_path.exists() else session_dir
+        try:
+            updated_at = datetime.fromtimestamp(updated_source.stat().st_mtime).isoformat(
+                timespec="minutes"
+            )
+        except OSError:
+            updated_at = "unknown"
+        message_count = 0
+        if messages_path.exists():
+            try:
+                message_lines = messages_path.read_text(encoding="utf-8").splitlines()
+                message_count = len(message_lines)
+            except OSError:
+                message_lines = []
+                message_count = 0
+        else:
+            message_lines = []
+        paper_count = 0
+        topic = "未命名主题"
+        for raw_line in message_lines:
+            try:
+                record = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("role") != "user":
+                continue
+            content = record.get("content")
+            if isinstance(content, dict):
+                content = content.get("message")
+            if isinstance(content, str) and content.strip():
+                topic = _summarize_topic(content)
+                break
+        if workspace_path.exists():
+            try:
+                summary_session = ChatSession(
+                    session_id=session_dir.name,
+                    root=session_dir,
+                    workspace_path=workspace_path,
+                    messages_path=messages_path,
+                    artifacts_dir=session_dir / "artifacts",
+                )
+                paper_count = len(load_workspace(summary_session).context.active_papers)
+            except Exception:
+                paper_count = 0
+        summaries.append(
+            ChatSessionSummary(
+                session_id=session_dir.name,
+                root=session_dir,
+                updated_at=updated_at,
+                topic=topic,
+                message_count=message_count,
+                paper_count=paper_count,
+            )
+        )
+    summaries.sort(key=lambda item: item.updated_at, reverse=True)
+    return summaries[:limit]
+
+
+def _summarize_topic(text: str, max_length: int = 24) -> str:
+    cleaned = " ".join(text.split()).strip(" ：:，,。.")
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[:max_length].rstrip() + "..."

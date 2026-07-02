@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from pydantic import BaseModel, Field
+
 from littrace.harnesses import HarnessResult, check_performance_cells, check_structured_artifacts
 from littrace.models import (
     ComparisonMatrix,
@@ -52,6 +54,88 @@ METRIC_PATTERN = re.compile(
     r"kPa-1|Pa-1|ppm|GPa|MPa|kPa|Pa|cycles|)?",
     re.IGNORECASE,
 )
+
+
+class ArtifactNeedReport(BaseModel):
+    needs_artifact_extraction: bool
+    reason: str
+    text_evidence_count: int = 0
+    performance_cell_count: int = 0
+    structured_artifact_count: int = 0
+    recommended_tools: list[str] = Field(default_factory=list)
+    recommended_parse_strategy: str = "text_only"
+    buttons: list[dict[str, str]] = Field(default_factory=list)
+
+
+def decide_artifact_extraction_need(workspace: LiteratureWorkspace) -> ArtifactNeedReport:
+    text_evidence_count = sum(
+        1
+        for parsed in workspace.parsed_papers.values()
+        for section in parsed.get("sections", [])
+        if isinstance(section, dict) and str(section.get("text") or "").strip()
+    )
+    artifact_count = len(_stored_structured_artifacts(workspace))
+    performance_count = len(workspace.performance_cells)
+    if performance_count and text_evidence_count:
+        return ArtifactNeedReport(
+            needs_artifact_extraction=False,
+            reason="正文和已抽取性能指标已能支撑基础综述；图表/公式抽取可作为增强步骤。",
+            text_evidence_count=text_evidence_count,
+            performance_cell_count=performance_count,
+            structured_artifact_count=artifact_count,
+            recommended_parse_strategy="text_only",
+            buttons=_ocr_choice_buttons("text_only"),
+        )
+    if artifact_count:
+        return ArtifactNeedReport(
+            needs_artifact_extraction=False,
+            reason="已有结构化图表/公式/图注证据。",
+            text_evidence_count=text_evidence_count,
+            performance_cell_count=performance_count,
+            structured_artifact_count=artifact_count,
+            recommended_parse_strategy="text_only",
+            buttons=_ocr_choice_buttons("text_only"),
+        )
+    if text_evidence_count:
+        return ArtifactNeedReport(
+            needs_artifact_extraction=True,
+            reason="已有正文证据但缺少性能单元；建议仅在需要精确性能对比、公式解释或图中趋势时抽取图表/公式。",
+            text_evidence_count=text_evidence_count,
+            performance_cell_count=performance_count,
+            structured_artifact_count=artifact_count,
+            recommended_tools=["paddleocr", "structured_artifact_extractor"],
+            recommended_parse_strategy="ocr",
+            buttons=_ocr_choice_buttons("ocr"),
+        )
+    return ArtifactNeedReport(
+        needs_artifact_extraction=True,
+        reason="缺少正文和结构化证据；需要先解析全文，扫描件或复杂图表优先使用 PaddleOCR。",
+        text_evidence_count=text_evidence_count,
+        performance_cell_count=performance_count,
+        structured_artifact_count=artifact_count,
+        recommended_tools=["paddleocr"],
+        recommended_parse_strategy="ocr",
+        buttons=_ocr_choice_buttons("ocr"),
+    )
+
+
+def _ocr_choice_buttons(recommended: str) -> list[dict[str, str]]:
+    return [
+        {
+            "id": "text_only",
+            "label": "只看文字层",
+            "parse_strategy": "text_only",
+            "recommended": str(recommended == "text_only").lower(),
+            "description": "速度快，适合可复制文字的 PDF；不会读取扫描图片里的文字。",
+        },
+        {
+            "id": "ocr",
+            "label": "使用 OCR",
+            "parse_strategy": "ocr",
+            "recommended": str(recommended == "ocr").lower(),
+            "description": "速度慢但能处理扫描件、图中标注、复杂图表和公式附近文字。",
+        },
+    ]
 
 
 def extract_performance_cells(workspace: LiteratureWorkspace) -> tuple[LiteratureWorkspace, HarnessResult]:
@@ -224,6 +308,19 @@ def _structured_artifacts_from_parsed(
     artifacts: list[StructuredArtifact] = []
     artifacts.extend(_artifacts_from_table_objects(paper_id, parsed))
     artifacts.extend(_artifacts_from_sections(paper_id, parsed))
+    return artifacts
+
+
+def _stored_structured_artifacts(workspace: LiteratureWorkspace) -> list[StructuredArtifact]:
+    raw = workspace.context.filters.get("structured_artifacts", [])
+    if not isinstance(raw, list):
+        return []
+    artifacts: list[StructuredArtifact] = []
+    for item in raw:
+        if isinstance(item, StructuredArtifact):
+            artifacts.append(item)
+        elif isinstance(item, dict):
+            artifacts.append(StructuredArtifact.model_validate(item))
     return artifacts
 
 

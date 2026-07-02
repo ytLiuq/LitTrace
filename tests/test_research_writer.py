@@ -25,6 +25,25 @@ def test_fallback_evidence_answer_includes_references():
     assert "https://doi.org/10.1000/example" in answer
 
 
+def test_fallback_evidence_answer_refuses_mock_workspace():
+    workspace = add_papers(
+        LiteratureWorkspace(context={"filters": {"search_mode": "mock"}}),
+        [
+            PaperMetadata(
+                paper_id="p1",
+                title="Mock Paper",
+                year=2026,
+                doi="10.1002/adfm.mock2026001",
+            )
+        ],
+    )
+
+    answer = fallback_evidence_answer("总结主要路线", workspace)
+
+    assert "mock/开发样例" in answer
+    assert "10.1002/adfm.mock2026001" not in answer
+
+
 @pytest.mark.anyio
 async def test_writer_reports_empty_workspace_without_llm():
     reply = await write_evidence_grounded_answer(
@@ -35,3 +54,20 @@ async def test_writer_reports_empty_workspace_without_llm():
 
     assert not reply.used_llm
     assert reply.error == "empty_workspace"
+
+
+@pytest.mark.anyio
+async def test_writer_refuses_mock_workspace_without_llm():
+    workspace = add_papers(
+        LiteratureWorkspace(context={"filters": {"search_mode": "mock"}}),
+        [PaperMetadata(paper_id="p1", title="Mock Paper", doi="10.1002/adfm.mock2026001")],
+    )
+
+    reply = await write_evidence_grounded_answer(
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
+        "总结主要路线",
+        workspace,
+    )
+
+    assert not reply.used_llm
+    assert reply.error == "mock_workspace"

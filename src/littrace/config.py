@@ -43,10 +43,14 @@ class PaddleOCRParserConfig(BaseModel):
     pdf_render_scale: float = 2.0
     max_pages: int | None = None
     ocr_batch_size: int = 4
+    ocr_page_workers: int = 1
+    cache_enabled: bool = True
+    cache_dir: Path | None = None
 
 
 class ParsingConfig(BaseModel):
     default_parser: str = "metadata_only"
+    parse_strategy: str = "auto"
     preferred_engines: list[str] = Field(
         default_factory=lambda: ["docling", "paddleocr", "marker", "grobid"]
     )
@@ -71,6 +75,7 @@ class LLMConfig(BaseModel):
     request_timeout_seconds: float = 30.0
     temperature: float = 0.2
     enabled: bool = True
+    intent_parser_enabled: bool = True
 
 
 class LiteratureContextDefaults(BaseModel):

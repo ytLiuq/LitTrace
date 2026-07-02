@@ -12,8 +12,13 @@ def build_ocr_tool(
     config: LitTraceConfig,
     paper_lookup: dict[str, PaperMetadata] | None = None,
 ) -> OCRTool:
+    strategy = config.parsing.parse_strategy.lower()
     backend = config.parsing.default_parser.lower()
-    if backend == "docling":
+    if strategy in {"text_only", "text-only", "text"}:
+        backend = "docling"
+    elif strategy in {"ocr", "paddleocr", "paddlerocr"}:
+        backend = "paddleocr"
+    if backend in {"docling", "text_only", "text-only", "text"}:
         return DoclingOCRTool()
     if backend in {"paddleocr", "paddlerocr"}:
         return PaddleOCRTool(config.parsing.paddleocr)

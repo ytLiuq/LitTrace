@@ -41,3 +41,36 @@ async def test_autonomous_loop_replans_when_full_text_missing():
     assert report.rounds
     assert "parse_full_text_with_paddleocr" in report.replan_actions
     assert "多 agent 复核后的限制说明" in report.final_answer
+
+
+@pytest.mark.anyio
+async def test_autonomous_loop_can_execute_safe_replan_actions(monkeypatch):
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [PaperMetadata(paper_id="p1", title="Traceable Sensor Paper", year=2026)],
+    )
+
+    def fake_parse(workspace, config):
+        workspace.parsed_papers["p1"] = {
+            "sections": [
+                {
+                    "name": "Results",
+                    "text": "Method improves sensitivity and discusses limitation.",
+                    "evidence": {"page": 1, "parser": "fake"},
+                }
+            ],
+            "parsed": True,
+        }
+        return workspace, {"parsed_count": 1, "metadata_only_count": 0}
+
+    monkeypatch.setattr("littrace.autonomous_loop.parse_workspace_papers", fake_parse)
+
+    report = await run_autonomous_research_loop(
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
+        "请自动重规划并比较性能",
+        workspace,
+        auto_replan=True,
+    )
+
+    assert "parse_full_text_with_paddleocr" in report.executed_replan_actions
+    assert workspace.parsed_papers

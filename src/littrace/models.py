@@ -70,9 +70,11 @@ class PaperSearchRequest(BaseModel):
     topic: str
     discipline: str = "materials chemistry"
     year_min: int | None = 2023
-    limit: int = 20
+    limit: int = 40
+    min_relevant_results: int = 5
     wants_recent: bool = True
     live: bool | None = None
+    query_variants: list[str] = Field(default_factory=list)
 
 
 class PaperSearchResult(BaseModel):
@@ -183,6 +185,21 @@ class ResearchRunRequest(BaseModel):
     build_storyline: bool = False
     compose_document: bool = False
     autonomous_review: bool = False
+    auto_replan: bool = False
+
+
+class WorkflowTraceStep(BaseModel):
+    node: str
+    status: str
+    reason: str
+    inputs: dict[str, object] = Field(default_factory=dict)
+    outputs: dict[str, object] = Field(default_factory=dict)
+    next_node: str | None = None
+    next_reason: str | None = None
+
+
+class WorkflowTrace(BaseModel):
+    steps: list[WorkflowTraceStep] = Field(default_factory=list)
 
 
 class ResearchRunResult(BaseModel):
@@ -197,6 +214,7 @@ class ResearchRunResult(BaseModel):
     storyline: list["StorylineClaim"] | None = None
     document_report: "ResearchDocumentReport | None" = None
     autonomous_loop_report: "AutonomousResearchLoopReport | None" = None
+    workflow_trace: WorkflowTrace | None = None
 
 
 class ChatRequest(BaseModel):
@@ -216,6 +234,7 @@ class ChatResponse(BaseModel):
     download_plan: DownloadPlan | None = None
     publisher_routes: object | None = None
     comparison_matrix: "ComparisonMatrixReport | None" = None
+    workflow_trace: WorkflowTrace | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -314,6 +333,7 @@ class AgentDebateRound(BaseModel):
     passed: bool
     score: float
     replan_actions: list[str] = Field(default_factory=list)
+    executed_replan_actions: list[str] = Field(default_factory=list)
 
 
 class AutonomousResearchLoopReport(BaseModel):
@@ -323,6 +343,7 @@ class AutonomousResearchLoopReport(BaseModel):
     passed: bool
     score: float
     replan_actions: list[str] = Field(default_factory=list)
+    executed_replan_actions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from littrace.config import PaddleOCRParserConfig
@@ -18,6 +20,7 @@ class PaddleOCRTool:
     def __init__(self, config: PaddleOCRParserConfig | None = None):
         self.config = config or PaddleOCRParserConfig()
         self._ocr_engine: Any | None = None
+        self.progress_callback: Any | None = None
 
     def parse_pdf(
         self,
@@ -139,6 +142,7 @@ class PaddleOCRTool:
                 batch_results.append(self.parse_image(image_path, mode, preferred_engines))
 
         for (page_number, _), parsed_page in zip(page_images, batch_results, strict=False):
+            self._emit_progress(page_number, len(page_images), parsed_page)
             reports.extend(parsed_page.parser_reports)
             for section in parsed_page.sections:
                 section = dict(section)
@@ -151,12 +155,33 @@ class PaddleOCRTool:
                 sections.append(section)
         return sections, reports
 
+    def _emit_progress(
+        self,
+        page_number: int,
+        total_pages: int,
+        parsed_page: ParsedPaper,
+    ) -> None:
+        if not self.progress_callback:
+            return
+        event = {
+            "parser": self.name,
+            "page": page_number,
+            "total_pages": total_pages,
+            "parsed": parsed_page.parsed,
+            "section_count": len(parsed_page.sections),
+            "error": parsed_page.error,
+        }
+        self.progress_callback(event)
+
     def parse_images_batch(
         self,
         image_paths: list[Path],
         mode: OCRMode = OCRMode.ACCURATE,
         preferred_engines: list[str] | None = None,
     ) -> list[ParsedPaper]:
+        if self.config.ocr_page_workers > 1:
+            return self._parse_images_parallel(image_paths, mode, preferred_engines)
+
         valid_paths = [path for path in image_paths if path.suffix.lower() in IMAGE_SUFFIXES]
         if len(valid_paths) != len(image_paths):
             return [self.parse_image(path, mode, preferred_engines) for path in image_paths]
@@ -172,22 +197,41 @@ class PaddleOCRTool:
 
         parsed_pages: list[ParsedPaper] = []
         for batch in _chunks(image_paths, max(self.config.ocr_batch_size, 1)):
-            raw_results = ocr.predict(
-                [str(path) for path in batch],
-                use_textline_orientation=self.config.use_angle_cls,
-            )
-            raw_pages = _align_batch_results(raw_results, len(batch))
-            for image_path, raw_page in zip(batch, raw_pages, strict=False):
-                parsed_pages.append(
-                    _parsed_paper_from_lines(
-                        image_path,
-                        normalize_paddleocr_result(raw_page),
-                        mode,
-                        preferred_engines,
-                        self.name,
-                        batched=True,
-                    )
+            cached_pages: list[ParsedPaper | None] = [
+                self._read_cached_page(path, mode, preferred_engines, batched=True) for path in batch
+            ]
+            missing = [
+                (index, path)
+                for index, (path, cached) in enumerate(zip(batch, cached_pages, strict=False))
+                if cached is None
+            ]
+            raw_pages_by_index: dict[int, Any] = {}
+            if missing:
+                raw_results = ocr.predict(
+                    [str(path) for _, path in missing],
+                    use_textline_orientation=self.config.use_angle_cls,
                 )
+                raw_pages = _align_batch_results(raw_results, len(missing))
+                raw_pages_by_index = {
+                    index: raw_page for (index, _), raw_page in zip(missing, raw_pages, strict=False)
+                }
+            for index, image_path in enumerate(batch):
+                cached = cached_pages[index]
+                if cached is not None:
+                    parsed_pages.append(cached)
+                    continue
+                raw_page = raw_pages_by_index.get(index)
+                lines = normalize_paddleocr_result(raw_page)
+                parsed_page = _parsed_paper_from_lines(
+                    image_path,
+                    lines,
+                    mode,
+                    preferred_engines,
+                    self.name,
+                    batched=True,
+                )
+                self._write_cached_page(image_path, mode, preferred_engines, parsed_page)
+                parsed_pages.append(parsed_page)
         return parsed_pages
 
     def parse_image(
@@ -226,6 +270,9 @@ class PaddleOCRTool:
             )
 
         try:
+            cached = self._read_cached_page(image_path, mode, preferred_engines, batched=False)
+            if cached is not None:
+                return cached
             from paddleocr import PaddleOCR
         except ImportError:
             return ParsedPaper(
@@ -252,7 +299,7 @@ class PaddleOCRTool:
             else:
                 raw_result = ocr.ocr(str(image_path), cls=self.config.use_angle_cls)
             lines = normalize_paddleocr_result(raw_result)
-            return _parsed_paper_from_lines(
+            parsed = _parsed_paper_from_lines(
                 image_path,
                 lines,
                 mode,
@@ -260,6 +307,8 @@ class PaddleOCRTool:
                 self.name,
                 batched=False,
             )
+            self._write_cached_page(image_path, mode, preferred_engines, parsed)
+            return parsed
         except Exception as exc:
             return ParsedPaper(
                 pdf_path=image_path,
@@ -282,6 +331,80 @@ class PaddleOCRTool:
                 lang=self.config.lang,
             )
         return self._ocr_engine
+
+    def _parse_images_parallel(
+        self,
+        image_paths: list[Path],
+        mode: OCRMode,
+        preferred_engines: list[str] | None,
+    ) -> list[ParsedPaper]:
+        workers = max(1, self.config.ocr_page_workers)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(
+                executor.map(
+                    lambda path: PaddleOCRTool(self.config).parse_image(
+                        path,
+                        mode,
+                        preferred_engines,
+                    ),
+                    image_paths,
+                )
+            )
+
+    def _cache_path(
+        self,
+        image_path: Path,
+        mode: OCRMode,
+        preferred_engines: list[str] | None,
+    ) -> Path:
+        root = self.config.cache_dir or Path(".littrace-cache") / "paddleocr"
+        digest = hashlib.sha256()
+        digest.update(image_path.read_bytes())
+        digest.update(str(mode).encode())
+        digest.update(self.config.lang.encode())
+        digest.update(str(self.config.use_angle_cls).encode())
+        digest.update(",".join(preferred_engines or []).encode())
+        return root / f"{digest.hexdigest()}.json"
+
+    def _read_cached_page(
+        self,
+        image_path: Path,
+        mode: OCRMode,
+        preferred_engines: list[str] | None,
+        batched: bool,
+    ) -> ParsedPaper | None:
+        if not self.config.cache_enabled or not image_path.exists():
+            return None
+        path = self._cache_path(image_path, mode, preferred_engines)
+        if not path.exists():
+            return None
+        try:
+            parsed = ParsedPaper.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        parsed.parser_reports.append(
+            {
+                "parser": self.name,
+                "mode": mode,
+                "preferred_engines": preferred_engines or [],
+                "cache_hit": True,
+                "batched": batched,
+            }
+        )
+        return parsed
+
+    def _write_cached_page(
+        self,
+        image_path: Path,
+        mode: OCRMode,
+        preferred_engines: list[str] | None,
+        parsed: ParsedPaper,
+    ) -> None:
+        if not self.config.cache_enabled or not image_path.exists() or not parsed.parsed:
+            return
+        path = self._cache_path(image_path, mode, preferred_engines)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(parsed.model_dump_json(), encoding="utf-8")
 
 
 def normalize_paddleocr_result(raw_result: Any) -> list[dict[str, object]]:

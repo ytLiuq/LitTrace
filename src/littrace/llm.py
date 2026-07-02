@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import asyncio
 
 import httpx
 
@@ -32,20 +33,7 @@ async def chat_completion(
     messages.append({"role": "user", "content": user_message})
 
     try:
-        async with httpx.AsyncClient(timeout=config.llm.request_timeout_seconds) as client:
-            response = await client.post(
-                f"{config.llm.base_url.rstrip('/')}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {config.llm.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": config.llm.model,
-                    "messages": messages,
-                    "temperature": config.llm.temperature,
-                },
-            )
-            response.raise_for_status()
+        response = await _post_chat_completion(config, messages)
     except Exception as exc:
         return LLMReply(text="", used_llm=False, error=f"{exc.__class__.__name__}: {exc}")
 
@@ -59,6 +47,39 @@ async def chat_completion(
     if not content:
         return LLMReply(text="", used_llm=False, error="empty_llm_response")
     return LLMReply(text=content, used_llm=True)
+
+
+async def _post_chat_completion(config: LitTraceConfig, messages: list[dict[str, str]]) -> httpx.Response:
+    retry_statuses = {429, 500, 502, 503, 504}
+    last_exc: Exception | None = None
+    async with httpx.AsyncClient(timeout=config.llm.request_timeout_seconds) as client:
+        for attempt in range(1, 4):
+            try:
+                response = await client.post(
+                    f"{config.llm.base_url.rstrip('/')}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {config.llm.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": config.llm.model,
+                        "messages": messages,
+                        "temperature": config.llm.temperature,
+                    },
+                )
+                if response.status_code not in retry_statuses:
+                    response.raise_for_status()
+                    return response
+                if attempt == 3:
+                    response.raise_for_status()
+            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                last_exc = exc
+                if attempt == 3:
+                    raise
+            await asyncio.sleep(0.8 * attempt)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("LLM retry loop exited unexpectedly")
 
 
 def research_assistant_system_prompt() -> str:

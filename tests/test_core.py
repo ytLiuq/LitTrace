@@ -174,6 +174,30 @@ def test_filter_search_results_removes_future_and_irrelevant_sensor_noise():
     assert [paper.paper_id for paper in papers] == ["target"]
 
 
+def test_filter_search_results_keeps_carbon_pdms_drift_match_from_chinese_query():
+    papers = filter_search_results(
+        [
+            PaperMetadata(
+                paper_id="target",
+                title="Carbon Black/PDMS Flexible Pressure Sensor with Reduced Long-Term Drift",
+                year=2024,
+                journal="ACS Applied Materials & Interfaces",
+                publisher="American Chemical Society",
+                doi="10.1021/acsami.example",
+            ),
+            PaperMetadata(
+                paper_id="noise",
+                title="Generic wireless pressure monitoring network",
+                year=2024,
+                journal="Sensors",
+            ),
+        ],
+        PaperSearchRequest(topic="碳基PDMS柔性薄膜传感器长时间受压漂移", year_min=None),
+    )
+
+    assert [paper.paper_id for paper in papers] == ["target"]
+
+
 def test_filter_search_results_removes_crossref_review_noise():
     papers = filter_search_results(
         [

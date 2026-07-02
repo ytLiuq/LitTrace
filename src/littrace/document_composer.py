@@ -29,6 +29,7 @@ def build_research_document_report(
     storyline_harness = check_storyline_claims(storyline)
     matrix = build_comparison_matrices(workspace)
     artifacts = _structured_artifacts(workspace)
+    autonomous_review = _autonomous_review_summary(workspace)
     quality = build_quality_report(config, workspace)
     doc_title = title or _infer_title(workspace)
     warnings = [
@@ -45,6 +46,7 @@ def build_research_document_report(
         _storyline_section(storyline),
         _matrix_section(matrix),
         _artifact_section(artifacts),
+        autonomous_review,
         _limitations_section(quality.metrics, warnings),
         _quality_section(quality.metrics),
         _references_section(citations),
@@ -215,6 +217,47 @@ def _artifact_section(artifacts: list[StructuredArtifact]) -> ResearchDocumentSe
         title="图表与公式证据",
         body="\n".join(lines),
         evidence=evidence,
+    )
+
+
+def _autonomous_review_summary(workspace: LiteratureWorkspace) -> ResearchDocumentSection:
+    raw = workspace.context.filters.get("autonomous_loop_report")
+    if not isinstance(raw, dict):
+        return ResearchDocumentSection(
+            title="多 Agent 复核与修订",
+            body="当前会话尚未运行 Autonomous Review Council；建议在最终报告前运行自动审稿/反驳/修订循环。",
+        )
+    rounds = raw.get("rounds") or []
+    lines = [
+        f"- Passed: {raw.get('passed')}",
+        f"- Score: {raw.get('score')}",
+    ]
+    actions = raw.get("replan_actions") or []
+    executed = raw.get("executed_replan_actions") or []
+    if actions:
+        lines.append(f"- Replan actions: {', '.join(str(item) for item in actions)}")
+    if executed:
+        lines.append(f"- Executed actions: {', '.join(str(item) for item in executed)}")
+    for item in rounds[:3]:
+        if not isinstance(item, dict):
+            continue
+        critiques = item.get("critiques") or []
+        lines.append(f"### Round {item.get('round_index')}")
+        lines.append(f"- Round score: {item.get('score')}; passed: {item.get('passed')}")
+        for critique in critiques[:5]:
+            if not isinstance(critique, dict):
+                continue
+            reviewer = critique.get("reviewer") or "Reviewer"
+            severity = critique.get("severity") or "info"
+            finding = str(critique.get("finding") or "")[:220]
+            lines.append(f"- **{reviewer} [{severity}]**: {finding}")
+    final_answer = str(raw.get("final_answer") or "").strip()
+    if final_answer:
+        lines.append("### Revised answer excerpt")
+        lines.append(final_answer[:1000])
+    return ResearchDocumentSection(
+        title="多 Agent 复核与修订",
+        body="\n".join(lines),
     )
 
 

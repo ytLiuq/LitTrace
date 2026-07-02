@@ -37,6 +37,8 @@ where = ["src"]
 
 [project.scripts]
 littrace = "littrace.cli:main"
+littrace-tui = "littrace.tui:main"
+littrace-window = "littrace.window:main"
 
 [tool.ruff]
 line-length = 100

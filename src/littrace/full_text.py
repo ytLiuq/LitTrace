@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 
 from littrace.config import LitTraceConfig
@@ -204,10 +206,14 @@ async def _crossref_full_text_candidates(
     if not paper.doi:
         return [], warnings
     try:
-        response = await client.get(f"https://api.crossref.org/works/{paper.doi}")
+        response = await _request_with_retry(
+            client,
+            "GET",
+            f"https://api.crossref.org/works/{paper.doi}",
+        )
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        return [], [f"crossref_full_text: {exc.__class__.__name__}: {exc}"]
+        return [], [f"crossref_full_text:{_failure_class(exc)}: {exc.__class__.__name__}: {exc}"]
     item = response.json().get("message", {})
     candidates: list[FullTextCandidate] = []
     resource_url = (item.get("resource") or {}).get("primary", {}).get("URL")
@@ -255,7 +261,9 @@ async def _unpaywall_candidates(
     if not paper.doi:
         return [], warnings
     try:
-        response = await client.get(
+        response = await _request_with_retry(
+            client,
+            "GET",
             f"https://api.unpaywall.org/v2/{paper.doi}",
             params={"email": email},
         )
@@ -263,7 +271,7 @@ async def _unpaywall_candidates(
             return [], warnings
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        return [], [f"unpaywall: {exc.__class__.__name__}: {exc}"]
+        return [], [f"unpaywall:{_failure_class(exc)}: {exc.__class__.__name__}: {exc}"]
     data = response.json()
     locations = []
     if data.get("best_oa_location"):
@@ -317,9 +325,11 @@ async def verify_full_text_candidates(
             verified.append(await _verify_candidate(client, candidate))
         except httpx.HTTPError as exc:
             update = candidate.model_dump()
-            update["note"] = f"verify_failed: {exc.__class__.__name__}"
+            update["note"] = f"verify_failed:{_failure_class(exc)}:{exc.__class__.__name__}"
             verified.append(FullTextCandidate.model_validate(update))
-            warnings.append(f"verify_candidate: {exc.__class__.__name__}: {candidate.url}")
+            warnings.append(
+                f"verify_candidate:{_failure_class(exc)}: {exc.__class__.__name__}: {candidate.url}"
+            )
     return verified, warnings
 
 
@@ -327,9 +337,19 @@ async def _verify_candidate(
     client: httpx.AsyncClient,
     candidate: FullTextCandidate,
 ) -> FullTextCandidate:
-    response = await client.head(str(candidate.url), follow_redirects=True)
+    response = await _request_with_retry(
+        client,
+        "HEAD",
+        str(candidate.url),
+        follow_redirects=True,
+    )
     if response.status_code == 405:
-        response = await client.get(str(candidate.url), follow_redirects=True)
+        response = await _request_with_retry(
+            client,
+            "GET",
+            str(candidate.url),
+            follow_redirects=True,
+        )
     content_type = response.headers.get("content-type", "")
     update = candidate.model_dump()
     update["status_code"] = response.status_code
@@ -352,7 +372,52 @@ async def _verify_candidate(
         else:
             update["requires_login"] = True
             update["access_type"] = AccessType.REQUIRES_LOGIN
+            update["note"] = "http_auth_or_forbidden"
+    elif response.status_code in {429, 500, 502, 503, 504}:
+        update["note"] = f"transient_http_{response.status_code}"
     return FullTextCandidate.model_validate(update)
+
+
+async def _request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    max_attempts: int = 3,
+    **kwargs,
+) -> httpx.Response:
+    last_exc: httpx.HTTPError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await client.request(method, url, **kwargs)
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < max_attempts:
+                await asyncio.sleep(0.2 * attempt)
+                continue
+            return response
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_exc = exc
+            if attempt < max_attempts:
+                await asyncio.sleep(0.2 * attempt)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    return await client.request(method, url, **kwargs)
+
+
+def _failure_class(exc: httpx.HTTPError) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in {429, 500, 502, 503, 504}:
+            return "transient_http"
+        if status in {401, 402, 403}:
+            return "auth_or_forbidden"
+        if status == 404:
+            return "not_found"
+    if isinstance(exc, httpx.TransportError):
+        return "transport"
+    return "http"
 
 
 def _build_report(

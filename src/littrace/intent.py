@@ -14,6 +14,8 @@ class ChatIntent:
     show_context: bool | None = None
     select_all_downloads: bool = False
     clear_download_selection: bool = False
+    auto_replan: bool = False
+    parse_strategy: str | None = None
     select_indices: list[int] = field(default_factory=list)
     deselect_indices: list[int] = field(default_factory=list)
 
@@ -34,11 +36,31 @@ def parse_chat_intent(message: str) -> ChatIntent:
     lowered = message.lower()
     intent = ChatIntent()
 
-    if any(token in lowered for token in ["检索", "搜索", "查找", "search", "papers"]):
+    if any(
+        token in lowered
+        for token in [
+            "检索",
+            "搜索",
+            "查找",
+            "调研",
+            "了解",
+            "研究一下",
+            "找一些",
+            "找几篇",
+            "有哪些论文",
+            "有什么文献",
+            "相关工作",
+            "文献调研",
+            "literature",
+            "survey",
+            "search",
+            "papers",
+        ]
+    ):
         intent.actions.append("search")
-    if any(token in lowered for token in ["下载", "download"]):
+    if any(token in lowered for token in ["下载", "保存", "存到本地", "download"]):
         intent.actions.append("download")
-    if any(token in lowered for token in ["选择", "选中", "select"]):
+    if any(token in lowered for token in ["选择", "选中", "勾选", "select"]):
         intent.actions.append("select_downloads")
     if any(token in lowered for token in ["取消选择", "取消下载", "deselect", "unselect"]):
         intent.actions.append("deselect_downloads")
@@ -52,10 +74,39 @@ def parse_chat_intent(message: str) -> ChatIntent:
             intent.actions.append("deselect_downloads")
     if any(token in lowered for token in ["解析", "全文", "ocr", "parse"]):
         intent.actions.append("parse")
-    if any(token in lowered for token in ["表格", "性能", "对比", "matrix", "table"]):
+    if any(token in lowered for token in ["只看文字", "文字层", "不要ocr", "不ocr", "text only", "text-only"]):
+        intent.parse_strategy = "text_only"
+        if "parse" not in intent.actions:
+            intent.actions.append("parse")
+    elif any(token in lowered for token in ["使用ocr", "用ocr", "强制ocr", "ocr解析", "force ocr"]):
+        intent.parse_strategy = "ocr"
+        if "parse" not in intent.actions:
+            intent.actions.append("parse")
+    if any(token in lowered for token in ["表格", "性能", "对比", "横向比较", "指标", "benchmark", "matrix", "table"]):
         intent.actions.append("table")
-    if any(token in lowered for token in ["故事", "脉络", "发展", "storyline", "narrative"]):
+    if any(
+        token in lowered
+        for token in [
+            "故事",
+            "脉络",
+            "发展",
+            "主要路线",
+            "研究路线",
+            "技术路线",
+            "路线",
+            "方向",
+            "演进",
+            "来龙去脉",
+            "前后关系",
+            "storyline",
+            "narrative",
+            "evolution",
+        ]
+    ):
         intent.actions.append("storyline")
+    if "总结" in lowered and any(token in lowered for token in ["路线", "方向", "脉络", "这些论文", "这些文献"]):
+        if "storyline" not in intent.actions:
+            intent.actions.append("storyline")
     if any(token in lowered for token in ["报告", "文档", "综述", "research report", "document", "brief"]):
         intent.actions.append("document")
     if any(
@@ -72,6 +123,10 @@ def parse_chat_intent(message: str) -> ChatIntent:
         ]
     ):
         intent.actions.append("autonomous_review")
+    if any(token in lowered for token in ["自动重规划", "自动补救", "自动优化", "auto replan"]):
+        intent.auto_replan = True
+        if "autonomous_review" not in intent.actions:
+            intent.actions.append("autonomous_review")
     if any(token in lowered for token in ["当前文献", "参考了哪些", "context"]):
         intent.actions.append("list_context")
     if any(token in lowered for token in ["agent状态", "agent 进度", "agents status", "agent status"]):
@@ -107,15 +162,28 @@ def parse_chat_intent(message: str) -> ChatIntent:
 
 def topic_from_message(message: str) -> str:
     cleaned = re.sub(
-        r"(请|帮我|please|search|检索|搜索|查找|最新|论文|文献|papers?|articles?|只保留|排除|生成|先别下载|不要下载|不下载)",
+        r"(我想|一下|请|帮我|please|search|检索|搜索|查找|调研|了解|研究一下|相关|最新|论文|文献|papers?|articles?|只保留|排除|生成|先别下载|不要下载|不下载)",
         " ",
         message,
         flags=re.IGNORECASE,
     )
+    cleaned = re.sub(r"(详细|深入|系统|研究|调研|帮我|一下)", " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"(20\d{2})\s*(年)?(后|以后|之后|以来|起)?", " ", cleaned)
     for alias in JOURNAL_ALIASES:
         cleaned = re.sub(re.escape(alias), " ", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ：:，,。.")
+    cleaned = re.sub(r"(的|关于|有关)$", "", cleaned).strip(" ：:，,。.")
+    cleaned = re.sub(r"^[的和与及，,、\s]+|[的和与及，,、\s]+$", "", cleaned).strip(" ：:，,。.")
+    if not cleaned or cleaned in {"表格", "性能", "对比", "性能对比表"}:
+        fallback = re.sub(
+            r"(请|帮我|please|search|检索|搜索|查找|生成|先别下载|不要下载|不下载|表格|性能|对比)",
+            " ",
+            message,
+            flags=re.IGNORECASE,
+        )
+        fallback = re.sub(r"(20\d{2})\s*(年)?(后|以后|之后|以来|起)?", " ", fallback)
+        fallback = re.sub(r"\s+", " ", fallback).strip(" ：:，,。.")
+        return fallback or message.strip()
     return cleaned or message.strip()
 
 

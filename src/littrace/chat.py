@@ -9,15 +9,16 @@ from littrace.config import LitTraceConfig
 from littrace.context import apply_context_update
 from littrace.document_composer import build_research_document_report
 from littrace.intent import ChatIntent, parse_chat_intent
+from littrace.intent_llm import IntentParseError, parse_chat_intent_semantic
 from littrace.models import (
     ChatRequest,
     ChatResponse,
     ContextUpdate,
     LiteratureWorkspace,
     PaperSearchRequest,
+    WorkflowTraceStep,
 )
 from littrace.parsing import parse_workspace_papers
-from littrace.publisher_connectors import build_publisher_route_report
 from littrace.research_writer import (
     fallback_evidence_answer,
     write_evidence_grounded_answer,
@@ -25,7 +26,11 @@ from littrace.research_writer import (
 )
 from littrace.storyline import build_storyline_from_workspace
 from littrace.tables import build_comparison_matrices, extract_performance_cells
-from littrace.workflow import run_research_graph, run_search_preview
+from littrace.workflow import run_research_graph
+from littrace.search import build_query_variants
+
+
+MIN_ANALYSIS_PAPERS = 5
 
 
 async def handle_chat(
@@ -34,7 +39,22 @@ async def handle_chat(
     config: LitTraceConfig,
 ) -> tuple[ChatResponse, LiteratureWorkspace]:
     message = request.message.strip()
-    intent = parse_chat_intent(message)
+    try:
+        intent = await parse_chat_intent_semantic(message, config)
+    except IntentParseError as exc:
+        return (
+            ChatResponse(
+                reply=(
+                    f"{exc}\n\n"
+                    "我没有继续执行，也没有回退到关键词规则。请检查 .env.local/config.yaml "
+                    "里的 LLM 配置，或显式关闭 llm.intent_parser_enabled。"
+                ),
+                action="intent_parse_error",
+                workspace=workspace,
+                warnings=[str(exc)],
+            ),
+            workspace,
+        )
 
     if "show_context" in intent.actions:
         workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=True))
@@ -79,6 +99,30 @@ async def handle_chat(
 
     if _should_run_composite(intent):
         return await _run_composite_intent(intent, request, workspace, config)
+
+    if _is_analysis_request(message) and _workspace_is_mock(workspace):
+        return (
+            ChatResponse(
+                reply=_mock_context_refusal(),
+                action="blocked_mock_context",
+                workspace=workspace,
+                citations=[],
+                warnings=["当前上下文来自 mock/开发样例，已禁止生成研究结论。"],
+            ),
+            workspace,
+        )
+
+    if _is_analysis_request(message) and not _workspace_has_real_minimum_evidence(workspace):
+        return (
+            ChatResponse(
+                reply=_insufficient_real_evidence_reply(workspace),
+                action="insufficient_real_evidence",
+                workspace=workspace,
+                citations=_active_citations(workspace),
+                warnings=[f"真实相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已拒绝生成分析型结论。"],
+            ),
+            workspace,
+        )
 
     llm_reply = await write_evidence_grounded_answer(config, message, workspace)
     if llm_reply.used_llm:
@@ -133,32 +177,136 @@ async def _run_composite_intent(
     matrix = None
     research_result = None
     publisher_routes = None
+    has_minimum_evidence = True
 
     if "search" in intent.actions:
-        workspace = await run_search_preview(
+        search_year_min = intent.year_min or config.literature_context.default_year_min
+        topic = intent.topic or request.message
+        query_variants = build_query_variants(topic)
+        research_result = await run_research_graph(
             PaperSearchRequest(
-                topic=intent.topic or request.message,
-                year_min=intent.year_min or config.literature_context.default_year_min,
+                topic=topic,
+                year_min=search_year_min,
+                limit=40,
                 live=request.live,
+                min_relevant_results=MIN_ANALYSIS_PAPERS,
+                query_variants=query_variants,
             ),
             config,
+            audit_citations_enabled=False,
+            plan_downloads_enabled=False,
+            route_publishers_enabled=True,
+            parse_full_text_enabled=False,
+            extract_tables_enabled=False,
+            build_storyline_enabled=False,
+            compose_document_enabled=False,
+            autonomous_review_enabled=False,
         )
+        workspace = research_result.workspace
         workspace = _apply_literature_filters(workspace, intent)
-        replies.append(
-            f"已围绕“{intent.topic}”检索并更新上下文，当前保留 {len(workspace.context.active_papers)} 篇文献。"
+        expanded_year_range = False
+        if len(workspace.context.active_papers) < MIN_ANALYSIS_PAPERS and search_year_min is not None:
+            before_expand_count = len(workspace.context.active_papers)
+            expanded_year_range = True
+            _append_chat_trace_step(
+                research_result,
+                node="evidence_gate",
+                status="expanded",
+                reason=(
+                    f"最近年份范围内只找到 {before_expand_count} 篇，少于最低分析门槛 "
+                    f"{MIN_ANALYSIS_PAPERS} 篇，因此扩大检索年限。"
+                ),
+                inputs={"year_min": search_year_min, "paper_count": before_expand_count},
+                outputs={"retry_year_min": None},
+            )
+            pre_retry_steps = (
+                list(research_result.workflow_trace.steps)
+                if research_result.workflow_trace is not None
+                else []
+            )
+            research_result = await run_research_graph(
+                PaperSearchRequest(
+                    topic=topic,
+                    year_min=None,
+                    limit=40,
+                    live=request.live,
+                    min_relevant_results=MIN_ANALYSIS_PAPERS,
+                    query_variants=query_variants,
+                ),
+                config,
+                audit_citations_enabled=False,
+                plan_downloads_enabled=False,
+                route_publishers_enabled=True,
+                parse_full_text_enabled=False,
+                extract_tables_enabled=False,
+                build_storyline_enabled=False,
+                compose_document_enabled=False,
+                autonomous_review_enabled=False,
+            )
+            if research_result.workflow_trace is not None and pre_retry_steps:
+                research_result.workflow_trace.steps = [
+                    *pre_retry_steps,
+                    *research_result.workflow_trace.steps,
+                ]
+            workspace = research_result.workspace
+            if intent.journals:
+                expanded_intent = ChatIntent(journals=intent.journals)
+                workspace = _apply_literature_filters(workspace, expanded_intent)
+            workspace.context.filters["expanded_year_range_from"] = search_year_min
+        _prepend_intent_trace_step(
+            research_result,
+            topic=topic,
+            intent=intent,
+            live=request.live if request.live is not None else config.api.enable_live_search,
+            query_variant_count=len(query_variants),
         )
-        publisher_routes = build_publisher_route_report(_active_papers(workspace)).model_dump()
+        search_mode = workspace.context.filters.get("search_mode")
+        is_real_search = search_mode == "live"
+        has_minimum_evidence = (
+            is_real_search and len(workspace.context.active_papers) >= MIN_ANALYSIS_PAPERS
+        )
+        _append_chat_trace_step(
+            research_result,
+            node="minimum_evidence_gate",
+            status="passed" if has_minimum_evidence else "blocked",
+            reason=(
+                f"当前上下文有 {len(workspace.context.active_papers)} 篇候选文献；"
+                f"检索模式为 {search_mode or 'unknown'}；最低分析门槛要求 "
+                f"{MIN_ANALYSIS_PAPERS} 篇真实检索文献。"
+            ),
+            inputs={"minimum_required": MIN_ANALYSIS_PAPERS},
+            outputs={
+                "paper_count": len(workspace.context.active_papers),
+                "search_mode": search_mode,
+                "real_search": is_real_search,
+            },
+        )
+        _append_query_expansion_trace(research_result, intent.topic or request.message)
+        _append_search_diagnostics_trace(research_result, workspace)
+        replies.append(
+            _format_search_result_reply(
+                intent.topic or request.message,
+                workspace,
+                expanded_year_range=expanded_year_range,
+                original_year_min=search_year_min,
+            )
+        )
+        publisher_routes = research_result.publisher_routes
         action = "search"
 
     if "parse" in intent.actions:
-        workspace, report = parse_workspace_papers(workspace, config)
+        parse_config = config
+        if intent.parse_strategy:
+            parse_config = config.model_copy(deep=True)
+            parse_config.parsing.parse_strategy = intent.parse_strategy
+        workspace, report = parse_workspace_papers(workspace, parse_config)
         replies.append(
             f"已尝试解析全文：解析 {report['parsed_count']} 篇，metadata-only {report['metadata_only_count']} 篇。"
         )
         warnings.append(str(report))
         action = "parse_full_text" if action == "composite" else action
 
-    if "table" in intent.actions:
+    if "table" in intent.actions and has_minimum_evidence:
         workspace, harness = extract_performance_cells(workspace)
         matrix = build_comparison_matrices(workspace)
         replies.append(
@@ -166,8 +314,13 @@ async def _run_composite_intent(
         )
         warnings.extend([*harness.errors, *harness.warnings, *matrix.warnings])
         action = "build_table" if action == "composite" else action
+    elif "table" in intent.actions and not has_minimum_evidence:
+        warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过性能对比表。")
 
-    if "storyline" in intent.actions:
+    if "storyline" in intent.actions and _workspace_is_mock(workspace):
+        replies.append(_mock_context_refusal())
+        warnings.append("当前上下文来自 mock/开发样例，已跳过发展脉络分析。")
+    elif "storyline" in intent.actions and has_minimum_evidence:
         storyline = build_storyline_from_workspace(workspace)
         if not storyline:
             replies.append("当前证据不足以生成真实的发展脉络。建议先检索并解析全文。")
@@ -194,8 +347,10 @@ async def _run_composite_intent(
         result.storyline = storyline
         research_result = result
         action = "build_storyline" if action == "composite" else action
+    elif "storyline" in intent.actions and not has_minimum_evidence:
+        warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过发展脉络分析。")
 
-    if "document" in intent.actions:
+    if "document" in intent.actions and has_minimum_evidence:
         report = build_research_document_report(workspace, config)
         workspace.context.filters["document_report"] = report.model_dump(mode="json")
         replies.append(
@@ -205,12 +360,15 @@ async def _run_composite_intent(
         if report.warnings:
             warnings.extend(report.warnings[:5])
         action = "compose_document" if action == "composite" else action
+    elif "document" in intent.actions and not has_minimum_evidence:
+        warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过报告生成。")
 
     if "autonomous_review" in intent.actions:
         loop_report = await run_autonomous_research_loop(
             config,
             intent.topic or request.message,
             workspace,
+            auto_replan=intent.auto_replan,
         )
         workspace.context.filters["autonomous_loop_report"] = loop_report.model_dump(mode="json")
         replies.append(
@@ -258,6 +416,60 @@ def _active_papers(workspace: LiteratureWorkspace):
 
 def _active_citations(workspace: LiteratureWorkspace):
     return citation_records_for_papers(_active_papers(workspace))
+
+
+def _workspace_is_mock(workspace: LiteratureWorkspace) -> bool:
+    if workspace.context.filters.get("search_mode") == "mock":
+        return True
+    return any((paper.doi or "").lower().find(".mock") >= 0 for paper in _active_papers(workspace))
+
+
+def _workspace_has_real_minimum_evidence(workspace: LiteratureWorkspace) -> bool:
+    return (
+        workspace.context.filters.get("search_mode") == "live"
+        and not _workspace_is_mock(workspace)
+        and len(workspace.context.active_papers) >= MIN_ANALYSIS_PAPERS
+    )
+
+
+def _is_analysis_request(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        token in lowered
+        for token in [
+            "总结",
+            "主要路线",
+            "研究路线",
+            "技术路线",
+            "脉络",
+            "发展",
+            "故事",
+            "综述",
+            "比较",
+            "分析",
+            "summarize",
+            "route",
+            "storyline",
+            "review",
+        ]
+    )
+
+
+def _mock_context_refusal() -> str:
+    return (
+        "当前文献上下文来自 mock/开发样例，不是真实联网文献。我不能基于这些内容总结研究路线或生成结论。\n\n"
+        "请先重新进行真实联网检索；当 live search 返回至少 5 篇真实相关文献后，我再按证据总结主要路线。"
+    )
+
+
+def _insufficient_real_evidence_reply(workspace: LiteratureWorkspace) -> str:
+    count = len(workspace.context.active_papers)
+    mode = workspace.context.filters.get("search_mode") or "unknown"
+    return (
+        f"当前只有 {count} 篇候选文献，检索模式为 {mode}；还没有达到 "
+        f"{MIN_ANALYSIS_PAPERS} 篇真实相关文献的分析门槛。\n\n"
+        "我先不做总结型结论。请先继续真实联网检索、扩大关键词，或解析 PDF 全文后再总结主要路线。"
+    )
 
 
 def _format_agent_status() -> str:
@@ -343,6 +555,154 @@ def _format_current_papers(workspace: LiteratureWorkspace) -> str:
         selected = "，已选下载" if paper_id in workspace.context.selected_for_download else ""
         lines.append(f"{index}. {paper.title} ({year}, {journal}{selected})")
     return "\n".join(lines)
+
+
+def _format_search_result_reply(
+    topic: str,
+    workspace: LiteratureWorkspace,
+    expanded_year_range: bool = False,
+    original_year_min: int | None = None,
+) -> str:
+    search_mode = workspace.context.filters.get("search_mode")
+    lines = [
+        f"我先按“{topic}”做了一轮文献检索，并把结果放进右侧当前文献上下文。",
+        "",
+        "当前可先看这些方向：",
+    ]
+    if search_mode == "mock":
+        lines.append("- 当前是 mock/开发样例检索，不是真实联网文献；这些结果只能用于验证流程和界面。")
+        lines.append("- 真实调研需要启用 live search 后重新检索，达到 5 篇真实文献后我再做分析型结论。")
+        return "\n".join(lines)
+    if expanded_year_range:
+        lines.insert(
+            1,
+            f"最近年份范围（{original_year_min} 年以来）没有找到足够结果，已自动扩大到不限年份。",
+        )
+        lines.insert(2, "")
+    if not workspace.context.active_papers:
+        lines.append("- 暂时没有检索到可用文献。可以换一个关键词，或打开 live search。")
+        return "\n".join(lines)
+    if len(workspace.context.active_papers) < MIN_ANALYSIS_PAPERS:
+        lines.append(
+            f"- 当前只找到 {len(workspace.context.active_papers)} 篇相关文献，少于最低分析门槛 "
+            f"{MIN_ANALYSIS_PAPERS} 篇；我先不做分析型结论。"
+        )
+        lines.append("- 常见原因：主题过窄、数据库对中文材料术语召回较弱，或相关性过滤后不足五篇。")
+        lines.append("- 我会继续优先用英文同义词和更宽材料关键词扩展检索，再达到五篇后做分析。")
+        return "\n".join(lines)
+
+    lines.append(f"- 已找到 {len(workspace.context.active_papers)} 篇真实候选文献，超过最低门槛 5 篇。")
+    lines.append("")
+    for index, paper_id in enumerate(workspace.context.active_papers, start=1):
+        paper = workspace.papers[paper_id]
+        year = paper.year or "n.d."
+        source = paper.journal or paper.publisher or "unknown source"
+        lines.append(f"{index}. {paper.title} ({year}, {source})")
+
+    lines.extend(
+        [
+            "",
+            "你可以直接继续问：",
+            "- 总结这些论文的主要路线",
+            "- 生成性能对比表",
+            "- 选择第 1、3 篇下载",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _append_chat_trace_step(
+    research_result,
+    node: str,
+    status: str,
+    reason: str,
+    inputs: dict[str, object] | None = None,
+    outputs: dict[str, object] | None = None,
+) -> None:
+    if research_result is None or research_result.workflow_trace is None:
+        return
+    research_result.workflow_trace.steps.append(
+        WorkflowTraceStep(
+            node=node,
+            status=status,
+            reason=reason,
+            inputs=inputs or {},
+            outputs=outputs or {},
+        )
+    )
+
+
+def _prepend_intent_trace_step(
+    research_result,
+    topic: str,
+    intent: ChatIntent,
+    live: bool,
+    query_variant_count: int,
+) -> None:
+    if research_result is None or research_result.workflow_trace is None:
+        return
+    step = WorkflowTraceStep(
+        node="parse_user_intent",
+        status="completed",
+        reason="拆解用户输入，提取研究主题、动作、年份限制和检索模式。",
+        inputs={"message_topic": topic},
+        outputs={
+            "topic": topic,
+            "actions": intent.actions,
+            "year_min": intent.year_min,
+            "journals": intent.journals,
+            "live_search": live,
+            "minimum_required": MIN_ANALYSIS_PAPERS,
+            "query_variant_count": query_variant_count,
+        },
+        next_node="plan_sources",
+        next_reason="意图拆解完成后进入检索源规划。",
+    )
+    research_result.workflow_trace.steps = [step, *research_result.workflow_trace.steps]
+
+
+def _append_search_diagnostics_trace(research_result, workspace: LiteratureWorkspace) -> None:
+    diagnostics = workspace.context.filters.get("search_diagnostics")
+    if research_result is None or research_result.workflow_trace is None or not isinstance(diagnostics, dict):
+        return
+    variants = diagnostics.get("query_variants") or []
+    source_counts = diagnostics.get("source_counts") or {}
+    filtered_counts = diagnostics.get("filtered_counts") or {}
+    errors = diagnostics.get("errors") or []
+    research_result.workflow_trace.steps.append(
+        WorkflowTraceStep(
+            node="query_expansion_diagnostics",
+            status="completed",
+            reason=(
+                "为避免中文窄查询漏召回，检索层已使用英文同义词和材料/器件概念扩展；"
+                "若仍不足五篇，通常是源返回少、HTTP 错误、或相关性过滤剔除了弱相关记录。"
+            ),
+            inputs={"query_variants": variants[:6]},
+            outputs={
+                "source_counts": source_counts,
+                "filtered_counts": filtered_counts,
+                "errors": errors[:5],
+            },
+        )
+    )
+
+
+def _append_query_expansion_trace(research_result, topic: str) -> None:
+    variants = build_query_variants(topic)
+    if research_result is None or research_result.workflow_trace is None or len(variants) <= 1:
+        return
+    research_result.workflow_trace.steps.append(
+        WorkflowTraceStep(
+            node="query_expansion",
+            status="completed",
+            reason=(
+                "原始中文材料主题较窄，直接投给 OpenAlex/Crossref 容易漏召回；"
+                "因此扩展为英文材料、器件、漂移和稳定性同义词后再检索。"
+            ),
+            inputs={"original_topic": topic},
+            outputs={"query_variants": variants[:6]},
+        )
+    )
 
 
 def _should_run_composite(intent: ChatIntent) -> bool:

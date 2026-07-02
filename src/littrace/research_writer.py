@@ -18,6 +18,15 @@ async def write_evidence_grounded_answer(
             used_llm=False,
             error="empty_workspace",
         )
+    if _workspace_is_mock(workspace):
+        return LLMReply(
+            text=(
+                "当前文献上下文来自 mock/开发样例，不是真实联网文献。"
+                "我不能基于这些内容总结研究路线或生成结论。请先进行真实联网检索。"
+            ),
+            used_llm=False,
+            error="mock_workspace",
+        )
 
     system_prompt = (
         "You are LitTrace Research Writer. Answer in Chinese. "
@@ -35,6 +44,11 @@ def fallback_evidence_answer(question: str, workspace: LiteratureWorkspace) -> s
     papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
     if not papers:
         return "当前还没有文献上下文。请先检索论文。"
+    if _workspace_is_mock(workspace):
+        return (
+            "当前文献上下文来自 mock/开发样例，不是真实联网文献。"
+            "我不能基于这些内容总结研究路线或生成结论。请先进行真实联网检索。"
+        )
     lines = [f"我会基于当前 {len(papers)} 篇文献回答：{question}"]
     lines.append("当前证据主要来自标题、摘要、解析片段和已抽取指标；证据不足处会保持保守。")
     lines.append("引用与访问链接：")
@@ -48,6 +62,12 @@ async def write_storyline_narrative(
     workspace: LiteratureWorkspace,
 ) -> LLMReply:
     claims = build_storyline_from_workspace(workspace)
+    if _workspace_is_mock(workspace):
+        return LLMReply(
+            text="当前文献上下文来自 mock/开发样例，不是真实联网文献。请先进行真实联网检索。",
+            used_llm=False,
+            error="mock_workspace",
+        )
     if not claims:
         return LLMReply(
             text="当前证据不足以生成真实的发展脉络。建议先解析 PDF 全文。",
@@ -101,6 +121,13 @@ def _writer_payload(question: str, workspace: LiteratureWorkspace) -> str:
     for record in citations:
         lines.append(f"- paper={record.paper_id}; citation={record.citation_text}; url={record.access_url}")
     return "\n".join(lines)
+
+
+def _workspace_is_mock(workspace: LiteratureWorkspace) -> bool:
+    if workspace.context.filters.get("search_mode") == "mock":
+        return True
+    papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
+    return any(".mock" in (paper.doi or "").lower() for paper in papers)
 
 
 def _storyline_payload(workspace: LiteratureWorkspace) -> str:

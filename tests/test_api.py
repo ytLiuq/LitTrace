@@ -1,11 +1,14 @@
 from fastapi.testclient import TestClient
 
-from littrace.config import LitTraceConfig
+from littrace.config import LLMConfig, LitTraceConfig
 from littrace.api.app import app
 
 
 def test_search_context_and_download_plan_api(monkeypatch):
-    monkeypatch.setattr("littrace.api.app.load_config", lambda: LitTraceConfig())
+    monkeypatch.setattr(
+        "littrace.api.app.load_config",
+        lambda: LitTraceConfig(llm=LLMConfig(intent_parser_enabled=False)),
+    )
     client = TestClient(app)
 
     response = client.post(
@@ -19,6 +22,8 @@ def test_search_context_and_download_plan_api(monkeypatch):
         "mxene-flexible-sensor-wiley-2026",
         "mxene-flexible-sensor-acs-2025",
         "mxene-flexible-sensor-mdpi-2024",
+        "mxene-flexible-sensor-nature-2024",
+        "mxene-flexible-sensor-rsc-2023",
     ]
 
     response = client.patch(
@@ -33,8 +38,8 @@ def test_search_context_and_download_plan_api(monkeypatch):
     response = client.post("/downloads/plan")
     assert response.status_code == 200
     plan = response.json()
-    assert plan["downloadable_count"] == 3
-    assert plan["requires_login_count"] == 2
+    assert plan["downloadable_count"] == 5
+    assert plan["requires_login_count"] == 3
     assert any(item["can_download"] for item in plan["items"])
 
     response = client.post("/full-text/resolve")
@@ -48,7 +53,7 @@ def test_search_context_and_download_plan_api(monkeypatch):
     response = client.get("/citations/context")
     assert response.status_code == 200
     citations = response.json()
-    assert len(citations) == 3
+    assert len(citations) == 5
     assert citations[0]["citation_text"]
     assert citations[0]["access_url"]
 
@@ -85,7 +90,7 @@ def test_search_context_and_download_plan_api(monkeypatch):
     response = client.get("/publishers/routes")
     assert response.status_code == 200
     publisher_routes = response.json()
-    assert len(publisher_routes["routes"]) == 3
+    assert len(publisher_routes["routes"]) == 5
     assert any(route["publisher_family"] == "acs" for route in publisher_routes["routes"])
 
     response = client.get("/publishers/search-plan", params={"topic": "MXene sensor"})
@@ -128,7 +133,7 @@ def test_search_context_and_download_plan_api(monkeypatch):
     response = client.post("/downloads/execute", json={"paper_ids": [], "dry_run": True})
     assert response.status_code == 200
     result = response.json()
-    assert result["requires_login_count"] == 2
+    assert result["requires_login_count"] == 3
     assert any(item["status"] == "planned" for item in result["items"])
 
     response = client.post(
@@ -194,3 +199,17 @@ def test_search_context_and_download_plan_api(monkeypatch):
     response = client.post(f"/sessions/{session_id}/export")
     assert response.status_code == 200
     assert "markdown" in response.json()
+
+
+def test_chat_api_reports_missing_intent_parser_key(monkeypatch):
+    monkeypatch.setattr(
+        "littrace.api.app.load_config",
+        lambda: LitTraceConfig(llm=LLMConfig(api_key=None, enabled=True, intent_parser_enabled=True)),
+    )
+    client = TestClient(app)
+
+    response = client.post("/chat", json={"message": "帮我找几篇柔性压力传感器论文"})
+
+    assert response.status_code == 200
+    assert response.json()["action"] == "intent_parse_error"
+    assert "没有配置 LLM API key" in response.json()["reply"]

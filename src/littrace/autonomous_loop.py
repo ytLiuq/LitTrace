@@ -3,6 +3,7 @@ from __future__ import annotations
 from littrace.citation_guard import guard_citations, remove_unsupported_sentences
 from littrace.config import LitTraceConfig
 from littrace.harnesses import check_performance_cells, check_storyline_claims
+from littrace.llm import chat_completion
 from littrace.models import (
     AgentCritique,
     AgentDebateRound,
@@ -12,6 +13,8 @@ from littrace.models import (
 from littrace.quality_report import build_quality_report
 from littrace.research_writer import fallback_evidence_answer, write_evidence_grounded_answer
 from littrace.storyline import build_storyline_from_workspace
+from littrace.parsing import parse_workspace_papers
+from littrace.tables import extract_performance_cells
 
 
 async def run_autonomous_research_loop(
@@ -19,6 +22,8 @@ async def run_autonomous_research_loop(
     objective: str,
     workspace: LiteratureWorkspace,
     max_rounds: int = 2,
+    enable_smart_debate: bool = True,
+    auto_replan: bool = False,
 ) -> AutonomousResearchLoopReport:
     """Run a bounded writer/reviewer/reviser/replanner loop over current evidence."""
 
@@ -38,13 +43,37 @@ async def run_autonomous_research_loop(
     final_score = 0.0
     passed = False
     aggregate_actions: list[str] = []
+    aggregate_executed_actions: list[str] = []
     aggregate_warnings: list[str] = []
 
     for round_index in range(1, max_rounds + 1):
         critiques = _review_draft(final_answer, workspace, config)
+        if enable_smart_debate:
+            critiques.extend(await _smart_debate_critiques(config, objective, final_answer, workspace))
         revised = _revise_draft(final_answer, critiques, workspace)
         score = _round_score(critiques, workspace, config)
         replan_actions = _replan_actions(critiques, workspace)
+        executed_actions: list[str] = []
+        if auto_replan and replan_actions:
+            workspace, executed_actions = _execute_safe_replan_actions(
+                config,
+                workspace,
+                replan_actions,
+            )
+            if executed_actions:
+                followup_critiques = _review_draft(revised, workspace, config)
+                critiques.extend(
+                    AgentCritique(
+                        reviewer="Replanning Agent",
+                        severity="info",
+                        finding=f"已执行自动重规划动作：{action}",
+                        suggested_fix="基于更新后的 workspace 继续下一轮复核。",
+                    )
+                    for action in executed_actions
+                )
+                critiques.extend(followup_critiques)
+                revised = _revise_draft(revised, followup_critiques, workspace)
+                score = _round_score(critiques, workspace, config)
         passed = not any(item.severity == "error" for item in critiques)
         rounds.append(
             AgentDebateRound(
@@ -55,11 +84,15 @@ async def run_autonomous_research_loop(
                 passed=passed,
                 score=score,
                 replan_actions=replan_actions,
+                executed_replan_actions=executed_actions,
             )
         )
         final_answer = revised
         final_score = score
         aggregate_actions.extend(action for action in replan_actions if action not in aggregate_actions)
+        aggregate_executed_actions.extend(
+            action for action in executed_actions if action not in aggregate_executed_actions
+        )
         aggregate_warnings.extend(item.finding for item in critiques if item.severity != "info")
         if passed:
             break
@@ -71,6 +104,7 @@ async def run_autonomous_research_loop(
         passed=passed,
         score=round(final_score, 3),
         replan_actions=aggregate_actions,
+        executed_replan_actions=aggregate_executed_actions,
         warnings=aggregate_warnings,
     )
 
@@ -176,6 +210,66 @@ def _review_draft(
     return critiques
 
 
+async def _smart_debate_critiques(
+    config: LitTraceConfig,
+    objective: str,
+    draft: str,
+    workspace: LiteratureWorkspace,
+) -> list[AgentCritique]:
+    if not config.llm.enabled or not config.llm.api_key:
+        return []
+    payload = _smart_debate_payload(objective, draft, workspace)
+    system_prompt = (
+        "You are a skeptical academic multi-agent review council. "
+        "Return concise Chinese critique bullets only. "
+        "Use the personas: Method Reviewer, Evidence Reviewer, Synthesis Reviewer. "
+        "Do not introduce new papers or facts. If evidence is insufficient, ask for replan actions."
+    )
+    reply = await chat_completion(config, system_prompt, payload, workspace=None)
+    if not reply.used_llm or not reply.text.strip():
+        return []
+    critiques: list[AgentCritique] = []
+    for line in reply.text.splitlines():
+        text = line.strip(" -\t")
+        if not text:
+            continue
+        severity = "warning"
+        lowered = text.lower()
+        if any(token in lowered for token in ["unsupported", "缺少证据", "无证据", "错误"]):
+            severity = "error"
+        critiques.append(
+            AgentCritique(
+                reviewer="LLM Debate Reviewer",
+                severity=severity,
+                finding=text,
+                suggested_fix="用当前 workspace 证据补足，或将相关结论降级为待验证假设。",
+            )
+        )
+    return critiques[:8]
+
+
+def _smart_debate_payload(
+    objective: str,
+    draft: str,
+    workspace: LiteratureWorkspace,
+) -> str:
+    lines = [f"Objective: {objective}", "", "Draft:", draft[:4000], "", "Workspace evidence:"]
+    for paper_id in workspace.context.active_papers[:12]:
+        paper = workspace.papers[paper_id]
+        lines.append(f"- paper={paper.paper_id}; title={paper.title}; year={paper.year}; doi={paper.doi}")
+    if workspace.performance_cells:
+        lines.append("Performance cells:")
+        for cell in workspace.performance_cells[:12]:
+            lines.append(f"- {cell.paper_id}: {cell.metric}={cell.value} {cell.unit or ''}; evidence={cell.evidence.snippet}")
+    if workspace.parsed_papers:
+        lines.append("Parsed snippets:")
+        for paper_id, parsed in list(workspace.parsed_papers.items())[:4]:
+            for section in (parsed.get("sections") or [])[:2]:
+                if isinstance(section, dict):
+                    lines.append(f"- {paper_id}: {str(section.get('text') or '')[:500]}")
+    return "\n".join(lines)
+
+
 def _revise_draft(
     draft: str,
     critiques: list[AgentCritique],
@@ -229,3 +323,25 @@ def _replan_actions(
     if any(item.reviewer == "Storyline Skeptic" for item in critiques):
         actions.append("rebuild_storyline_from_parsed_evidence")
     return actions
+
+
+def _execute_safe_replan_actions(
+    config: LitTraceConfig,
+    workspace: LiteratureWorkspace,
+    actions: list[str],
+) -> tuple[LiteratureWorkspace, list[str]]:
+    executed: list[str] = []
+    if "parse_full_text_with_paddleocr" in actions:
+        workspace, report = parse_workspace_papers(workspace, config)
+        if report.get("parsed_count", 0) or report.get("metadata_only_count", 0):
+            executed.append("parse_full_text_with_paddleocr")
+    if "extract_tables_and_structured_artifacts" in actions:
+        workspace, _ = extract_performance_cells(workspace)
+        executed.append("extract_tables_and_structured_artifacts")
+    if "rebuild_storyline_from_parsed_evidence" in actions:
+        claims = build_storyline_from_workspace(workspace)
+        workspace.context.filters["storyline_claim_count"] = len(claims)
+        executed.append("rebuild_storyline_from_parsed_evidence")
+    if "rerun_citation_guard_after_revision" in actions:
+        executed.append("rerun_citation_guard_after_revision")
+    return workspace, executed

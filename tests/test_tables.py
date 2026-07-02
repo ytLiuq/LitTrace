@@ -1,6 +1,7 @@
 from littrace.models import LiteratureWorkspace, PaperMetadata
 from littrace.tables import (
     build_comparison_matrices,
+    decide_artifact_extraction_need,
     extract_performance_cells,
     extract_structured_artifacts,
 )
@@ -256,3 +257,36 @@ def test_extract_structured_artifacts_with_evidence():
     assert harness.passed
     assert {artifact["artifact_type"] for artifact in artifacts} >= {"figure", "table", "equation"}
     assert all(artifact["evidence"]["page"] == 4 for artifact in artifacts)
+
+
+def test_decide_artifact_extraction_need_does_not_block_when_text_metrics_exist():
+    workspace = LiteratureWorkspace(
+        parsed_papers={
+            "p1": {
+                "sections": [
+                    {
+                        "name": "Results",
+                        "text": "The sensitivity reached 10 kPa-1.",
+                        "evidence": {"page": 1},
+                    }
+                ]
+            }
+        }
+    )
+    workspace, _ = extract_performance_cells(workspace)
+
+    report = decide_artifact_extraction_need(workspace)
+
+    assert not report.needs_artifact_extraction
+    assert report.performance_cell_count >= 1
+    assert report.recommended_parse_strategy == "text_only"
+    assert any(button["id"] == "text_only" for button in report.buttons)
+
+
+def test_decide_artifact_extraction_need_recommends_paddleocr_without_text():
+    report = decide_artifact_extraction_need(LiteratureWorkspace())
+
+    assert report.needs_artifact_extraction
+    assert "paddleocr" in report.recommended_tools
+    assert report.recommended_parse_strategy == "ocr"
+    assert any(button["id"] == "ocr" and button["recommended"] == "true" for button in report.buttons)

@@ -52,6 +52,16 @@ def test_registry_supports_paddlerocr_alias():
     assert isinstance(tool, PaddleOCRTool)
 
 
+def test_registry_strategy_can_force_text_only():
+    from littrace.ocr.docling_adapter import DoclingOCRTool
+
+    tool = build_ocr_tool(
+        LitTraceConfig(parsing=ParsingConfig(default_parser="paddleocr", parse_strategy="text_only"))
+    )
+
+    assert isinstance(tool, DoclingOCRTool)
+
+
 def test_paddleocr_pdf_parser_marks_page_evidence(monkeypatch, tmp_path):
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
@@ -124,13 +134,60 @@ def test_paddleocr_batch_predict_maps_pages(monkeypatch, tmp_path):
                 {"rec_texts": ["Second page"], "rec_scores": [0.8], "rec_boxes": [[0, 0, 1, 1]]},
             ]
 
-    tool = PaddleOCRTool(PaddleOCRParserConfig(ocr_batch_size=2))
+    tool = PaddleOCRTool(PaddleOCRParserConfig(ocr_batch_size=2, cache_enabled=False))
     monkeypatch.setattr(tool, "_get_ocr_engine", lambda cls: FakeOCR())
 
     parsed = tool.parse_images_batch([image1, image2])
 
     assert [page.sections[0]["text"] for page in parsed] == ["First page", "Second page"]
     assert parsed[0].parser_reports[0]["batched"]
+
+
+def test_paddleocr_cache_reuses_page_result(monkeypatch, tmp_path):
+    image = tmp_path / "page_1.png"
+    image.write_bytes(b"png")
+    calls = 0
+
+    class FakeOCR:
+        def predict(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return [{"rec_texts": ["Cached page"], "rec_scores": [0.9], "rec_boxes": [[0, 0, 1, 1]]}]
+
+    config = PaddleOCRParserConfig(cache_dir=tmp_path / "cache")
+    tool = PaddleOCRTool(config)
+    monkeypatch.setattr(tool, "_get_ocr_engine", lambda cls: FakeOCR())
+
+    first = tool.parse_images_batch([image])[0]
+    second = tool.parse_images_batch([image])[0]
+
+    assert first.sections[0]["text"] == "Cached page"
+    assert second.sections[0]["text"] == "Cached page"
+    assert calls == 1
+    assert second.parser_reports[-1]["cache_hit"]
+
+
+def test_paddleocr_parallel_page_workers(monkeypatch, tmp_path):
+    image1 = tmp_path / "page_1.png"
+    image2 = tmp_path / "page_2.png"
+    image1.write_bytes(b"png")
+    image2.write_bytes(b"png")
+
+    def fake_parse_image(self, image_path, mode=None, preferred_engines=None):
+        from littrace.ocr.tool import ParsedPaper
+
+        return ParsedPaper(
+            pdf_path=image_path,
+            sections=[{"name": "ocr_text", "text": image_path.stem, "evidence": {}}],
+            parsed=True,
+        )
+
+    monkeypatch.setattr(PaddleOCRTool, "parse_image", fake_parse_image)
+    tool = PaddleOCRTool(PaddleOCRParserConfig(ocr_page_workers=2))
+
+    parsed = tool.parse_images_batch([image1, image2])
+
+    assert [page.sections[0]["text"] for page in parsed] == ["page_1", "page_2"]
 
 
 def test_render_pdf_pages_to_images_requires_pypdfium2_when_missing(monkeypatch, tmp_path):

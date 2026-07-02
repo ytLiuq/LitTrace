@@ -16,6 +16,12 @@ async def test_run_research_graph_returns_workspace_audit_and_download_plan():
     assert result.citation_audit is not None
     assert result.download_plan is not None
     assert result.publisher_routes is not None
+    assert result.workflow_trace is not None
+    assert [step.node for step in result.workflow_trace.steps[:2]] == [
+        "plan_sources",
+        "search_papers",
+    ]
+    assert result.workflow_trace.steps[1].next_reason
 
 
 @pytest.mark.anyio
@@ -31,6 +37,8 @@ async def test_run_research_graph_can_skip_optional_nodes():
     assert result.citation_audit is None
     assert result.download_plan is None
     assert result.publisher_routes is not None
+    assert result.workflow_trace is not None
+    assert any(step.next_node == "route_publishers" for step in result.workflow_trace.steps)
 
 
 @pytest.mark.anyio

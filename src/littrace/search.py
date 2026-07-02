@@ -26,6 +26,7 @@ class SearchDiagnostics:
     used_fallback: bool = False
     source_counts: dict[str, int] = field(default_factory=dict)
     filtered_counts: dict[str, int] = field(default_factory=dict)
+    query_variants: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -78,6 +79,34 @@ class MockMaterialsSearchClient:
                 relevance_score=0.81,
                 recency_score=0.72,
             ),
+            PaperMetadata(
+                paper_id=f"{seed}-nature-2024",
+                title=f"{request.topic}: interface design and device reliability",
+                authors=["Nature Example"],
+                year=2024,
+                journal="Nature Communications",
+                publisher="Springer Nature",
+                doi="10.1038/s41467.mock2024001",
+                abstract="Mock Nature-style metadata for mechanism and reliability discussion.",
+                source_urls=["https://doi.org/10.1038/s41467.mock2024001"],
+                access_type=AccessType.OPEN_ACCESS,
+                relevance_score=0.79,
+                recency_score=0.7,
+            ),
+            PaperMetadata(
+                paper_id=f"{seed}-rsc-2023",
+                title=f"{request.topic}: materials chemistry route for scalable sensors",
+                authors=["RSC Example"],
+                year=2023,
+                journal="Journal of Materials Chemistry C",
+                publisher="Royal Society of Chemistry",
+                doi="10.1039/d3tc.mock001",
+                abstract="Mock RSC metadata for materials chemistry source routing.",
+                source_urls=["https://doi.org/10.1039/d3tc.mock001"],
+                access_type=AccessType.REQUIRES_LOGIN,
+                relevance_score=0.76,
+                recency_score=0.62,
+            ),
         ]
         if request.year_min is not None:
             papers = [paper for paper in papers if paper.year is None or paper.year >= request.year_min]
@@ -94,19 +123,39 @@ class LiveSearchClient:
     async def search(self, request: PaperSearchRequest) -> PaperSearchResult:
         timeout = httpx.Timeout(self.config.api.request_timeout_seconds)
         headers = {"User-Agent": self.config.api.user_agent}
+        requests = _variant_requests(request)
+        self.diagnostics.query_variants = [variant.topic for variant in requests]
+        openalex_results: list[PaperMetadata] = []
+        crossref_results: list[PaperMetadata] = []
         async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
-            openalex, crossref = await _gather_named(
-                {
-                    "openalex": self._search_openalex(client, request),
-                    "crossref": self._search_crossref(client, request),
-                },
-                self.diagnostics,
-            )
-            self.diagnostics.source_counts["openalex"] = len(openalex)
-            self.diagnostics.source_counts["crossref"] = len(crossref)
+            for index, variant_request in enumerate(requests, start=1):
+                openalex, crossref = await _gather_named(
+                    {
+                        f"openalex_variant_{index}": self._search_openalex(client, variant_request),
+                        f"crossref_variant_{index}": self._search_crossref(client, variant_request),
+                    },
+                    self.diagnostics,
+                )
+                self.diagnostics.source_counts[f"openalex_variant_{index}"] = len(openalex)
+                self.diagnostics.source_counts[f"crossref_variant_{index}"] = len(crossref)
+                openalex_results.extend(openalex)
+                crossref_results.extend(crossref)
+                relevant_so_far = filter_search_results(
+                    merge_papers([*openalex_results, *crossref_results]),
+                    request,
+                )
+                self.diagnostics.filtered_counts[f"after_variant_{index}"] = (
+                    len(openalex_results) + len(crossref_results) - len(relevant_so_far)
+                )
+                if _has_enough_relevant_results(relevant_so_far, request):
+                    break
 
-            merged = filter_search_results(merge_papers([*openalex, *crossref]), request)
-            self.diagnostics.filtered_counts["merged"] = len(openalex) + len(crossref) - len(merged)
+            self.diagnostics.source_counts["openalex"] = len(openalex_results)
+            self.diagnostics.source_counts["crossref"] = len(crossref_results)
+
+            merged_raw = merge_papers([*openalex_results, *crossref_results])
+            merged = filter_search_results(merged_raw, request)
+            self.diagnostics.filtered_counts["merged"] = len(merged_raw) - len(merged)
             if self.config.api.unpaywall_email:
                 merged = await self._enrich_unpaywall(client, merged)
                 self.diagnostics.source_counts["unpaywall_enriched"] = len(
@@ -278,6 +327,60 @@ def _crossref_attempt_params(request: PaperSearchRequest) -> list[dict[str, str 
         attempts.append(_crossref_params("query.title", compact_topic, request, rows=12))
     attempts.append(_crossref_params("query.bibliographic", compact_topic, request, rows=12))
     return attempts
+
+
+def build_query_variants(topic: str) -> list[str]:
+    normalized = re.sub(r"\s+", " ", topic).strip()
+    variants = [normalized] if normalized else []
+    lowered = normalized.lower()
+    expanded: list[str] = []
+
+    if any(token in normalized for token in ["碳基", "碳", "炭"]) or "carbon" in lowered:
+        expanded.extend(["carbon-based", "carbon black", "graphene", "carbon nanotube", "CNT"])
+    if "pdms" in lowered or "聚二甲基硅氧烷" in normalized:
+        expanded.extend(["PDMS", "polydimethylsiloxane"])
+    if any(token in normalized for token in ["柔性", "薄膜", "压敏", "压力", "传感"]):
+        expanded.extend(["flexible thin-film pressure sensor", "flexible pressure sensor"])
+    if any(token in normalized for token in ["长时间", "长期", "受压", "漂移", "稳定"]):
+        expanded.extend(["long-term pressure drift", "compression drift", "signal drift", "hysteresis", "stability"])
+    if any(token in normalized for token in ["材料", "化学"]) or expanded:
+        expanded.extend(["materials chemistry", "wearable sensor"])
+
+    if expanded:
+        variants.append(" ".join(dict.fromkeys(expanded)))
+        variants.append("carbon PDMS flexible pressure sensor long-term stability drift hysteresis")
+        variants.append("carbon black PDMS pressure sensor stability drift compression")
+        variants.append("graphene PDMS flexible pressure sensor long-term stability")
+        variants.append("CNT PDMS flexible pressure sensor drift hysteresis")
+        variants.append("PDMS flexible pressure sensor long-term stability")
+        variants.append("flexible piezoresistive pressure sensor drift stability")
+        variants.append("conductive polymer composite flexible pressure sensor hysteresis")
+        variants.append("carbon composite flexible pressure sensor durability")
+
+    return list(dict.fromkeys(variant for variant in variants if variant))[:10]
+
+
+def _variant_requests(request: PaperSearchRequest) -> list[PaperSearchRequest]:
+    variants = request.query_variants or build_query_variants(request.topic)
+    if request.topic not in variants:
+        variants.insert(0, request.topic)
+    return [
+        request.model_copy(update={"topic": variant, "query_variants": []})
+        for variant in list(dict.fromkeys(variants))[:10]
+    ]
+
+
+def _has_enough_relevant_results(
+    papers: list[PaperMetadata],
+    request: PaperSearchRequest,
+) -> bool:
+    if len(papers) < request.min_relevant_results:
+        return False
+    if len(papers) >= request.limit:
+        return True
+    if len(papers) >= min(request.limit, max(request.min_relevant_results * 4, 20)):
+        return True
+    return False
 
 
 def _crossref_params(
@@ -555,6 +658,15 @@ def _title_tokens(title: str) -> set[str]:
 
 def _query_tokens(topic: str) -> set[str]:
     tokens = _title_tokens(topic)
+    lowered = topic.lower()
+    if any(token in topic for token in ["碳基", "碳", "炭"]) or "carbon" in lowered:
+        tokens.update({"carbon", "graphene", "cnt", "nanotube", "black"})
+    if "pdms" in lowered or "聚二甲基硅氧烷" in topic:
+        tokens.update({"pdms", "polydimethylsiloxane"})
+    if any(token in topic for token in ["柔性", "薄膜", "压敏", "压力", "传感"]):
+        tokens.update({"flexible", "film", "thin", "pressure", "sensor"})
+    if any(token in topic for token in ["长时间", "长期", "受压", "漂移", "稳定"]):
+        tokens.update({"long", "term", "drift", "stability", "hysteresis", "compression"})
     if "mxene" in topic.lower():
         tokens.add("mxene")
     if "hydrogel" in topic.lower():
@@ -583,15 +695,28 @@ def _lexical_relevance_score(topic: str, paper: PaperMetadata) -> float:
         candidate.add("hydrogel")
     overlap = len(query & candidate) / max(len(query), 1)
     phrase_bonus = 0.0
+    topic_lowered = topic.lower()
     lowered = text.lower()
-    if "mxene" in topic.lower() and "mxene" in lowered:
+    if "mxene" in topic_lowered and "mxene" in lowered:
         phrase_bonus += 0.2
-    if "hydrogel" in topic.lower() and "hydrogel" in lowered:
+    if "hydrogel" in topic_lowered and "hydrogel" in lowered:
         phrase_bonus += 0.2
-    if "pressure" in topic.lower() and "pressure" in lowered:
+    if ("pressure" in topic_lowered or "压力" in topic or "压敏" in topic) and "pressure" in lowered:
         phrase_bonus += 0.1
-    if "strain" in topic.lower() and "strain" in lowered:
+    if "strain" in topic_lowered and "strain" in lowered:
         phrase_bonus += 0.1
+    if ("pdms" in topic_lowered or "聚二甲基硅氧烷" in topic) and "pdms" in lowered:
+        phrase_bonus += 0.16
+    if ("漂移" in topic or "drift" in topic_lowered) and "drift" in lowered:
+        phrase_bonus += 0.16
+    if ("稳定" in topic or "stability" in topic_lowered) and any(
+        marker in lowered for marker in ["stable", "stability"]
+    ):
+        phrase_bonus += 0.12
+    if ("碳" in topic or "carbon" in topic_lowered) and any(
+        marker in lowered for marker in ["carbon", "graphene", "nanotube", "cnt"]
+    ):
+        phrase_bonus += 0.16
     return min(1.0, overlap + phrase_bonus)
 
 

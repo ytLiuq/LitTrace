@@ -47,7 +47,22 @@ pip install -e ".[dev]"
 uvicorn littrace.api.app:app --reload
 ```
 
-For the Codex-style local agent shell:
+For the Codex-style local interactive app, start the native popup window:
+
+```bash
+littrace-window
+```
+
+The window is the recommended product surface. It opens a local desktop-style
+chat window, keeps the literature context in a hideable side panel, and uses
+separate popups for context selection, OCR/text-layer choice, and login-gated
+download handoff. It is not a web app and does not require starting FastAPI.
+
+If your Python build does not include Tk support, use a Python distribution
+with Tkinter enabled, then reinstall the editable package and run
+`littrace-window` again.
+
+For the lower-level command shell:
 
 ```bash
 littrace

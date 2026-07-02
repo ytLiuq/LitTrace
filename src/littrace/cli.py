@@ -32,6 +32,7 @@ from littrace.session import append_message, create_chat_session, save_workspace
 from littrace.storyline import render_structured_storyline_report
 from littrace.storyline_review import review_storyline
 from littrace.supplementary import attach_supplementary_file
+from littrace.tables import decide_artifact_extraction_need
 
 
 @dataclass
@@ -58,7 +59,7 @@ async def run_shell() -> None:
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /browser-login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /quality /agents /agent-flow /agent-audits /plan topic /init-config /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
+        "/dashboard /quality /agents /agent-flow /agent-audits /plan topic /init-config /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -101,6 +102,19 @@ async def run_shell() -> None:
                 print(f"- {name}: {value}")
             if report.warnings:
                 print("注意：" + "；".join(report.warnings[:8]))
+            continue
+        if message == "/ocr-choice":
+            report = decide_artifact_extraction_need(state.workspace)
+            print(f"OCR 建议: {report.recommended_parse_strategy}")
+            print(f"理由: {report.reason}")
+            print("按钮:")
+            for button in report.buttons:
+                marker = "推荐" if button.get("recommended") == "true" else "可选"
+                print(
+                    f"- [{marker}] {button['label']} -> parse_strategy={button['parse_strategy']}"
+                )
+                print(f"  {button['description']}")
+            print("你也可以直接输入：只看文字层解析PDF / 强制OCR解析")
             continue
         if message == "/agents":
             report = build_agent_portfolio_report(config, state.workspace)
