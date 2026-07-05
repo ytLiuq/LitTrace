@@ -26,6 +26,7 @@ class SearchDiagnostics:
     used_fallback: bool = False
     source_counts: dict[str, int] = field(default_factory=dict)
     filtered_counts: dict[str, int] = field(default_factory=dict)
+    ranking_counts: dict[str, int] = field(default_factory=dict)
     query_variants: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -140,14 +141,26 @@ class LiveSearchClient:
                 self.diagnostics.source_counts[f"crossref_variant_{index}"] = len(crossref)
                 openalex_results.extend(openalex)
                 crossref_results.extend(crossref)
-                relevant_so_far = filter_search_results(
-                    merge_papers([*openalex_results, *crossref_results]),
+                relevant_so_far = rank_papers(
+                    filter_search_results(
+                        merge_papers([*openalex_results, *crossref_results]),
+                        request,
+                    ),
                     request,
+                )
+                context_ready_so_far = [
+                    paper for paper in relevant_so_far if _context_relevance_score(request, paper) >= 0.45
+                ]
+                self.diagnostics.ranking_counts[f"context_ready_after_variant_{index}"] = len(
+                    context_ready_so_far
                 )
                 self.diagnostics.filtered_counts[f"after_variant_{index}"] = (
                     len(openalex_results) + len(crossref_results) - len(relevant_so_far)
                 )
-                if _has_enough_relevant_results(relevant_so_far, request):
+                self.diagnostics.source_counts[f"relevant_after_variant_{index}"] = len(
+                    relevant_so_far
+                )
+                if _has_enough_relevant_results(context_ready_so_far, request):
                     break
 
             self.diagnostics.source_counts["openalex"] = len(openalex_results)
@@ -156,12 +169,17 @@ class LiveSearchClient:
             merged_raw = merge_papers([*openalex_results, *crossref_results])
             merged = filter_search_results(merged_raw, request)
             self.diagnostics.filtered_counts["merged"] = len(merged_raw) - len(merged)
+            self.diagnostics.filtered_counts["basic_candidate_pool"] = len(merged)
             if self.config.api.unpaywall_email:
                 merged = await self._enrich_unpaywall(client, merged)
                 self.diagnostics.source_counts["unpaywall_enriched"] = len(
                     [paper for paper in merged if paper.access_type == AccessType.OPEN_ACCESS]
                 )
             merged = rank_papers(merged, request)
+            self.diagnostics.ranking_counts["ranked_candidate_pool"] = len(merged)
+            self.diagnostics.ranking_counts["context_ready"] = len(
+                [paper for paper in merged if _context_relevance_score(request, paper) >= 0.45]
+            )
             return PaperSearchResult(request=request, papers=merged[: request.limit])
 
     async def _search_openalex(
@@ -494,17 +512,27 @@ def rank_papers(papers: list[PaperMetadata], request: PaperSearchRequest) -> lis
         paper.recency_score = _recency_score(paper.year, current_year)
         citation_score = math.log1p(paper.citation_count or 0) / 10
         lexical_score = _lexical_relevance_score(request.topic, paper)
+        title_score = _title_relevance_score(request.topic, paper)
+        phrase_score = _key_phrase_score(request.topic, paper)
+        topical_score = _topical_specificity_score(request.topic, paper)
+        concept_score = _concept_group_score(request.topic, paper)
         venue_score = _materials_venue_score(paper)
+        mandatory = 1.0 if _matches_mandatory_concepts(request.topic, paper) else 0.35
         relevance = paper.relevance_score or lexical_score
         access = 1.0 if paper.access_type == AccessType.OPEN_ACCESS else 0.4
         paper.relevance_score = min(
             1.0,
-            0.24 * relevance
-            + 0.28 * lexical_score
-            + 0.2 * paper.recency_score
-            + 0.14 * venue_score
-            + 0.09 * citation_score
-            + 0.05 * access,
+            0.10 * relevance
+            + 0.19 * lexical_score
+            + 0.24 * title_score
+            + 0.18 * concept_score
+            + 0.10 * phrase_score
+            + 0.07 * topical_score
+            + 0.07 * paper.recency_score
+            + 0.05 * venue_score
+            + 0.025 * citation_score
+            + 0.01 * access
+            + 0.005 * mandatory,
         )
     return sorted(
         papers,
@@ -522,9 +550,15 @@ def filter_search_results(
     request: PaperSearchRequest,
     current_year: int = 2026,
 ) -> list[PaperMetadata]:
+    """Keep a broad candidate pool and remove only obvious noise.
+
+    Relevance-specific concept checks belong in ranking, not destructive recall filtering.
+    """
     filtered: list[PaperMetadata] = []
     for paper in papers:
         if _is_noise_paper(paper):
+            continue
+        if _is_materials_sensor_domain_noise(request.topic, paper):
             continue
         if paper.year is not None:
             if paper.year > current_year:
@@ -533,10 +567,36 @@ def filter_search_results(
                 continue
         lexical = _lexical_relevance_score(request.topic, paper)
         venue = _materials_venue_score(paper)
-        if lexical < 0.18 and venue < 0.4:
+        concept_score = _concept_group_score(request.topic, paper)
+        if lexical < 0.08 and concept_score < 0.25 and venue < 0.4:
             continue
         filtered.append(paper)
     return filtered
+
+
+def select_context_papers(
+    papers: list[PaperMetadata],
+    request: PaperSearchRequest,
+    limit: int = 15,
+) -> list[PaperMetadata]:
+    ranked = rank_papers(list(papers), request)
+    strong = [paper for paper in ranked if _context_relevance_score(request, paper) >= 0.45]
+    if len(strong) >= min(request.min_relevant_results, limit):
+        return strong[:limit]
+    return ranked[:limit]
+
+
+def _context_relevance_score(request: PaperSearchRequest, paper: PaperMetadata) -> float:
+    lexical = _lexical_relevance_score(request.topic, paper)
+    title = _title_relevance_score(request.topic, paper)
+    concept = _concept_group_score(request.topic, paper)
+    phrase = _key_phrase_score(request.topic, paper)
+    mandatory = 1.0 if _matches_mandatory_concepts(request.topic, paper) else 0.0
+    ranked = paper.relevance_score or 0.0
+    return min(
+        1.0,
+        0.24 * ranked + 0.24 * lexical + 0.22 * title + 0.18 * concept + 0.08 * phrase + 0.04 * mandatory,
+    )
 
 
 def _is_noise_paper(paper: PaperMetadata) -> bool:
@@ -545,6 +605,45 @@ def _is_noise_paper(paper: PaperMetadata) -> bool:
     if title.startswith("review for "):
         return True
     return any(marker in doi for marker in ["/review", "/decision", "/response"])
+
+
+def _is_materials_sensor_domain_noise(topic: str, paper: PaperMetadata) -> bool:
+    lowered_topic = topic.lower()
+    if not any(
+        marker in topic or marker in lowered_topic
+        for marker in ["sensor", "传感", "压力", "压敏", "柔性", "pdms", "mxene", "hydrogel"]
+    ):
+        return False
+    text = _paper_search_text(paper)
+    title = paper.title.lower()
+    material_markers = [
+        "pdms",
+        "polydimethylsiloxane",
+        "mxene",
+        "hydrogel",
+        "carbon",
+        "graphene",
+        "nanotube",
+        "cnt",
+        "polymer",
+        "composite",
+        "film",
+        "thin-film",
+        "elastomer",
+    ]
+    if any(marker in text for marker in material_markers):
+        return False
+    cross_domain_markers = [
+        "wireless sensor network",
+        "wireless pressure monitoring network",
+        "sensor networks",
+        "routing protocol",
+        "state estimator",
+        "sensor faults",
+        "fault diagnosis",
+        "infrastructures",
+    ]
+    return any(marker in title or marker in text for marker in cross_domain_markers)
 
 
 def _slug(value: str) -> str:
@@ -718,6 +817,147 @@ def _lexical_relevance_score(topic: str, paper: PaperMetadata) -> float:
     ):
         phrase_bonus += 0.16
     return min(1.0, overlap + phrase_bonus)
+
+
+def _title_relevance_score(topic: str, paper: PaperMetadata) -> float:
+    query = _query_tokens(topic)
+    if not query:
+        return 0.0
+    title = paper.title.lower()
+    title_tokens = _title_tokens(title)
+    if "mxene" in title:
+        title_tokens.add("mxene")
+    if "hydrogel" in title:
+        title_tokens.add("hydrogel")
+    overlap = len(query & title_tokens) / max(len(query), 1)
+    return min(1.0, overlap + _title_phrase_bonus(topic, title))
+
+
+def _title_phrase_bonus(topic: str, title: str) -> float:
+    topic_lowered = topic.lower()
+    bonus = 0.0
+    pairs = [
+        ("low temperature", ["low-temperature", "low temperature"]),
+        ("bending fatigue", ["bending fatigue"]),
+        ("pressure sensor", ["pressure sensor"]),
+        ("strain sensor", ["strain sensor"]),
+        ("flexible pressure", ["flexible pressure"]),
+        ("conductive hydrogel", ["conductive hydrogel"]),
+    ]
+    for query_phrase, title_phrases in pairs:
+        if query_phrase in topic_lowered and any(phrase in title for phrase in title_phrases):
+            bonus += 0.12
+    if "review" in topic_lowered and any(marker in title for marker in ["review", "progress"]):
+        bonus += 0.18
+    if "fatigue" in topic_lowered and "fatigue" in title:
+        bonus += 0.12
+    if "temperature" in topic_lowered and any(marker in title for marker in ["temperature", "low-temperature"]):
+        bonus += 0.08
+    return min(0.45, bonus)
+
+
+def _key_phrase_score(topic: str, paper: PaperMetadata) -> float:
+    topic_lowered = topic.lower()
+    text = _paper_search_text(paper)
+    phrases = []
+    if "low temperature" in topic_lowered or "low-temperature" in topic_lowered:
+        phrases.append({"low-temperature", "low temperature"})
+    if "bending" in topic_lowered:
+        phrases.append({"bending"})
+    if "fatigue" in topic_lowered:
+        phrases.append({"fatigue"})
+    if "review" in topic_lowered:
+        phrases.append({"review", "progress"})
+    if "temperature" in topic_lowered:
+        phrases.append({"temperature"})
+    if not phrases:
+        return 1.0
+    matched = sum(any(marker in text for marker in group) for group in phrases)
+    return matched / len(phrases)
+
+
+def _topical_specificity_score(topic: str, paper: PaperMetadata) -> float:
+    topic_lowered = topic.lower()
+    text = _paper_search_text(paper)
+    score = 0.0
+    if "hydrogel" in topic_lowered and "hydrogel" in text:
+        score += 0.25
+    if "conductive" in topic_lowered and any(marker in text for marker in ["conductive", "conductivity"]):
+        score += 0.2
+    if "strain" in topic_lowered and "strain" in text:
+        score += 0.2
+    if "temperature" in text and "strain" in text and ("hydrogel" in topic_lowered or "strain" in topic_lowered):
+        score += 0.16
+    if "wearable" in topic_lowered and any(
+        marker in text for marker in ["wearable", "human motion", "motion monitoring", "flexible"]
+    ):
+        score += 0.12
+    if any(marker in text for marker in ["meeting abstracts", "conference", "figshare"]):
+        score -= 0.18
+    return max(0.0, min(1.0, score))
+
+
+def _paper_search_text(paper: PaperMetadata) -> str:
+    return " ".join(
+        value
+        for value in [
+            paper.title,
+            paper.abstract or "",
+            paper.journal or "",
+            paper.publisher or "",
+        ]
+        if value
+    ).lower()
+
+
+def _concept_group_score(topic: str, paper: PaperMetadata) -> float:
+    groups = _required_concept_groups(topic)
+    if not groups:
+        return 1.0
+    text = _paper_search_text(paper)
+    matched = sum(any(marker in text for marker in markers) for markers in groups)
+    return matched / len(groups)
+
+
+def _matches_mandatory_concepts(topic: str, paper: PaperMetadata) -> bool:
+    lowered = topic.lower()
+    text = _paper_search_text(paper)
+    if ("pdms" in lowered or "聚二甲基硅氧烷" in topic) and not any(
+        marker in text for marker in ["pdms", "polydimethylsiloxane"]
+    ):
+        return False
+    if "mxene" in lowered and "mxene" not in text:
+        return False
+    if "hydrogel" in lowered and "hydrogel" not in text:
+        return False
+    return True
+
+
+def _required_concept_score(topic: str) -> float:
+    groups = _required_concept_groups(topic)
+    if not groups:
+        return 0.0
+    if len(groups) <= 2:
+        return 1.0
+    return 0.75
+
+
+def _required_concept_groups(topic: str) -> list[set[str]]:
+    lowered = topic.lower()
+    groups: list[set[str]] = []
+    if "pdms" in lowered or "聚二甲基硅氧烷" in topic:
+        groups.append({"pdms", "polydimethylsiloxane"})
+    if any(token in topic for token in ["碳基", "碳", "炭"]) or "carbon" in lowered:
+        groups.append({"carbon", "graphene", "nanotube", "cnt", "carbon black"})
+    if any(token in topic for token in ["压力", "压敏", "受压"]) or "pressure" in lowered:
+        groups.append({"pressure", "piezoresistive", "tactile"})
+    if any(token in topic for token in ["传感", "传感器"]) or "sensor" in lowered:
+        groups.append({"sensor", "sensing"})
+    if "mxene" in lowered:
+        groups.append({"mxene"})
+    if "hydrogel" in lowered:
+        groups.append({"hydrogel"})
+    return groups
 
 
 def _materials_venue_score(paper: PaperMetadata) -> float:

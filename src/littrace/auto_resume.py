@@ -31,6 +31,14 @@ class DownloadWatchResult(BaseModel):
     resume_result: AutoResumeResult
 
 
+class BrowserSessionDownloadTestResult(BaseModel):
+    planned_count: int
+    target_paths: list[str] = Field(default_factory=list)
+    download_dirs: list[str] = Field(default_factory=list)
+    watch_result: DownloadWatchResult
+    warnings: list[str] = Field(default_factory=list)
+
+
 def auto_resume_downloaded_pdfs(
     config: LitTraceConfig,
     workspace: LiteratureWorkspace,
@@ -90,6 +98,39 @@ def watch_and_resume_downloads(
                 resume_result=last_result,
             )
         time.sleep(max(poll_interval_seconds, 0.1))
+
+
+def run_browser_session_download_handoff_test(
+    config: LitTraceConfig,
+    workspace: LiteratureWorkspace,
+    session: ChatSession | None = None,
+    timeout_seconds: float = 5.0,
+    poll_interval_seconds: float = 1.0,
+) -> tuple[LiteratureWorkspace, BrowserSessionDownloadTestResult]:
+    from littrace.login_flow import browser_login_session_plans_for_workspace
+
+    plans = browser_login_session_plans_for_workspace(config, workspace)
+    workspace, watch = watch_and_resume_downloads(
+        config,
+        workspace,
+        session=session,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+    warnings: list[str] = []
+    if not plans:
+        warnings.append("No login-capable papers in current active context.")
+    if plans and not watch.completed:
+        warnings.append(
+            "No authorized PDF appeared before timeout. Keep the browser session open, finish login, and retry."
+        )
+    return workspace, BrowserSessionDownloadTestResult(
+        planned_count=len(plans),
+        target_paths=[plan.target_path for plan in plans],
+        download_dirs=sorted({plan.download_dir for plan in plans}),
+        watch_result=watch,
+        warnings=warnings,
+    )
 
 
 def auto_archive_login_downloads(

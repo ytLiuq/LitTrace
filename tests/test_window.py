@@ -75,3 +75,11 @@ def test_window_output_text_widgets_have_copy_bindings():
     assert "_copy_text_selection" in class_source
     assert "复制" in source
     assert "_readonly_text_key" in class_source
+
+
+def test_window_has_user_confirmation_popup_for_cloudflare():
+    class_source = inspect.getsource(window.LitTraceWindow)
+
+    assert "_show_user_confirmation_popup" in class_source
+    assert "请完成浏览器中的真人验证" in class_source
+    assert "requires_user_confirmation" in class_source

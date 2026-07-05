@@ -25,10 +25,13 @@ from littrace.attachments import (
 )
 from littrace.auto_resume import (
     AutoResumeResult,
+    BrowserSessionDownloadTestResult,
     DownloadWatchResult,
     auto_resume_downloaded_pdfs,
+    run_browser_session_download_handoff_test,
     watch_and_resume_downloads,
 )
+from littrace.browser import BrowserActStatus, check_browser_act
 from littrace.citations import audit_citation_links, citation_records_for_papers
 from littrace.chat import handle_chat
 from littrace.config import load_config
@@ -43,6 +46,7 @@ from littrace.login_flow import (
     BrowserLoginSessionPlan,
     LoginLaunchResult,
     browser_login_session_for_paper,
+    publisher_window_session_name_for_chat,
     launch_login_for_paper,
 )
 from littrace.models import (
@@ -87,6 +91,9 @@ from littrace.publisher_retrieval import (
     parse_publisher_article_html,
 )
 from littrace.quality_report import QualityReport, build_quality_report
+from littrace.publisher_session import PublisherSessionE2EReport, build_publisher_session_e2e_report
+from littrace.rerank_learning import RerankLearningReport, learn_rerank_policy_from_golden
+from littrace.retrieval_eval import RetrievalEvalReport, run_retrieval_golden_eval
 from littrace.research_planner import ResearchPlan, build_research_plan
 from littrace.session import (
     append_message,
@@ -119,6 +126,11 @@ WORKSPACE = LiteratureWorkspace()
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/doctor/browser", response_model=BrowserActStatus)
+def doctor_browser() -> BrowserActStatus:
+    return check_browser_act(load_config())
 
 
 @app.post("/config/init", response_model=ConfigWizardResult)
@@ -341,6 +353,7 @@ def downloads_login(paper_id: str, dry_run: bool = False) -> LoginLaunchResult:
 def downloads_browser_session(
     paper_id: str,
     browser_profile: str = "littrace-auth",
+    session_id: str | None = None,
 ) -> BrowserLoginSessionPlan:
     config = load_config()
     paper = WORKSPACE.papers[paper_id]
@@ -349,6 +362,7 @@ def downloads_browser_session(
         paper,
         WORKSPACE.full_text_reports.get(paper_id),
         browser_profile=browser_profile,
+        browser_session_name=publisher_window_session_name_for_chat(session_id),
     )
 
 
@@ -515,6 +529,42 @@ def eval_end_to_end(topic: str | None = None) -> EvalMetricReport:
 @app.get("/eval/golden", response_model=GoldenEvalReport)
 def eval_golden() -> GoldenEvalReport:
     return run_golden_eval(load_config(), WORKSPACE)
+
+
+@app.get("/eval/retrieval-golden", response_model=RetrievalEvalReport)
+async def eval_retrieval_golden(live: bool = True) -> RetrievalEvalReport:
+    return await run_retrieval_golden_eval(load_config(), live=live)
+
+
+@app.post("/downloads/browser-session-test", response_model=BrowserSessionDownloadTestResult)
+def downloads_browser_session_test(timeout_seconds: float = 5.0) -> BrowserSessionDownloadTestResult:
+    global WORKSPACE
+    WORKSPACE, result = run_browser_session_download_handoff_test(
+        load_config(),
+        WORKSPACE,
+        timeout_seconds=timeout_seconds,
+    )
+    return result
+
+
+@app.post("/downloads/publisher-session-test", response_model=PublisherSessionE2EReport)
+def downloads_publisher_session_test(
+    publisher_family: str | None = None,
+    timeout_seconds: float = 5.0,
+) -> PublisherSessionE2EReport:
+    global WORKSPACE
+    WORKSPACE, result = build_publisher_session_e2e_report(
+        load_config(),
+        WORKSPACE,
+        publisher_family=publisher_family,
+        timeout_seconds=timeout_seconds,
+    )
+    return result
+
+
+@app.get("/eval/rerank-learn", response_model=RerankLearningReport)
+async def eval_rerank_learn(live: bool = True) -> RerankLearningReport:
+    return await learn_rerank_policy_from_golden(load_config(), live=live)
 
 
 @app.get("/quality", response_model=QualityReport)

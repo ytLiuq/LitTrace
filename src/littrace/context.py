@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from littrace.models import ContextUpdate, LiteratureContext, LiteratureWorkspace, PaperMetadata
+from littrace.search import select_context_papers
+from littrace.models import PaperSearchRequest
 
 
 def add_papers(workspace: LiteratureWorkspace, papers: list[PaperMetadata]) -> LiteratureWorkspace:
@@ -11,6 +13,34 @@ def add_papers(workspace: LiteratureWorkspace, papers: list[PaperMetadata]) -> L
             and paper.paper_id not in workspace.context.excluded_papers
         ):
             workspace.context.active_papers.append(paper.paper_id)
+    return workspace
+
+
+def add_ranked_candidate_papers(
+    workspace: LiteratureWorkspace,
+    papers: list[PaperMetadata],
+    request: PaperSearchRequest,
+    active_limit: int = 15,
+) -> LiteratureWorkspace:
+    for paper in papers:
+        workspace.papers[paper.paper_id] = paper
+
+    ranked_ids = [paper.paper_id for paper in papers]
+    active = [
+        paper.paper_id
+        for paper in select_context_papers(papers, request, limit=active_limit)
+        if paper.paper_id not in workspace.context.excluded_papers
+    ]
+    workspace.context.active_papers = active
+    workspace.context.filters.update(
+        {
+            "candidate_pool_ids": ranked_ids,
+            "candidate_pool_count": len(ranked_ids),
+            "active_context_limit": active_limit,
+            "active_context_count": len(active),
+            "ranking_policy": "wide_recall_rank_then_top_context",
+        }
+    )
     return workspace
 
 

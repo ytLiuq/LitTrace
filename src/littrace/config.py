@@ -67,11 +67,27 @@ class APIConfig(BaseModel):
     enable_live_search: bool = False
 
 
+class BrowserAutomationConfig(BaseModel):
+    browser_act_path: str = "browser-act"
+    required: bool = True
+    default_browser_id: str | None = None
+    default_browser_name: str = "littrace-publisher-auth"
+    default_browser_type: str = "chrome"
+    confirm_before_use: bool = True
+    allow_confirm_browser_fallback: bool = False
+    chrome_direct_open_retries: int = 3
+    chrome_direct_retry_delay_seconds: float = 2.0
+
+
 class LLMConfig(BaseModel):
     provider: str = "deepseek"
     api_key: str | None = None
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-chat"
+    fallback_models: list[str] = Field(default_factory=list)
+    fallback_api_key: str | None = None
+    fallback_base_url: str | None = None
+    fallback_model: str | None = None
     request_timeout_seconds: float = 30.0
     temperature: float = 0.2
     enabled: bool = True
@@ -82,6 +98,7 @@ class LiteratureContextDefaults(BaseModel):
     visible_to_user: bool = True
     default_year_min: int = 2023
     default_recent_year_min: int = 2023
+    active_context_limit: int = 15
     preferred_disciplines: list[str] = Field(default_factory=list)
     preferred_publishers: list[str] = Field(default_factory=list)
     preferred_journals: list[str] = Field(default_factory=list)
@@ -95,6 +112,7 @@ class EvalConfig(BaseModel):
 class LitTraceConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     api: APIConfig = Field(default_factory=APIConfig)
+    browser: BrowserAutomationConfig = Field(default_factory=BrowserAutomationConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     paper_download: PaperDownloadConfig = Field(default_factory=PaperDownloadConfig)
     parsing: ParsingConfig = Field(default_factory=ParsingConfig)
@@ -133,4 +151,14 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     config.llm.api_key = os.environ.get("DEEPSEEK_API_KEY") or config.llm.api_key
     config.llm.base_url = os.environ.get("DEEPSEEK_BASE_URL") or config.llm.base_url
     config.llm.model = os.environ.get("DEEPSEEK_MODEL") or config.llm.model
+    config.browser.browser_act_path = os.environ.get("LITTRACE_BROWSER_ACT_PATH") or config.browser.browser_act_path
+    config.browser.default_browser_id = os.environ.get("LITTRACE_BROWSER_ID") or config.browser.default_browser_id
+    fallback_models = os.environ.get("LITTRACE_LLM_FALLBACK_MODELS")
+    if fallback_models:
+        config.llm.fallback_models = [
+            model.strip() for model in fallback_models.split(",") if model.strip()
+        ]
+    config.llm.fallback_api_key = os.environ.get("LITTRACE_FALLBACK_LLM_API_KEY") or config.llm.fallback_api_key
+    config.llm.fallback_base_url = os.environ.get("LITTRACE_FALLBACK_LLM_BASE_URL") or config.llm.fallback_base_url
+    config.llm.fallback_model = os.environ.get("LITTRACE_FALLBACK_LLM_MODEL") or config.llm.fallback_model
     return config

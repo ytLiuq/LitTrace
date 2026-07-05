@@ -195,6 +195,20 @@ async def test_chat_trace_starts_with_intent_parsing():
 
 
 @pytest.mark.anyio
+async def test_chat_search_trace_includes_evidence_quality_gate():
+    response, _ = await handle_chat(
+        ChatRequest(message="检索 carbon PDMS pressure sensor", live=False),
+        LiteratureWorkspace(),
+        _offline_config(),
+    )
+
+    assert any(
+        step.node == "evidence_quality_gate"
+        for step in response.research_result.workflow_trace.steps
+    )
+
+
+@pytest.mark.anyio
 async def test_chat_can_select_downloads_by_index():
     workspace = add_papers(
         LiteratureWorkspace(),

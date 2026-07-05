@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import dataclass
 
 from littrace.attachments import attach_pdf_to_paper, check_download_presence
@@ -8,6 +9,7 @@ from littrace.agent_interactions import build_agent_interaction_report
 from littrace.agent_audits import audit_parser_agent, audit_storyline_agent, audit_table_agent
 from littrace.agent_strength import build_agent_portfolio_report
 from littrace.auto_resume import auto_resume_downloaded_pdfs
+from littrace.browser import check_browser_act
 from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.config_wizard import write_config_template
@@ -18,7 +20,11 @@ from littrace.full_text import (
     resolve_workspace_full_text,
 )
 from littrace.golden_eval import run_golden_eval
-from littrace.login_flow import browser_login_session_for_paper, launch_login_for_paper
+from littrace.login_flow import (
+    browser_login_session_for_paper,
+    launch_login_for_paper,
+    publisher_window_session_name_for_chat,
+)
 from littrace.models import ChatRequest, LiteratureWorkspace
 from littrace.pdf_benchmark import benchmark_pdf_parsing
 from littrace.publisher_connectors import build_publisher_search_plan
@@ -27,6 +33,9 @@ from littrace.publisher_retrieval import (
     merge_retrieval_result_into_workspace,
 )
 from littrace.quality_report import build_quality_report
+from littrace.publisher_session import build_publisher_session_e2e_report
+from littrace.rerank_learning import learn_rerank_policy_from_golden
+from littrace.retrieval_eval import run_retrieval_golden_eval
 from littrace.research_planner import build_research_plan
 from littrace.session import append_message, create_chat_session, save_workspace
 from littrace.storyline import render_structured_storyline_report
@@ -44,6 +53,10 @@ class ShellState:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "doctor":
+        config = load_config()
+        _print_doctor(config)
+        return
     asyncio.run(run_shell())
 
 
@@ -59,7 +72,7 @@ async def run_shell() -> None:
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /browser-login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /quality /agents /agent-flow /agent-audits /plan topic /init-config /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /export /quit"
+        "/dashboard /quality /agents /agent-flow /agent-audits /plan topic /init-config /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /retrieval-eval /rerank-learn /publisher-session-test /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -94,6 +107,9 @@ async def run_shell() -> None:
             continue
         if message in {"/dashboard", "/tui"}:
             print(format_dashboard(state))
+            continue
+        if message == "/doctor":
+            _print_doctor(config)
             continue
         if message == "/quality":
             report = build_quality_report(config, state.workspace)
@@ -240,10 +256,12 @@ async def run_shell() -> None:
                 config,
                 paper,
                 state.workspace.full_text_reports.get(paper_id),
+                browser_session_name=publisher_window_session_name_for_chat(state.session_id),
             )
             print(f"浏览器会话: {plan.login_url or '无'}")
-            print(f"下载目录: {plan.download_dir}")
             print(f"目标 PDF: {plan.target_path}")
+            if plan.pdf_url:
+                print(f"授权后后台 PDF: {plan.pdf_url}")
             if plan.browser_act_command:
                 print("browser-act 命令:")
                 print(" ".join(plan.browser_act_command))
@@ -350,6 +368,49 @@ async def run_shell() -> None:
             if report.warnings:
                 print("注意：" + "；".join(report.warnings))
             continue
+        if message in {"/retrieval-eval", "/retrieval-eval-live"}:
+            report = await run_retrieval_golden_eval(config, live=True)
+            print(f"Retrieval golden eval: cases={report.case_count}, live={report.live}")
+            for name, value in report.metrics.items():
+                print(f"- {name}: {value}")
+            for case in report.cases:
+                print(
+                    f"- {case.case_id}: active_recall={case.active_recall}, "
+                    f"candidate_recall={case.candidate_recall}, mrr={case.mrr}, "
+                    f"active={case.active_count}, candidates={case.candidate_count}"
+                )
+                if case.warnings:
+                    print(f"  warnings: {'；'.join(case.warnings[:3])}")
+            if report.warnings:
+                print("注意：" + "；".join(report.warnings))
+            continue
+        if message == "/rerank-learn":
+            report = await learn_rerank_policy_from_golden(config, live=True)
+            print(f"Rerank learning: candidates={report.candidate_count}, best={report.best_candidate}, score={report.best_score}")
+            for item in report.results:
+                print(f"- {item['name']}: score={item['score']} metrics={item['metrics']}")
+            if report.warnings:
+                print("注意：" + "；".join(report.warnings))
+            continue
+        if message.startswith("/publisher-session-test"):
+            family = message.removeprefix("/publisher-session-test").strip() or None
+            state.workspace, report = build_publisher_session_e2e_report(
+                config,
+                state.workspace,
+                session=session,
+                publisher_family=family,
+                timeout_seconds=5.0,
+            )
+            save_workspace(session, state.workspace)
+            print(
+                f"Publisher session E2E: planned={report.planned_count}, "
+                f"completed={report.completed}, parsed={report.parsed_count}"
+            )
+            for path in report.target_paths[:8]:
+                print(f"- target: {path}")
+            if report.warnings:
+                print("注意：" + "；".join(report.warnings))
+            continue
         if message == "/export":
             paths = export_session_bundle(session, state.workspace)
             print("已导出研究包：")
@@ -412,6 +473,30 @@ def format_context_panel(workspace: LiteratureWorkspace) -> str:
     if len(ids) > 12:
         lines.append(f"... 还有 {len(ids) - 12} 篇")
     return "\n".join(lines)
+
+
+def _print_doctor(config) -> None:
+    status = check_browser_act(config)
+    print(f"browser-act: {'ok' if status.available else 'missing'}")
+    print(f"command: {status.command}")
+    if status.version:
+        print(f"version: {status.version}")
+    if status.browser_id:
+        print(f"default browser: {status.browser_id}")
+    if status.default_browser_type:
+        print(f"default browser type: {status.default_browser_type}")
+    if status.browser_found is not None:
+        print(f"default browser found: {'yes' if status.browser_found else 'no'}")
+    if status.active_sessions:
+        print(f"active sessions: {', '.join(status.active_sessions)}")
+    else:
+        print("active sessions: none")
+    for diagnostic in status.diagnostics:
+        print(f"diagnostic: {diagnostic}")
+    for error in status.errors:
+        print(f"error: {error}")
+    if not status.available:
+        print(f"install: {status.install_hint}")
 
 
 def format_dashboard(state: ShellState) -> str:

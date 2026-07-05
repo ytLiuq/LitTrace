@@ -12,6 +12,14 @@ api:
   request_timeout_seconds: 20
   enable_live_search: true
 
+browser:
+  browser_act_path: "browser-act"
+  required: true
+  default_browser_id: null
+  default_browser_name: "littrace-publisher-auth"
+  default_browser_type: "chrome"
+  confirm_before_use: true
+
 paper_download:
   mode: "ask_each_time"
   organize_by: "year_doi"

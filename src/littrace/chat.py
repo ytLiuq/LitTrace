@@ -283,6 +283,7 @@ async def _run_composite_intent(
         )
         _append_query_expansion_trace(research_result, intent.topic or request.message)
         _append_search_diagnostics_trace(research_result, workspace)
+        _append_evidence_quality_trace(research_result, workspace)
         replies.append(
             _format_search_result_reply(
                 intent.topic or request.message,
@@ -306,6 +307,7 @@ async def _run_composite_intent(
         warnings.append(str(report))
         action = "parse_full_text" if action == "composite" else action
 
+    evidence_quality = _workspace_evidence_quality(workspace)
     if "table" in intent.actions and has_minimum_evidence:
         workspace, harness = extract_performance_cells(workspace)
         matrix = build_comparison_matrices(workspace)
@@ -321,6 +323,10 @@ async def _run_composite_intent(
         replies.append(_mock_context_refusal())
         warnings.append("当前上下文来自 mock/开发样例，已跳过发展脉络分析。")
     elif "storyline" in intent.actions and has_minimum_evidence:
+        if evidence_quality["parsed_count"] == 0:
+            warnings.append(
+                "当前只有题录/摘要级证据，发展路线只能作为候选预览；解析 PDF 全文后才能生成强结论。"
+            )
         storyline = build_storyline_from_workspace(workspace)
         if not storyline:
             replies.append("当前证据不足以生成真实的发展脉络。建议先检索并解析全文。")
@@ -351,6 +357,8 @@ async def _run_composite_intent(
         warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过发展脉络分析。")
 
     if "document" in intent.actions and has_minimum_evidence:
+        if evidence_quality["parsed_count"] == 0:
+            warnings.append("当前缺少全文解析证据，报告会标记为 metadata-level draft。")
         report = build_research_document_report(workspace, config)
         workspace.context.filters["document_report"] = report.model_dump(mode="json")
         replies.append(
@@ -430,6 +438,22 @@ def _workspace_has_real_minimum_evidence(workspace: LiteratureWorkspace) -> bool
         and not _workspace_is_mock(workspace)
         and len(workspace.context.active_papers) >= MIN_ANALYSIS_PAPERS
     )
+
+
+def _workspace_evidence_quality(workspace: LiteratureWorkspace) -> dict[str, int]:
+    active = set(workspace.context.active_papers)
+    parsed_count = sum(
+        bool(parsed.get("parsed")) for paper_id, parsed in workspace.parsed_papers.items() if paper_id in active
+    )
+    full_text_count = sum(1 for paper_id in active if paper_id in workspace.full_text_reports)
+    performance_count = len(workspace.performance_cells)
+    return {
+        "active_count": len(active),
+        "full_text_report_count": full_text_count,
+        "parsed_count": parsed_count,
+        "performance_cell_count": performance_count,
+        "candidate_pool_count": workspace.context.filters.get("candidate_pool_count", len(active)),
+    }
 
 
 def _is_analysis_request(message: str) -> bool:
@@ -564,8 +588,12 @@ def _format_search_result_reply(
     original_year_min: int | None = None,
 ) -> str:
     search_mode = workspace.context.filters.get("search_mode")
+    candidate_count = int(
+        workspace.context.filters.get("candidate_pool_count") or len(workspace.context.active_papers)
+    )
+    active_limit = workspace.context.filters.get("active_context_limit")
     lines = [
-        f"我先按“{topic}”做了一轮文献检索，并把结果放进右侧当前文献上下文。",
+        f"我先按“{topic}”做了一轮文献检索；宽召回得到 {candidate_count} 篇候选，已按相关性排序，把前 {len(workspace.context.active_papers)} 篇放入当前文献上下文。",
         "",
         "当前可先看这些方向：",
     ]
@@ -591,7 +619,11 @@ def _format_search_result_reply(
         lines.append("- 我会继续优先用英文同义词和更宽材料关键词扩展检索，再达到五篇后做分析。")
         return "\n".join(lines)
 
-    lines.append(f"- 已找到 {len(workspace.context.active_papers)} 篇真实候选文献，超过最低门槛 5 篇。")
+    if active_limit:
+        lines.append(f"- 模型上下文最多使用前 {active_limit} 篇；其余候选保留在候选池，避免弱相关文献污染回答。")
+    lines.append(
+        f"- 已找到 {len(workspace.context.active_papers)} 篇真实候选文献，其中当前上下文为排序靠前的高相关文献，超过最低门槛 5 篇。"
+    )
     lines.append("")
     for index, paper_id in enumerate(workspace.context.active_papers, start=1):
         paper = workspace.papers[paper_id]
@@ -683,6 +715,27 @@ def _append_search_diagnostics_trace(research_result, workspace: LiteratureWorks
                 "filtered_counts": filtered_counts,
                 "errors": errors[:5],
             },
+        )
+    )
+
+
+def _append_evidence_quality_trace(research_result, workspace: LiteratureWorkspace) -> None:
+    if research_result is None or research_result.workflow_trace is None:
+        return
+    quality = _workspace_evidence_quality(workspace)
+    status = "strong" if quality["parsed_count"] else "metadata_only"
+    reason = (
+        "已有全文解析证据，可支持更强的分析。"
+        if quality["parsed_count"]
+        else "当前主要是题录/摘要级证据，路线和表格结论需要保持候选预览。"
+    )
+    research_result.workflow_trace.steps.append(
+        WorkflowTraceStep(
+            node="evidence_quality_gate",
+            status=status,
+            reason=reason,
+            inputs={"active_papers": quality["active_count"]},
+            outputs=quality,
         )
     )
 

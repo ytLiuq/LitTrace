@@ -13,6 +13,7 @@ def test_citation_guard_flags_claim_without_anchor():
 
     assert not report.passed
     assert report.unsupported_sentences
+    assert "Missing/weak anchor types" in report.warnings[0]
 
 
 def test_citation_guard_accepts_claim_with_doi_anchor():

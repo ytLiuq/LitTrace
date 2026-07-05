@@ -18,6 +18,7 @@ from littrace.search import (
     filter_search_results,
     merge_papers,
     rank_papers,
+    select_context_papers,
 )
 from littrace.models import PaperSearchRequest
 
@@ -198,6 +199,65 @@ def test_filter_search_results_keeps_carbon_pdms_drift_match_from_chinese_query(
     assert [paper.paper_id for paper in papers] == ["target"]
 
 
+def test_filter_search_results_keeps_wide_recall_for_specific_query():
+    papers = filter_search_results(
+        [
+            PaperMetadata(
+                paper_id="target",
+                title="Carbon black PDMS flexible piezoresistive pressure sensor with long-term stability",
+                year=2025,
+                journal="ACS Applied Materials & Interfaces",
+            ),
+            PaperMetadata(
+                paper_id="generic",
+                title="Carbon nanotube flexible wireless pressure sensor for health monitoring",
+                year=2025,
+                journal="Sensors",
+            ),
+            PaperMetadata(
+                paper_id="pdms_only",
+                title="PDMS optical vibration sensor for flexible waveguides",
+                year=2025,
+                journal="Optics Letters",
+            ),
+        ],
+        PaperSearchRequest(topic="碳基PDMS柔性薄膜传感器长时间受压漂移", year_min=None),
+    )
+
+    assert [paper.paper_id for paper in papers] == ["target", "generic", "pdms_only"]
+
+
+def test_select_context_papers_ranks_specific_match_before_wide_candidates():
+    request = PaperSearchRequest(topic="碳基PDMS柔性薄膜传感器长时间受压漂移", year_min=None)
+    papers = select_context_papers(
+        [
+            PaperMetadata(
+                paper_id="generic",
+                title="Carbon nanotube flexible wireless pressure sensor for health monitoring",
+                year=2025,
+                journal="Sensors",
+            ),
+            PaperMetadata(
+                paper_id="target",
+                title="Carbon black PDMS flexible piezoresistive pressure sensor with long-term stability",
+                year=2025,
+                journal="ACS Applied Materials & Interfaces",
+            ),
+            PaperMetadata(
+                paper_id="pdms_only",
+                title="PDMS optical vibration sensor for flexible waveguides",
+                year=2025,
+                journal="Optics Letters",
+            ),
+        ],
+        request,
+        limit=2,
+    )
+
+    assert papers[0].paper_id == "target"
+    assert "pdms_only" not in [paper.paper_id for paper in papers]
+
+
 def test_filter_search_results_removes_crossref_review_noise():
     papers = filter_search_results(
         [
@@ -246,6 +306,53 @@ def test_rank_papers_prefers_materials_topic_match_over_generic_sensor_paper():
     )
 
     assert papers[0].paper_id == "mxene"
+
+
+def test_rank_papers_prefers_exact_title_phrases_over_newer_generic_match():
+    papers = rank_papers(
+        [
+            PaperMetadata(
+                paper_id="generic-new",
+                title="Superelastic and ultra-soft MXene CNF aerogel PDMS based dual-modal pressure sensor",
+                year=2025,
+                journal="Advanced Science",
+            ),
+            PaperMetadata(
+                paper_id="exact-old",
+                title="Low-Temperature Bending Fatigue of MXene/PDMS Flexible Pressure Sensor",
+                year=2022,
+                journal="Advanced Materials Interfaces",
+            ),
+        ],
+        PaperSearchRequest(
+            topic="MXene PDMS pressure sensor low temperature bending fatigue",
+            year_min=2022,
+        ),
+    )
+
+    assert papers[0].paper_id == "exact-old"
+
+
+def test_rank_papers_prefers_review_when_review_is_in_query():
+    papers = rank_papers(
+        [
+            PaperMetadata(
+                paper_id="new-primary",
+                title="Mechanically excellent highly conductive double-network hydrogel for flexible strain sensor",
+                year=2024,
+                journal="ACS Applied Materials & Interfaces",
+            ),
+            PaperMetadata(
+                paper_id="review",
+                title="A Review of Conductive Hydrogel Used in Flexible Strain Sensor",
+                year=2020,
+                journal="Materials",
+            ),
+        ],
+        PaperSearchRequest(topic="conductive hydrogel strain sensor review materials", year_min=2020),
+    )
+
+    assert papers[0].paper_id == "review"
 
 
 def test_search_diagnostics_defaults_to_empty_counts():

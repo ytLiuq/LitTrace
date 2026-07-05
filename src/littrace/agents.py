@@ -138,7 +138,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             implemented=True,
             workflow_node="plan_downloads",
             callable_tools=["build_download_plan", "execute_downloads"],
-            remaining_work=["Detect when the manually downloaded PDF has appeared and resume parsing."],
+            remaining_work=["Detect authorized browser PDF responses, archive them, and resume parsing without user file handling."],
         ),
         AgentRuntimeStatus(
             name="FullText Resolver",

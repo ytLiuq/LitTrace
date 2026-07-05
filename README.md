@@ -40,18 +40,35 @@ LitTrace is intentionally a **LangGraph + CrewAI** project:
 
 ## Local Development
 
+LitTrace is designed for **local native use**. Docker is optional for CI or
+API-only batch jobs, but the main product surface is a local desktop window
+that can cooperate with your browser login state and local PDF folders.
+
 ```bash
+git clone https://github.com/ytLiuq/LitTrace.git
+cd LitTrace
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
-uvicorn littrace.api.app:app --reload
-```
-
-For the Codex-style local interactive app, start the native popup window:
-
-```bash
+pip install -e ".[dev,parsers]"
+uv tool install browser-act-cli --python 3.12
+littrace doctor
 littrace-window
 ```
+
+`browser-act` is a required external CLI for publisher-authenticated full-text
+access. LitTrace resolves it in this order: `LITTRACE_BROWSER_ACT_PATH`,
+`config.yaml`, your `PATH`, then common `uv tool` install locations. Keep the
+default config portable:
+
+```yaml
+browser:
+  browser_act_path: "browser-act"
+```
+
+Only set an absolute path in your private local `config.yaml` if your shell
+cannot find `browser-act`.
+
+For the Codex-style local interactive app, start the native popup window:
 
 The window is the recommended product surface. It opens a local desktop-style
 chat window, keeps the literature context in a hideable side panel, and uses

@@ -162,7 +162,8 @@ def render_context_lines(workspace: LiteratureWorkspace) -> list[str]:
     if not ids:
         return ["文献上下文", "当前没有文献。", "输入：检索 MXene flexible sensor"]
     selected = set(workspace.context.selected_for_download)
-    lines = [f"文献上下文 ({len(ids)} 篇)"]
+    pool_count = workspace.context.filters.get("candidate_pool_count", len(ids))
+    lines = [f"文献上下文 ({len(ids)} / 候选池 {pool_count} 篇)"]
     for index, paper_id in enumerate(ids[:12], start=1):
         paper = workspace.papers[paper_id]
         marker = "*" if paper_id in selected else " "

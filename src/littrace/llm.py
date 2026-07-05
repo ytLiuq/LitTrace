@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import asyncio
+from typing import NamedTuple
 
 import httpx
 
@@ -32,10 +33,16 @@ async def chat_completion(
         messages.append({"role": "system", "content": _workspace_context_prompt(workspace)})
     messages.append({"role": "user", "content": user_message})
 
-    try:
-        response = await _post_chat_completion(config, messages)
-    except Exception as exc:
-        return LLMReply(text="", used_llm=False, error=f"{exc.__class__.__name__}: {exc}")
+    errors: list[str] = []
+    response = None
+    for endpoint in _llm_endpoints(config):
+        try:
+            response = await _post_chat_completion(config, messages, endpoint)
+            break
+        except Exception as exc:
+            errors.append(f"{endpoint.label}:{exc.__class__.__name__}: {exc}")
+    if response is None:
+        return LLMReply(text="", used_llm=False, error="; ".join(errors) or "no_llm_endpoint")
 
     payload = response.json()
     content = (
@@ -49,20 +56,55 @@ async def chat_completion(
     return LLMReply(text=content, used_llm=True)
 
 
-async def _post_chat_completion(config: LitTraceConfig, messages: list[dict[str, str]]) -> httpx.Response:
+def _llm_endpoints(config: LitTraceConfig) -> list[LLMEndpoint]:
+    endpoints = [
+        LLMEndpoint(
+            api_key=config.llm.api_key or "",
+            base_url=config.llm.base_url,
+            model=config.llm.model,
+            label="primary",
+        )
+    ]
+    for model in config.llm.fallback_models:
+        if model != config.llm.model:
+            endpoints.append(
+                LLMEndpoint(
+                    api_key=config.llm.api_key or "",
+                    base_url=config.llm.base_url,
+                    model=model,
+                    label=f"primary_fallback_model:{model}",
+                )
+            )
+    if config.llm.fallback_api_key and config.llm.fallback_base_url and config.llm.fallback_model:
+        endpoints.append(
+            LLMEndpoint(
+                api_key=config.llm.fallback_api_key,
+                base_url=config.llm.fallback_base_url,
+                model=config.llm.fallback_model,
+                label="fallback",
+            )
+        )
+    return endpoints
+
+
+async def _post_chat_completion(
+    config: LitTraceConfig,
+    messages: list[dict[str, str]],
+    endpoint: LLMEndpoint,
+) -> httpx.Response:
     retry_statuses = {429, 500, 502, 503, 504}
     last_exc: Exception | None = None
     async with httpx.AsyncClient(timeout=config.llm.request_timeout_seconds) as client:
         for attempt in range(1, 4):
             try:
                 response = await client.post(
-                    f"{config.llm.base_url.rstrip('/')}/chat/completions",
+                    f"{endpoint.base_url.rstrip('/')}/chat/completions",
                     headers={
-                        "Authorization": f"Bearer {config.llm.api_key}",
+                        "Authorization": f"Bearer {endpoint.api_key}",
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": config.llm.model,
+                        "model": endpoint.model,
                         "messages": messages,
                         "temperature": config.llm.temperature,
                     },
@@ -108,3 +150,8 @@ def _workspace_context_prompt(workspace: LiteratureWorkspace) -> str:
     if len(workspace.context.active_papers) > 12:
         lines.append(f"... {len(workspace.context.active_papers) - 12} more papers omitted.")
     return "\n".join(lines)
+class LLMEndpoint(NamedTuple):
+    api_key: str
+    base_url: str
+    model: str
+    label: str

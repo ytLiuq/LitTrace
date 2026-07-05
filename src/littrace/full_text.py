@@ -431,6 +431,7 @@ def _build_report(
         if candidate.is_pdf and candidate.access_type == AccessType.OPEN_ACCESS
     ]
     landings = [candidate for candidate in candidates if not candidate.is_pdf]
+    warnings = [*warnings, *_full_text_next_steps(paper, candidates)]
     return FullTextResolutionReport(
         paper_id=paper.paper_id,
         doi=paper.doi,
@@ -444,6 +445,23 @@ def _build_report(
         verified_candidate_count=sum(candidate.verified for candidate in candidates),
         warnings=warnings,
     )
+
+
+def _full_text_next_steps(
+    paper: PaperMetadata,
+    candidates: list[FullTextCandidate],
+) -> list[str]:
+    if any(candidate.is_pdf and candidate.access_type == AccessType.OPEN_ACCESS for candidate in candidates):
+        return []
+    if any(candidate.requires_login for candidate in candidates):
+        return [f"{paper.paper_id}: login_required_try_browser_session"]
+    if any(candidate.note and "transient_http" in candidate.note for candidate in candidates):
+        return [f"{paper.paper_id}: transient_http_retry_later"]
+    if any(candidate.source.startswith("unpaywall") for candidate in candidates):
+        return [f"{paper.paper_id}: oa_evidence_without_verified_pdf_try_landing_page"]
+    if paper.doi:
+        return [f"{paper.paper_id}: no_pdf_found_try_publisher_or_user_upload"]
+    return [f"{paper.paper_id}: missing_doi_try_metadata_backfill_or_user_upload"]
 
 
 def _content_type_from_url(url: str) -> str:

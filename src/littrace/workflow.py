@@ -6,11 +6,12 @@ from littrace.access import build_download_plan
 from littrace.agent_interactions import build_agent_interaction_report
 from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.citations import audit_citation_links
-from littrace.context import add_papers
+from littrace.context import add_papers, add_ranked_candidate_papers
 from littrace.config import LitTraceConfig, load_config
 from littrace.document_composer import build_research_document_report
 from littrace.models import (
     LiteratureWorkspace,
+    PaperSearchResult,
     PaperSearchRequest,
     ResearchRunResult,
     WorkflowTrace,
@@ -65,9 +66,8 @@ async def run_search_preview(
             result = await live_client.search(request)
             diagnostics = live_client.diagnostics
         except Exception as exc:
-            result = await MockMaterialsSearchClient().search(request)
+            result = PaperSearchResult(request=request, papers=[])
             diagnostics = live_client.diagnostics
-            diagnostics.used_fallback = True
             diagnostics.errors.append(f"live_search: {exc.__class__.__name__}: {exc}")
     else:
         result = await MockMaterialsSearchClient().search(request)
@@ -81,7 +81,12 @@ async def run_search_preview(
         "search_mode": "live" if use_live else "mock",
         "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
     }
-    return add_papers(workspace, result.papers)
+    return add_ranked_candidate_papers(
+        workspace,
+        result.papers,
+        request,
+        active_limit=config.literature_context.active_context_limit,
+    )
 
 
 def build_littrace_graph():
@@ -115,9 +120,8 @@ def build_littrace_graph():
                 result = await live_client.search(request)
                 diagnostics = live_client.diagnostics
             except Exception as exc:
-                result = await MockMaterialsSearchClient().search(request)
+                result = PaperSearchResult(request=request, papers=[])
                 diagnostics = live_client.diagnostics
-                diagnostics.used_fallback = True
                 diagnostics.errors.append(f"live_search: {exc.__class__.__name__}: {exc}")
         else:
             result = await MockMaterialsSearchClient().search(request)
@@ -131,7 +135,12 @@ def build_littrace_graph():
             "search_mode": "live" if use_live else "mock",
             "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
         }
-        state["workspace"] = add_papers(workspace, result.papers)
+        state["workspace"] = add_ranked_candidate_papers(
+            workspace,
+            result.papers,
+            request,
+            active_limit=config.literature_context.active_context_limit,
+        )
         next_node, next_reason = _next_after_search(state)
         _trace_step(
             state,
@@ -141,6 +150,8 @@ def build_littrace_graph():
             inputs={"topic": request.topic, "live": use_live, "year_min": request.year_min},
             outputs={
                 "paper_count": len(state["workspace"].context.active_papers),
+                "candidate_pool_count": state["workspace"].context.filters.get("candidate_pool_count", 0),
+                "active_context_limit": state["workspace"].context.filters.get("active_context_limit"),
                 "search_mode": "live" if use_live else "mock",
             },
             next_node=next_node,
@@ -386,7 +397,11 @@ async def run_research_graph(
             "search_papers",
             "LangGraph 不可用，使用顺序 fallback 执行检索。",
             inputs={"topic": request.topic, "live": request.live, "year_min": request.year_min},
-            outputs={"paper_count": len(workspace.context.active_papers)},
+            outputs={
+                "paper_count": len(workspace.context.active_papers),
+                "candidate_pool_count": workspace.context.filters.get("candidate_pool_count", 0),
+                "active_context_limit": workspace.context.filters.get("active_context_limit"),
+            },
         )
         papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
         citation_audit = (

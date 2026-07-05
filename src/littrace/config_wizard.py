@@ -26,6 +26,8 @@ def write_config_template(path: str | Path = "config.yaml", overwrite: bool = Fa
     raw = config.model_dump(mode="json")
     raw["api"]["enable_live_search"] = False
     raw["api"]["unpaywall_email"] = "you@example.com"
+    raw["browser"]["browser_act_path"] = "browser-act"
+    raw["browser"]["required"] = True
     raw["parsing"]["default_parser"] = "metadata_only"
     target.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return ConfigWizardResult(path=str(target), created=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from littrace.cache import cache_key, read_text_cache, write_text_cache
 from littrace.config import LitTraceConfig
 from littrace.intent import ChatIntent, parse_chat_intent
 from littrace.llm import chat_completion
@@ -22,6 +23,13 @@ async def parse_chat_intent_semantic(
         raise IntentParseError("LLM 意图解析已启用，但 LLM 当前被禁用。")
     if not config.llm.api_key:
         raise IntentParseError("LLM 意图解析已启用，但没有配置 LLM API key。")
+    cache_id = cache_key(f"{config.llm.model}\n{message}")
+    cached = read_text_cache(config, "intent-llm", cache_id)
+    if cached:
+        try:
+            return _merge_intents(rule_intent, json.loads(cached))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
 
     reply = await chat_completion(
         config,
@@ -35,29 +43,14 @@ async def parse_chat_intent_semantic(
         payload = json.loads(_extract_json(reply.text))
     except (TypeError, ValueError, json.JSONDecodeError):
         raise IntentParseError("LLM 意图解析返回了无效 JSON。")
+    write_text_cache(config, "intent-llm", cache_id, json.dumps(payload, ensure_ascii=False))
     return _merge_intents(rule_intent, payload)
 
 
-_INTENT_SYSTEM_PROMPT = """You parse user intent for LitTrace, a literature research assistant.
-Return only strict JSON. Do not answer the user.
-Schema:
-{
-  "actions": ["search"|"download"|"select_downloads"|"deselect_downloads"|"parse"|"table"|"storyline"|"document"|"autonomous_review"|"list_context"|"agent_status"|"show_context"|"hide_context"],
-  "topic": "string or null",
-  "year_min": 2024 or null,
-  "journals": ["canonical journal names"],
-  "skip_download": true|false,
-  "select_all_downloads": true|false,
-  "clear_download_selection": true|false,
-  "auto_replan": true|false,
-  "parse_strategy": "text_only"|"ocr"|null,
-  "select_indices": [1,2],
-  "deselect_indices": [3]
-}
-Prefer search when the user asks to investigate, survey, find papers, understand a topic, or research a field.
-Prefer storyline when the user asks for routes, main lines, evolution, narrative, development logic, or how papers relate.
-Prefer table when the user asks for metrics, comparison, performance, benchmark, or matrix.
-Do not include actions that the user explicitly negates."""
+_INTENT_SYSTEM_PROMPT = """Parse LitTrace user intent. Return strict compact JSON only.
+keys: actions, topic, year_min, journals, skip_download, select_all_downloads, clear_download_selection, auto_replan, parse_strategy, select_indices, deselect_indices.
+actions allowed: search, download, select_downloads, deselect_downloads, parse, table, storyline, document, autonomous_review, list_context, agent_status, show_context, hide_context.
+Use search for literature investigation. Use storyline for routes/evolution/logic. Use table for metrics/comparison. Respect negation."""
 
 
 def _intent_user_message(message: str, rule_intent: ChatIntent) -> str:

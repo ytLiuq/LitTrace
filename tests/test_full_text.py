@@ -131,6 +131,26 @@ def test_full_text_metrics_only_count_successfully_parsed_papers():
 
 
 @pytest.mark.anyio
+async def test_full_text_report_adds_next_step_for_login_required_candidate():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"content-type": "text/html"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        report = await resolve_full_text_for_paper(
+            client,
+            PaperMetadata(
+                paper_id="p1",
+                title="Gated paper",
+                source_urls=["https://publisher.example/article"],
+                access_type=AccessType.REQUIRES_LOGIN,
+            ),
+            LitTraceConfig(),
+        )
+
+    assert any("login_required_try_browser_session" in warning for warning in report.warnings)
+
+
+@pytest.mark.anyio
 async def test_unpaywall_oa_candidate_keeps_oa_status_when_head_forbidden():
     async def handler(request: httpx.Request) -> httpx.Response:
         if "api.crossref.org" in str(request.url):

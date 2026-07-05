@@ -8,6 +8,7 @@ from littrace.intent_llm import (
     _merge_intents,
     parse_chat_intent_semantic,
 )
+from littrace.cache import cache_key, write_text_cache
 
 
 def test_semantic_intent_merge_adds_actions_from_llm_payload():
@@ -67,3 +68,22 @@ async def test_semantic_intent_parser_allows_explicit_offline_mode():
     )
 
     assert "search" in intent.actions
+
+
+@pytest.mark.anyio
+async def test_semantic_intent_parser_uses_cache_before_api_call(tmp_path):
+    message = "这些文章放在一起到底走了哪几条路？"
+    config = LitTraceConfig(
+        storage={"cache_dir": tmp_path / "cache"},
+        llm=LLMConfig(api_key="cached-key", enabled=True, intent_parser_enabled=True),
+    )
+    write_text_cache(
+        config,
+        "intent-llm",
+        cache_key(f"{config.llm.model}\n{message}"),
+        '{"actions":["storyline"],"topic":null}',
+    )
+
+    intent = await parse_chat_intent_semantic(message, config)
+
+    assert "storyline" in intent.actions

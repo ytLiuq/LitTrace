@@ -50,7 +50,9 @@ async def _execute_one(
     if paper.access_type == AccessType.REQUIRES_LOGIN:
         from littrace.login_flow import login_action_for_paper
 
-        return login_action_for_paper(config, paper)
+        item = login_action_for_paper(config, paper)
+        item.action = "request_user_authorization"
+        return item
     pdf_url = paper.pdf_url
     if paper.access_type == AccessType.OPEN_ACCESS and not pdf_url:
         report = await resolve_full_text_for_paper(client, paper, config)

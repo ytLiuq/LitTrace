@@ -35,14 +35,19 @@ CLAIM_HINTS = [
 def guard_citations(text: str, workspace: LiteratureWorkspace) -> CitationGuardReport:
     papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
     records = citation_records_for_papers(papers)
-    anchors = set()
+    anchors_by_type: dict[str, set[str]] = {
+        "paper_id": set(),
+        "doi": set(),
+        "title": set(),
+        "url": set(),
+    }
     for paper in papers:
-        anchors.add(paper.paper_id.lower())
+        anchors_by_type["paper_id"].add(paper.paper_id.lower())
         if paper.doi:
-            anchors.add(paper.doi.lower())
-        anchors.add(paper.title[:40].lower())
+            anchors_by_type["doi"].add(paper.doi.lower())
+        anchors_by_type["title"].add(paper.title[:40].lower())
     for record in records:
-        anchors.add(str(record.access_url).lower())
+        anchors_by_type["url"].add(str(record.access_url).lower())
 
     checked = 0
     unsupported: list[str] = []
@@ -51,12 +56,17 @@ def guard_citations(text: str, workspace: LiteratureWorkspace) -> CitationGuardR
         if not any(hint.lower() in lowered for hint in CLAIM_HINTS):
             continue
         checked += 1
-        if not any(anchor and anchor in lowered for anchor in anchors):
+        if not _has_any_anchor(lowered, anchors_by_type):
             unsupported.append(sentence)
 
     warnings = []
     if unsupported:
-        warnings.append("Some evidence-bearing sentences lack a paper id, DOI, title anchor, or access URL.")
+        missing = _missing_anchor_types(unsupported, anchors_by_type)
+        warnings.append(
+            "Some evidence-bearing sentences lack citation anchors. Missing/weak anchor types: "
+            + ", ".join(missing)
+            + "."
+        )
     return CitationGuardReport(
         passed=not unsupported,
         checked_sentence_count=checked,
@@ -78,6 +88,25 @@ def remove_unsupported_sentences(text: str, report: CitationGuardReport) -> str:
     if not repaired:
         return "生成内容因缺少句子级引用证据已被移除。请先解析更多全文或放宽问题范围。"
     return repaired
+
+
+def _has_any_anchor(sentence: str, anchors_by_type: dict[str, set[str]]) -> bool:
+    return any(
+        anchor and anchor in sentence
+        for anchors in anchors_by_type.values()
+        for anchor in anchors
+    )
+
+
+def _missing_anchor_types(
+    sentences: list[str],
+    anchors_by_type: dict[str, set[str]],
+) -> list[str]:
+    missing = []
+    for anchor_type, anchors in anchors_by_type.items():
+        if not any(anchor and anchor in sentence.lower() for sentence in sentences for anchor in anchors):
+            missing.append(anchor_type)
+    return missing or ["unknown"]
 
 
 def _split_sentences(text: str) -> list[str]:

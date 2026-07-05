@@ -5,9 +5,16 @@ import json
 import threading
 
 from littrace.chat import handle_chat
+from littrace.auto_resume import auto_resume_downloaded_pdfs
 from littrace.config import load_config
 from littrace.intent import parse_chat_intent
-from littrace.login_flow import launch_login_for_paper
+from littrace.login_flow import (
+    browser_login_session_for_paper,
+    fetch_authorized_pdf_after_user_auth,
+    open_browser_login_session,
+    publisher_window_session_name_for_chat,
+    wait_for_browser_authorization,
+)
 from littrace.models import ChatRequest, DownloadPlan, LiteratureWorkspace, WorkflowTrace
 from littrace.session import (
     ChatSession,
@@ -513,8 +520,6 @@ class LitTraceWindow:
             self._refresh_ocr_buttons()
             self._refresh_context_popup()
             self._refresh_session_history()
-            if response.download_plan and response.download_plan.requires_login_count:
-                self._open_login_popup(response.download_plan)
 
         self.root.after(0, apply_response)
 
@@ -771,7 +776,7 @@ class LitTraceWindow:
         )
         self.ttk.Label(
             outer,
-            text="LitTrace 只打开授权页面，不绕过登录。登录完成后把 PDF 保存到目标路径，再回到主窗口继续解析。",
+            text="LitTrace 只打开授权页面，不绕过登录。认证完成后请保持授权窗口打开；PDF 归档完成后主窗口会继续解析，并尝试关闭后台会话。",
             style="Caption.TLabel",
             wraplength=720,
             justify=self.tk.LEFT,
@@ -801,19 +806,130 @@ class LitTraceWindow:
         if paper is None:
             self._append_message("system", "没有找到这篇文献。")
             return
-        result = launch_login_for_paper(
+        plan = browser_login_session_for_paper(
             self.config,
             paper,
             self.workspace.full_text_reports.get(paper_id),
+            browser_session_name=publisher_window_session_name_for_chat(self.session.session_id),
         )
-        lines = [
-            f"登录页: {result.login_url or '无'}",
-            f"目标路径: {result.target_path or '无'}",
-            *result.instructions,
-        ]
-        if result.error:
-            lines.append(f"错误: {result.error}")
-        self._append_message("system", "\n".join(lines))
+        self._render_planned_trace(["打开授权窗口", "等待用户完成授权", "后台获取 PDF", "归档并解析"])
+        if plan.error or not plan.browser_act_command:
+            self._append_message("system", plan.error or "无法打开授权浏览器。")
+            return
+        self.status_var.set("等待授权完成，LitTrace 会自动继续")
+        threading.Thread(
+            target=self._wait_for_login_and_resume_thread,
+            args=(paper_id, plan.session_name or ""),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._open_login_browser_thread,
+            args=(paper_id,),
+            daemon=True,
+        ).start()
+
+    def _open_login_browser_thread(self, paper_id: str) -> None:
+        paper = self.workspace.papers.get(paper_id)
+        if paper is None:
+            return
+        result = open_browser_login_session(
+            self.config,
+            paper,
+            self.workspace.full_text_reports.get(paper_id),
+            timeout_seconds=60.0,
+            browser_session_name=publisher_window_session_name_for_chat(self.session.session_id),
+        )
+        if not result.opened:
+            self.root.after(
+                0,
+                lambda: self._append_message("system", f"授权浏览器打开失败：{result.error or result.stderr or result.stdout}"),
+            )
+            return
+        if result.fallback_used:
+            self.root.after(
+                0,
+                lambda: self.status_var.set("已切换备用浏览器，等待授权完成"),
+            )
+
+    def _wait_for_login_and_resume_thread(self, paper_id: str, session_name: str) -> None:
+        paper = self.workspace.papers.get(paper_id)
+        if paper is None:
+            return
+        report = self.workspace.full_text_reports.get(paper_id)
+        auth = wait_for_browser_authorization(
+            self.config,
+            session_name,
+            timeout_seconds=180.0,
+            poll_interval_seconds=2.0,
+        )
+        if not auth.authorized:
+            if auth.requires_user_confirmation:
+                self.root.after(0, self._show_user_confirmation_popup)
+            self.root.after(
+                0,
+                lambda: self.status_var.set("授权等待超时，请重新打开授权窗口"),
+            )
+            return
+        fetch = fetch_authorized_pdf_after_user_auth(
+            self.config,
+            paper,
+            report,
+            timeout_seconds=60.0,
+            auth_wait_result=auth,
+            browser_session_name=session_name,
+        )
+        self.workspace, resume = auto_resume_downloaded_pdfs(
+            self.config,
+            self.workspace,
+            self.session,
+        )
+
+        def apply_result() -> None:
+            save_workspace(self.session, self.workspace)
+            self._refresh_context()
+            self._refresh_context_popup()
+            if fetch.error:
+                self._append_message("system", f"授权已完成，但后台 PDF 获取失败：{fetch.error}")
+                self.status_var.set("PDF 获取失败")
+                return
+            if resume.parsed_count or resume.ready_to_parse_count or resume.auto_archived_count:
+                self._append_message("assistant", "授权已完成，PDF 已后台归档并开始解析。")
+                self.status_var.set("授权完成，PDF 已归档")
+            else:
+                self.status_var.set("授权完成，正在等待 PDF 下载落盘")
+
+        self.root.after(0, apply_result)
+        # Keep the chat-scoped publisher browser alive for the next paper.
+
+    def _show_user_confirmation_popup(self) -> None:
+        popup = self.tk.Toplevel(self.root)
+        popup.title("需要真人验证")
+        popup.geometry("420x180")
+        popup.configure(background=DESIGN["parchment"])
+        popup.transient(self.root)
+        popup.lift()
+        outer = self.ttk.Frame(popup, style="Tile.TFrame", padding=20)
+        outer.pack(fill=self.tk.BOTH, expand=True)
+        self.ttk.Label(outer, text="请完成浏览器中的真人验证", style="TileHeader.TLabel").pack(anchor="w")
+        self.ttk.Label(
+            outer,
+            text="ACS/Cloudflare 需要你确认是真人。请在已打开的授权浏览器窗口中完成验证，并保持窗口打开，直到 LitTrace 显示 PDF 已归档。",
+            style="Caption.TLabel",
+            wraplength=360,
+            justify=self.tk.LEFT,
+        ).pack(anchor="w", pady=(8, 14))
+        self.ttk.Button(outer, text="我知道了", command=popup.destroy).pack(anchor="e")
+
+    def _close_browser_session_silently(self, session_name: str | None) -> None:
+        if not session_name:
+            return
+        from littrace.browser import run_browser_act
+
+        run_browser_act(
+            self.config,
+            ["session", "close", session_name],
+            timeout_seconds=10.0,
+        )
 
     def _refresh_session_history(self) -> None:
         self.session_history_text.delete("1.0", self.tk.END)
