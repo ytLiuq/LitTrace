@@ -13,8 +13,18 @@ from littrace.eval_api import (
 )
 from littrace.access import build_download_plan
 from littrace.agent_interactions import AgentInteractionReport, build_agent_interaction_report
-from littrace.agents import AgentRoleSpec, AgentRuntimeStatus, agent_runtime_statuses, crew_role_specs
-from littrace.agent_audits import AgentAuditReport, audit_parser_agent, audit_storyline_agent, audit_table_agent
+from littrace.agents import (
+    AgentRoleSpec,
+    AgentRuntimeStatus,
+    agent_runtime_statuses,
+    crew_role_specs,
+)
+from littrace.agent_audits import (
+    AgentAuditReport,
+    audit_parser_agent,
+    audit_storyline_agent,
+    audit_table_agent,
+)
 from littrace.agent_strength import AgentPortfolioReport, build_agent_portfolio_report
 from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.attachments import (
@@ -117,8 +127,41 @@ from littrace.supplementary import (
 from littrace.source_router import route_sources
 from littrace.workflow import run_research_graph, run_search_preview
 from littrace.tracing import append_trace
+from littrace.log import get_logger, metrics, timed
+
+logger = get_logger("api")
 
 app = FastAPI(title="LitTrace API", version="0.1.0")
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    """Log every HTTP request with method, path, status and duration."""
+    import time as _time
+
+    start = _time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((_time.perf_counter() - start) * 1000, 2)
+    metrics.record(
+        "http_request_ms",
+        duration_ms,
+        labels={
+            "method": request.method,
+            "path": request.url.path,
+            "status": str(response.status_code),
+        },
+    )
+    logger.info(
+        "http_request",
+        extra={
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "duration_ms": duration_ms,
+        },
+    )
+    return response
+
 
 WORKSPACE = LiteratureWorkspace()
 
@@ -126,6 +169,12 @@ WORKSPACE = LiteratureWorkspace()
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def get_metrics() -> dict[str, object]:
+    """In-memory metrics snapshot for monitoring."""
+    return metrics.snapshot()
 
 
 @app.get("/doctor/browser", response_model=BrowserActStatus)
@@ -192,7 +241,7 @@ async def agents_autonomous_loop(
         max_rounds=max_rounds,
         auto_replan=auto_replan,
     )
-    WORKSPACE.context.filters["autonomous_loop_report"] = report.model_dump(mode="json")
+    WORKSPACE.context.filters.autonomous_loop_report = report.model_dump(mode="json")
     return report
 
 
@@ -201,7 +250,9 @@ async def search_preview(request: PaperSearchRequest) -> LiteratureWorkspace:
     global WORKSPACE
     config = load_config()
     WORKSPACE = await run_search_preview(request, config)
-    append_trace(config, "search_preview", {"topic": request.topic, "papers": len(WORKSPACE.papers)})
+    append_trace(
+        config, "search_preview", {"topic": request.topic, "papers": len(WORKSPACE.papers)}
+    )
     return WORKSPACE
 
 
@@ -411,7 +462,9 @@ def attach_pdf(paper_id: str, source_path: str) -> AttachmentResult:
 
 
 @app.post("/papers/{paper_id}/attach-si", response_model=SupplementaryAttachResult)
-def attach_si(paper_id: str, source_path: str, session_id: str | None = None) -> SupplementaryAttachResult:
+def attach_si(
+    paper_id: str, source_path: str, session_id: str | None = None
+) -> SupplementaryAttachResult:
     global WORKSPACE
     config = load_config()
     session = load_or_create_session(config, session_id)
@@ -428,9 +481,9 @@ def parse_context() -> LiteratureWorkspace:
 
 
 @app.post("/tables/extract", response_model=ResearchRunResult)
-def tables_extract() -> ResearchRunResult:
+async def tables_extract() -> ResearchRunResult:
     global WORKSPACE
-    WORKSPACE, harness = extract_performance_cells(WORKSPACE)
+    WORKSPACE, harness = await extract_performance_cells(WORKSPACE, load_config())
     return ResearchRunResult(
         workspace=WORKSPACE,
         table_harness=harness.model_dump(),
@@ -457,7 +510,7 @@ def storyline_report() -> dict[str, str]:
 def research_report(title: str | None = None) -> ResearchDocumentReport:
     global WORKSPACE
     report = build_research_document_report(WORKSPACE, load_config(), title=title)
-    WORKSPACE.context.filters["document_report"] = report.model_dump(mode="json")
+    WORKSPACE.context.filters.document_report = report.model_dump(mode="json")
     return report
 
 
@@ -481,12 +534,22 @@ async def audit_context_citations() -> CitationAudit:
 
 @app.post("/eval/retrieval", response_model=EvalMetricReport)
 def eval_retrieval(topic: str | None = None) -> EvalMetricReport:
-    return EvalMetricReport(run_id="preview", topic=topic, metrics=retrieval_metrics())
+    config = load_config()
+    return EvalMetricReport(
+        run_id="preview",
+        topic=topic,
+        metrics=retrieval_metrics(workspace=WORKSPACE, config=config),
+    )
 
 
 @app.post("/eval/pdf-parsing", response_model=EvalMetricReport)
 def eval_pdf_parsing(topic: str | None = None) -> EvalMetricReport:
-    return EvalMetricReport(run_id="preview", topic=topic, metrics=parsing_metrics())
+    config = load_config()
+    return EvalMetricReport(
+        run_id="preview",
+        topic=topic,
+        metrics=parsing_metrics(workspace=WORKSPACE, config=config),
+    )
 
 
 @app.get("/eval/pdf-benchmark", response_model=PDFBenchmarkReport)
@@ -512,17 +575,21 @@ def eval_full_text() -> EvalMetricReport:
 
 @app.post("/eval/storyline", response_model=EvalMetricReport)
 def eval_storyline(topic: str | None = None) -> EvalMetricReport:
-    return EvalMetricReport(run_id="preview", topic=topic, metrics=storyline_metrics())
+    return EvalMetricReport(
+        run_id="preview",
+        topic=topic,
+        metrics=storyline_metrics(workspace=WORKSPACE),
+    )
 
 
 @app.post("/eval/end-to-end", response_model=EvalMetricReport)
 def eval_end_to_end(topic: str | None = None) -> EvalMetricReport:
+    config = load_config()
     metrics = {}
-    metrics.update(retrieval_metrics())
-    metrics.update(parsing_metrics())
-    metrics.update(storyline_metrics())
-    metrics["pdf_download_success_rate"] = 0.0
-    metrics["citation_link_verified_rate"] = 0.0
+    metrics.update(retrieval_metrics(workspace=WORKSPACE, config=config))
+    metrics.update(parsing_metrics(workspace=WORKSPACE, config=config))
+    metrics.update(storyline_metrics(workspace=WORKSPACE))
+    metrics.update(full_text_metrics_from_workspace(WORKSPACE))
     return EvalMetricReport(run_id="preview", topic=topic, metrics=metrics)
 
 
@@ -537,7 +604,9 @@ async def eval_retrieval_golden(live: bool = True) -> RetrievalEvalReport:
 
 
 @app.post("/downloads/browser-session-test", response_model=BrowserSessionDownloadTestResult)
-def downloads_browser_session_test(timeout_seconds: float = 5.0) -> BrowserSessionDownloadTestResult:
+def downloads_browser_session_test(
+    timeout_seconds: float = 5.0,
+) -> BrowserSessionDownloadTestResult:
     global WORKSPACE
     WORKSPACE, result = run_browser_session_download_handoff_test(
         load_config(),

@@ -9,7 +9,7 @@ from littrace.agent_interactions import build_agent_interaction_report
 from littrace.agent_audits import audit_parser_agent, audit_storyline_agent, audit_table_agent
 from littrace.agent_strength import build_agent_portfolio_report
 from littrace.auto_resume import auto_resume_downloaded_pdfs
-from littrace.browser import check_browser_act
+from littrace.cdp_downloader import check_cdp_status
 from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.config_wizard import write_config_template
@@ -34,6 +34,7 @@ from littrace.publisher_retrieval import (
 )
 from littrace.quality_report import build_quality_report
 from littrace.publisher_session import build_publisher_session_e2e_report
+from littrace.publisher_e2e import run_interactive_publisher_e2e
 from littrace.rerank_learning import learn_rerank_policy_from_golden
 from littrace.retrieval_eval import run_retrieval_golden_eval
 from littrace.research_planner import build_research_plan
@@ -57,7 +58,85 @@ def main() -> None:
         config = load_config()
         _print_doctor(config)
         return
+    if len(sys.argv) > 2 and sys.argv[1] == "publisher-e2e":
+        config = load_config()
+        doi = sys.argv[2]
+        timeout = _arg_float("--timeout", 900.0)
+        poll = _arg_float("--poll", 5.0)
+        max_reopens = int(_arg_float("--max-browser-reopens", 2.0))
+        wait_user_action = "--no-wait-user-action" not in sys.argv
+        user_action_timeout = _arg_float_or_none("--user-action-timeout")
+        asyncio.run(
+            _run_publisher_e2e_command(
+                config,
+                doi,
+                timeout,
+                poll,
+                wait_user_action,
+                user_action_timeout,
+                max_reopens,
+            )
+        )
+        return
     asyncio.run(run_shell())
+
+
+async def _run_publisher_e2e_command(
+    config,
+    doi: str,
+    timeout: float,
+    poll: float,
+    wait_user_action: bool,
+    user_action_timeout: float | None,
+    max_browser_reopens: int,
+) -> None:
+    report = await run_interactive_publisher_e2e(
+        config.model_copy(
+            update={
+                "browser": config.browser.model_copy(
+                    update={"allow_confirm_browser_fallback": True}
+                )
+            }
+        ),
+        doi,
+        timeout_seconds=timeout,
+        poll_interval_seconds=poll,
+        wait_for_user_action=wait_user_action,
+        user_action_timeout_seconds=user_action_timeout,
+        max_browser_reopens=max_browser_reopens,
+    )
+    print(f"Publisher E2E: completed={report.completed}, downloaded={report.downloaded_pdf}, parsed={report.parsed_full_text}")
+    print(f"session={report.session_name}")
+    print(f"target={report.target_path}")
+    print(f"attempts={report.attempts}, elapsed={report.elapsed_seconds}s, access={report.last_access_state}")
+    if report.institutional_login_opened:
+        print("institutional_login_opened=true")
+    if report.needs_user_action and report.user_action_message:
+        print(f"user_action={report.user_action_message}")
+    if report.last_error:
+        print(f"error={report.last_error}")
+    if report.warnings:
+        print("warnings=" + "；".join(report.warnings))
+
+
+def _arg_float(name: str, default: float) -> float:
+    if name not in sys.argv:
+        return default
+    index = sys.argv.index(name)
+    try:
+        return float(sys.argv[index + 1])
+    except (IndexError, ValueError):
+        return default
+
+
+def _arg_float_or_none(name: str) -> float | None:
+    if name not in sys.argv:
+        return None
+    index = sys.argv.index(name)
+    try:
+        return float(sys.argv[index + 1])
+    except (IndexError, ValueError):
+        return None
 
 
 async def run_shell() -> None:
@@ -351,7 +430,7 @@ async def run_shell() -> None:
             print(
                 "PDF/OCR benchmark: "
                 f"active={report.active_papers}, local_pdf={report.local_pdf_count}, "
-                f"parsed={report.parsed_count}, metadata_only={report.metadata_only_count}, "
+                f"parsed={report.parsed_count}, failed={report.failed_count}, "
                 f"page_evidence={report.parsed_with_page_evidence}, "
                 f"avg_conf={report.average_evidence_confidence}"
             )
@@ -476,27 +555,16 @@ def format_context_panel(workspace: LiteratureWorkspace) -> str:
 
 
 def _print_doctor(config) -> None:
-    status = check_browser_act(config)
-    print(f"browser-act: {'ok' if status.available else 'missing'}")
-    print(f"command: {status.command}")
-    if status.version:
-        print(f"version: {status.version}")
-    if status.browser_id:
-        print(f"default browser: {status.browser_id}")
-    if status.default_browser_type:
-        print(f"default browser type: {status.default_browser_type}")
-    if status.browser_found is not None:
-        print(f"default browser found: {'yes' if status.browser_found else 'no'}")
-    if status.active_sessions:
-        print(f"active sessions: {', '.join(status.active_sessions)}")
-    else:
-        print("active sessions: none")
-    for diagnostic in status.diagnostics:
-        print(f"diagnostic: {diagnostic}")
-    for error in status.errors:
-        print(f"error: {error}")
-    if not status.available:
-        print(f"install: {status.install_hint}")
+    status = check_cdp_status(config)
+    print(f"cdp downloader: {'ok' if status.available else 'missing'}")
+    print(f"cdp url: {status.cdp_url}")
+    if status.browser:
+        print(f"browser: {status.browser}")
+    if status.web_socket_debugger_url:
+        print("websocket: available")
+    if status.error:
+        print(f"error: {status.error}")
+        print("start chrome: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=19222")
 
 
 def format_dashboard(state: ShellState) -> str:

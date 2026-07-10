@@ -26,7 +26,7 @@ class AgentInteractionReport(BaseModel):
 
 
 def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInteractionReport:
-    has_routes = bool(workspace.context.filters.get("source_routes"))
+    has_routes = bool(getattr(workspace.context.filters, "source_routes", None))
     has_papers = bool(workspace.context.active_papers)
     has_download_selection = bool(workspace.context.selected_for_download)
     has_full_text_reports = bool(workspace.full_text_reports)
@@ -34,8 +34,8 @@ def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInter
     has_cells = bool(workspace.performance_cells)
     has_storyline = bool(build_storyline_from_workspace(workspace))
     has_guard_reports = bool(workspace.guard_reports)
-    has_document = bool(workspace.context.filters.get("document_report"))
-    has_autonomous_loop = bool(workspace.context.filters.get("autonomous_loop_report"))
+    has_document = bool(getattr(workspace.context.filters, "document_report", None))
+    has_autonomous_loop = bool(getattr(workspace.context.filters, "autonomous_loop_report", None))
 
     handoffs = [
         AgentHandoff(
@@ -88,7 +88,9 @@ def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInter
             quality_gate="Parsed output includes parser name, confidence, and evidence spans.",
             status="complete" if has_parsed else ("ready" if has_papers else "blocked"),
             blocking_if_missing=False,
-            notes=[] if has_parsed else ["Parser can fall back to metadata-only evidence."],
+            notes=[]
+            if has_parsed
+            else ["Full-text PDF parsing is required; metadata/abstract fallback is disabled."],
         ),
         AgentHandoff(
             from_agent="PDF/OCR Parser",
@@ -105,7 +107,9 @@ def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInter
             required_inputs=["active papers", "parsed snippets", "performance cells"],
             quality_gate="Narrative claims follow solution-limit-response and cite paper-level evidence.",
             status="complete" if has_storyline else ("ready" if has_papers else "blocked"),
-            notes=[] if has_cells else ["Storyline can start from metadata, but table-backed claims are stronger."],
+            notes=[]
+            if has_cells
+            else ["Storyline can start from metadata, but table-backed claims are stronger."],
         ),
         AgentHandoff(
             from_agent="Storyline Verifier",
@@ -131,7 +135,11 @@ def build_agent_interaction_report(workspace: LiteratureWorkspace) -> AgentInter
             quality_gate="Report sections must cite active papers and surface harness warnings.",
             status="complete" if has_document else ("ready" if has_papers else "blocked"),
             blocking_if_missing=False,
-            notes=[] if has_storyline else ["Document Composer can draft context reports, but full-text storyline evidence improves it."],
+            notes=[]
+            if has_storyline
+            else [
+                "Document Composer can draft context reports, but full-text storyline evidence improves it."
+            ],
         ),
         AgentHandoff(
             from_agent="Document Composer",

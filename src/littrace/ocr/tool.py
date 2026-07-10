@@ -4,9 +4,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
-from pydantic import BaseModel, Field
-
-from littrace.models import EvidenceSpan
+from littrace.models import EvidenceSpan, ParsedPaper, ParsedTable  # noqa: F401
 
 
 class OCRMode(StrEnum):
@@ -17,24 +15,8 @@ class OCRMode(StrEnum):
     FIGURES = "figures"
 
 
-class ParsedTable(BaseModel):
-    table_id: str
-    caption: str | None = None
-    cells: list[dict[str, object]] = Field(default_factory=list)
-    evidence: EvidenceSpan
-
-
-class ParsedPaper(BaseModel):
-    pdf_path: Path
-    title: str | None = None
-    abstract: str | None = None
-    sections: list[dict[str, object]] = Field(default_factory=list)
-    tables: list[ParsedTable] = Field(default_factory=list)
-    figures: list[dict[str, object]] = Field(default_factory=list)
-    equations: list[dict[str, object]] = Field(default_factory=list)
-    parser_reports: list[dict[str, object]] = Field(default_factory=list)
-    parsed: bool = False
-    error: str | None = None
+# Re-export for backward compatibility
+__all__ = ["OCRMode", "ParsedTable", "ParsedPaper", "OCRTool"]
 
 
 class OCRTool(Protocol):

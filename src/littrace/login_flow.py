@@ -9,7 +9,10 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, HttpUrl
 
 from littrace.access import target_pdf_path
-from littrace.authorized_pdf_archiver import AuthorizedPdfArchiveResult, archive_authorized_pdf_response
+from littrace.authorized_pdf_archiver import (
+    AuthorizedPdfArchiveResult,
+    archive_authorized_pdf_response,
+)
 from littrace.browser import (
     browser_act_command,
     browser_open_args,
@@ -20,6 +23,7 @@ from littrace.browser import (
 )
 from littrace.config import LitTraceConfig
 from littrace.models import DownloadExecutionItem, FullTextResolutionReport, PaperMetadata
+from littrace.retry import retry_async, RetryConfig, BackoffStrategy
 
 
 class LoginLaunchRequest(BaseModel):
@@ -57,6 +61,7 @@ class BrowserLoginOpenResult(BaseModel):
     opened: bool
     session_name: str
     browser_id: str | None = None
+    institutional_login_opened: bool = False
     fallback_used: bool = False
     fallback_blocked: bool = False
     stdout: str = ""
@@ -95,7 +100,9 @@ class BrowserPdfLinkDiscoveryResult(BaseModel):
     attempted: bool
     pdf_url: str | None = None
     source: str = "browser_dom"
+    access_state: str = "unknown"
     requires_user_confirmation: bool = False
+    requires_login: bool = False
     recoverable_window_closed: bool = False
     stdout: str = ""
     stderr: str = ""
@@ -108,10 +115,21 @@ class BrowserAuthorizationWaitResult(BaseModel):
     attempts: int
     elapsed_seconds: float
     pdf_url: str | None = None
+    access_state: str = "unknown"
     recoverable_window_closed: bool = False
     requires_user_confirmation: bool = False
+    requires_login: bool = False
     last_stdout: str = ""
     last_stderr: str = ""
+    error: str | None = None
+
+
+class BrowserFocusResult(BaseModel):
+    session_name: str
+    attempted: bool = True
+    focused: bool = False
+    stdout: str = ""
+    stderr: str = ""
     error: str | None = None
 
 
@@ -259,8 +277,44 @@ def resume_browser_auth_after_user_close(
         target_path=plan.target_path,
         stdout=result.stdout,
         stderr=result.stderr,
-        error=None if result.returncode == 0 or result.recoverable_window_closed else result.stderr or result.stdout,
+        error=None
+        if result.returncode == 0 or result.recoverable_window_closed
+        else result.stderr or result.stdout,
     )
+
+
+class _BrowserActRetryable(Exception):
+    """Raised when browser-act fails with a recoverable error, to trigger retry."""
+
+
+def _browser_open_with_retry(
+    config: LitTraceConfig,
+    args: list[str],
+    timeout_seconds: float,
+) -> object:
+    """Run browser-act with unified retry via @retry_async.
+
+    Replaces the hand-written ``for _attempt in range(...)`` loop.
+    Raises _BrowserActRetryable on recoverable failures (triggers retry),
+    returns the result on success.
+    """
+    max_retries = max(config.browser.chrome_direct_open_retries, 1)
+    retry_delay = max(config.browser.chrome_direct_retry_delay_seconds, 0.0)
+    retry_config = RetryConfig(
+        max_attempts=max_retries,
+        backoff_strategy=BackoffStrategy.FIXED,
+        base_delay_seconds=retry_delay,
+        retry_on=(_BrowserActRetryable,),
+    )
+
+    @retry_async(retry_config, operation="browser_act_open", retry_on=(_BrowserActRetryable,))
+    def _single_open():
+        result = run_browser_act(config, args, timeout_seconds=timeout_seconds)
+        if result.returncode != 0 and result.recoverable_browser_open_failed:
+            raise _BrowserActRetryable(f"browser-act failed (returncode={result.returncode})")
+        return result
+
+    return _single_open()
 
 
 def open_browser_login_session(
@@ -279,7 +333,8 @@ def open_browser_login_session(
     if plan.error or not plan.login_url:
         return BrowserLoginOpenResult(
             opened=False,
-            session_name=plan.session_name or browser_session_name_for_paper(paper.paper_id, "auth"),
+            session_name=plan.session_name
+            or browser_session_name_for_paper(paper.paper_id, "auth"),
             error=plan.error or "No login URL available.",
         )
     browser_ids = _candidate_browser_ids(config)
@@ -294,12 +349,23 @@ def open_browser_login_session(
         timeout_seconds=min(timeout_seconds, 15.0),
     )
     if navigate.returncode == 0:
+        institutional_login = open_institutional_login_if_available(
+            config,
+            session_name,
+            paper,
+            timeout_seconds=min(timeout_seconds, 20.0),
+        )
         return BrowserLoginOpenResult(
             opened=True,
             session_name=session_name,
             browser_id=last_browser_id,
-            stdout=navigate.stdout,
-            stderr=navigate.stderr,
+            institutional_login_opened=institutional_login.opened,
+            stdout="\n".join(
+                part for part in [navigate.stdout, institutional_login.stdout] if part
+            ),
+            stderr="\n".join(
+                part for part in [navigate.stderr, institutional_login.stderr] if part
+            ),
         )
     if navigate.returncode != 0 and not navigate.recoverable_window_closed:
         last_stdout = navigate.stdout
@@ -318,39 +384,40 @@ def open_browser_login_session(
             str(plan.login_url),
             headed=True,
         )
-        result = run_browser_act(config, args, timeout_seconds=timeout_seconds)
+        # Unified retry via @retry_async — replaces hand-written retry loop
+        try:
+            result = _browser_open_with_retry(config, args, timeout_seconds)
+        except _BrowserActRetryable:
+            # All retries exhausted with recoverable errors — try next browser_id
+            result = run_browser_act(config, args, timeout_seconds=timeout_seconds)
         last_stdout = result.stdout
         last_stderr = result.stderr
-        if result.returncode != 0 and result.recoverable_browser_open_failed:
-            for _attempt in range(max(config.browser.chrome_direct_open_retries, 1)):
-                time.sleep(max(config.browser.chrome_direct_retry_delay_seconds, 0.0))
-                retry = run_browser_act(config, args, timeout_seconds=timeout_seconds)
-                last_stdout = retry.stdout
-                last_stderr = retry.stderr
-                if retry.returncode == 0:
-                    return BrowserLoginOpenResult(
-                        opened=True,
-                        session_name=session_name,
-                        browser_id=browser_id,
-                        fallback_used=index > 0,
-                        stdout=retry.stdout,
-                        stderr=retry.stderr,
-                    )
-                result = retry
-                if not retry.recoverable_browser_open_failed:
-                    break
         if result.returncode == 0:
+            institutional_login = open_institutional_login_if_available(
+                config,
+                session_name,
+                paper,
+                timeout_seconds=min(timeout_seconds, 20.0),
+            )
             return BrowserLoginOpenResult(
                 opened=True,
                 session_name=session_name,
                 browser_id=browser_id,
+                institutional_login_opened=institutional_login.opened,
                 fallback_used=index > 0,
-                stdout=result.stdout,
-                stderr=result.stderr,
+                stdout="\n".join(
+                    part for part in [result.stdout, institutional_login.stdout] if part
+                ),
+                stderr="\n".join(
+                    part for part in [result.stderr, institutional_login.stderr] if part
+                ),
             )
         if result.api_key_required:
             break
-        if not result.recoverable_browser_open_failed:
+        has_next_browser = index + 1 < len(browser_ids)
+        if not result.recoverable_browser_open_failed and not (
+            config.browser.allow_confirm_browser_fallback and has_next_browser
+        ):
             break
     final_error = last_stderr or last_stdout or "Could not open browser login session."
     fallback_message = _blocked_browser_fallback_message(config, final_error)
@@ -392,9 +459,7 @@ def fetch_authorized_pdf_after_user_auth(
             target_path=plan.target_path,
             error=auth_wait.error or "No publisher PDF URL could be inferred after authorization.",
         )
-    auth_session_name = plan.session_name or browser_session_name_for_paper(
-        paper.paper_id, "auth"
-    )
+    auth_session_name = plan.session_name or browser_session_name_for_paper(paper.paper_id, "auth")
     if not auth_wait.authorized:
         return AuthorizedPdfFetchResult(
             paper_id=paper.paper_id,
@@ -428,6 +493,23 @@ def fetch_authorized_pdf_after_user_auth(
             stderr=auth_wait.last_stderr,
             archive_result=archive_result,
         )
+    if _archive_result_requires_login(archive_result):
+        return AuthorizedPdfFetchResult(
+            paper_id=paper.paper_id,
+            attempted=True,
+            opened_pdf=False,
+            recoverable_window_closed=auth_wait.recoverable_window_closed,
+            session_name=auth_session_name,
+            pdf_url=pdf_url,
+            target_path=plan.target_path,
+            stdout=auth_wait.last_stdout,
+            stderr=auth_wait.last_stderr,
+            archive_result=archive_result,
+            error=(
+                "Publisher PDF request is still denied. Complete publisher or "
+                "institutional login in the authorization window, then retry."
+            ),
+        )
     if _is_landing_first_publisher(paper):
         return AuthorizedPdfFetchResult(
             paper_id=paper.paper_id,
@@ -458,7 +540,8 @@ def fetch_authorized_pdf_after_user_auth(
         paper_id=paper.paper_id,
         attempted=True,
         opened_pdf=result.returncode == 0,
-        recoverable_window_closed=result.recoverable_window_closed or auth_wait.recoverable_window_closed,
+        recoverable_window_closed=result.recoverable_window_closed
+        or auth_wait.recoverable_window_closed,
         session_name=pdf_session_name,
         pdf_url=pdf_url,
         target_path=plan.target_path,
@@ -467,8 +550,141 @@ def fetch_authorized_pdf_after_user_auth(
         archive_result=archive_result,
         error=None
         if (result.returncode == 0 or result.recoverable_window_closed)
-        and not (archive_result and archive_result.error and archive_result.warning != "needs_binary_body_export")
+        and not (
+            archive_result
+            and archive_result.error
+            and archive_result.warning != "needs_binary_body_export"
+        )
         else result.stderr or result.stdout or (archive_result.error if archive_result else None),
+    )
+
+
+class InstitutionalLoginOpenResult(BaseModel):
+    attempted: bool = False
+    opened: bool = False
+    login_required: bool = False
+    institutional_url: str | None = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+
+
+def open_institutional_login_if_available(
+    config: LitTraceConfig,
+    session_name: str,
+    paper: PaperMetadata | None = None,
+    timeout_seconds: float = 20.0,
+) -> InstitutionalLoginOpenResult:
+    if paper is not None and not _is_wiley_paper(paper):
+        return InstitutionalLoginOpenResult()
+    discovery = discover_pdf_url_from_browser_session(
+        config,
+        session_name,
+        timeout_seconds=min(timeout_seconds, 10.0),
+    )
+    if not discovery.requires_login:
+        return InstitutionalLoginOpenResult(
+            attempted=False,
+            opened=False,
+            login_required=False,
+            stdout=discovery.stdout,
+            stderr=discovery.stderr,
+        )
+    link = discover_institutional_login_url_from_browser_session(
+        config,
+        session_name,
+        timeout_seconds=min(timeout_seconds, 10.0),
+    )
+    if not link.institutional_url:
+        return InstitutionalLoginOpenResult(
+            attempted=True,
+            opened=False,
+            login_required=True,
+            stdout="\n".join(part for part in [discovery.stdout, link.stdout] if part),
+            stderr="\n".join(part for part in [discovery.stderr, link.stderr] if part),
+            error=link.error
+            or "Publisher login is required, but no institutional login link was found.",
+        )
+    result = _navigate_existing_browser_session(
+        config,
+        session_name,
+        link.institutional_url,
+        timeout_seconds=min(timeout_seconds, 15.0),
+    )
+    return InstitutionalLoginOpenResult(
+        attempted=True,
+        opened=result.returncode == 0,
+        login_required=True,
+        institutional_url=link.institutional_url,
+        stdout="\n".join(part for part in [discovery.stdout, link.stdout, result.stdout] if part),
+        stderr="\n".join(part for part in [discovery.stderr, link.stderr, result.stderr] if part),
+        error=None if result.returncode == 0 else result.stderr or result.stdout,
+    )
+
+
+class InstitutionalLoginDiscoveryResult(BaseModel):
+    institutional_url: str | None = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+
+
+def discover_institutional_login_url_from_browser_session(
+    config: LitTraceConfig,
+    session_name: str,
+    timeout_seconds: float = 10.0,
+) -> InstitutionalLoginDiscoveryResult:
+    script = r"""
+(() => {
+  const normalize = (href) => {
+    try { return new URL(href, location.href).href; } catch (_) { return null; }
+  };
+  const candidates = Array.from(document.querySelectorAll('a[href], button'))
+    .map((element) => {
+      const href = normalize(element.getAttribute('href') || element.href || '');
+      const text = [
+        element.textContent || '',
+        element.getAttribute('title') || '',
+        element.getAttribute('aria-label') || '',
+        element.getAttribute('class') || '',
+        element.id || '',
+        href || ''
+      ].join(' ').toLowerCase();
+      let score = 0;
+      if (href && href.includes('/action/ssostart')) score += 50;
+      if (href && href.includes('shibboleth')) score += 40;
+      if (href && href.includes('institution')) score += 30;
+      if (text.includes('institutional login')) score += 35;
+      if (text.includes('institution')) score += 20;
+      if (text.includes('sign in through your institution')) score += 35;
+      if (text.includes('log in through your institution')) score += 35;
+      if (text.includes('sso')) score += 20;
+      if (text.includes('individual login')) score -= 20;
+      if (text.includes('register')) score -= 20;
+      return { href, text: text.slice(0, 160), score };
+    })
+    .filter((item) => item.href && item.score > 0)
+    .sort((left, right) => right.score - left.score);
+  return JSON.stringify({
+    institutionalUrl: candidates.length ? candidates[0].href : null,
+    candidates: candidates.slice(0, 8),
+    url: location.href,
+    title: document.title || ''
+  });
+})()
+""".strip()
+    result = run_browser_act(
+        config,
+        ["--session", session_name, "eval", script],
+        timeout_seconds=timeout_seconds,
+    )
+    payload_text = _extract_browser_eval_payload(result.stdout)
+    institutional_url = _extract_institutional_url_from_payload(payload_text)
+    return InstitutionalLoginDiscoveryResult(
+        institutional_url=institutional_url,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        error=None if institutional_url else result.stderr or result.stdout,
     )
 
 
@@ -488,13 +704,14 @@ def wait_for_browser_authorization(
             session_name,
             timeout_seconds=min(max(poll_interval_seconds, 1.0), 10.0),
         )
-        if last.pdf_url:
+        if last.pdf_url and last.access_state == "authorized":
             return BrowserAuthorizationWaitResult(
                 session_name=session_name,
                 authorized=True,
                 attempts=attempts,
                 elapsed_seconds=round(time.monotonic() - start, 3),
                 pdf_url=last.pdf_url,
+                access_state=last.access_state,
                 last_stdout=last.stdout,
                 last_stderr=last.stderr,
             )
@@ -507,6 +724,8 @@ def wait_for_browser_authorization(
                 elapsed_seconds=round(elapsed, 3),
                 recoverable_window_closed=True,
                 requires_user_confirmation=last.requires_user_confirmation,
+                requires_login=last.requires_login,
+                access_state=last.access_state,
                 last_stdout=last.stdout,
                 last_stderr=last.stderr,
                 error="Authorization browser session closed before a PDF link was visible.",
@@ -520,7 +739,9 @@ def wait_for_browser_authorization(
                 last_stdout=last.stdout if last else "",
                 last_stderr=last.stderr if last else "",
                 requires_user_confirmation=last.requires_user_confirmation if last else False,
-                error="Timed out waiting for user authorization to complete.",
+                requires_login=last.requires_login if last else False,
+                access_state=last.access_state if last else "unknown",
+                error=_authorization_wait_error(last),
             )
         time.sleep(max(poll_interval_seconds, 0.2))
 
@@ -558,11 +779,48 @@ def discover_pdf_url_from_browser_session(
     return { href, score };
   }).filter((item) => item.href && item.score > 0);
   scored.sort((a, b) => b.score - a.score);
+  const bodyText = document.body ? document.body.innerText.slice(0, 6000) : '';
+  const lowerText = bodyText.toLowerCase();
+  const loginButton = !!document.querySelector('#indivLogin, [aria-label*="Log in" i], [aria-label*="Register" i]');
+  const analyticsText = JSON.stringify(window.dataLayer || []).toLowerCase();
+  const accessDenied = (
+    analyticsText.includes('wol_publication_access') && analyticsText.includes('no')
+  ) || lowerText.includes('access denied') || lowerText.includes('purchase access') || lowerText.includes('get access');
+  const fullAccess = (
+    lowerText.includes('full access') ||
+    currentUrl.includes('/doi/full/') ||
+    analyticsText.includes('wol_publication_access') && analyticsText.includes('yes')
+  );
+  const loginRequired = (
+    loginButton ||
+    lowerText.includes('login / register') ||
+    lowerText.includes('log in or register') ||
+    lowerText.includes('institutional login') ||
+    lowerText.includes('sign in through your institution')
+  );
+  const confirmationRequired = (
+    lowerText.includes('cloudflare') ||
+    lowerText.includes('just a moment') ||
+    lowerText.includes('verify you are human') ||
+    lowerText.includes('captcha') ||
+    currentUrl.includes('__cf_chl')
+  );
+  const pdfUrl = currentLooksPdf ? currentUrl : (scored.length ? scored[0].href : null);
+  let accessState = 'unknown';
+  if (confirmationRequired) accessState = 'confirmation_required';
+  else if (fullAccess && pdfUrl) accessState = 'authorized';
+  else if (accessDenied || loginRequired) accessState = 'login_required';
+  else if (pdfUrl) accessState = 'authorized';
   return JSON.stringify({
-    pdfUrl: currentLooksPdf ? currentUrl : (scored.length ? scored[0].href : null),
+    pdfUrl,
+    accessState,
+    loginRequired,
+    accessDenied,
+    fullAccess,
+    confirmationRequired,
     title: document.title || '',
     url: currentUrl,
-    text: document.body ? document.body.innerText.slice(0, 3000) : ''
+    text: bodyText
   });
 })()
 """.strip()
@@ -572,17 +830,33 @@ def discover_pdf_url_from_browser_session(
         timeout_seconds=timeout_seconds,
     )
     payload_text = _extract_browser_eval_payload(result.stdout)
+    access_state = _extract_access_state_from_payload(payload_text)
     pdf_url = _extract_pdf_url_from_payload(payload_text)
     if not _is_json_payload(payload_text):
         pdf_url = pdf_url or _extract_url_from_browser_eval(result.stdout)
-    requires_confirmation = _looks_like_user_confirmation_required(
-        f"{payload_text}\n{result.stdout}\n{result.stderr}"
-    )
+    diagnostic_output = f"{payload_text}\n{result.stdout}\n{result.stderr}"
+    if access_state == "unknown" and not pdf_url:
+        state_result = run_browser_act(
+            config,
+            ["--session", session_name, "state"],
+            timeout_seconds=min(max(timeout_seconds, 1.0), 10.0),
+        )
+        diagnostic_output = f"{diagnostic_output}\n{state_result.stdout}\n{state_result.stderr}"
+    requires_confirmation = _looks_like_user_confirmation_required(diagnostic_output)
+    requires_login = _looks_like_login_required(diagnostic_output)
+    if access_state == "authorized":
+        requires_login = False
+    elif requires_confirmation:
+        access_state = "confirmation_required"
+    elif requires_login:
+        access_state = "login_required"
     return BrowserPdfLinkDiscoveryResult(
         session_name=session_name,
         attempted=True,
         pdf_url=pdf_url,
+        access_state=access_state,
         requires_user_confirmation=requires_confirmation,
+        requires_login=requires_login,
         recoverable_window_closed=result.recoverable_window_closed,
         stdout=result.stdout,
         stderr=result.stderr,
@@ -618,7 +892,28 @@ def detect_user_confirmation_required(
         recoverable_window_closed=result.recoverable_window_closed,
         stdout=result.stdout,
         stderr=result.stderr,
-        error=None if result.returncode == 0 or result.recoverable_window_closed else result.stderr or result.stdout,
+        error=None
+        if result.returncode == 0 or result.recoverable_window_closed
+        else result.stderr or result.stdout,
+    )
+
+
+def focus_browser_session(
+    config: LitTraceConfig,
+    session_name: str,
+    timeout_seconds: float = 10.0,
+) -> BrowserFocusResult:
+    result = run_browser_act(
+        config,
+        ["--session", session_name, "state"],
+        timeout_seconds=timeout_seconds,
+    )
+    return BrowserFocusResult(
+        session_name=session_name,
+        focused=result.returncode == 0,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        error=None if result.returncode == 0 else result.stderr or result.stdout,
     )
 
 
@@ -631,7 +926,7 @@ def browser_login_session_plans_for_workspace(
     plans: list[BrowserLoginSessionPlan] = []
     for paper_id in workspace.context.active_papers:
         paper = workspace.papers[paper_id]
-        if paper.access_type.value not in {"requires_login", "metadata_only"}:
+        if paper.access_type.value not in {"requires_login", "unavailable"}:
             continue
         plans.append(
             browser_login_session_for_paper(
@@ -765,11 +1060,51 @@ def _extract_pdf_url_from_payload(payload_text: str) -> str | None:
     pdf_url = payload.get("pdfUrl")
     if not isinstance(pdf_url, str):
         current_url = payload.get("url")
-        pdf_url = current_url if isinstance(current_url, str) and _looks_like_pdf_url(current_url) else None
+        pdf_url = (
+            current_url
+            if isinstance(current_url, str) and _looks_like_pdf_url(current_url)
+            else None
+        )
     if not pdf_url:
         return None
     parsed = urlparse(pdf_url)
     return pdf_url if parsed.scheme in {"http", "https"} and parsed.netloc else None
+
+
+def _extract_access_state_from_payload(payload_text: str) -> str:
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return "unknown"
+    if not isinstance(payload, dict):
+        return "unknown"
+    state = payload.get("accessState")
+    if isinstance(state, str) and state in {
+        "authorized",
+        "login_required",
+        "confirmation_required",
+        "unknown",
+    }:
+        return state
+    if payload.get("confirmationRequired"):
+        return "confirmation_required"
+    if payload.get("loginRequired") or payload.get("accessDenied"):
+        return "login_required"
+    return "unknown"
+
+
+def _extract_institutional_url_from_payload(payload_text: str) -> str | None:
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    url = payload.get("institutionalUrl")
+    if not isinstance(url, str):
+        return None
+    parsed = urlparse(url)
+    return url if parsed.scheme in {"http", "https"} and parsed.netloc else None
 
 
 def _is_json_payload(payload_text: str) -> bool:
@@ -796,6 +1131,38 @@ def _looks_like_user_confirmation_required(output: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _looks_like_login_required(output: str) -> bool:
+    lowered = output.lower()
+    markers = [
+        "login / register",
+        "log in or register",
+        "institutional login",
+        "sign in through your institution",
+        "wol_publication_access=no",
+        '"wol_publication_access":"no"',
+        "purchase access",
+        "get access",
+        "access denied",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def _authorization_wait_error(last: BrowserPdfLinkDiscoveryResult | None) -> str:
+    if last and last.requires_user_confirmation:
+        return "Publisher page still requires Cloudflare or human verification."
+    if last and last.requires_login:
+        return (
+            "Publisher page is reachable, but full-text access still requires "
+            "publisher or institutional login."
+        )
+    if last and last.pdf_url and last.access_state != "authorized":
+        return (
+            "A PDF link is visible, but publisher access has not been confirmed. "
+            "Complete login or institutional authorization first."
+        )
+    return "Timed out waiting for user authorization to complete."
+
+
 def _looks_like_pdf_url(url: str) -> bool:
     lowered = url.lower()
     return (
@@ -820,7 +1187,22 @@ def _is_acs_paper(paper: PaperMetadata) -> bool:
             str(paper.source_urls[0]) if paper.source_urls else "",
         ]
     ).lower()
-    return "american chemical society" in haystack or "acs" in haystack or "pubs.acs.org" in haystack
+    return (
+        "american chemical society" in haystack or "acs" in haystack or "pubs.acs.org" in haystack
+    )
+
+
+def _is_wiley_paper(paper: PaperMetadata) -> bool:
+    haystack = " ".join(
+        value or ""
+        for value in [
+            paper.publisher,
+            paper.journal,
+            str(paper.source_urls[0]) if paper.source_urls else "",
+            str(paper.pdf_url) if paper.pdf_url else "",
+        ]
+    ).lower()
+    return "wiley" in haystack or "onlinelibrary.wiley.com" in haystack
 
 
 def _is_landing_first_publisher(paper: PaperMetadata) -> bool:
@@ -843,6 +1225,22 @@ def _is_landing_first_publisher(paper: PaperMetadata) -> bool:
         "pubs.rsc.org",
     ]
     return any(marker in haystack for marker in markers)
+
+
+def _archive_result_requires_login(result: AuthorizedPdfArchiveResult | None) -> bool:
+    if result is None:
+        return False
+    if result.status_code in {401, 403}:
+        return True
+    text = " ".join(
+        part or ""
+        for part in [
+            result.error,
+            result.warning,
+            result.mime_type,
+        ]
+    )
+    return _looks_like_login_required(text)
 
 
 def _login_url_for_paper(

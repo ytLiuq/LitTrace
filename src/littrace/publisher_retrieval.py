@@ -71,7 +71,9 @@ async def fetch_publisher_search_results(
     timeout = httpx.Timeout(config.api.request_timeout_seconds)
     headers = {"User-Agent": config.api.user_agent}
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, headers=headers, follow_redirects=True
+        ) as client:
             response = await client.get(str(plan.query_url))
             response.raise_for_status()
     except httpx.HTTPError as exc:
@@ -100,7 +102,9 @@ def parse_publisher_search_html(
                 publisher=plan.publisher_family,
                 doi=doi,
                 source_urls=[f"https://doi.org/{doi}"],
-                access_type=AccessType.REQUIRES_LOGIN if plan.requires_browser else AccessType.METADATA_ONLY,
+                access_type=AccessType.REQUIRES_LOGIN
+                if plan.requires_browser
+                else AccessType.UNAVAILABLE,
             )
         )
     warnings = []
@@ -119,8 +123,9 @@ def merge_retrieval_result_into_workspace(
     result: PublisherRetrievalResult,
 ) -> LiteratureWorkspace:
     workspace = add_papers(workspace, result.papers)
-    workspace.context.filters.setdefault("publisher_retrievals", [])
-    retrievals = workspace.context.filters["publisher_retrievals"]
+    if getattr(workspace.context.filters, "publisher_retrievals", None) is None:
+        workspace.context.filters.publisher_retrievals = []
+    retrievals = workspace.context.filters.publisher_retrievals
     if isinstance(retrievals, list):
         retrievals.append(
             {
@@ -163,7 +168,9 @@ def _title_near_doi(html: str, doi: str) -> str | None:
     if position < 0:
         return None
     window = html[max(0, position - 600) : min(len(html), position + 600)]
-    candidates = re.findall(r"<(?:h2|h3|h4|a|span)[^>]*>(.*?)</(?:h2|h3|h4|a|span)>", window, re.I | re.S)
+    candidates = re.findall(
+        r"<(?:h2|h3|h4|a|span)[^>]*>(.*?)</(?:h2|h3|h4|a|span)>", window, re.I | re.S
+    )
     cleaned = [_strip_tags(candidate) for candidate in candidates]
     cleaned = [candidate for candidate in cleaned if 12 <= len(candidate) <= 240]
     return cleaned[-1] if cleaned else None
@@ -191,7 +198,9 @@ def _extract_abstract(html: str) -> str | None:
 
 
 def _extract_keywords(html: str) -> list[str]:
-    match = re.search(r"<meta[^>]+name=[\"']keywords[\"'][^>]+content=[\"']([^\"']+)[\"']", html, re.I)
+    match = re.search(
+        r"<meta[^>]+name=[\"']keywords[\"'][^>]+content=[\"']([^\"']+)[\"']", html, re.I
+    )
     if not match:
         return []
     return [keyword.strip() for keyword in match.group(1).split(",") if keyword.strip()]

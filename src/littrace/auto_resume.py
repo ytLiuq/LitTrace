@@ -44,12 +44,14 @@ def auto_resume_downloaded_pdfs(
     workspace: LiteratureWorkspace,
     session: ChatSession | None = None,
 ) -> tuple[LiteratureWorkspace, AutoResumeResult]:
+    import asyncio
+
     archived_count, archive_warnings = auto_archive_login_downloads(config, workspace)
     presence = check_download_presence(config, workspace)
     warnings = [*archive_warnings, *presence.warnings]
     if presence.ready_to_parse_count:
         workspace, parse_report = parse_workspace_papers(workspace, config)
-        workspace, table_harness = extract_performance_cells(workspace)
+        workspace, table_harness = asyncio.run(extract_performance_cells(workspace, config))
         matrix = build_comparison_matrices(workspace)
         warnings.extend(parse_report.get("warnings", []))
         warnings.extend(table_harness.warnings)
@@ -82,7 +84,11 @@ def watch_and_resume_downloads(
     while True:
         attempts += 1
         workspace, last_result = auto_resume_downloaded_pdfs(config, workspace, session)
-        if last_result.ready_to_parse_count or last_result.auto_archived_count or last_result.parsed_count:
+        if (
+            last_result.ready_to_parse_count
+            or last_result.auto_archived_count
+            or last_result.parsed_count
+        ):
             return workspace, DownloadWatchResult(
                 completed=True,
                 attempts=attempts,
@@ -151,7 +157,9 @@ def auto_archive_login_downloads(
         target.parent.mkdir(parents=True, exist_ok=True)
         source.replace(target)
         archived += 1
-        warnings.append(f"Auto-archived browser download for {paper_id}: {source.name} -> paper.pdf")
+        warnings.append(
+            f"Auto-archived browser download for {paper_id}: {source.name} -> paper.pdf"
+        )
     return archived, warnings
 
 

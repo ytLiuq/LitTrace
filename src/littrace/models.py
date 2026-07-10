@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import Path
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 
 class AccessType(StrEnum):
     OPEN_ACCESS = "open_access"
     REQUIRES_LOGIN = "requires_login"
     UNAVAILABLE = "unavailable"
-    METADATA_ONLY = "metadata_only"
     USER_UPLOAD = "user_upload"
 
 
@@ -33,7 +33,7 @@ class PaperMetadata(BaseModel):
     citation_count: int | None = None
     source_urls: list[HttpUrl] = Field(default_factory=list)
     pdf_url: HttpUrl | None = None
-    access_type: AccessType = AccessType.METADATA_ONLY
+    access_type: AccessType = AccessType.UNAVAILABLE
     relevance_score: float | None = None
     recency_score: float | None = None
 
@@ -43,7 +43,7 @@ class FullTextCandidate(BaseModel):
     url: HttpUrl
     source: str
     content_type: str = "landing_page"
-    access_type: AccessType = AccessType.METADATA_ONLY
+    access_type: AccessType = AccessType.UNAVAILABLE
     requires_login: bool = False
     is_pdf: bool = False
     is_xml: bool = False
@@ -86,19 +86,61 @@ class DOIBackfillRequest(BaseModel):
     dois: list[str] = Field(default_factory=list)
 
 
+class WorkspaceFilters(BaseModel):
+    """Strongly-typed filter bag for the literature workspace context.
+
+    Known keys have explicit types and defaults; ``model_config`` allows
+    extra keys so legacy code can still set dynamic filters without breaking.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    # Search-related
+    search_mode: str | None = None
+    topic: str | None = None
+    discipline: str | None = None
+    expanded_year_range_from: int | None = None
+    active_context_limit: int | None = None
+    candidate_pool_count: int = 0
+    candidate_pool_ids: list[str] = Field(default_factory=list)
+    requires_login_candidate_ids: list[str] = Field(default_factory=list)
+    search_diagnostics: dict[str, object] = Field(default_factory=dict)
+
+    # Parse-related
+    parsed_full_text_count: int = 0
+    downloaded_full_text_count: int = 0
+
+    # Full-text context
+    full_text_context_warnings: list[str] = Field(default_factory=list)
+
+    # Storyline / structured artifacts
+    storyline_claim_count: int = 0
+    structured_artifacts: list[dict[str, object]] = Field(default_factory=list)
+
+    # Reports (stored as model_dump dicts for serialization)
+    document_report: dict[str, object] | None = None
+    autonomous_loop_report: dict[str, object] | None = None
+
+    # Publisher retrieval
+    publisher_retrievals: list[dict[str, object]] = Field(default_factory=list)
+
+    # Source routes (publisher routing results — list of route names)
+    source_routes: list[str] = Field(default_factory=list)
+
+
 class LiteratureContext(BaseModel):
     visible_to_user: bool = True
     active_papers: list[str] = Field(default_factory=list)
     excluded_papers: list[str] = Field(default_factory=list)
     pinned_papers: list[str] = Field(default_factory=list)
     selected_for_download: list[str] = Field(default_factory=list)
-    filters: dict[str, object] = Field(default_factory=dict)
+    filters: WorkspaceFilters = Field(default_factory=WorkspaceFilters)
 
 
 class LiteratureWorkspace(BaseModel):
     context: LiteratureContext = Field(default_factory=LiteratureContext)
     papers: dict[str, PaperMetadata] = Field(default_factory=dict)
-    parsed_papers: dict[str, dict[str, object]] = Field(default_factory=dict)
+    parsed_papers: dict[str, "ParsedPaper"] = Field(default_factory=dict)
     performance_cells: list["PerformanceCell"] = Field(default_factory=list)
     supplementary_links: dict[str, list[str]] = Field(default_factory=dict)
     guard_reports: list[dict[str, object]] = Field(default_factory=list)
@@ -113,7 +155,7 @@ class ContextUpdate(BaseModel):
     unpin_paper_ids: list[str] = Field(default_factory=list)
     select_for_download: list[str] = Field(default_factory=list)
     deselect_for_download: list[str] = Field(default_factory=list)
-    filters: dict[str, object] | None = None
+    filters: WorkspaceFilters | None = None
 
 
 class DownloadPlanItem(BaseModel):
@@ -250,6 +292,39 @@ class EvidenceSpan(BaseModel):
     confidence: float = 0.0
 
 
+class ParsedTable(BaseModel):
+    table_id: str
+    caption: str | None = None
+    cells: list[dict[str, object]] = Field(default_factory=list)
+    evidence: EvidenceSpan
+
+
+class ParsedPaper(BaseModel):
+    pdf_path: Path | None = None
+    title: str | None = None
+    abstract: str | None = None
+    sections: list[dict[str, object]] = Field(default_factory=list)
+    tables: list[ParsedTable] = Field(default_factory=list)
+    figures: list[dict[str, object]] = Field(default_factory=list)
+    equations: list[dict[str, object]] = Field(default_factory=list)
+    parser_reports: list[dict[str, object]] = Field(default_factory=list)
+    parsed: bool = False
+    error: str | None = None
+
+
+def coerce_parsed(value: object) -> ParsedPaper:
+    """Coerce a dict or ParsedPaper into a ParsedPaper.
+
+    Needed because ``dict.__setitem__`` bypasses Pydantic validation,
+    so ``workspace.parsed_papers["p1"] = {...}`` stores a raw dict.
+    """
+    if isinstance(value, ParsedPaper):
+        return value
+    if isinstance(value, dict):
+        return ParsedPaper.model_validate(value)
+    return ParsedPaper()
+
+
 class PerformanceCell(BaseModel):
     paper_id: str
     task: str | None = None
@@ -352,3 +427,9 @@ class StorylineClaim(BaseModel):
     claim_type: str
     evidence: list[EvidenceSpan]
     confidence: float = 0.0
+
+
+# Resolve forward references
+LiteratureWorkspace.model_rebuild()
+ResearchRunResult.model_rebuild()
+ChatResponse.model_rebuild()

@@ -15,7 +15,9 @@ class CitationGuardReport(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-CLAIM_HINTS = [
+# Default claim-hint keywords — used when no config overrides are provided.
+# Configure via ``config.citation_guard.claim_hints`` in config.yaml.
+DEFAULT_CLAIM_HINTS: list[str] = [
     "表明",
     "说明",
     "提升",
@@ -31,8 +33,23 @@ CLAIM_HINTS = [
     "challenge",
 ]
 
+# Backwards-compatible module-level alias (tests and legacy code may import this).
+CLAIM_HINTS = DEFAULT_CLAIM_HINTS
 
-def guard_citations(text: str, workspace: LiteratureWorkspace) -> CitationGuardReport:
+
+def guard_citations(
+    text: str,
+    workspace: LiteratureWorkspace,
+    *,
+    claim_hints: list[str] | None = None,
+) -> CitationGuardReport:
+    """Check that claim-bearing sentences have citation anchors.
+
+    Args:
+        claim_hints: Optional list of keywords to override DEFAULT_CLAIM_HINTS.
+            If provided, only these keywords are used. If None, defaults are used.
+    """
+    hints = claim_hints if claim_hints is not None else DEFAULT_CLAIM_HINTS
     papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
     records = citation_records_for_papers(papers)
     anchors_by_type: dict[str, set[str]] = {
@@ -53,7 +70,7 @@ def guard_citations(text: str, workspace: LiteratureWorkspace) -> CitationGuardR
     unsupported: list[str] = []
     for sentence in _split_sentences(text):
         lowered = sentence.lower()
-        if not any(hint.lower() in lowered for hint in CLAIM_HINTS):
+        if not any(hint.lower() in lowered for hint in hints):
             continue
         checked += 1
         if not _has_any_anchor(lowered, anchors_by_type):
@@ -92,9 +109,7 @@ def remove_unsupported_sentences(text: str, report: CitationGuardReport) -> str:
 
 def _has_any_anchor(sentence: str, anchors_by_type: dict[str, set[str]]) -> bool:
     return any(
-        anchor and anchor in sentence
-        for anchors in anchors_by_type.values()
-        for anchor in anchors
+        anchor and anchor in sentence for anchors in anchors_by_type.values() for anchor in anchors
     )
 
 
@@ -104,7 +119,9 @@ def _missing_anchor_types(
 ) -> list[str]:
     missing = []
     for anchor_type, anchors in anchors_by_type.items():
-        if not any(anchor and anchor in sentence.lower() for sentence in sentences for anchor in anchors):
+        if not any(
+            anchor and anchor in sentence.lower() for sentence in sentences for anchor in anchors
+        ):
             missing.append(anchor_type)
     return missing or ["unknown"]
 

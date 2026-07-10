@@ -65,7 +65,9 @@ def build_research_document_report(
 
 
 def _infer_title(workspace: LiteratureWorkspace) -> str:
-    topic = workspace.context.filters.get("topic") or workspace.context.filters.get("discipline")
+    topic = getattr(workspace.context.filters, "topic", None) or getattr(
+        workspace.context.filters, "discipline", None
+    )
     if isinstance(topic, str) and topic.strip():
         return f"LitTrace Research Report: {topic.strip()}"
     return "LitTrace Research Report"
@@ -94,9 +96,9 @@ def _methods_section(
     metrics: dict[str, float],
 ) -> ResearchDocumentSection:
     filters = workspace.context.filters
-    routes = filters.get("source_routes") or []
-    year_min = filters.get("year_min") or "未限定"
-    search_mode = filters.get("search_mode") or "unknown"
+    routes = getattr(filters, "source_routes", None) or []
+    year_min = getattr(filters, "year_min", None) or "未限定"
+    search_mode = getattr(filters, "search_mode", None) or "unknown"
     lines = [
         "本报告采用证据优先的会话内综述流程：先检索和筛选文献，再解析可获得全文，"
         "随后抽取性能指标、结构化图表/公式证据，并用 citation/storyline/table harness 进行复核。",
@@ -188,9 +190,9 @@ def _matrix_section(matrix) -> ResearchDocumentSection:
         lines.append("|---|---:|---:|---|---|---|")
         for row in item.rows:
             evidence.append(row.evidence)
-            snippet = (row.evidence.snippet or row.evidence.table_id or row.evidence.section or "").replace(
-                "\n", " "
-            )[:120]
+            snippet = (
+                row.evidence.snippet or row.evidence.table_id or row.evidence.section or ""
+            ).replace("\n", " ")[:120]
             lines.append(
                 f"| {row.title or row.paper_id} | {row.year or ''} | {row.value} | "
                 f"{row.unit or ''} | {row.comparable} | {snippet} |"
@@ -210,9 +212,13 @@ def _artifact_section(artifacts: list[StructuredArtifact]) -> ResearchDocumentSe
     for artifact in artifacts[:20]:
         evidence.append(artifact.evidence)
         label = f" {artifact.label}" if artifact.label else ""
-        location = f"p.{artifact.evidence.page}" if artifact.evidence.page is not None else "evidence"
+        location = (
+            f"p.{artifact.evidence.page}" if artifact.evidence.page is not None else "evidence"
+        )
         text = artifact.text.replace("\n", " ")[:220]
-        lines.append(f"- **{artifact.artifact_type}{label}** [{artifact.paper_id}, {location}]: {text}")
+        lines.append(
+            f"- **{artifact.artifact_type}{label}** [{artifact.paper_id}, {location}]: {text}"
+        )
     return ResearchDocumentSection(
         title="图表与公式证据",
         body="\n".join(lines),
@@ -221,7 +227,7 @@ def _artifact_section(artifacts: list[StructuredArtifact]) -> ResearchDocumentSe
 
 
 def _autonomous_review_summary(workspace: LiteratureWorkspace) -> ResearchDocumentSection:
-    raw = workspace.context.filters.get("autonomous_loop_report")
+    raw = getattr(workspace.context.filters, "autonomous_loop_report", None)
     if not isinstance(raw, dict):
         return ResearchDocumentSection(
             title="多 Agent 复核与修订",
@@ -303,7 +309,7 @@ def _references_section(citations) -> ResearchDocumentSection:
 
 
 def _structured_artifacts(workspace: LiteratureWorkspace) -> list[StructuredArtifact]:
-    raw = workspace.context.filters.get("structured_artifacts", [])
+    raw = getattr(workspace.context.filters, "structured_artifacts", [])
     artifacts: list[StructuredArtifact] = []
     if not isinstance(raw, list):
         return artifacts

@@ -95,7 +95,7 @@ def test_merge_papers_deduplicates_by_doi_and_prefers_oa():
                 paper_id="left",
                 title="Same",
                 doi="10.1000/example",
-                access_type=AccessType.METADATA_ONLY,
+                access_type=AccessType.UNAVAILABLE,
             ),
             PaperMetadata(
                 paper_id="right",

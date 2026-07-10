@@ -6,10 +6,15 @@ from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.citation_guard import guard_citations, remove_unsupported_sentences
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
-from littrace.context import apply_context_update
+from littrace.context import apply_context_update, _merge_filters
 from littrace.document_composer import build_research_document_report
+from littrace.harnesses import (
+    check_hallucination_grounding,
+    HallucinationCheckItem,
+)
 from littrace.intent import ChatIntent, parse_chat_intent
 from littrace.intent_llm import IntentParseError, parse_chat_intent_semantic
+from littrace.log import get_logger, timed, cost_tracker
 from littrace.models import (
     ChatRequest,
     ChatResponse,
@@ -17,10 +22,10 @@ from littrace.models import (
     LiteratureWorkspace,
     PaperSearchRequest,
     WorkflowTraceStep,
+    coerce_parsed,
 )
 from littrace.parsing import parse_workspace_papers
 from littrace.research_writer import (
-    fallback_evidence_answer,
     write_evidence_grounded_answer,
     write_storyline_narrative,
 )
@@ -28,6 +33,8 @@ from littrace.storyline import build_storyline_from_workspace
 from littrace.tables import build_comparison_matrices, extract_performance_cells
 from littrace.workflow import run_research_graph
 from littrace.search import build_query_variants
+
+logger = get_logger("chat")
 
 
 MIN_ANALYSIS_PAPERS = 5
@@ -39,22 +46,30 @@ async def handle_chat(
     config: LitTraceConfig,
 ) -> tuple[ChatResponse, LiteratureWorkspace]:
     message = request.message.strip()
-    try:
-        intent = await parse_chat_intent_semantic(message, config)
-    except IntentParseError as exc:
-        return (
-            ChatResponse(
-                reply=(
-                    f"{exc}\n\n"
-                    "我没有继续执行，也没有回退到关键词规则。请检查 .env.local/config.yaml "
-                    "里的 LLM 配置，或显式关闭 llm.intent_parser_enabled。"
+    with timed("intent_parse"):
+        try:
+            intent = await parse_chat_intent_semantic(message, config)
+        except IntentParseError as exc:
+            logger.warning(
+                "intent_parse_failed", extra={"msg_preview": message[:200], "error": str(exc)}
+            )
+            return (
+                ChatResponse(
+                    reply=(
+                        f"{exc}\n\n"
+                        "我没有继续执行，也没有回退到关键词规则。请检查 .env.local/config.yaml "
+                        "里的 LLM 配置，或显式关闭 llm.intent_parser_enabled。"
+                    ),
+                    action="intent_parse_error",
+                    workspace=workspace,
+                    warnings=[str(exc)],
                 ),
-                action="intent_parse_error",
-                workspace=workspace,
-                warnings=[str(exc)],
-            ),
-            workspace,
-        )
+                workspace,
+            )
+    logger.info(
+        "intent_parsed",
+        extra={"actions": intent.actions, "topic": intent.topic, "year_min": intent.year_min},
+    )
 
     if "show_context" in intent.actions:
         workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=True))
@@ -62,7 +77,9 @@ async def handle_chat(
 
     if "hide_context" in intent.actions:
         workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=False))
-        return _response("已隐藏当前文献上下文，后续对话会保持简洁。", "hide_context", workspace), workspace
+        return _response(
+            "已隐藏当前文献上下文，后续对话会保持简洁。", "hide_context", workspace
+        ), workspace
 
     if intent.actions == ["list_context"]:
         return (
@@ -98,9 +115,11 @@ async def handle_chat(
         )
 
     if _should_run_composite(intent):
+        logger.info("composite_intent", extra={"actions": intent.actions})
         return await _run_composite_intent(intent, request, workspace, config)
 
     if _is_analysis_request(message) and _workspace_is_mock(workspace):
+        logger.warning("blocked_mock_context", extra={"msg_preview": message[:200]})
         return (
             ChatResponse(
                 reply=_mock_context_refusal(),
@@ -113,6 +132,16 @@ async def handle_chat(
         )
 
     if _is_analysis_request(message) and not _workspace_has_real_minimum_evidence(workspace):
+        active = len(workspace.context.active_papers)
+        parsed = len(workspace.parsed_papers)
+        logger.warning(
+            "insufficient_evidence",
+            extra={
+                "active_papers": active,
+                "parsed_papers": parsed,
+                "min_required": MIN_ANALYSIS_PAPERS,
+            },
+        )
         return (
             ChatResponse(
                 reply=_insufficient_real_evidence_reply(workspace),
@@ -126,27 +155,50 @@ async def handle_chat(
 
     llm_reply = await write_evidence_grounded_answer(config, message, workspace)
     if llm_reply.used_llm:
-        guard = guard_citations(llm_reply.text, workspace)
+        claim_hints = config.citation_guard.claim_hints or None
+        guard = guard_citations(llm_reply.text, workspace, claim_hints=claim_hints)
         reply_text = remove_unsupported_sentences(llm_reply.text, guard)
         workspace.guard_reports.append(guard.model_dump())
+
+        # Dimension 2: Run hallucination grounding harness
+        hallucination_report = check_hallucination_grounding(
+            [
+                HallucinationCheckItem(
+                    text=reply_text,
+                    checked_sentence_count=guard.checked_sentence_count,
+                    unsupported_sentence_count=len(guard.unsupported_sentences),
+                    unsupported_sentences=guard.unsupported_sentences,
+                    source="chat",
+                )
+            ]
+        )
+        extra_warnings = list(hallucination_report.errors[:3]) + list(
+            hallucination_report.warnings[:3]
+        )
+
         return (
             ChatResponse(
                 reply=reply_text,
                 action="llm_chat",
                 workspace=workspace,
                 citations=_active_citations(workspace),
-                warnings=guard.warnings + guard.unsupported_sentences[:3],
+                warnings=guard.warnings + guard.unsupported_sentences[:3] + extra_warnings,
             ),
             workspace,
         )
+    # LLM unavailable — no degradation, return error
     if workspace.context.active_papers:
+        logger.error("llm_unavailable", extra={"error": llm_reply.error})
         return (
             ChatResponse(
-                reply=fallback_evidence_answer(message, workspace),
-                action="evidence_answer",
+                reply=(
+                    f"LLM 调用失败，无法生成回答。错误：{llm_reply.error}\n\n"
+                    "请检查 LLM 配置（DEEPSEEK_API_KEY / base_url / model）后重试。"
+                ),
+                action="llm_error",
                 workspace=workspace,
                 citations=_active_citations(workspace),
-                warnings=[llm_reply.error] if llm_reply.error else [],
+                warnings=[llm_reply.error or "llm_unavailable"],
             ),
             workspace,
         )
@@ -205,7 +257,10 @@ async def _run_composite_intent(
         workspace = research_result.workspace
         workspace = _apply_literature_filters(workspace, intent)
         expanded_year_range = False
-        if len(workspace.context.active_papers) < MIN_ANALYSIS_PAPERS and search_year_min is not None:
+        if (
+            len(workspace.context.active_papers) < MIN_ANALYSIS_PAPERS
+            and search_year_min is not None
+        ):
             before_expand_count = len(workspace.context.active_papers)
             expanded_year_range = True
             _append_chat_trace_step(
@@ -252,7 +307,7 @@ async def _run_composite_intent(
             if intent.journals:
                 expanded_intent = ChatIntent(journals=intent.journals)
                 workspace = _apply_literature_filters(workspace, expanded_intent)
-            workspace.context.filters["expanded_year_range_from"] = search_year_min
+            workspace.context.filters.expanded_year_range_from = search_year_min
         _prepend_intent_trace_step(
             research_result,
             topic=topic,
@@ -260,23 +315,33 @@ async def _run_composite_intent(
             live=request.live if request.live is not None else config.api.enable_live_search,
             query_variant_count=len(query_variants),
         )
-        search_mode = workspace.context.filters.get("search_mode")
+        search_mode = getattr(workspace.context.filters, "search_mode", None)
         is_real_search = search_mode == "live"
+        parsed_full_text_count = int(
+            getattr(workspace.context.filters, "parsed_full_text_count", None) or 0
+        )
+        downloaded_full_text_count = int(
+            getattr(workspace.context.filters, "downloaded_full_text_count", None) or 0
+        )
         has_minimum_evidence = (
-            is_real_search and len(workspace.context.active_papers) >= MIN_ANALYSIS_PAPERS
+            is_real_search
+            and len(workspace.context.active_papers) >= MIN_ANALYSIS_PAPERS
+            and parsed_full_text_count >= MIN_ANALYSIS_PAPERS
         )
         _append_chat_trace_step(
             research_result,
             node="minimum_evidence_gate",
             status="passed" if has_minimum_evidence else "blocked",
             reason=(
-                f"当前上下文有 {len(workspace.context.active_papers)} 篇候选文献；"
+                f"当前上下文有 {len(workspace.context.active_papers)} 篇已下载全文文献；"
                 f"检索模式为 {search_mode or 'unknown'}；最低分析门槛要求 "
-                f"{MIN_ANALYSIS_PAPERS} 篇真实检索文献。"
+                f"{MIN_ANALYSIS_PAPERS} 篇真实全文解析文献。"
             ),
             inputs={"minimum_required": MIN_ANALYSIS_PAPERS},
             outputs={
                 "paper_count": len(workspace.context.active_papers),
+                "downloaded_full_text_count": downloaded_full_text_count,
+                "parsed_full_text_count": parsed_full_text_count,
                 "search_mode": search_mode,
                 "real_search": is_real_search,
             },
@@ -284,14 +349,49 @@ async def _run_composite_intent(
         _append_query_expansion_trace(research_result, intent.topic or request.message)
         _append_search_diagnostics_trace(research_result, workspace)
         _append_evidence_quality_trace(research_result, workspace)
-        replies.append(
-            _format_search_result_reply(
-                intent.topic or request.message,
-                workspace,
-                expanded_year_range=expanded_year_range,
-                original_year_min=search_year_min,
-            )
-        )
+        if _is_search_only_intent(intent):
+            if has_minimum_evidence:
+                llm_reply = await write_evidence_grounded_answer(config, request.message, workspace)
+                if llm_reply.used_llm:
+                    claim_hints = config.citation_guard.claim_hints or None
+                    guard = guard_citations(llm_reply.text, workspace, claim_hints=claim_hints)
+                    cleaned = remove_unsupported_sentences(llm_reply.text, guard)
+                    workspace.guard_reports.append(guard.model_dump())
+                    replies.append(cleaned)
+                    warnings.extend(guard.warnings)
+                    warnings.extend(guard.unsupported_sentences[:3])
+
+                    # Dimension 2: Hallucination harness
+                    halu_report = check_hallucination_grounding(
+                        [
+                            HallucinationCheckItem(
+                                text=cleaned,
+                                checked_sentence_count=guard.checked_sentence_count,
+                                unsupported_sentence_count=len(guard.unsupported_sentences),
+                                unsupported_sentences=guard.unsupported_sentences,
+                                source="chat:search_only",
+                            )
+                        ]
+                    )
+                    warnings.extend(halu_report.errors[:2])
+                    warnings.extend(halu_report.warnings[:2])
+                else:
+                    logger.error("llm_unavailable_composite", extra={"error": llm_reply.error})
+                    replies.append(
+                        f"LLM 调用失败，无法生成研究回答。错误：{llm_reply.error}\n"
+                        "请检查 LLM 配置后重试。"
+                    )
+                    if llm_reply.error:
+                        warnings.append(llm_reply.error)
+            else:
+                replies.append(
+                    _format_search_result_reply(
+                        intent.topic or request.message,
+                        workspace,
+                        expanded_year_range=expanded_year_range,
+                        original_year_min=search_year_min,
+                    )
+                )
         publisher_routes = research_result.publisher_routes
         action = "search"
 
@@ -302,14 +402,14 @@ async def _run_composite_intent(
             parse_config.parsing.parse_strategy = intent.parse_strategy
         workspace, report = parse_workspace_papers(workspace, parse_config)
         replies.append(
-            f"已尝试解析全文：解析 {report['parsed_count']} 篇，metadata-only {report['metadata_only_count']} 篇。"
+            f"已尝试解析全文：成功解析 {report['parsed_count']} 篇，失败 {report['failed_count']} 篇。"
         )
         warnings.append(str(report))
         action = "parse_full_text" if action == "composite" else action
 
     evidence_quality = _workspace_evidence_quality(workspace)
     if "table" in intent.actions and has_minimum_evidence:
-        workspace, harness = extract_performance_cells(workspace)
+        workspace, harness = await extract_performance_cells(workspace, config)
         matrix = build_comparison_matrices(workspace)
         replies.append(
             f"已生成性能对比表：抽取 {len(workspace.performance_cells)} 个指标单元，形成 {len(matrix.matrices)} 个指标矩阵。"
@@ -325,7 +425,7 @@ async def _run_composite_intent(
     elif "storyline" in intent.actions and has_minimum_evidence:
         if evidence_quality["parsed_count"] == 0:
             warnings.append(
-                "当前只有题录/摘要级证据，发展路线只能作为候选预览；解析 PDF 全文后才能生成强结论。"
+                "当前没有可用全文解析证据，已禁止基于题录/摘要生成强结论；请先获取并解析 PDF 全文。"
             )
         storyline = build_storyline_from_workspace(workspace)
         if not storyline:
@@ -333,11 +433,28 @@ async def _run_composite_intent(
         else:
             narrative = await write_storyline_narrative(config, workspace)
             if narrative.used_llm:
-                guard = guard_citations(narrative.text, workspace)
+                claim_hints = config.citation_guard.claim_hints or None
+                guard = guard_citations(narrative.text, workspace, claim_hints=claim_hints)
+                cleaned_narrative = remove_unsupported_sentences(narrative.text, guard)
                 workspace.guard_reports.append(guard.model_dump())
-                replies.append(remove_unsupported_sentences(narrative.text, guard))
+                replies.append(cleaned_narrative)
                 warnings.extend(guard.warnings)
                 warnings.extend(guard.unsupported_sentences[:3])
+
+                # Dimension 2: Hallucination harness for storyline
+                halu_report = check_hallucination_grounding(
+                    [
+                        HallucinationCheckItem(
+                            text=cleaned_narrative,
+                            checked_sentence_count=guard.checked_sentence_count,
+                            unsupported_sentence_count=len(guard.unsupported_sentences),
+                            unsupported_sentences=guard.unsupported_sentences,
+                            source="chat:storyline",
+                        )
+                    ]
+                )
+                warnings.extend(halu_report.errors[:2])
+                warnings.extend(halu_report.warnings[:2])
             else:
                 replies.append("已基于当前证据生成发展脉络草案；低证据部分会保持保守。")
                 if narrative.error:
@@ -358,9 +475,9 @@ async def _run_composite_intent(
 
     if "document" in intent.actions and has_minimum_evidence:
         if evidence_quality["parsed_count"] == 0:
-            warnings.append("当前缺少全文解析证据，报告会标记为 metadata-level draft。")
+            warnings.append("当前缺少全文解析证据，已禁止基于题录/摘要生成报告。")
         report = build_research_document_report(workspace, config)
-        workspace.context.filters["document_report"] = report.model_dump(mode="json")
+        workspace.context.filters.document_report = report.model_dump(mode="json")
         replies.append(
             f"已生成可审计研究报告：{len(report.sections)} 个章节，"
             f"{report.evidence_count} 条证据锚点，{len(report.citation_records)} 条引用。"
@@ -378,7 +495,7 @@ async def _run_composite_intent(
             workspace,
             auto_replan=intent.auto_replan,
         )
-        workspace.context.filters["autonomous_loop_report"] = loop_report.model_dump(mode="json")
+        workspace.context.filters.autonomous_loop_report = loop_report.model_dump(mode="json")
         replies.append(
             f"已完成多 agent 审稿/反驳/修订循环：{len(loop_report.rounds)} 轮，"
             f"score={loop_report.score:.3f}，passed={loop_report.passed}。"
@@ -389,12 +506,16 @@ async def _run_composite_intent(
 
     if "download" in intent.actions and not intent.skip_download:
         papers = _active_papers(workspace)
-        download_plan = build_download_plan(config, papers, set(workspace.context.selected_for_download))
+        download_plan = build_download_plan(
+            config, papers, set(workspace.context.selected_for_download)
+        )
         replies.append(
             f"已生成下载计划：{download_plan.downloadable_count} 篇可处理，其中 {download_plan.requires_login_count} 篇需要登录。"
         )
         action = "plan_downloads" if action == "composite" else action
 
+    if not replies and "search" in intent.actions:
+        replies.append(_format_search_result_reply(intent.topic or request.message, workspace))
     if not replies:
         replies.append("已理解你的指令，但当前没有可执行动作。")
 
@@ -427,14 +548,14 @@ def _active_citations(workspace: LiteratureWorkspace):
 
 
 def _workspace_is_mock(workspace: LiteratureWorkspace) -> bool:
-    if workspace.context.filters.get("search_mode") == "mock":
+    if getattr(workspace.context.filters, "search_mode", None) == "mock":
         return True
     return any((paper.doi or "").lower().find(".mock") >= 0 for paper in _active_papers(workspace))
 
 
 def _workspace_has_real_minimum_evidence(workspace: LiteratureWorkspace) -> bool:
     return (
-        workspace.context.filters.get("search_mode") == "live"
+        getattr(workspace.context.filters, "search_mode", None) == "live"
         and not _workspace_is_mock(workspace)
         and len(workspace.context.active_papers) >= MIN_ANALYSIS_PAPERS
     )
@@ -443,7 +564,9 @@ def _workspace_has_real_minimum_evidence(workspace: LiteratureWorkspace) -> bool
 def _workspace_evidence_quality(workspace: LiteratureWorkspace) -> dict[str, int]:
     active = set(workspace.context.active_papers)
     parsed_count = sum(
-        bool(parsed.get("parsed")) for paper_id, parsed in workspace.parsed_papers.items() if paper_id in active
+        bool(coerce_parsed(parsed).parsed)
+        for paper_id, parsed in workspace.parsed_papers.items()
+        if paper_id in active
     )
     full_text_count = sum(1 for paper_id in active if paper_id in workspace.full_text_reports)
     performance_count = len(workspace.performance_cells)
@@ -452,8 +575,23 @@ def _workspace_evidence_quality(workspace: LiteratureWorkspace) -> dict[str, int
         "full_text_report_count": full_text_count,
         "parsed_count": parsed_count,
         "performance_cell_count": performance_count,
-        "candidate_pool_count": workspace.context.filters.get("candidate_pool_count", len(active)),
+        "candidate_pool_count": getattr(
+            workspace.context.filters, "candidate_pool_count", len(active)
+        ),
     }
+
+
+def _is_search_only_intent(intent: ChatIntent) -> bool:
+    non_search_actions = {
+        action
+        for action in intent.actions
+        if action
+        not in {
+            "search",
+            "download",
+        }
+    }
+    return "search" in intent.actions and not non_search_actions
 
 
 def _is_analysis_request(message: str) -> bool:
@@ -488,7 +626,7 @@ def _mock_context_refusal() -> str:
 
 def _insufficient_real_evidence_reply(workspace: LiteratureWorkspace) -> str:
     count = len(workspace.context.active_papers)
-    mode = workspace.context.filters.get("search_mode") or "unknown"
+    mode = getattr(workspace.context.filters, "search_mode", None) or "unknown"
     return (
         f"当前只有 {count} 篇候选文献，检索模式为 {mode}；还没有达到 "
         f"{MIN_ANALYSIS_PAPERS} 篇真实相关文献的分析门槛。\n\n"
@@ -564,7 +702,9 @@ def _apply_literature_filters(
             excluded.append(paper_id)
     workspace.context.active_papers = active
     workspace.context.excluded_papers = excluded
-    workspace.context.filters.update({"year_min": intent.year_min, "journals": intent.journals})
+    _merge_filters(
+        workspace.context.filters, {"year_min": intent.year_min, "journals": intent.journals}
+    )
     return workspace
 
 
@@ -587,59 +727,39 @@ def _format_search_result_reply(
     expanded_year_range: bool = False,
     original_year_min: int | None = None,
 ) -> str:
-    search_mode = workspace.context.filters.get("search_mode")
-    candidate_count = int(
-        workspace.context.filters.get("candidate_pool_count") or len(workspace.context.active_papers)
-    )
-    active_limit = workspace.context.filters.get("active_context_limit")
+    search_mode = getattr(workspace.context.filters, "search_mode", None)
     lines = [
-        f"我先按“{topic}”做了一轮文献检索；宽召回得到 {candidate_count} 篇候选，已按相关性排序，把前 {len(workspace.context.active_papers)} 篇放入当前文献上下文。",
-        "",
-        "当前可先看这些方向：",
+        f"我已围绕“{topic}”检索并尝试获取全文。",
     ]
     if search_mode == "mock":
-        lines.append("- 当前是 mock/开发样例检索，不是真实联网文献；这些结果只能用于验证流程和界面。")
-        lines.append("- 真实调研需要启用 live search 后重新检索，达到 5 篇真实文献后我再做分析型结论。")
+        lines.append(
+            "- 当前是 mock/开发样例检索，不是真实联网文献；这些结果只能用于验证流程和界面。"
+        )
+        lines.append(
+            "- 真实调研需要启用 live search 后重新检索，达到 5 篇真实文献后我再做分析型结论。"
+        )
         return "\n".join(lines)
     if expanded_year_range:
-        lines.insert(
-            1,
-            f"最近年份范围（{original_year_min} 年以来）没有找到足够结果，已自动扩大到不限年份。",
-        )
-        lines.insert(2, "")
+        lines.append(f"最近年份范围（{original_year_min} 年以来）证据不足，已自动扩大检索年限。")
     if not workspace.context.active_papers:
-        lines.append("- 暂时没有检索到可用文献。可以换一个关键词，或打开 live search。")
+        login_ids = getattr(workspace.context.filters, "requires_login_candidate_ids", None) or []
+        lines.append(
+            "目前还没有可进入上下文的已下载全文文献，因此我不会基于题录或摘要给出分析结论。"
+        )
+        if login_ids:
+            lines.append("部分相关文献可能需要 publisher 登录授权后才能下载全文。")
         return "\n".join(lines)
     if len(workspace.context.active_papers) < MIN_ANALYSIS_PAPERS:
-        lines.append(
-            f"- 当前只找到 {len(workspace.context.active_papers)} 篇相关文献，少于最低分析门槛 "
-            f"{MIN_ANALYSIS_PAPERS} 篇；我先不做分析型结论。"
-        )
-        lines.append("- 常见原因：主题过窄、数据库对中文材料术语召回较弱，或相关性过滤后不足五篇。")
-        lines.append("- 我会继续优先用英文同义词和更宽材料关键词扩展检索，再达到五篇后做分析。")
+        lines.append(f"当前全文证据还不足 {MIN_ANALYSIS_PAPERS} 篇，我先不做分析型结论。")
+        lines.append("可以继续扩大关键词/年份，或完成需要授权的 publisher 登录后再继续。")
         return "\n".join(lines)
 
-    if active_limit:
-        lines.append(f"- 模型上下文最多使用前 {active_limit} 篇；其余候选保留在候选池，避免弱相关文献污染回答。")
-    lines.append(
-        f"- 已找到 {len(workspace.context.active_papers)} 篇真实候选文献，其中当前上下文为排序靠前的高相关文献，超过最低门槛 5 篇。"
-    )
-    lines.append("")
+    lines.append("全文证据已达到最低门槛，可以继续提出分析问题。")
     for index, paper_id in enumerate(workspace.context.active_papers, start=1):
         paper = workspace.papers[paper_id]
         year = paper.year or "n.d."
         source = paper.journal or paper.publisher or "unknown source"
         lines.append(f"{index}. {paper.title} ({year}, {source})")
-
-    lines.extend(
-        [
-            "",
-            "你可以直接继续问：",
-            "- 总结这些论文的主要路线",
-            "- 生成性能对比表",
-            "- 选择第 1、3 篇下载",
-        ]
-    )
     return "\n".join(lines)
 
 
@@ -694,8 +814,12 @@ def _prepend_intent_trace_step(
 
 
 def _append_search_diagnostics_trace(research_result, workspace: LiteratureWorkspace) -> None:
-    diagnostics = workspace.context.filters.get("search_diagnostics")
-    if research_result is None or research_result.workflow_trace is None or not isinstance(diagnostics, dict):
+    diagnostics = getattr(workspace.context.filters, "search_diagnostics", None)
+    if (
+        research_result is None
+        or research_result.workflow_trace is None
+        or not isinstance(diagnostics, dict)
+    ):
         return
     variants = diagnostics.get("query_variants") or []
     source_counts = diagnostics.get("source_counts") or {}
@@ -723,11 +847,11 @@ def _append_evidence_quality_trace(research_result, workspace: LiteratureWorkspa
     if research_result is None or research_result.workflow_trace is None:
         return
     quality = _workspace_evidence_quality(workspace)
-    status = "strong" if quality["parsed_count"] else "metadata_only"
+    status = "strong" if quality["parsed_count"] else "missing_full_text"
     reason = (
         "已有全文解析证据，可支持更强的分析。"
         if quality["parsed_count"]
-        else "当前主要是题录/摘要级证据，路线和表格结论需要保持候选预览。"
+        else "当前没有全文解析证据；metadata/abstract fallback 已禁用。"
     )
     research_result.workflow_trace.steps.append(
         WorkflowTraceStep(

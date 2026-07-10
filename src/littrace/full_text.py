@@ -13,6 +13,7 @@ from littrace.models import (
     LiteratureWorkspace,
     PaperMetadata,
 )
+from littrace.retry import retry_async, RetryConfig, BackoffStrategy
 from littrace.search import (
     _crossref_authors,
     _crossref_year,
@@ -141,7 +142,7 @@ async def fetch_crossref_paper_by_doi(
         source_urls=source_urls,
         access_type=AccessType.REQUIRES_LOGIN
         if _looks_gated(str(source_urls[0]), probe)
-        else AccessType.METADATA_ONLY,
+        else AccessType.UNAVAILABLE,
     )
 
 
@@ -385,23 +386,33 @@ async def _request_with_retry(
     max_attempts: int = 3,
     **kwargs,
 ) -> httpx.Response:
-    last_exc: httpx.HTTPError | None = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = await client.request(method, url, **kwargs)
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < max_attempts:
-                await asyncio.sleep(0.2 * attempt)
-                continue
-            return response
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
-            last_exc = exc
-            if attempt < max_attempts:
-                await asyncio.sleep(0.2 * attempt)
-                continue
-            raise
-    if last_exc is not None:
-        raise last_exc
-    return await client.request(method, url, **kwargs)
+    """HTTP request with unified retry via @retry_async.
+
+    The inner _single_request does one HTTP request; retries are handled
+    by the decorator. Retry traces are recorded in retry_tracker.
+    """
+    retry_config = RetryConfig(
+        max_attempts=max_attempts,
+        backoff_strategy=BackoffStrategy.LINEAR,
+        base_delay_seconds=0.2,
+        retry_status_codes=frozenset({429, 500, 502, 503, 504}),
+        retry_on=(httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError),
+    )
+
+    @retry_async(
+        retry_config, operation=f"full_text_request:{method}", retry_on=retry_config.retry_on
+    )
+    async def _single_request() -> httpx.Response:
+        response = await client.request(method, url, **kwargs)
+        if response.status_code in retry_config.retry_status_codes:
+            raise httpx.HTTPStatusError(
+                f"HTTP {response.status_code}",
+                request=response.request,
+                response=response,
+            )
+        return response
+
+    return await _single_request()
 
 
 def _failure_class(exc: httpx.HTTPError) -> str:
@@ -451,7 +462,10 @@ def _full_text_next_steps(
     paper: PaperMetadata,
     candidates: list[FullTextCandidate],
 ) -> list[str]:
-    if any(candidate.is_pdf and candidate.access_type == AccessType.OPEN_ACCESS for candidate in candidates):
+    if any(
+        candidate.is_pdf and candidate.access_type == AccessType.OPEN_ACCESS
+        for candidate in candidates
+    ):
         return []
     if any(candidate.requires_login for candidate in candidates):
         return [f"{paper.paper_id}: login_required_try_browser_session"]
@@ -461,7 +475,7 @@ def _full_text_next_steps(
         return [f"{paper.paper_id}: oa_evidence_without_verified_pdf_try_landing_page"]
     if paper.doi:
         return [f"{paper.paper_id}: no_pdf_found_try_publisher_or_user_upload"]
-    return [f"{paper.paper_id}: missing_doi_try_metadata_backfill_or_user_upload"]
+    return [f"{paper.paper_id}: missing_doi_try_publisher_search_or_user_upload"]
 
 
 def _content_type_from_url(url: str) -> str:
@@ -487,7 +501,9 @@ def _has_open_access_evidence(candidate: FullTextCandidate) -> bool:
         "plos.org",
         "arxiv.org/pdf",
     ]
-    return candidate.access_type == AccessType.OPEN_ACCESS and any(host in lowered for host in oa_hosts)
+    return candidate.access_type == AccessType.OPEN_ACCESS and any(
+        host in lowered for host in oa_hosts
+    )
 
 
 def _is_doi_resolver_candidate(candidate: FullTextCandidate) -> bool:

@@ -186,19 +186,32 @@ class PaddleOCRTool:
         if len(valid_paths) != len(image_paths):
             return [self.parse_image(path, mode, preferred_engines) for path in image_paths]
 
+        # Obtain an OCR engine.  If paddleocr is not importable we fall back
+        # to per-image parsing, unless an engine has been injected (e.g. via
+        # monkeypatch or DI), in which case we use it directly.
+        ocr: Any = None
         try:
             from paddleocr import PaddleOCR
-        except ImportError:
-            return [self.parse_image(path, mode, preferred_engines) for path in image_paths]
 
-        ocr = self._get_ocr_engine(PaddleOCR)
+            ocr = self._get_ocr_engine(PaddleOCR)
+        except ImportError:
+            # If _get_ocr_engine was overridden (e.g. monkeypatched) it may
+            # still return a usable engine without the import.
+            try:
+                ocr = self._get_ocr_engine(None)
+            except Exception:
+                pass
+            if ocr is None:
+                return [self.parse_image(path, mode, preferred_engines) for path in image_paths]
+
         if not hasattr(ocr, "predict"):
             return [self.parse_image(path, mode, preferred_engines) for path in image_paths]
 
         parsed_pages: list[ParsedPaper] = []
         for batch in _chunks(image_paths, max(self.config.ocr_batch_size, 1)):
             cached_pages: list[ParsedPaper | None] = [
-                self._read_cached_page(path, mode, preferred_engines, batched=True) for path in batch
+                self._read_cached_page(path, mode, preferred_engines, batched=True)
+                for path in batch
             ]
             missing = [
                 (index, path)
@@ -213,7 +226,8 @@ class PaddleOCRTool:
                 )
                 raw_pages = _align_batch_results(raw_results, len(missing))
                 raw_pages_by_index = {
-                    index: raw_page for (index, _), raw_page in zip(missing, raw_pages, strict=False)
+                    index: raw_page
+                    for (index, _), raw_page in zip(missing, raw_pages, strict=False)
                 }
             for index, image_path in enumerate(batch):
                 cached = cached_pages[index]

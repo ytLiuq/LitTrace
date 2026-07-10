@@ -38,7 +38,7 @@ def export_session_bundle(
     report_json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
     autonomous_path.write_text(
         json.dumps(
-            workspace.context.filters.get("autonomous_loop_report", {}),
+            getattr(workspace.context.filters, "autonomous_loop_report", {}),
             ensure_ascii=False,
             indent=2,
         ),
@@ -140,9 +140,7 @@ def render_bibtex(workspace: LiteratureWorkspace) -> str:
             "doi": paper.doi,
             "url": str(paper.source_urls[0]) if paper.source_urls else None,
         }
-        body = "\n".join(
-            f"  {name} = {{{value}}}," for name, value in fields.items() if value
-        )
+        body = "\n".join(f"  {name} = {{{value}}}," for name, value in fields.items() if value)
         entries.append(f"@article{{{key},\n{body}\n}}")
     return "\n\n".join(entries) + ("\n" if entries else "")
 
@@ -176,9 +174,13 @@ def render_numbered_references(workspace: LiteratureWorkspace, style: str) -> st
         source = paper.journal or paper.publisher or ""
         doi = f" DOI: {paper.doi}." if paper.doi else ""
         if style == "nature":
-            lines.append(f"{index}. {authors}. {paper.title}. {source} ({paper.year or 'n.d.'}).{doi}")
+            lines.append(
+                f"{index}. {authors}. {paper.title}. {source} ({paper.year or 'n.d.'}).{doi}"
+            )
         else:
-            lines.append(f"({index}) {authors}. {paper.title}. {source} {paper.year or 'n.d.'}.{doi}")
+            lines.append(
+                f"({index}) {authors}. {paper.title}. {source} {paper.year or 'n.d.'}.{doi}"
+            )
     return "\n".join(lines) + ("\n" if lines else "")
 
 

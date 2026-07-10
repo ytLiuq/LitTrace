@@ -43,7 +43,7 @@ def test_golden_eval_scores_workspace_against_real_task(tmp_path):
             )
         ],
     )
-    workspace.context.filters["source_routes"] = ["Crossref"]
+    workspace.context.filters.source_routes = ["Crossref"]
     workspace.performance_cells.append(
         PerformanceCell(
             paper_id="p1",

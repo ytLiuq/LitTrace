@@ -6,9 +6,11 @@ from littrace.access import build_download_plan
 from littrace.agent_interactions import build_agent_interaction_report
 from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.citations import audit_citation_links
-from littrace.context import add_papers, add_ranked_candidate_papers
+from littrace.context import add_papers, add_ranked_candidate_papers, _merge_filters
 from littrace.config import LitTraceConfig, load_config
 from littrace.document_composer import build_research_document_report
+from littrace.full_text_context import build_full_text_context
+from littrace.log import get_logger, timed
 from littrace.models import (
     LiteratureWorkspace,
     PaperSearchResult,
@@ -23,6 +25,8 @@ from littrace.search import LiveSearchClient, MockMaterialsSearchClient
 from littrace.source_router import SourceRoute, route_sources
 from littrace.storyline import build_storyline_from_workspace, verify_storyline_preview
 from littrace.tables import build_comparison_matrices, extract_performance_cells
+
+logger = get_logger("workflow")
 
 
 class ResearchWorkflowState(TypedDict, total=False):
@@ -73,20 +77,28 @@ async def run_search_preview(
         result = await MockMaterialsSearchClient().search(request)
         diagnostics = None
     workspace = LiteratureWorkspace()
-    workspace.context.filters = {
-        "discipline": request.discipline,
-        "year_min": request.year_min,
-        "source_routes": [route.name for route in routes],
-        "publisher_search_plan": build_publisher_search_plan(request.topic).model_dump(),
-        "search_mode": "live" if use_live else "mock",
-        "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
-    }
-    return add_ranked_candidate_papers(
+    _merge_filters(
+        workspace.context.filters,
+        {
+            "discipline": request.discipline,
+            "year_min": request.year_min,
+            "source_routes": [route.name for route in routes],
+            "publisher_search_plan": build_publisher_search_plan(request.topic).model_dump(),
+            "search_mode": "live" if use_live else "mock",
+            "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
+        },
+    )
+    workspace = add_ranked_candidate_papers(
         workspace,
         result.papers,
         request,
         active_limit=config.literature_context.active_context_limit,
     )
+    if use_live:
+        context_result = await build_full_text_context(workspace, request, config)
+        workspace = context_result.workspace
+        workspace.context.filters.full_text_context_warnings = context_result.warnings
+    return workspace
 
 
 def build_littrace_graph():
@@ -96,19 +108,27 @@ def build_littrace_graph():
         return None
 
     async def plan_sources(state: ResearchWorkflowState) -> ResearchWorkflowState:
-        request = state["request"]
-        state["routes"] = route_sources(request.discipline, request.wants_recent)
-        _trace_step(
-            state,
-            "plan_sources",
-            "completed",
-            "根据学科和时效偏好选择检索源。",
-            inputs={"discipline": request.discipline, "wants_recent": request.wants_recent},
-            outputs={"routes": [route.name for route in state["routes"]]},
-            next_node="search_papers",
-            next_reason="检索源规划完成后进入论文检索。",
-        )
-        return state
+        with timed("plan_sources"):
+            request = state["request"]
+            state["routes"] = route_sources(request.discipline, request.wants_recent)
+            logger.info(
+                "plan_sources",
+                extra={
+                    "discipline": request.discipline,
+                    "routes": [r.name for r in state["routes"]],
+                },
+            )
+            _trace_step(
+                state,
+                "plan_sources",
+                "completed",
+                "根据学科和时效偏好选择检索源。",
+                inputs={"discipline": request.discipline, "wants_recent": request.wants_recent},
+                outputs={"routes": [route.name for route in state["routes"]]},
+                next_node="search_papers",
+                next_reason="检索源规划完成后进入论文检索。",
+            )
+            return state
 
     async def search_papers(state: ResearchWorkflowState) -> ResearchWorkflowState:
         request = state["request"]
@@ -127,20 +147,28 @@ def build_littrace_graph():
             result = await MockMaterialsSearchClient().search(request)
             diagnostics = None
         workspace = LiteratureWorkspace()
-        workspace.context.filters = {
-            "discipline": request.discipline,
-            "year_min": request.year_min,
-            "source_routes": [route.name for route in state.get("routes", [])],
-            "publisher_search_plan": build_publisher_search_plan(request.topic).model_dump(),
-            "search_mode": "live" if use_live else "mock",
-            "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
-        }
-        state["workspace"] = add_ranked_candidate_papers(
+        _merge_filters(
+            workspace.context.filters,
+            {
+                "discipline": request.discipline,
+                "year_min": request.year_min,
+                "source_routes": [route.name for route in state.get("routes", [])],
+                "publisher_search_plan": build_publisher_search_plan(request.topic).model_dump(),
+                "search_mode": "live" if use_live else "mock",
+                "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
+            },
+        )
+        workspace = add_ranked_candidate_papers(
             workspace,
             result.papers,
             request,
             active_limit=config.literature_context.active_context_limit,
         )
+        if use_live:
+            context_result = await build_full_text_context(workspace, request, config)
+            workspace = context_result.workspace
+            workspace.context.filters.full_text_context_warnings = context_result.warnings
+        state["workspace"] = workspace
         next_node, next_reason = _next_after_search(state)
         _trace_step(
             state,
@@ -150,8 +178,21 @@ def build_littrace_graph():
             inputs={"topic": request.topic, "live": use_live, "year_min": request.year_min},
             outputs={
                 "paper_count": len(state["workspace"].context.active_papers),
-                "candidate_pool_count": state["workspace"].context.filters.get("candidate_pool_count", 0),
-                "active_context_limit": state["workspace"].context.filters.get("active_context_limit"),
+                "candidate_pool_count": getattr(
+                    state["workspace"].context.filters, "candidate_pool_count", 0
+                ),
+                "valid_candidate_count": getattr(
+                    state["workspace"].context.filters, "valid_candidate_count", 0
+                ),
+                "downloaded_full_text_count": getattr(
+                    state["workspace"].context.filters, "downloaded_full_text_count", 0
+                ),
+                "parsed_full_text_count": getattr(
+                    state["workspace"].context.filters, "parsed_full_text_count", 0
+                ),
+                "active_context_limit": getattr(
+                    state["workspace"].context.filters, "active_context_limit", None
+                ),
                 "search_mode": "live" if use_live else "mock",
             },
             next_node=next_node,
@@ -171,7 +212,10 @@ def build_littrace_graph():
             "completed",
             "citation_audit_enabled=True，需要检查引用和访问链接。",
             inputs={"paper_count": len(papers)},
-            outputs={"passed": state["citation_audit"].passed, "score": state["citation_audit"].score},
+            outputs={
+                "passed": state["citation_audit"].passed,
+                "score": state["citation_audit"].score,
+            },
             next_node=next_node,
             next_reason=next_reason,
         )
@@ -237,7 +281,7 @@ def build_littrace_graph():
     async def compose_document(state: ResearchWorkflowState) -> ResearchWorkflowState:
         config = state.get("config") or load_config()
         report = build_research_document_report(state["workspace"], config)
-        state["workspace"].context.filters["document_report"] = report.model_dump(mode="json")
+        state["workspace"].context.filters.document_report = report.model_dump(mode="json")
         state["document_report"] = report
         next_node, next_reason = _next_after_document(state)
         _trace_step(
@@ -246,7 +290,10 @@ def build_littrace_graph():
             "completed",
             "compose_document_enabled=True，需要生成学术化可审计报告。",
             inputs={"paper_count": len(state["workspace"].context.active_papers)},
-            outputs={"section_count": len(report.sections), "evidence_count": report.evidence_count},
+            outputs={
+                "section_count": len(report.sections),
+                "evidence_count": report.evidence_count,
+            },
             next_node=next_node,
             next_reason=next_reason,
         )
@@ -261,7 +308,7 @@ def build_littrace_graph():
             state["workspace"],
             auto_replan=state.get("auto_replan_enabled", False),
         )
-        state["workspace"].context.filters["autonomous_loop_report"] = report.model_dump(mode="json")
+        state["workspace"].context.filters.autonomous_loop_report = report.model_dump(mode="json")
         state["autonomous_loop_report"] = report
         _trace_step(
             state,
@@ -269,7 +316,11 @@ def build_littrace_graph():
             "completed",
             "autonomous_review_enabled=True，需要多 Agent 复核、反驳和修订。",
             inputs={"objective": objective, "auto_replan": state.get("auto_replan_enabled", False)},
-            outputs={"round_count": len(report.rounds), "score": report.score, "passed": report.passed},
+            outputs={
+                "round_count": len(report.rounds),
+                "score": report.score,
+                "passed": report.passed,
+            },
             next_node=None,
             next_reason="复核循环完成，流程结束。",
         )
@@ -285,11 +336,12 @@ def build_littrace_graph():
             state,
             "parse_full_text",
             "completed",
-            "parse_full_text_enabled=True，需要解析本地 PDF 或元数据。",
+            "parse_full_text_enabled=True，需要解析本地 PDF；metadata/abstract fallback 已禁用。",
             inputs={"parse_strategy": config.parsing.parse_strategy},
             outputs={
                 "parsed_count": report.get("parsed_count"),
-                "metadata_only_count": report.get("metadata_only_count"),
+                "failed_count": report.get("failed_count"),
+                "missing_pdf_count": report.get("missing_pdf_count"),
             },
             next_node=next_node,
             next_reason=next_reason,
@@ -297,7 +349,8 @@ def build_littrace_graph():
         return state
 
     async def extract_tables(state: ResearchWorkflowState) -> ResearchWorkflowState:
-        workspace, harness = extract_performance_cells(state["workspace"])
+        config = state.get("config") or load_config()
+        workspace, harness = await extract_performance_cells(state["workspace"], config)
         state["workspace"] = workspace
         state["table_harness"] = harness.model_dump()
         state["comparison_matrix"] = build_comparison_matrices(workspace)
@@ -349,17 +402,38 @@ def build_littrace_graph():
         node, _reason = _next_after_document(state)
         return node or END
 
+    def _wrap_node(name: str, fn):
+        """Wrap a LangGraph node with timed logging."""
+        import functools
+
+        @functools.wraps(fn)
+        async def wrapped(state, *args, **kwargs):
+            with timed(f"node:{name}"):
+                result = await fn(state, *args, **kwargs)
+                ws = state.get("workspace")
+                logger.info(
+                    "node_completed",
+                    extra={
+                        "node": name,
+                        "paper_count": len(ws.context.active_papers) if ws else 0,
+                        "parsed_count": len(ws.parsed_papers) if ws else 0,
+                    },
+                )
+                return result
+
+        return wrapped
+
     graph = StateGraph(ResearchWorkflowState)
-    graph.add_node("plan_sources", plan_sources)
-    graph.add_node("search_papers", search_papers)
-    graph.add_node("audit_citations", audit_citations)
-    graph.add_node("plan_downloads", plan_downloads)
-    graph.add_node("route_publishers", route_publishers)
-    graph.add_node("parse_full_text", parse_full_text)
-    graph.add_node("extract_tables", extract_tables)
-    graph.add_node("build_storyline", build_storyline)
-    graph.add_node("compose_document", compose_document)
-    graph.add_node("autonomous_review", autonomous_review)
+    graph.add_node("plan_sources", _wrap_node("plan_sources", plan_sources))
+    graph.add_node("search_papers", _wrap_node("search_papers", search_papers))
+    graph.add_node("audit_citations", _wrap_node("audit_citations", audit_citations))
+    graph.add_node("plan_downloads", _wrap_node("plan_downloads", plan_downloads))
+    graph.add_node("route_publishers", _wrap_node("route_publishers", route_publishers))
+    graph.add_node("parse_full_text", _wrap_node("parse_full_text", parse_full_text))
+    graph.add_node("extract_tables", _wrap_node("extract_tables", extract_tables))
+    graph.add_node("build_storyline", _wrap_node("build_storyline", build_storyline))
+    graph.add_node("compose_document", _wrap_node("compose_document", compose_document))
+    graph.add_node("autonomous_review", _wrap_node("autonomous_review", autonomous_review))
     graph.set_entry_point("plan_sources")
     graph.add_edge("plan_sources", "search_papers")
     graph.add_conditional_edges("search_papers", after_search)
@@ -390,6 +464,24 @@ async def run_research_graph(
     config = config or load_config()
     workflow_trace = WorkflowTrace()
     graph = build_littrace_graph()
+    logger.info(
+        "run_research_graph_start",
+        extra={
+            "topic": request.topic,
+            "live": request.live,
+            "langgraph_available": graph is not None,
+            "flags": {
+                "audit": audit_citations_enabled,
+                "downloads": plan_downloads_enabled,
+                "publishers": route_publishers_enabled,
+                "parse": parse_full_text_enabled,
+                "tables": extract_tables_enabled,
+                "storyline": build_storyline_enabled,
+                "document": compose_document_enabled,
+                "review": autonomous_review_enabled,
+            },
+        },
+    )
     if graph is None:
         workspace = await run_search_preview(request, config)
         _trace_direct(
@@ -399,8 +491,12 @@ async def run_research_graph(
             inputs={"topic": request.topic, "live": request.live, "year_min": request.year_min},
             outputs={
                 "paper_count": len(workspace.context.active_papers),
-                "candidate_pool_count": workspace.context.filters.get("candidate_pool_count", 0),
-                "active_context_limit": workspace.context.filters.get("active_context_limit"),
+                "candidate_pool_count": getattr(
+                    workspace.context.filters, "candidate_pool_count", 0
+                ),
+                "active_context_limit": getattr(
+                    workspace.context.filters, "active_context_limit", None
+                ),
             },
         )
         papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
@@ -438,9 +534,7 @@ async def run_research_graph(
                 },
             )
         publisher_routes = (
-            build_publisher_route_report(papers).model_dump()
-            if route_publishers_enabled
-            else None
+            build_publisher_route_report(papers).model_dump() if route_publishers_enabled else None
         )
         if publisher_routes is not None:
             _trace_direct(
@@ -459,13 +553,14 @@ async def run_research_graph(
                 inputs={"parse_strategy": config.parsing.parse_strategy},
                 outputs={
                     "parsed_count": parse_report.get("parsed_count"),
-                    "metadata_only_count": parse_report.get("metadata_only_count"),
+                    "failed_count": parse_report.get("failed_count"),
+                    "missing_pdf_count": parse_report.get("missing_pdf_count"),
                 },
             )
         table_harness = None
         comparison_matrix = None
         if extract_tables_enabled:
-            workspace, harness = extract_performance_cells(workspace)
+            workspace, harness = await extract_performance_cells(workspace, config)
             table_harness = harness.model_dump()
             comparison_matrix = build_comparison_matrices(workspace)
             _trace_direct(
@@ -474,9 +569,7 @@ async def run_research_graph(
                 "extract_tables_enabled=True，抽取性能指标。",
                 outputs={"cell_count": len(workspace.performance_cells)},
             )
-        storyline = (
-            build_storyline_from_workspace(workspace) if build_storyline_enabled else None
-        )
+        storyline = build_storyline_from_workspace(workspace) if build_storyline_enabled else None
         if storyline is not None:
             _trace_direct(
                 workflow_trace,
@@ -487,7 +580,7 @@ async def run_research_graph(
         document_report = None
         if compose_document_enabled:
             document_report = build_research_document_report(workspace, config)
-            workspace.context.filters["document_report"] = document_report.model_dump(mode="json")
+            workspace.context.filters.document_report = document_report.model_dump(mode="json")
             _trace_direct(
                 workflow_trace,
                 "compose_document",
@@ -502,13 +595,19 @@ async def run_research_graph(
                 workspace,
                 auto_replan=auto_replan_enabled,
             )
-            workspace.context.filters["autonomous_loop_report"] = autonomous_loop_report.model_dump(mode="json")
+            workspace.context.filters.autonomous_loop_report = autonomous_loop_report.model_dump(
+                mode="json"
+            )
             _trace_direct(
                 workflow_trace,
                 "autonomous_review",
                 "autonomous_review_enabled=True，执行多 Agent 复核。",
                 outputs={"round_count": len(autonomous_loop_report.rounds)},
             )
+        logger.info(
+            "run_research_graph_done",
+            extra={"path": "fallback", "papers": len(workspace.context.active_papers)},
+        )
         return ResearchRunResult(
             workspace=workspace,
             citation_audit=citation_audit,
@@ -524,21 +623,26 @@ async def run_research_graph(
             workflow_trace=workflow_trace,
         )
 
-    state = await graph.ainvoke(
-        {
-            "request": request,
-            "config": config,
-            "audit_citations_enabled": audit_citations_enabled,
-            "plan_downloads_enabled": plan_downloads_enabled,
-            "route_publishers_enabled": route_publishers_enabled,
-            "parse_full_text_enabled": parse_full_text_enabled,
-            "extract_tables_enabled": extract_tables_enabled,
-            "build_storyline_enabled": build_storyline_enabled,
-            "compose_document_enabled": compose_document_enabled,
-            "autonomous_review_enabled": autonomous_review_enabled,
-            "auto_replan_enabled": auto_replan_enabled,
-            "workflow_trace": workflow_trace,
-        }
+    with timed("graph_ainvoke"):
+        state = await graph.ainvoke(
+            {
+                "request": request,
+                "config": config,
+                "audit_citations_enabled": audit_citations_enabled,
+                "plan_downloads_enabled": plan_downloads_enabled,
+                "route_publishers_enabled": route_publishers_enabled,
+                "parse_full_text_enabled": parse_full_text_enabled,
+                "extract_tables_enabled": extract_tables_enabled,
+                "build_storyline_enabled": build_storyline_enabled,
+                "compose_document_enabled": compose_document_enabled,
+                "autonomous_review_enabled": autonomous_review_enabled,
+                "auto_replan_enabled": auto_replan_enabled,
+                "workflow_trace": workflow_trace,
+            }
+        )
+    logger.info(
+        "run_research_graph_done",
+        extra={"path": "langgraph", "papers": len(state["workspace"].context.active_papers)},
     )
     return ResearchRunResult(
         workspace=state["workspace"],
@@ -599,7 +703,9 @@ def _trace_direct(
     )
 
 
-def _first_enabled(state: ResearchWorkflowState, candidates: list[tuple[str, str]]) -> tuple[str | None, str]:
+def _first_enabled(
+    state: ResearchWorkflowState, candidates: list[tuple[str, str]]
+) -> tuple[str | None, str]:
     for flag, node in candidates:
         if state.get(flag, False):
             return node, f"{flag}=True，因此进入 {node}。"

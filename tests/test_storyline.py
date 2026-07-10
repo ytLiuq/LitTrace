@@ -10,7 +10,7 @@ from littrace.storyline import (
 )
 
 
-def test_storyline_preview_is_conservative_with_metadata_only():
+def test_storyline_preview_is_disabled_without_full_text():
     claims = build_storyline_preview(
         [
             PaperMetadata(paper_id="p1", title="Paper 1", year=2025, journal="ACS Nano"),
@@ -23,8 +23,7 @@ def test_storyline_preview_is_conservative_with_metadata_only():
         ]
     )
 
-    assert claims
-    assert "full-text parsing is required" in claims[0].claim
+    assert claims == []
     assert verify_storyline_preview(claims).passed
 
 

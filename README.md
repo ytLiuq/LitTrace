@@ -5,13 +5,14 @@ workflows. It helps researchers search papers, manage the active literature
 context, optionally download PDFs, parse full text with OCR tools, build
 evidence-grounded comparison tables, and generate truthful research storylines.
 
-LitTrace is intentionally a **LangGraph + CrewAI** project:
+LitTrace is intentionally a **LangGraph** project:
 
 - **LangGraph** is the primary stateful workflow engine for source routing,
   search, citation auditing, download planning, OCR parsing, and later
   storyline/table verification.
-- **CrewAI** is the optional role layer for research-team style agents such as
-  Source Router, Citation Verifier, Access Manager, and Storyline Verifier.
+- **13 Agent roles** (defined in `agents.py`) describe the system's
+  organizational structure and tool ownership. They are executed as LangGraph
+  nodes or direct Python function calls—not via an external agent framework.
 
 ## Product Principles
 
@@ -50,23 +51,21 @@ cd LitTrace
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,parsers]"
-uv tool install browser-act-cli --python 3.12
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=19222
 littrace doctor
 littrace-window
 ```
 
-`browser-act` is a required external CLI for publisher-authenticated full-text
-access. LitTrace resolves it in this order: `LITTRACE_BROWSER_ACT_PATH`,
-`config.yaml`, your `PATH`, then common `uv tool` install locations. Keep the
-default config portable:
+Publisher-authenticated full-text access uses a local Chrome CDP connection,
+not BrowserAct. Start Chrome with a remote debugging port before running real
+publisher downloads:
 
 ```yaml
-browser:
-  browser_act_path: "browser-act"
+cdp_downloader:
+  cdp_url: "http://127.0.0.1:19222"
 ```
 
-Only set an absolute path in your private local `config.yaml` if your shell
-cannot find `browser-act`.
+You can override the CDP endpoint with `LITTRACE_CDP_URL`.
 
 For the Codex-style local interactive app, start the native popup window:
 
@@ -145,11 +144,11 @@ Conversation examples:
 生成发展脉络
 ```
 
-For login-gated papers, `/login N` opens the authorized publisher or DOI page in
-the local browser and prints the exact target path where the PDF should be
-saved for the current session/parser flow. `/check-downloads` detects whether
-those PDFs have appeared, and `/attach N /path/to/paper.pdf` copies an existing
-local PDF into the expected LitTrace folder for that paper. `/resume-downloads`
+For login-gated papers, LitTrace uses the CDP publisher downloader: it opens the
+authorized publisher or DOI page in local Chrome, lets the user complete
+Cloudflare or institutional login when needed, and then saves the PDF into the
+expected LitTrace folder. `/attach N /path/to/paper.pdf` can still copy an
+existing local PDF into the expected folder for that paper. `/resume-downloads`
 parses ready PDFs, extracts tables, and writes session artifacts.
 `/publisher-retrieve family topic` merges DOI-level publisher search results
 into the active context, and `/attach-si N path` stores supplementary files
@@ -198,18 +197,22 @@ page and stores page-aware evidence spans.
 - `Source Router` routes materials/chemistry queries toward OpenAlex, Crossref,
   Unpaywall, and preferred publisher families.
 - `Citation Verifier` builds citation records and audits access links.
-- `Access Manager` plans compliant downloads and marks login-required papers
-  instead of bypassing authentication. Login-required papers return an
-  `open_login_popup` action with the authorized URL, target path, and manual
-  handoff instructions.
+- `Access Manager` plans compliant downloads and uses the CDP publisher
+  downloader for login-gated papers. It asks the user to complete required
+  Cloudflare or institutional authentication in local Chrome, then downloads
+  via publisher-specific PDF routes.
 - `Publisher Connector` maps papers to publisher families such as ACS, Wiley,
   Nature, MDPI, RSC, and Elsevier, then emits DOI/publisher access routes.
-- `PDF/OCR Parser` exposes metadata-only, Docling, and PaddleOCR tools.
+- `PDF/OCR Parser` requires a local PDF and uses Docling or PaddleOCR; metadata/abstract
+  fallback is disabled for research answers.
 - `Table Agent` extracts performance cells into evidence-preserving matrices.
 - `Research Planner` turns a question into a retrieval/parse/table/storyline
   plan using the current context.
 - `Research Writer` produces evidence-grounded answers behind citation guard.
 - `Eval Auditor` reports agent strength, quality metrics, and golden-set status.
+- `Publisher E2E` can run real golden-set DOI checks with
+  `LITTRACE_RUN_PUBLISHER_E2E=1 pytest tests/test_publisher_e2e.py`; each case must
+  download and parse a PDF, otherwise it fails.
 - `Research Storyline Agent` builds conservative solution-limit-response chains
   from parsed evidence and refuses unsupported broad narratives.
 - `Dialogue Agent` is the primary product surface: a local shell with a

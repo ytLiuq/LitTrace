@@ -4,7 +4,7 @@ from littrace.models import LiteratureWorkspace, PaperMetadata
 from littrace.parsing import parse_workspace_papers
 
 
-def test_parse_workspace_papers_uses_metadata_only_tool_without_local_pdf():
+def test_parse_workspace_papers_fails_without_local_pdf():
     workspace = add_papers(
         LiteratureWorkspace(),
         [
@@ -19,6 +19,9 @@ def test_parse_workspace_papers_uses_metadata_only_tool_without_local_pdf():
 
     workspace, report = parse_workspace_papers(workspace, LitTraceConfig())
 
-    assert report["parser"] == "metadata_only"
+    assert report["parser"] == "docling"
     assert report["missing_pdf_count"] == 1
-    assert workspace.parsed_papers["p1"]["title"] == "A materials paper"
+    assert report["failed_count"] == 1
+    assert report["parsed_count"] == 0
+    assert workspace.parsed_papers["p1"].title == "A materials paper"
+    assert "metadata/abstract fallback is disabled" in workspace.parsed_papers["p1"].error

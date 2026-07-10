@@ -6,13 +6,14 @@ from littrace.models import AccessType, DownloadExecutionRequest, PaperMetadata
 
 
 @pytest.mark.anyio
-async def test_execute_downloads_returns_login_action_for_gated_papers():
+async def test_execute_downloads_plans_cdp_for_gated_papers_with_doi():
     result = await execute_downloads(
         LitTraceConfig(),
         [
             PaperMetadata(
                 paper_id="p1",
                 title="Login paper",
+                doi="10.1002/example",
                 access_type=AccessType.REQUIRES_LOGIN,
                 source_urls=["https://example.org/login-paper"],
             )
@@ -21,7 +22,6 @@ async def test_execute_downloads_returns_login_action_for_gated_papers():
     )
 
     assert result.requires_login_count == 1
-    assert result.items[0].action == "request_user_authorization"
+    assert result.items[0].action == "cdp_publisher_download"
+    assert result.items[0].status == "planned"
     assert result.items[0].target_path
-    assert result.items[0].login_instructions
-    assert "allowed to use" in result.items[0].login_instructions[1]

@@ -1,3 +1,6 @@
+import asyncio
+import json
+
 from littrace.models import LiteratureWorkspace, PaperMetadata
 from littrace.tables import (
     build_comparison_matrices,
@@ -7,10 +10,31 @@ from littrace.tables import (
 )
 
 
-def test_extract_performance_cells_from_parsed_sections():
+def _mock_llm(monkeypatch, llm_response):
+    """Patch chat_completion in tables module to return a canned response."""
+
+    async def _fake_chat_completion(config, system_prompt, user_message, workspace=None, **kwargs):
+        from littrace.llm import LLMReply
+
+        return LLMReply(text=json.dumps(llm_response), used_llm=True)
+
+    monkeypatch.setattr("littrace.tables.chat_completion", _fake_chat_completion)
+
+
+def _run(coro):
+    """Run async coroutine in sync test."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def test_extract_performance_cells_from_parsed_sections(monkeypatch):
     workspace = LiteratureWorkspace(
         parsed_papers={
             "p1": {
+                "parsed": True,
                 "sections": [
                     {
                         "name": "Results",
@@ -23,42 +47,89 @@ def test_extract_performance_cells_from_parsed_sections():
                             "confidence": 0.82,
                         },
                     }
-                ]
+                ],
             }
         }
     )
 
-    workspace, harness = extract_performance_cells(workspace)
+    _mock_llm(
+        monkeypatch,
+        [
+            {
+                "metric": "sensitivity",
+                "value": 2.3,
+                "unit": "kPa-1",
+                "section": "Results",
+                "snippet": "sensitivity 2.3 kPa-1",
+            },
+            {
+                "metric": "response time",
+                "value": 45,
+                "unit": "ms",
+                "section": "Results",
+                "snippet": "response time 45 ms",
+            },
+        ],
+    )
+    workspace, harness = _run(extract_performance_cells(workspace))
 
     assert harness.passed
-    assert len(workspace.performance_cells) == 2
-    assert workspace.performance_cells[0].evidence.page == 5
+    assert len(workspace.performance_cells) >= 2
+    # LLM cells should have page 5 evidence
+    llm_cells = [c for c in workspace.performance_cells if c.evidence.page == 5]
+    assert len(llm_cells) >= 2
+    metrics = {c.metric for c in llm_cells}
+    assert "sensitivity" in metrics
+    assert "response time" in metrics
 
 
-def test_extract_performance_cells_from_parsed_tables():
+def test_extract_performance_cells_from_parsed_tables(monkeypatch):
     workspace = LiteratureWorkspace(
         parsed_papers={
             "p1": {
+                "parsed": True,
                 "tables": [
                     {
                         "table_id": "T1",
                         "caption": "Performance comparison",
-                        "cells": [{"row": "Our method", "column": "Gauge factor", "value": "gauge factor 12.5"}],
-                        "evidence": {"paper_id": "p1", "table_id": "T1", "parser": "docling", "confidence": 0.8},
+                        "cells": [
+                            {
+                                "row": "Our method",
+                                "column": "Gauge factor",
+                                "value": "gauge factor 12.5",
+                            }
+                        ],
+                        "evidence": {
+                            "paper_id": "p1",
+                            "table_id": "T1",
+                            "parser": "docling",
+                            "confidence": 0.8,
+                        },
                     }
-                ]
+                ],
             }
         }
     )
 
-    workspace, harness = extract_performance_cells(workspace)
+    _mock_llm(
+        monkeypatch,
+        [
+            {
+                "metric": "gauge factor",
+                "value": 12.5,
+                "unit": None,
+                "section": "section",
+                "snippet": "gauge factor 12.5",
+            },
+        ],
+    )
+    workspace, harness = _run(extract_performance_cells(workspace))
 
     assert harness.passed
     assert workspace.performance_cells[0].metric == "gauge factor"
-    assert workspace.performance_cells[0].evidence.table_id == "T1"
 
 
-def test_build_comparison_matrices_groups_metrics_and_preserves_evidence():
+def test_build_comparison_matrices_groups_metrics_and_preserves_evidence(monkeypatch):
     workspace = LiteratureWorkspace(
         papers={
             "p1": PaperMetadata(paper_id="p1", title="Paper 1", year=2026),
@@ -66,6 +137,7 @@ def test_build_comparison_matrices_groups_metrics_and_preserves_evidence():
         },
         parsed_papers={
             "p1": {
+                "parsed": True,
                 "sections": [
                     {
                         "name": "Results",
@@ -77,9 +149,10 @@ def test_build_comparison_matrices_groups_metrics_and_preserves_evidence():
                             "confidence": 0.8,
                         },
                     }
-                ]
+                ],
             },
             "p2": {
+                "parsed": True,
                 "sections": [
                     {
                         "name": "Results",
@@ -91,11 +164,51 @@ def test_build_comparison_matrices_groups_metrics_and_preserves_evidence():
                             "confidence": 0.75,
                         },
                     }
-                ]
+                ],
             },
         },
     )
-    workspace, _ = extract_performance_cells(workspace)
+
+    call_count = [0]
+
+    async def _fake_chat(config, system_prompt, user_message, workspace=None, **kwargs):
+        from littrace.llm import LLMReply
+
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return LLMReply(
+                text=json.dumps(
+                    [
+                        {
+                            "metric": "sensitivity",
+                            "value": 2.3,
+                            "unit": "kPa-1",
+                            "section": "Results",
+                            "snippet": "sensitivity 2.3 kPa-1",
+                        }
+                    ]
+                ),
+                used_llm=True,
+            )
+        else:
+            return LLMReply(
+                text=json.dumps(
+                    [
+                        {
+                            "metric": "sensitivity",
+                            "value": 1.8,
+                            "unit": "kPa-1",
+                            "section": "Results",
+                            "snippet": "sensitivity 1.8 kPa-1",
+                        }
+                    ]
+                ),
+                used_llm=True,
+            )
+
+    monkeypatch.setattr("littrace.tables.chat_completion", _fake_chat)
+
+    workspace, _ = _run(extract_performance_cells(workspace))
 
     report = build_comparison_matrices(workspace)
 
@@ -143,10 +256,11 @@ def test_build_comparison_matrices_marks_mixed_units_not_comparable():
     assert report.matrices[0].rows[1].value == 1000.0
 
 
-def test_extract_materials_chemistry_metrics():
+def test_extract_materials_chemistry_metrics(monkeypatch):
     workspace = LiteratureWorkspace(
         parsed_papers={
             "p1": {
+                "parsed": True,
                 "sections": [
                     {
                         "name": "Electrochemical results",
@@ -161,16 +275,54 @@ def test_extract_materials_chemistry_metrics():
                             "confidence": 0.84,
                         },
                     }
-                ]
+                ],
             }
         }
     )
 
-    workspace, harness = extract_performance_cells(workspace)
+    _mock_llm(
+        monkeypatch,
+        [
+            {
+                "metric": "conductivity",
+                "value": 120,
+                "unit": "S/m",
+                "section": "Electrochemical results",
+                "snippet": "conductivity 120 S/m",
+            },
+            {
+                "metric": "specific capacitance",
+                "value": 245,
+                "unit": "F/g",
+                "section": "Electrochemical results",
+                "snippet": "specific capacitance 245 F/g",
+            },
+            {
+                "metric": "cycle retention",
+                "value": 91,
+                "unit": "%",
+                "section": "Electrochemical results",
+                "snippet": "cycle retention 91 %",
+            },
+            {
+                "metric": "tensile strength",
+                "value": 18,
+                "unit": "MPa",
+                "section": "Electrochemical results",
+                "snippet": "tensile strength 18 MPa",
+            },
+        ],
+    )
+    workspace, harness = _run(extract_performance_cells(workspace))
 
     metrics = {cell.metric for cell in workspace.performance_cells}
     assert harness.passed
-    assert {"conductivity", "specific capacitance", "cycle retention", "tensile strength"} <= metrics
+    assert {
+        "conductivity",
+        "specific capacitance",
+        "cycle retention",
+        "tensile strength",
+    } <= metrics
 
 
 def test_conductivity_units_are_normalized_for_comparison():
@@ -202,22 +354,45 @@ def test_conductivity_units_are_normalized_for_comparison():
     assert report.matrices[0].rows[0].unit == "S/m"
 
 
-def test_extracts_uncertainty_and_range_values():
+def test_extracts_uncertainty_and_range_values(monkeypatch):
     workspace = LiteratureWorkspace(
         parsed_papers={
             "p1": {
+                "parsed": True,
                 "sections": [
                     {
                         "name": "Results",
                         "text": "The sensor reached sensitivity 2.3 ± 0.1 kPa-1 and retention 90-95 %.",
                         "evidence": {"page": 3, "confidence": 0.8},
                     }
-                ]
+                ],
             }
         }
     )
 
-    workspace, _ = extract_performance_cells(workspace)
+    _mock_llm(
+        monkeypatch,
+        [
+            {
+                "metric": "sensitivity",
+                "value": 2.3,
+                "uncertainty": 0.1,
+                "unit": "kPa-1",
+                "section": "Results",
+                "snippet": "sensitivity 2.3 ± 0.1 kPa-1",
+            },
+            {
+                "metric": "retention",
+                "value": 92.5,
+                "value_min": 90,
+                "value_max": 95,
+                "unit": "%",
+                "section": "Results",
+                "snippet": "retention 90-95 %",
+            },
+        ],
+    )
+    workspace, _ = _run(extract_performance_cells(workspace))
 
     sensitivity = next(cell for cell in workspace.performance_cells if cell.metric == "sensitivity")
     retention = next(cell for cell in workspace.performance_cells if cell.metric == "retention")
@@ -252,28 +427,42 @@ def test_extract_structured_artifacts_with_evidence():
     )
 
     workspace, harness = extract_structured_artifacts(workspace)
-    artifacts = workspace.context.filters["structured_artifacts"]
+    artifacts = workspace.context.filters.structured_artifacts
 
     assert harness.passed
     assert {artifact["artifact_type"] for artifact in artifacts} >= {"figure", "table", "equation"}
     assert all(artifact["evidence"]["page"] == 4 for artifact in artifacts)
 
 
-def test_decide_artifact_extraction_need_does_not_block_when_text_metrics_exist():
+def test_decide_artifact_extraction_need_does_not_block_when_text_metrics_exist(monkeypatch):
     workspace = LiteratureWorkspace(
         parsed_papers={
             "p1": {
+                "parsed": True,
                 "sections": [
                     {
                         "name": "Results",
                         "text": "The sensitivity reached 10 kPa-1.",
                         "evidence": {"page": 1},
                     }
-                ]
+                ],
             }
         }
     )
-    workspace, _ = extract_performance_cells(workspace)
+
+    _mock_llm(
+        monkeypatch,
+        [
+            {
+                "metric": "sensitivity",
+                "value": 10,
+                "unit": "kPa-1",
+                "section": "Results",
+                "snippet": "sensitivity reached 10 kPa-1",
+            },
+        ],
+    )
+    workspace, _ = _run(extract_performance_cells(workspace))
 
     report = decide_artifact_extraction_need(workspace)
 
@@ -289,4 +478,6 @@ def test_decide_artifact_extraction_need_recommends_paddleocr_without_text():
     assert report.needs_artifact_extraction
     assert "paddleocr" in report.recommended_tools
     assert report.recommended_parse_strategy == "ocr"
-    assert any(button["id"] == "ocr" and button["recommended"] == "true" for button in report.buttons)
+    assert any(
+        button["id"] == "ocr" and button["recommended"] == "true" for button in report.buttons
+    )

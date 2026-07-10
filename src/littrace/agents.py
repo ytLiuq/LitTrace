@@ -90,7 +90,12 @@ LITTRACE_CREW_ROLES = [
         name="Autonomous Review Council",
         goal="Run bounded writer-reviewer-reviser-replanner loops over research answers.",
         backstory="A skeptical multi-agent council that debates evidence, removes unsupported claims, and proposes recovery actions.",
-        tools=["run_autonomous_research_loop", "guard_citations", "check_storyline_claims", "check_performance_cells"],
+        tools=[
+            "run_autonomous_research_loop",
+            "guard_citations",
+            "check_storyline_claims",
+            "check_performance_cells",
+        ],
     ),
     AgentRoleSpec(
         name="Eval Auditor",
@@ -115,16 +120,18 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
     return [
         AgentRuntimeStatus(
             name="Source Router",
-            role_layer="CrewAI role + LangGraph node",
+            role_layer="LangGraph node",
             runtime="LangGraph",
             implemented=True,
             workflow_node="plan_sources",
             callable_tools=["route_sources"],
-            remaining_work=["Turn publisher search-plan URLs into optional browser-assisted retrieval."],
+            remaining_work=[
+                "Turn publisher search-plan URLs into optional browser-assisted retrieval."
+            ],
         ),
         AgentRuntimeStatus(
             name="Citation Verifier",
-            role_layer="CrewAI role + LangGraph node",
+            role_layer="LangGraph node",
             runtime="LangGraph",
             implemented=True,
             workflow_node="audit_citations",
@@ -133,16 +140,18 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
         ),
         AgentRuntimeStatus(
             name="Access Manager",
-            role_layer="CrewAI role + callable tool",
+            role_layer="callable tool",
             runtime="Local async tool",
             implemented=True,
             workflow_node="plan_downloads",
             callable_tools=["build_download_plan", "execute_downloads"],
-            remaining_work=["Detect authorized browser PDF responses, archive them, and resume parsing without user file handling."],
+            remaining_work=[
+                "Detect authorized browser PDF responses, archive them, and resume parsing without user file handling."
+            ],
         ),
         AgentRuntimeStatus(
             name="FullText Resolver",
-            role_layer="CrewAI role + callable tool",
+            role_layer="callable tool",
             runtime="Local async resolver",
             implemented=True,
             workflow_node=None,
@@ -152,38 +161,46 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
                 "verify_full_text_candidates",
                 "resolve_workspace_full_text",
             ],
-            remaining_work=["Add provider-level backoff metrics and institution login redirect classification."],
+            remaining_work=[
+                "Add provider-level backoff metrics and institution login redirect classification."
+            ],
         ),
         AgentRuntimeStatus(
             name="Publisher Connector",
-            role_layer="CrewAI role + LangGraph node",
+            role_layer="LangGraph node",
             runtime="LangGraph",
             implemented=True,
             workflow_node="route_publishers",
             callable_tools=["build_publisher_route_report", "infer_publisher_family"],
-            remaining_work=["Parse publisher search result pages when terms and authentication allow it."],
+            remaining_work=[
+                "Parse publisher search result pages when terms and authentication allow it."
+            ],
         ),
         AgentRuntimeStatus(
             name="PDF/OCR Parser",
-            role_layer="CrewAI role + LangGraph node",
+            role_layer="LangGraph node",
             runtime="LangGraph",
             implemented=True,
             workflow_node="parse_full_text",
             callable_tools=["parse_workspace_papers", "docling", "paddleocr"],
-            remaining_work=["Expand the benchmark from session metrics to a curated golden PDF set."],
+            remaining_work=[
+                "Expand the benchmark from session metrics to a curated golden PDF set."
+            ],
         ),
         AgentRuntimeStatus(
             name="Table Extractor",
-            role_layer="CrewAI role + LangGraph node",
+            role_layer="LangGraph node",
             runtime="LangGraph",
             implemented=True,
             workflow_node="extract_tables",
             callable_tools=["extract_performance_cells", "build_comparison_matrices"],
-            remaining_work=["Add stronger unit conversion and chemistry-specific comparability rules."],
+            remaining_work=[
+                "Add stronger unit conversion and chemistry-specific comparability rules."
+            ],
         ),
         AgentRuntimeStatus(
             name="Research Planner",
-            role_layer="CrewAI role + callable tool",
+            role_layer="callable tool",
             runtime="Local deterministic planner",
             implemented=True,
             workflow_node=None,
@@ -192,7 +209,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
         ),
         AgentRuntimeStatus(
             name="Research Writer",
-            role_layer="CrewAI role + LLM tool",
+            role_layer="LLM tool",
             runtime="DeepSeek-compatible LLM + citation guard",
             implemented=True,
             workflow_node=None,
@@ -201,7 +218,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
         ),
         AgentRuntimeStatus(
             name="Document Composer",
-            role_layer="CrewAI role + callable tool",
+            role_layer="callable tool",
             runtime="Local deterministic report composer",
             implemented=True,
             workflow_node="compose_document",
@@ -210,7 +227,7 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
         ),
         AgentRuntimeStatus(
             name="Autonomous Review Council",
-            role_layer="CrewAI role cluster + callable loop",
+            role_layer="cluster + callable loop",
             runtime="Local bounded autonomous loop",
             implemented=True,
             workflow_node="autonomous_review",
@@ -220,41 +237,30 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
                 "check_storyline_claims",
                 "check_performance_cells",
             ],
-            remaining_work=["Add optional LLM-based reviewer personas after deterministic gates pass."],
+            remaining_work=[
+                "Add optional LLM-based reviewer personas after deterministic gates pass."
+            ],
         ),
         AgentRuntimeStatus(
             name="Eval Auditor",
-            role_layer="CrewAI role + callable tools",
+            role_layer="callable tools",
             runtime="Local quality/golden-set tools",
             implemented=True,
             workflow_node=None,
-            callable_tools=["build_quality_report", "run_golden_eval", "build_agent_portfolio_report"],
+            callable_tools=[
+                "build_quality_report",
+                "run_golden_eval",
+                "build_agent_portfolio_report",
+            ],
             remaining_work=["Expand the curated materials/chemistry golden set."],
         ),
         AgentRuntimeStatus(
             name="Storyline Verifier",
-            role_layer="CrewAI role + LangGraph node",
+            role_layer="LangGraph node",
             runtime="LangGraph",
             implemented=True,
             workflow_node="build_storyline",
             callable_tools=["build_storyline_from_workspace", "check_storyline_claims"],
             remaining_work=["Add sentence-level citation validation for generated narratives."],
         ),
-    ]
-
-
-def build_crewai_agents():
-    try:
-        from crewai import Agent
-    except ImportError:
-        return None
-
-    return [
-        Agent(
-            role=spec.name,
-            goal=spec.goal,
-            backstory=spec.backstory,
-            verbose=False,
-        )
-        for spec in LITTRACE_CREW_ROLES
     ]

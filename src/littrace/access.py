@@ -28,8 +28,6 @@ def plan_download(
     mode = config.paper_download.mode
     selected_paper_ids = selected_paper_ids or set()
 
-    if mode == DownloadMode.METADATA_ONLY:
-        return DownloadDecision("save_metadata_only")
     if mode == DownloadMode.ASK_EACH_TIME:
         return DownloadDecision("ask_user")
     if mode == DownloadMode.DOWNLOAD_SELECTED:

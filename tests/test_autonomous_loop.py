@@ -19,7 +19,8 @@ async def test_autonomous_loop_reports_empty_workspace():
 
 
 @pytest.mark.anyio
-async def test_autonomous_loop_replans_when_full_text_missing():
+async def test_autonomous_loop_raises_when_llm_disabled_with_papers():
+    """LLM disabled → RuntimeError (no degradation)."""
     workspace = add_papers(
         LiteratureWorkspace(),
         [
@@ -32,19 +33,17 @@ async def test_autonomous_loop_replans_when_full_text_missing():
         ],
     )
 
-    report = await run_autonomous_research_loop(
-        LitTraceConfig(llm=LLMConfig(enabled=False)),
-        "请比较性能并讲发展脉络",
-        workspace,
-    )
-
-    assert report.rounds
-    assert "parse_full_text_with_paddleocr" in report.replan_actions
-    assert "多 agent 复核后的限制说明" in report.final_answer
+    with pytest.raises(RuntimeError, match="LLM unavailable"):
+        await run_autonomous_research_loop(
+            LitTraceConfig(llm=LLMConfig(enabled=False)),
+            "请比较性能并讲发展脉络",
+            workspace,
+        )
 
 
 @pytest.mark.anyio
-async def test_autonomous_loop_can_execute_safe_replan_actions(monkeypatch):
+async def test_autonomous_loop_raises_when_llm_disabled_even_with_parsed(monkeypatch):
+    """LLM disabled → RuntimeError even when papers are parsed (no degradation)."""
     workspace = add_papers(
         LiteratureWorkspace(),
         [PaperMetadata(paper_id="p1", title="Traceable Sensor Paper", year=2026)],
@@ -61,16 +60,14 @@ async def test_autonomous_loop_can_execute_safe_replan_actions(monkeypatch):
             ],
             "parsed": True,
         }
-        return workspace, {"parsed_count": 1, "metadata_only_count": 0}
+        return workspace, {"parsed_count": 1, "failed_count": 0}
 
     monkeypatch.setattr("littrace.autonomous_loop.parse_workspace_papers", fake_parse)
 
-    report = await run_autonomous_research_loop(
-        LitTraceConfig(llm=LLMConfig(enabled=False)),
-        "请自动重规划并比较性能",
-        workspace,
-        auto_replan=True,
-    )
-
-    assert "parse_full_text_with_paddleocr" in report.executed_replan_actions
-    assert workspace.parsed_papers
+    with pytest.raises(RuntimeError, match="LLM unavailable"):
+        await run_autonomous_research_loop(
+            LitTraceConfig(llm=LLMConfig(enabled=False)),
+            "请自动重规划并比较性能",
+            workspace,
+            auto_replan=True,
+        )

@@ -3,7 +3,21 @@ import pytest
 from littrace.chat import _format_search_result_reply, handle_chat
 from littrace.config import LLMConfig, LitTraceConfig
 from littrace.context import add_papers
-from littrace.models import ChatRequest, LiteratureWorkspace, PaperMetadata
+from littrace.llm import LLMReply
+from littrace.models import (
+    ChatRequest,
+    LiteratureWorkspace,
+    PaperMetadata,
+    ResearchRunResult,
+    WorkflowTrace,
+)
+
+
+def _mock_llm_reply(monkeypatch, text="这是一个包含引用与访问链接的研究回答。", used_llm=True):
+    async def _fake_chat(config, system_prompt, user_message, workspace=None, **kwargs):
+        return LLMReply(text=text, used_llm=used_llm)
+
+    monkeypatch.setattr("littrace.research_writer.chat_completion", _fake_chat)
 
 
 def _offline_config() -> LitTraceConfig:
@@ -58,7 +72,7 @@ async def test_chat_research_request_runs_search_instead_of_help():
 
 def test_search_reply_mentions_expanded_year_range():
     workspace = LiteratureWorkspace()
-    workspace.context.filters["search_mode"] = "live"
+    workspace.context.filters.search_mode = "live"
     reply = _format_search_result_reply(
         "rare topic",
         workspace,
@@ -66,7 +80,7 @@ def test_search_reply_mentions_expanded_year_range():
         original_year_min=2024,
     )
 
-    assert "已自动扩大到不限年份" in reply
+    assert "已自动扩大检索年限" in reply
 
 
 def test_search_reply_refuses_analysis_below_five_papers():
@@ -74,12 +88,14 @@ def test_search_reply_refuses_analysis_below_five_papers():
         LiteratureWorkspace(),
         [PaperMetadata(paper_id=f"p{i}", title=f"Paper {i}") for i in range(4)],
     )
-    workspace.context.filters["search_mode"] = "live"
+    workspace.context.filters.search_mode = "live"
 
     reply = _format_search_result_reply("rare topic", workspace)
 
-    assert "少于最低分析门槛 5 篇" in reply
+    assert "全文证据还不足 5 篇" in reply
     assert "我先不做分析型结论" in reply
+    assert "宽召回" not in reply
+    assert "成功解析" not in reply
 
 
 def test_search_reply_lists_all_results_above_five():
@@ -87,12 +103,53 @@ def test_search_reply_lists_all_results_above_five():
         LiteratureWorkspace(),
         [PaperMetadata(paper_id=f"p{i}", title=f"Paper {i}") for i in range(7)],
     )
-    workspace.context.filters["search_mode"] = "live"
+    workspace.context.filters.search_mode = "live"
 
     reply = _format_search_result_reply("topic", workspace)
 
-    assert "已找到 7 篇真实候选文献" in reply
+    assert "全文证据已达到最低门槛" in reply
     assert "7. Paper 6" in reply
+    assert "宽召回" not in reply
+
+
+@pytest.mark.anyio
+async def test_search_only_with_full_text_evidence_returns_answer_not_metrics(monkeypatch):
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [
+            PaperMetadata(paper_id=f"p{i}", title=f"Paper {i}", doi=f"10.1000/p{i}")
+            for i in range(5)
+        ],
+    )
+    workspace.context.filters.search_mode = "live"
+    workspace.context.filters.candidate_pool_count = 12
+    workspace.context.filters.valid_candidate_count = 10
+    workspace.context.filters.downloaded_full_text_count = 5
+    workspace.context.filters.parsed_full_text_count = 5
+    for paper_id in workspace.context.active_papers:
+        workspace.parsed_papers[paper_id] = {
+            "parsed": True,
+            "sections": [{"name": "Results", "text": "Full text evidence."}],
+        }
+
+    async def fake_run_research_graph(*_args, **_kwargs):
+        return ResearchRunResult(workspace=workspace, workflow_trace=WorkflowTrace())
+
+    monkeypatch.setattr("littrace.chat.run_research_graph", fake_run_research_graph)
+    _mock_llm_reply(monkeypatch, text="这是一个包含引用与访问链接的研究回答。")
+
+    response, _ = await handle_chat(
+        ChatRequest(message="我想了解一下 carbon PDMS pressure sensor", live=True),
+        LiteratureWorkspace(),
+        LitTraceConfig(
+            llm=LLMConfig(enabled=True, api_key="fake-key", intent_parser_enabled=False)
+        ),
+    )
+
+    assert response.action == "search"
+    assert "引用与访问链接" in response.reply
+    assert "宽召回" not in response.reply
+    assert "成功解析" not in response.reply
 
 
 @pytest.mark.anyio
@@ -129,18 +186,20 @@ async def test_chat_help_for_unknown_intent():
 @pytest.mark.anyio
 async def test_chat_composite_search_and_table():
     response, workspace = await handle_chat(
-        ChatRequest(message="检索 2024 年后的 AFM 和 ACS Nano，先别下载，生成性能对比表", live=False),
+        ChatRequest(
+            message="检索 2024 年后的 AFM 和 ACS Nano，先别下载，生成性能对比表", live=False
+        ),
         LiteratureWorkspace(),
         _offline_config(),
     )
 
     assert response.action == "search"
-    assert "我先按" in response.reply
+    assert "我已围绕" in response.reply
     assert response.comparison_matrix is None
     assert any("不足 5 篇" in warning for warning in response.warnings)
     assert "download" not in response.action
-    assert workspace.context.filters["year_min"] is None
-    assert workspace.context.filters["expanded_year_range_from"] == 2024
+    assert workspace.context.filters.year_min is None
+    assert workspace.context.filters.expanded_year_range_from == 2024
 
 
 @pytest.mark.anyio
@@ -249,18 +308,27 @@ async def test_chat_reports_agent_status():
 
 
 @pytest.mark.anyio
-async def test_chat_runs_autonomous_review_loop():
+async def test_chat_runs_autonomous_review_loop(monkeypatch):
     workspace = add_papers(
         LiteratureWorkspace(),
         [PaperMetadata(paper_id="p1", title="Traceable Paper", year=2026, doi="10.1000/example")],
     )
+    workspace.parsed_papers["p1"] = {
+        "parsed": True,
+        "sections": [{"name": "Results", "text": "Key evidence for review."}],
+    }
+    workspace.context.filters.search_mode = "live"
+
+    _mock_llm_reply(monkeypatch, text="多 agent 审稿后的研究结论。")
 
     response, workspace = await handle_chat(
         ChatRequest(message="请多轮反驳并修订当前结论"),
         workspace,
-        LitTraceConfig(llm=LLMConfig(enabled=False, intent_parser_enabled=False)),
+        LitTraceConfig(
+            llm=LLMConfig(enabled=True, api_key="fake-key", intent_parser_enabled=False)
+        ),
     )
 
     assert response.action == "autonomous_review"
     assert "多 agent 审稿" in response.reply
-    assert "autonomous_loop_report" in workspace.context.filters
+    assert workspace.context.filters.autonomous_loop_report is not None

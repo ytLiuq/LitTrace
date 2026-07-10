@@ -1,6 +1,7 @@
 import pytest
 
 from littrace.config import LLMConfig, LitTraceConfig
+from littrace.llm import LLMReply
 from littrace.models import PaperSearchRequest
 from littrace.workflow import run_research_graph
 
@@ -21,6 +22,9 @@ async def test_run_research_graph_returns_workspace_audit_and_download_plan():
         "plan_sources",
         "search_papers",
     ]
+    assert "candidate_pool_count" in result.workflow_trace.steps[1].outputs
+    assert "downloaded_full_text_count" in result.workflow_trace.steps[1].outputs
+    assert "parsed_full_text_count" in result.workflow_trace.steps[1].outputs
     assert result.workflow_trace.steps[1].next_reason
 
 
@@ -61,10 +65,23 @@ async def test_run_research_graph_can_build_storyline_preview():
 
 
 @pytest.mark.anyio
-async def test_run_research_graph_can_run_autonomous_review():
+async def test_run_research_graph_can_run_autonomous_review(monkeypatch):
+    from littrace.llm import LLMReply
+
+    async def _fake_chat(config, system_prompt, user_message, workspace=None, **kwargs):
+        return LLMReply(text="多 agent 审稿后的研究结论。", used_llm=True)
+
+    async def _fake_write(config, question, workspace):
+        return LLMReply(text="多 agent 审稿后的研究结论。", used_llm=True)
+
+    monkeypatch.setattr("littrace.research_writer.chat_completion", _fake_chat)
+    monkeypatch.setattr("littrace.autonomous_loop.chat_completion", _fake_chat)
+    monkeypatch.setattr("littrace.research_writer.write_evidence_grounded_answer", _fake_write)
+    monkeypatch.setattr("littrace.autonomous_loop.write_evidence_grounded_answer", _fake_write)
+
     result = await run_research_graph(
         PaperSearchRequest(topic="MXene flexible sensor", live=False),
-        LitTraceConfig(llm=LLMConfig(enabled=False)),
+        LitTraceConfig(llm=LLMConfig(enabled=True, api_key="fake-key")),
         audit_citations_enabled=False,
         plan_downloads_enabled=False,
         route_publishers_enabled=False,
@@ -72,4 +89,4 @@ async def test_run_research_graph_can_run_autonomous_review():
     )
 
     assert result.autonomous_loop_report is not None
-    assert "autonomous_loop_report" in result.workspace.context.filters
+    assert result.workspace.context.filters.autonomous_loop_report is not None

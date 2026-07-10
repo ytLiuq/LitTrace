@@ -5,11 +5,13 @@ from littrace.login_flow import (
     browser_login_session_for_paper,
     BrowserAuthorizationWaitResult,
     detect_user_confirmation_required,
+    discover_institutional_login_url_from_browser_session,
     discover_pdf_url_from_browser_session,
     fetch_authorized_pdf_after_user_auth,
     launch_login_for_paper,
     login_action_for_paper,
     open_browser_login_session,
+    open_institutional_login_if_available,
     resume_browser_auth_after_user_close,
     wait_for_browser_authorization,
 )
@@ -162,6 +164,7 @@ def test_open_browser_login_session_blocks_confirm_fallback_by_default(monkeypat
             default_browser_id="direct_local_105121787802550357",
             default_browser_type="chrome-direct",
             confirm_before_use=True,
+            allow_confirm_browser_fallback=False,
             chrome_direct_open_retries=1,
         )
     )
@@ -208,7 +211,10 @@ def test_open_browser_login_session_does_not_invent_fixed_browser_fallback_witho
     monkeypatch.setattr("littrace.login_flow.time.sleep", lambda *_args, **_kwargs: None)
 
     config = LitTraceConfig(
-        browser=BrowserAutomationConfig(chrome_direct_open_retries=1)
+        browser=BrowserAutomationConfig(
+            allow_confirm_browser_fallback=False,
+            chrome_direct_open_retries=1,
+        )
     )
 
     result = open_browser_login_session(config, paper)
@@ -262,6 +268,57 @@ def test_open_browser_login_session_can_fallback_when_explicitly_allowed(monkeyp
     assert result.fallback_used
     assert len(calls) == 4
     assert calls[2][4] != calls[3][4]
+
+
+def test_open_browser_login_session_falls_back_after_nonrecoverable_direct_failure(monkeypatch):
+    paper = PaperMetadata(
+        paper_id="wiley",
+        title="Wiley paper",
+        doi="10.1002/adfm.202316712",
+        publisher="Wiley",
+        access_type=AccessType.REQUIRES_LOGIN,
+        source_urls=["https://advanced.onlinelibrary.wiley.com/doi/10.1002/adfm.202316712"],
+    )
+    calls = []
+
+    class FakeRunResult:
+        def __init__(self, returncode, stderr="", recoverable=False):
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = stderr
+            self.recoverable_window_closed = recoverable
+            self.recoverable_browser_open_failed = recoverable
+            self.api_key_required = False
+
+    def fake_run(_config, args, **_kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            return FakeRunResult(1, 'Error: Session "littrace-wiley-auth" not found', True)
+        if len(calls) == 2:
+            return FakeRunResult(1, "Error 210101: Connection health check failed.")
+        return FakeRunResult(0)
+
+    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.login_flow.time.sleep", lambda *_args, **_kwargs: None)
+    config = LitTraceConfig(
+        browser=BrowserAutomationConfig(
+            default_browser_id="direct_local_105121787802550357",
+            default_browser_type="chrome-direct",
+            confirm_before_use=True,
+            allow_confirm_browser_fallback=True,
+            chrome_direct_open_retries=1,
+        )
+    )
+
+    result = open_browser_login_session(config, paper)
+
+    assert result.opened
+    assert result.fallback_used
+    browser_ids = [call[4] for call in calls if "browser" in call and "open" in call]
+    assert browser_ids == [
+        "direct_local_105121787802550357",
+        "chrome_local_104956678805389514",
+    ]
 
 
 def test_open_browser_login_session_retries_same_browser_after_recoverable_open_failure(monkeypatch):
@@ -672,6 +729,34 @@ def test_discover_pdf_url_marks_cloudflare_query_confirmation_required(monkeypat
     assert result.requires_user_confirmation
 
 
+def test_discover_pdf_url_uses_state_fallback_for_cloudflare(monkeypatch):
+    calls = []
+
+    class FakeRunResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+        recoverable_window_closed = False
+
+    class FakeStateResult:
+        returncode = 0
+        stdout = "title=Just a moment...\nVerify you are human\nCloudflare"
+        stderr = ""
+        recoverable_window_closed = False
+
+    def fake_run(_config, args, **_kwargs):
+        calls.append(args)
+        return FakeStateResult() if args[-1] == "state" else FakeRunResult()
+
+    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+
+    result = discover_pdf_url_from_browser_session(LitTraceConfig(), "littrace-wiley-auth")
+
+    assert result.requires_user_confirmation
+    assert result.access_state == "confirmation_required"
+    assert len(calls) == 2
+
+
 def test_discover_pdf_url_extracts_sciencedirect_pdfft_link(monkeypatch):
     class FakeRunResult:
         returncode = 0
@@ -734,8 +819,10 @@ def test_fetch_authorized_pdf_prefers_frontend_pdf_link_over_fallback(monkeypatc
     def fake_discover(*_args, **_kwargs):
         class Frontend:
             pdf_url = "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548?download=true"
+            access_state = "authorized"
             recoverable_window_closed = False
             requires_user_confirmation = False
+            requires_login = False
             stdout = ""
             stderr = ""
         return Frontend()
@@ -905,8 +992,10 @@ def test_wait_for_browser_authorization_polls_until_pdf_link(monkeypatch):
 
         class Result:
             pdf_url = None if len(calls) == 1 else "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548"
+            access_state = "confirmation_required" if len(calls) == 1 else "authorized"
             recoverable_window_closed = False
             requires_user_confirmation = len(calls) == 1
+            requires_login = False
             stdout = "Just a moment..." if len(calls) == 1 else "article page"
             stderr = ""
 
@@ -934,8 +1023,10 @@ def test_wait_for_browser_authorization_tolerates_stale_session_before_ready(mon
 
         class Result:
             pdf_url = None if len(calls) == 1 else "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548"
+            access_state = "unknown" if len(calls) == 1 else "authorized"
             recoverable_window_closed = len(calls) == 1
             requires_user_confirmation = False
+            requires_login = False
             stdout = ""
             stderr = 'Error: Session "littrace-acs-auth" not found' if len(calls) == 1 else ""
 
@@ -957,8 +1048,10 @@ def test_wait_for_browser_authorization_tolerates_stale_session_before_ready(mon
 def test_wait_for_browser_authorization_times_out(monkeypatch):
     class Result:
         pdf_url = None
+        access_state = "confirmation_required"
         recoverable_window_closed = False
         requires_user_confirmation = True
+        requires_login = False
         stdout = "Just a moment..."
         stderr = ""
 
@@ -976,4 +1069,127 @@ def test_wait_for_browser_authorization_times_out(monkeypatch):
 
     assert not result.authorized
     assert result.requires_user_confirmation
-    assert "Timed out" in (result.error or "")
+    assert "human verification" in (result.error or "")
+
+
+def test_wait_for_browser_authorization_does_not_treat_wiley_login_page_as_authorized(
+    monkeypatch,
+):
+    class Result:
+        pdf_url = "https://advanced.onlinelibrary.wiley.com/doi/pdf/10.1002/adfm.202316712"
+        access_state = "login_required"
+        recoverable_window_closed = False
+        requires_user_confirmation = False
+        requires_login = True
+        stdout = "Login / Register wol_publication_access=no PDF"
+        stderr = ""
+
+    monkeypatch.setattr(
+        "littrace.login_flow.discover_pdf_url_from_browser_session",
+        lambda *_args, **_kwargs: Result(),
+    )
+
+    result = wait_for_browser_authorization(
+        LitTraceConfig(),
+        "littrace-wiley-auth",
+        timeout_seconds=0.01,
+        poll_interval_seconds=0.01,
+    )
+
+    assert not result.authorized
+    assert result.pdf_url is None
+    assert result.requires_login
+    assert result.access_state == "login_required"
+    assert "requires publisher or institutional login" in (result.error or "")
+
+
+def test_discover_pdf_url_treats_wiley_full_access_as_authorized(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = (
+            '{"pdfUrl":"https://advanced.onlinelibrary.wiley.com/doi/pdf/10.1002/adfm.202316712",'
+            '"accessState":"authorized","loginRequired":true,"accessDenied":true,'
+            '"fullAccess":true,"confirmationRequired":false,'
+            '"title":"Wiley","url":"https://advanced.onlinelibrary.wiley.com/doi/full/10.1002/adfm.202316712",'
+            '"text":"Medical College Of Shanghai Login / Register Full Access PDF"}'
+        )
+        stderr = ""
+        recoverable_window_closed = False
+
+    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: Result())
+
+    result = discover_pdf_url_from_browser_session(
+        LitTraceConfig(),
+        "littrace-wiley-auth",
+    )
+
+    assert result.access_state == "authorized"
+    assert not result.requires_login
+    assert result.pdf_url.endswith("/doi/pdf/10.1002/adfm.202316712")
+
+
+def test_discover_institutional_login_url_prefers_wiley_ssostart(monkeypatch):
+    class Result:
+        returncode = 0
+        stdout = (
+            '{"institutionalUrl":"https://advanced.onlinelibrary.wiley.com/action/ssostart?'
+            'redirectUri=%2Fdoi%2Fabs%2F10.1002%2Fadfm.202316712",'
+            '"candidates":[]}'
+        )
+        stderr = ""
+        recoverable_window_closed = False
+
+    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: Result())
+
+    result = discover_institutional_login_url_from_browser_session(
+        LitTraceConfig(),
+        "littrace-wiley-auth",
+    )
+
+    assert result.institutional_url
+    assert "/action/ssostart" in result.institutional_url
+
+
+def test_open_institutional_login_if_available_navigates_when_login_required(monkeypatch):
+    calls = []
+
+    class Discovery:
+        requires_login = True
+        stdout = "Login / Register wol_publication_access=no"
+        stderr = ""
+
+    class Link:
+        institutional_url = "https://advanced.onlinelibrary.wiley.com/action/ssostart?redirectUri=%2Fdoi%2Fabs%2F10.1002%2Fadfm.202316712"
+        stdout = "institutional"
+        stderr = ""
+        error = None
+
+    class RunResult:
+        returncode = 0
+        stdout = "navigated"
+        stderr = ""
+        recoverable_window_closed = False
+
+    monkeypatch.setattr(
+        "littrace.login_flow.discover_pdf_url_from_browser_session",
+        lambda *_args, **_kwargs: Discovery(),
+    )
+    monkeypatch.setattr(
+        "littrace.login_flow.discover_institutional_login_url_from_browser_session",
+        lambda *_args, **_kwargs: Link(),
+    )
+
+    def fake_run(_config, args, **_kwargs):
+        calls.append(args)
+        return RunResult()
+
+    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+
+    result = open_institutional_login_if_available(
+        LitTraceConfig(),
+        "littrace-wiley-auth",
+    )
+
+    assert result.opened
+    assert calls[-1][2] == "navigate"
+    assert "/action/ssostart" in calls[-1][3]

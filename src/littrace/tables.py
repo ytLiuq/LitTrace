@@ -1,20 +1,54 @@
 from __future__ import annotations
 
+import json
 import re
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from littrace.harnesses import HarnessResult, check_performance_cells, check_structured_artifacts
+from littrace.config import LitTraceConfig
+from littrace.harnesses import (
+    HarnessResult,
+    check_performance_cells,
+    check_structured_artifacts,
+    check_schema_compliance,
+    SchemaCheckItem,
+)
+from littrace.llm import chat_completion
+from littrace.log import get_logger, timed
 from littrace.models import (
     ComparisonMatrix,
     ComparisonMatrixReport,
     ComparisonMatrixRow,
     EvidenceSpan,
     LiteratureWorkspace,
+    ParsedPaper,
     PerformanceCell,
     StructuredArtifact,
+    coerce_parsed,
 )
 from littrace.units import normalize_metric_unit
+
+logger = get_logger("tables")
+
+
+# ── Schema for LLM output validation (Dimension 3) ─────────────
+
+
+class _LLMCellSchema(BaseModel):
+    """Pydantic schema for validating each LLM-returned performance cell."""
+
+    metric: str
+    value: float
+    value_min: float | None = None
+    value_max: float | None = None
+    uncertainty: float | None = None
+    unit: str | None = None
+    section: str = "section"
+    snippet: str = ""
+    dataset: str | None = None
+    task: str | None = None
+    method_name: str | None = None
 
 
 METRIC_DIRECTIONS = {
@@ -70,8 +104,8 @@ class ArtifactNeedReport(BaseModel):
 def decide_artifact_extraction_need(workspace: LiteratureWorkspace) -> ArtifactNeedReport:
     text_evidence_count = sum(
         1
-        for parsed in workspace.parsed_papers.values()
-        for section in parsed.get("sections", [])
+        for parsed in map(coerce_parsed, workspace.parsed_papers.values())
+        for section in parsed.sections or []
         if isinstance(section, dict) and str(section.get("text") or "").strip()
     )
     artifact_count = len(_stored_structured_artifacts(workspace))
@@ -138,26 +172,253 @@ def _ocr_choice_buttons(recommended: str) -> list[dict[str, str]]:
     ]
 
 
-def extract_performance_cells(workspace: LiteratureWorkspace) -> tuple[LiteratureWorkspace, HarnessResult]:
+_EXTRACTION_SYSTEM_PROMPT = """You are a materials/chemistry performance-metric extractor.
+Read the parsed PDF text (sections + tables) and extract every quantitative performance metric.
+
+Return STRICT JSON: a list of objects, each with keys:
+  metric (string), value (number), value_min (number|null), value_max (number|null),
+  uncertainty (number|null), unit (string|null), section (string), snippet (string),
+  dataset (string|null), task (string|null), method_name (string|null)
+
+Rules:
+- Extract ONLY from the provided text; do NOT invent values.
+- snippet must be the exact surrounding text (max 200 chars) where the value was found.
+- If a value appears as a range (e.g. "0.1-0.5 S/cm"), set value_min and value_max.
+- Common metrics: sensitivity, gauge factor, response time, recovery time, limit of detection,
+  conductivity, specific capacitance, capacity, retention, selectivity, tensile strength,
+  young's modulus, strain range, accuracy, f1, auc, mse, mae, rmse.
+- If no metrics are found, return an empty list [].
+- Do NOT wrap the JSON in markdown fences."""
+
+
+def _build_extraction_payload(paper_id: str, parsed: ParsedPaper) -> str:
+    """Build the text payload sent to the LLM for metric extraction."""
+    parts: list[str] = [f"Paper ID: {paper_id}"]
+    for section in parsed.sections or []:
+        if not isinstance(section, dict):
+            continue
+        name = str(section.get("name") or "section")
+        text = str(section.get("text") or "")
+        if text.strip():
+            parts.append(f"\n[Section: {name}]\n{text[:2000]}")
+    for table in parsed.tables or []:
+        caption = str(table.caption or "")
+        table_id = str(table.table_id or "")
+        cells = table.cells or []
+        if cells:
+            parts.append(f"\n[Table: {table_id}] {caption}\n{cells}")
+    return "\n".join(parts)
+
+
+def _parse_llm_cells(
+    paper_id: str,
+    raw_cells: list[dict[str, object]],
+    parsed: ParsedPaper | dict[str, object],
+) -> tuple[list[PerformanceCell], list[str]]:
+    """Convert LLM-returned JSON objects into PerformanceCell models.
+
+    Uses Pydantic _LLMCellSchema for schema validation (Dimension 3).
+    Returns (valid_cells, schema_errors) — errors are collected for harness
+    reporting instead of being silently dropped.
+    """
+    cells: list[PerformanceCell] = []
+    schema_errors: list[str] = []
+    section_evidence: dict[str, dict[str, object]] = {}
+
+    # Support both ParsedPaper objects and plain dicts for backwards compat
+    raw_sections: list = []
+    if isinstance(parsed, ParsedPaper):
+        raw_sections = parsed.sections or []
+    elif isinstance(parsed, dict):
+        raw_sections = parsed.get("sections") or []
+
+    for section in raw_sections:
+        if isinstance(section, dict):
+            name = str(section.get("name") or "section")
+            ev = section.get("evidence") or {}
+            if isinstance(ev, dict):
+                section_evidence[name] = ev
+
+    for idx, raw in enumerate(raw_cells):
+        if not isinstance(raw, dict):
+            schema_errors.append(f"Item {idx}: expected object, got {type(raw).__name__}")
+            continue
+        try:
+            # Dimension 3: Validate via Pydantic schema
+            validated = _LLMCellSchema.model_validate(raw)
+            metric = validated.metric.strip().lower()
+            if not metric:
+                schema_errors.append(f"Item {idx}: empty metric name")
+                continue
+
+            section_name = validated.section or "section"
+            ev = section_evidence.get(section_name, {})
+            snippet = (validated.snippet or "")[:200]
+            cells.append(
+                PerformanceCell(
+                    paper_id=paper_id,
+                    dataset=validated.dataset or _guess_dataset(snippet),
+                    task=validated.task or None,
+                    method_name=validated.method_name or None,
+                    metric=metric,
+                    value=validated.value,
+                    value_min=validated.value_min,
+                    value_max=validated.value_max,
+                    uncertainty=validated.uncertainty,
+                    unit=validated.unit or None,
+                    higher_is_better=METRIC_DIRECTIONS.get(metric),
+                    evidence=EvidenceSpan(
+                        paper_id=paper_id,
+                        section=section_name,
+                        page=ev.get("page"),
+                        snippet=snippet,
+                        parser=ev.get("parser"),
+                        confidence=0.85,
+                    ),
+                )
+            )
+        except ValidationError as exc:
+            # Collect the first error message for harness reporting
+            errors = exc.errors()
+            if errors:
+                loc = ".".join(str(x) for x in errors[0]["loc"])
+                msg = errors[0]["msg"]
+                schema_errors.append(f"Item {idx} ({loc}): {msg}")
+            else:
+                schema_errors.append(f"Item {idx}: validation error")
+        except (ValueError, TypeError) as exc:
+            schema_errors.append(f"Item {idx}: {exc}")
+    return cells, schema_errors
+
+
+async def extract_performance_cells(
+    workspace: LiteratureWorkspace,
+    config: LitTraceConfig | None = None,
+) -> tuple[LiteratureWorkspace, HarnessResult]:
+    """Extract performance metrics from parsed papers using LLM.
+
+    A secondary regex pass catches values the LLM missed (e.g. in dense tables).
+    If the LLM call fails entirely, the error is raised -- no silent degradation.
+    """
+    if config is None:
+        from littrace.config import load_config
+
+        config = load_config()
+
     cells: list[PerformanceCell] = []
     artifacts: list[StructuredArtifact] = []
+    all_schema_errors: list[str] = []
+    total_raw_items = 0
+
     for paper_id, parsed in workspace.parsed_papers.items():
-        cells.extend(_cells_from_sections(paper_id, parsed))
-        cells.extend(_cells_from_tables(paper_id, parsed))
+        parsed = coerce_parsed(parsed)
         artifacts.extend(_structured_artifacts_from_parsed(paper_id, parsed))
+
+        if not parsed.parsed:
+            continue
+
+        payload = _build_extraction_payload(paper_id, parsed)
+        if not payload.strip():
+            continue
+
+        with timed("llm_metric_extract", paper_id=paper_id):
+            reply = await chat_completion(
+                config,
+                _EXTRACTION_SYSTEM_PROMPT,
+                payload,
+                workspace=None,
+            )
+
+        if not reply.used_llm:
+            raise RuntimeError(f"LLM metric extraction failed for paper {paper_id}: {reply.error}")
+
+        try:
+            raw_cells = json.loads(reply.text)
+            if not isinstance(raw_cells, list):
+                raw_cells = []
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("llm_json_parse_error", extra={"paper_id": paper_id, "error": str(exc)})
+            raw_cells = []
+
+        total_raw_items += len(raw_cells)
+        # Dimension 3: schema-validated parsing with error collection
+        llm_cells, schema_errors = _parse_llm_cells(paper_id, raw_cells, parsed)
+        cells.extend(llm_cells)
+        if schema_errors:
+            all_schema_errors.extend(schema_errors)
+            logger.warning(
+                "schema_validation_errors",
+                extra={
+                    "paper_id": paper_id,
+                    "error_count": len(schema_errors),
+                    "errors": schema_errors[:5],
+                },
+            )
+
+        # Secondary regex pass: catch values the LLM missed
+        regex_cells = _cells_from_sections(paper_id, parsed)
+        regex_cells.extend(_cells_from_tables(paper_id, parsed))
+        existing_snippets = {c.evidence.snippet for c in llm_cells}
+        missed = [c for c in regex_cells if c.evidence.snippet not in existing_snippets]
+        if missed:
+            logger.info(
+                "regex_supplement",
+                extra={
+                    "paper_id": paper_id,
+                    "llm_count": len(llm_cells),
+                    "regex_extra": len(missed),
+                },
+            )
+            cells.extend(missed)
 
     workspace.performance_cells = cells
     _store_structured_artifacts(workspace, artifacts)
-    return workspace, _combine_harnesses(
+
+    # Dimension 3: Run schema compliance harness if there were any LLM items
+    if total_raw_items > 0:
+        schema_report = check_schema_compliance(
+            [
+                SchemaCheckItem(
+                    source="tables.py:extract_performance_cells",
+                    total_items=total_raw_items,
+                    valid_items=total_raw_items - len(all_schema_errors),
+                    invalid_items=all_schema_errors,
+                    schema_name="PerformanceCell",
+                )
+            ]
+        )
+        if not schema_report.passed:
+            logger.warning(
+                "schema_harness_failed",
+                extra={
+                    "score": schema_report.score,
+                    "errors": schema_report.errors[:5],
+                },
+            )
+
+    harness = _combine_harnesses(
         performance=check_performance_cells(cells),
         artifacts=check_structured_artifacts(artifacts),
         artifact_count=len(artifacts),
     )
+    logger.info(
+        "extraction_done",
+        extra={
+            "total_cells": len(cells),
+            "total_artifacts": len(artifacts),
+            "harness_score": harness.score,
+            "schema_errors": len(all_schema_errors),
+        },
+    )
+    return workspace, harness
 
 
-def extract_structured_artifacts(workspace: LiteratureWorkspace) -> tuple[LiteratureWorkspace, HarnessResult]:
+def extract_structured_artifacts(
+    workspace: LiteratureWorkspace,
+) -> tuple[LiteratureWorkspace, HarnessResult]:
     artifacts: list[StructuredArtifact] = []
     for paper_id, parsed in workspace.parsed_papers.items():
+        parsed = coerce_parsed(parsed)
         artifacts.extend(_structured_artifacts_from_parsed(paper_id, parsed))
     _store_structured_artifacts(workspace, artifacts)
     return workspace, check_structured_artifacts(artifacts)
@@ -214,9 +475,9 @@ def _normalized_cell(cell: PerformanceCell) -> PerformanceCell:
     return PerformanceCell.model_validate(update)
 
 
-def _cells_from_sections(paper_id: str, parsed: dict[str, object]) -> list[PerformanceCell]:
+def _cells_from_sections(paper_id: str, parsed: ParsedPaper) -> list[PerformanceCell]:
     cells: list[PerformanceCell] = []
-    sections = parsed.get("sections") or []
+    sections = parsed.sections or []
     if not isinstance(sections, list):
         return cells
     for section in sections:
@@ -255,20 +516,14 @@ def _cells_from_sections(paper_id: str, parsed: dict[str, object]) -> list[Perfo
     return cells
 
 
-def _cells_from_tables(paper_id: str, parsed: dict[str, object]) -> list[PerformanceCell]:
+def _cells_from_tables(paper_id: str, parsed: ParsedPaper) -> list[PerformanceCell]:
     cells: list[PerformanceCell] = []
-    tables = parsed.get("tables") or []
-    if not isinstance(tables, list):
-        return cells
+    tables = parsed.tables or []
     for table in tables:
-        if not isinstance(table, dict):
-            continue
-        table_id = str(table.get("table_id") or "")
-        caption = str(table.get("caption") or "")
-        evidence = table.get("evidence") or {}
-        if not isinstance(evidence, dict):
-            evidence = {}
-        for cell in table.get("cells") or []:
+        table_id = str(table.table_id or "")
+        caption = str(table.caption or "")
+        evidence = table.evidence
+        for cell in table.cells or []:
             if not isinstance(cell, dict):
                 continue
             text = " ".join(str(value) for value in cell.values())
@@ -281,7 +536,9 @@ def _cells_from_tables(paper_id: str, parsed: dict[str, object]) -> list[Perform
                         metric=metric,
                         value=float(match.group("value")),
                         value_min=float(match.group("value")) if match.group("value_max") else None,
-                        value_max=float(match.group("value_max")) if match.group("value_max") else None,
+                        value_max=float(match.group("value_max"))
+                        if match.group("value_max")
+                        else None,
                         uncertainty=float(match.group("uncertainty"))
                         if match.group("uncertainty")
                         else None,
@@ -293,8 +550,8 @@ def _cells_from_tables(paper_id: str, parsed: dict[str, object]) -> list[Perform
                             row_label=str(cell.get("row") or "") or None,
                             column_label=str(cell.get("column") or "") or None,
                             snippet=_window(f"{caption} {text}", match.start(), match.end()),
-                            parser=evidence.get("parser"),
-                            confidence=float(evidence.get("confidence") or 0.7),
+                            parser=evidence.parser,
+                            confidence=evidence.confidence or 0.7,
                         ),
                     )
                 )
@@ -303,7 +560,7 @@ def _cells_from_tables(paper_id: str, parsed: dict[str, object]) -> list[Perform
 
 def _structured_artifacts_from_parsed(
     paper_id: str,
-    parsed: dict[str, object],
+    parsed: ParsedPaper,
 ) -> list[StructuredArtifact]:
     artifacts: list[StructuredArtifact] = []
     artifacts.extend(_artifacts_from_table_objects(paper_id, parsed))
@@ -312,7 +569,7 @@ def _structured_artifacts_from_parsed(
 
 
 def _stored_structured_artifacts(workspace: LiteratureWorkspace) -> list[StructuredArtifact]:
-    raw = workspace.context.filters.get("structured_artifacts", [])
+    raw = getattr(workspace.context.filters, "structured_artifacts", [])
     if not isinstance(raw, list):
         return []
     artifacts: list[StructuredArtifact] = []
@@ -326,21 +583,14 @@ def _stored_structured_artifacts(workspace: LiteratureWorkspace) -> list[Structu
 
 def _artifacts_from_table_objects(
     paper_id: str,
-    parsed: dict[str, object],
+    parsed: ParsedPaper,
 ) -> list[StructuredArtifact]:
     artifacts: list[StructuredArtifact] = []
-    tables = parsed.get("tables") or []
-    if not isinstance(tables, list):
-        return artifacts
-    for table in tables:
-        if not isinstance(table, dict):
-            continue
-        evidence = table.get("evidence") or {}
-        if not isinstance(evidence, dict):
-            evidence = {}
-        label = str(table.get("table_id") or "") or None
-        caption = str(table.get("caption") or "")
-        cells = table.get("cells") or []
+    for table in parsed.tables or []:
+        evidence = table.evidence
+        label = str(table.table_id or "") or None
+        caption = str(table.caption or "")
+        cells = table.cells or []
         text = caption
         if cells:
             text = f"{caption}\n{cells}".strip()
@@ -354,18 +604,18 @@ def _artifacts_from_table_objects(
                     paper_id=paper_id,
                     table_id=label,
                     snippet=text[:500],
-                    parser=evidence.get("parser"),
-                    confidence=float(evidence.get("confidence") or 0.75),
+                    parser=evidence.parser,
+                    confidence=evidence.confidence or 0.75,
                 ),
-                confidence=float(evidence.get("confidence") or 0.75),
+                confidence=evidence.confidence or 0.75,
             )
         )
     return artifacts
 
 
-def _artifacts_from_sections(paper_id: str, parsed: dict[str, object]) -> list[StructuredArtifact]:
+def _artifacts_from_sections(paper_id: str, parsed: ParsedPaper) -> list[StructuredArtifact]:
     artifacts: list[StructuredArtifact] = []
-    sections = parsed.get("sections") or []
+    sections = parsed.sections or []
     if not isinstance(sections, list):
         return artifacts
     for section in sections:
@@ -445,7 +695,9 @@ def _equation_artifacts(
             artifacts.append(
                 StructuredArtifact(
                     paper_id=paper_id,
-                    artifact_type="equation" if label.lower().startswith(("eq", "equation")) else "formula",
+                    artifact_type="equation"
+                    if label.lower().startswith(("eq", "equation"))
+                    else "formula",
                     label=label,
                     text=artifact_text,
                     evidence=EvidenceSpan(
@@ -466,7 +718,7 @@ def _store_structured_artifacts(
     workspace: LiteratureWorkspace,
     artifacts: list[StructuredArtifact],
 ) -> None:
-    workspace.context.filters["structured_artifacts"] = [
+    workspace.context.filters.structured_artifacts = [
         artifact.model_dump(mode="json") for artifact in artifacts
     ]
 

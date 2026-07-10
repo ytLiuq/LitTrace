@@ -16,7 +16,7 @@ def test_agent_interactions_progress_after_evidence_exists():
         LiteratureWorkspace(),
         [PaperMetadata(paper_id="p1", title="MXene sensor", year=2026)],
     )
-    workspace.context.filters["source_routes"] = ["OpenAlex", "Crossref"]
+    workspace.context.filters.source_routes = ["OpenAlex", "Crossref"]
     workspace.parsed_papers["p1"] = {"sections": [{"text": "sensitivity 12 kPa-1"}]}
     workspace.performance_cells.append(
         PerformanceCell(

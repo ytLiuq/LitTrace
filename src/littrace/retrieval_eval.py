@@ -67,7 +67,7 @@ async def run_retrieval_golden_eval(
         ranked = _ranked_dois(workspace)
         active_hits = _ordered_hits(expected, ranked.active)
         candidate_hits = _ordered_hits(expected, ranked.candidates)
-        diagnostics = workspace.context.filters.get("search_diagnostics") or {}
+        diagnostics = getattr(workspace.context.filters, "search_diagnostics", None) or {}
         case_warnings = []
         if isinstance(diagnostics, dict):
             case_warnings.extend(str(item) for item in diagnostics.get("errors", [])[:5])
@@ -79,7 +79,10 @@ async def run_retrieval_golden_eval(
                 active_doi_hits=active_hits,
                 candidate_doi_hits=candidate_hits,
                 active_count=len(workspace.context.active_papers),
-                candidate_count=int(workspace.context.filters.get("candidate_pool_count") or len(workspace.papers)),
+                candidate_count=int(
+                    getattr(workspace.context.filters, "candidate_pool_count", None)
+                    or len(workspace.papers)
+                ),
                 active_recall=_safe_div(len(active_hits), len(expected)),
                 candidate_recall=_safe_div(len(candidate_hits), len(expected)),
                 mrr=_mrr(expected, ranked.candidates),
@@ -114,7 +117,7 @@ def _ranked_dois(workspace) -> _RankedDOIs:
         for paper_id in workspace.context.active_papers
         if workspace.papers[paper_id].doi
     ]
-    candidate_ids = workspace.context.filters.get("candidate_pool_ids")
+    candidate_ids = getattr(workspace.context.filters, "candidate_pool_ids", None)
     if not isinstance(candidate_ids, list):
         candidate_ids = list(workspace.papers)
     candidates = [
@@ -124,7 +127,9 @@ def _ranked_dois(workspace) -> _RankedDOIs:
         and paper_id in workspace.papers
         and workspace.papers[paper_id].doi
     ]
-    return _RankedDOIs(active=[doi for doi in active if doi], candidates=[doi for doi in candidates if doi])
+    return _RankedDOIs(
+        active=[doi for doi in active if doi], candidates=[doi for doi in candidates if doi]
+    )
 
 
 def _normalize_dois(raw: object) -> set[str]:

@@ -33,7 +33,7 @@ def test_document_report_is_citation_and_evidence_backed():
             ),
         )
     )
-    workspace.context.filters["autonomous_loop_report"] = {
+    workspace.context.filters.autonomous_loop_report = {
         "passed": False,
         "score": 0.71,
         "replan_actions": ["parse_full_text_with_paddleocr"],

@@ -4,48 +4,19 @@ from collections import defaultdict
 
 from littrace.harnesses import HarnessResult, check_storyline_claims
 from littrace.citations import citation_records_for_papers
-from littrace.models import EvidenceSpan, LiteratureWorkspace, PaperMetadata, StorylineClaim
+from littrace.models import (
+    EvidenceSpan,
+    LiteratureWorkspace,
+    PaperMetadata,
+    StorylineClaim,
+    coerce_parsed,
+)
 
 
 def build_storyline_preview(papers: list[PaperMetadata]) -> list[StorylineClaim]:
-    """Build a conservative evidence-first storyline preview from metadata only.
+    """Metadata/abstract-only storyline fallback is disabled."""
 
-    Full narrative claims should wait for parsed full text. Metadata can support
-    only cautious year/source trends, so this function intentionally emits
-    low-volume claims.
-    """
-
-    by_year: dict[int, list[PaperMetadata]] = defaultdict(list)
-    for paper in papers:
-        if paper.year is not None:
-            by_year[paper.year].append(paper)
-
-    claims: list[StorylineClaim] = []
-    recent_years = sorted(year for year in by_year if year >= 2023)
-    if len(recent_years) >= 2:
-        evidence = [
-            EvidenceSpan(
-                paper_id=paper.paper_id,
-                section="metadata",
-                snippet=f"{paper.year}; {paper.journal or paper.publisher or 'unknown source'}",
-                confidence=0.75,
-            )
-            for year in recent_years[-2:]
-            for paper in by_year[year][:2]
-        ]
-        claims.append(
-            StorylineClaim(
-                claim=(
-                    "Recent retrieved literature is concentrated in 2023 or later; "
-                    "full-text parsing is required before making solution-limit-response claims."
-                ),
-                claim_type="trend_by_year_and_method",
-                evidence=evidence,
-                confidence=0.72,
-            )
-        )
-
-    return claims
+    return []
 
 
 def verify_storyline_preview(claims: list[StorylineClaim]) -> HarnessResult:
@@ -56,8 +27,7 @@ def build_storyline_from_workspace(workspace: LiteratureWorkspace) -> list[Story
     parsed_claims = _claims_from_parsed_papers(workspace)
     if parsed_claims:
         return parsed_claims
-    papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
-    return build_storyline_preview(papers)
+    return []
 
 
 def render_structured_storyline_report(workspace: LiteratureWorkspace) -> str:
@@ -85,7 +55,11 @@ def render_structured_storyline_report(workspace: LiteratureWorkspace) -> str:
             evidence_ids = ", ".join(sorted({item.paper_id for item in claim.evidence}))
             lines.append(f"- {claim.claim} 证据：{evidence_ids}")
             for evidence in claim.evidence[:3]:
-                location = f"p.{evidence.page}" if evidence.page is not None else evidence.section or "evidence"
+                location = (
+                    f"p.{evidence.page}"
+                    if evidence.page is not None
+                    else evidence.section or "evidence"
+                )
                 snippet = evidence.snippet or ""
                 lines.append(f"  - [{evidence.paper_id}] {location}: {snippet[:180]}")
 
@@ -105,7 +79,8 @@ def _claims_from_parsed_papers(workspace: LiteratureWorkspace) -> list[Storyline
         lambda: {"method": [], "limitation": [], "response": []}
     )
     for paper_id, parsed in workspace.parsed_papers.items():
-        for section in parsed.get("sections", []):
+        parsed = coerce_parsed(parsed)
+        for section in parsed.sections or []:
             text = str(section.get("text") or "")
             name = str(section.get("name") or "")
             lowered = f"{name} {text}".lower()

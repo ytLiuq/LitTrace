@@ -12,19 +12,22 @@ api:
   request_timeout_seconds: 20
   enable_live_search: true
 
+cdp_downloader:
+  cdp_url: "http://127.0.0.1:19222"
+  cloudflare_wait_seconds: 60
+  user_action_wait_seconds: 30
+  command_timeout_seconds: 60
+  websocket_reconnect_attempts: 3
+
 browser:
-  browser_act_path: "browser-act"
-  required: true
-  default_browser_id: null
-  default_browser_name: "littrace-publisher-auth"
-  default_browser_type: "chrome"
-  confirm_before_use: true
+  # Legacy BrowserAct settings. Publisher PDF download uses cdp_downloader.
+  required: false
 
 paper_download:
   mode: "ask_each_time"
   organize_by: "year_doi"
   filename_template: "{year}_{first_author}_{short_title}_{doi_hash}.pdf"
-  save_metadata_even_if_pdf_skipped: true
+  save_metadata_even_if_pdf_skipped: false
   allow_requires_login_download: true
 
 parsing:

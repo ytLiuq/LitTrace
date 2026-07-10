@@ -48,6 +48,7 @@ def test_archive_authorized_pdf_response_writes_base64_pdf(monkeypatch, tmp_path
         paper,
         "littrace-acs-pdf",
         "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548?ref=article_openPDF",
+        timeout_seconds=0.01,
     )
 
     assert result.archived
@@ -95,6 +96,7 @@ def test_archive_authorized_pdf_response_reports_viewer_shell(monkeypatch, tmp_p
         paper,
         "littrace-acs-pdf",
         "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548?ref=article_openPDF",
+        timeout_seconds=0.01,
     )
 
     assert not result.archived
@@ -152,6 +154,7 @@ def test_archive_authorized_pdf_response_falls_back_to_browser_context_fetch(
         paper,
         "littrace-acs-pdf",
         "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548?ref=article_openPDF",
+        timeout_seconds=0.01,
     )
 
     assert result.archived
@@ -198,6 +201,7 @@ def test_archive_authorized_pdf_response_fetches_without_network_pdf_record(
         paper,
         "littrace-acs-auth",
         "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548",
+        timeout_seconds=0.01,
     )
 
     assert result.archived
@@ -263,6 +267,7 @@ def test_archive_authorized_pdf_response_cookie_http_after_missing_network_and_f
         paper,
         "littrace-mdpi-auth",
         "https://www.mdpi.com/1424-8220/24/1/1/pdf?version=1702959558",
+        timeout_seconds=0.01,
     )
 
     assert result.archived
@@ -334,6 +339,7 @@ def test_archive_authorized_pdf_response_click_download_after_http_fallbacks_fai
         paper,
         "littrace-mdpi-auth",
         "https://www.mdpi.com/1424-8220/24/1/1/pdf?version=1702959558",
+        timeout_seconds=0.01,
     )
 
     target = tmp_path / "papers" / "unknown-year" / "10.3390_s24010001" / "paper.pdf"
@@ -341,6 +347,55 @@ def test_archive_authorized_pdf_response_click_download_after_http_fallbacks_fai
     assert result.method == "browser_click_download"
     assert target.read_bytes().startswith(b"%PDF")
     assert not downloaded.exists()
+
+
+def test_archive_authorized_pdf_response_prefers_browser_download_before_http_fallbacks(
+    monkeypatch, tmp_path
+):
+    config = LitTraceConfig(storage=StorageConfig(paper_library_dir=tmp_path / "papers"))
+    paper = PaperMetadata(
+        paper_id="wiley",
+        title="Wiley paper",
+        doi="10.1002/adfm.202316712",
+    )
+    downloaded = tmp_path / "papers" / "wiley-browser-download.pdf"
+    calls = []
+
+    class Result:
+        def __init__(self, stdout, returncode=0, stderr=""):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+            self.recoverable_window_closed = False
+
+    def fake_run(_config, args, **_kwargs):
+        calls.append(args)
+        if "requests" in args:
+            return Result("# format: csv\nrequest_id,method,status,resource_type,mime_type,timestamp,url\n")
+        if "clickedHref" in args[-1]:
+            downloaded.parent.mkdir(parents=True, exist_ok=True)
+            downloaded.write_bytes(b"%PDF-1.7\nwiley-browser")
+            return Result(
+                '{"clicked":true,"clickedHref":"https://advanced.onlinelibrary.wiley.com/doi/pdf/10.1002/adfm.202316712"}'
+            )
+        raise AssertionError(f"Unexpected fallback before browser click: {args}")
+
+    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
+
+    result = archive_authorized_pdf_response(
+        config,
+        paper,
+        "littrace-wiley-pdf",
+        "https://advanced.onlinelibrary.wiley.com/doi/pdf/10.1002/adfm.202316712",
+        timeout_seconds=0.01,
+    )
+
+    target = tmp_path / "papers" / "unknown-year" / "10.1002_adfm.202316712" / "paper.pdf"
+    assert result.archived
+    assert result.method == "browser_click_download"
+    assert target.read_bytes().startswith(b"%PDF")
+    assert calls[0][2:4] == ["network", "requests"]
+    assert "clickedHref" in calls[1][-1]
 
 
 def test_archive_authorized_pdf_response_falls_back_to_cookie_http(
@@ -423,6 +478,7 @@ def test_archive_authorized_pdf_response_falls_back_to_cookie_http(
         paper,
         "littrace-acs-pdf",
         "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548?ref=article_openPDF",
+        timeout_seconds=0.01,
     )
 
     assert result.archived
@@ -503,6 +559,7 @@ def test_archive_authorized_pdf_response_cookie_http_falls_back_to_document_cook
         paper,
         "littrace-acs-pdf",
         "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548?ref=article_openPDF",
+        timeout_seconds=0.01,
     )
 
     assert result.archived
@@ -604,6 +661,7 @@ def test_archive_authorized_pdf_response_follows_wiley_pdfdirect(
         paper,
         "littrace-wiley-pdf",
         "https://advanced.onlinelibrary.wiley.com/doi/pdf/10.1002/adfm.202316712",
+        timeout_seconds=0.01,
     )
 
     assert result.archived
@@ -657,6 +715,7 @@ def test_archive_authorized_pdf_response_prefers_pdf_over_viewer_html(monkeypatc
         paper,
         "littrace-acs-pdf",
         "https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548?ref=article_openPDF",
+        timeout_seconds=0.01,
     )
 
     assert result.archived

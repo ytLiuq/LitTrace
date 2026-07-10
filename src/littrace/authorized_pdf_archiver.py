@@ -55,6 +55,16 @@ def archive_authorized_pdf_response(
     )
     candidate = _select_pdf_request(requests.stdout, pdf_url)
     if candidate is None:
+        click_fallback = _download_pdf_by_browser_click(
+            config,
+            paper,
+            session_name,
+            pdf_url,
+            target,
+            timeout_seconds=timeout_seconds,
+        )
+        if click_fallback.archived:
+            return click_fallback
         fallback = _download_pdf_in_browser_context(
             config,
             paper,
@@ -75,26 +85,16 @@ def archive_authorized_pdf_response(
         )
         if cookie_fallback.archived:
             return cookie_fallback
-        click_fallback = _download_pdf_by_browser_click(
-            config,
-            paper,
-            session_name,
-            pdf_url,
-            target,
-            timeout_seconds=timeout_seconds,
-        )
-        if click_fallback.archived:
-            return click_fallback
         return AuthorizedPdfArchiveResult(
             paper_id=paper.paper_id,
             pdf_url=pdf_url,
             target_path=str(target),
-            method="browser_context_fetch",
+            method="browser_click_download",
             error=(
                 "No authorized application/pdf network response was found. "
+                f"browser click fallback: {click_fallback.error}; "
                 f"Browser-context fetch: {fallback.error}; "
-                f"cookie HTTP fallback: {cookie_fallback.error}; "
-                f"browser click fallback: {click_fallback.error}"
+                f"cookie HTTP fallback: {cookie_fallback.error}"
             ),
         )
 
@@ -110,26 +110,6 @@ def archive_authorized_pdf_response(
         _extract_header(detail.stdout, "content-disposition")
     )
     if body is None:
-        fallback = _download_pdf_in_browser_context(
-            config,
-            paper,
-            session_name,
-            pdf_url,
-            target,
-            timeout_seconds=timeout_seconds,
-        )
-        if fallback.archived:
-            return fallback
-        fallback = _download_pdf_with_browser_cookies(
-            config,
-            paper,
-            session_name,
-            pdf_url,
-            target,
-            timeout_seconds=timeout_seconds,
-        )
-        if fallback.archived:
-            return fallback
         click_fallback = _download_pdf_by_browser_click(
             config,
             paper,
@@ -140,6 +120,26 @@ def archive_authorized_pdf_response(
         )
         if click_fallback.archived:
             return click_fallback
+        fallback = _download_pdf_in_browser_context(
+            config,
+            paper,
+            session_name,
+            pdf_url,
+            target,
+            timeout_seconds=timeout_seconds,
+        )
+        if fallback.archived:
+            return fallback
+        cookie_fallback = _download_pdf_with_browser_cookies(
+            config,
+            paper,
+            session_name,
+            pdf_url,
+            target,
+            timeout_seconds=timeout_seconds,
+        )
+        if cookie_fallback.archived:
+            return cookie_fallback
         return AuthorizedPdfArchiveResult(
             paper_id=paper.paper_id,
             pdf_url=pdf_url,
@@ -151,33 +151,14 @@ def archive_authorized_pdf_response(
             method="browser_network",
             error=(
                 "PDF response body was not available from browser-act. "
-                f"Cookie fallback: {fallback.error}; "
-                f"browser click fallback: {click_fallback.error}"
+                f"browser click fallback: {click_fallback.error}; "
+                f"browser-context fetch fallback: {fallback.error}; "
+                f"cookie HTTP fallback: {cookie_fallback.error}"
             ),
         )
 
     data = base64.b64decode(body) if encoded else body.encode("latin1", errors="ignore")
     if not data.startswith(b"%PDF"):
-        fallback = _download_pdf_in_browser_context(
-            config,
-            paper,
-            session_name,
-            pdf_url,
-            target,
-            timeout_seconds=timeout_seconds,
-        )
-        if fallback.archived:
-            return fallback
-        fallback = _download_pdf_with_browser_cookies(
-            config,
-            paper,
-            session_name,
-            pdf_url,
-            target,
-            timeout_seconds=timeout_seconds,
-        )
-        if fallback.archived:
-            return fallback
         click_fallback = _download_pdf_by_browser_click(
             config,
             paper,
@@ -188,6 +169,26 @@ def archive_authorized_pdf_response(
         )
         if click_fallback.archived:
             return click_fallback
+        fallback = _download_pdf_in_browser_context(
+            config,
+            paper,
+            session_name,
+            pdf_url,
+            target,
+            timeout_seconds=timeout_seconds,
+        )
+        if fallback.archived:
+            return fallback
+        cookie_fallback = _download_pdf_with_browser_cookies(
+            config,
+            paper,
+            session_name,
+            pdf_url,
+            target,
+            timeout_seconds=timeout_seconds,
+        )
+        if cookie_fallback.archived:
+            return cookie_fallback
         return AuthorizedPdfArchiveResult(
             paper_id=paper.paper_id,
             pdf_url=pdf_url,
@@ -199,7 +200,9 @@ def archive_authorized_pdf_response(
             method="browser_network",
             error=(
                 "Authorized response was application/pdf, but browser-act exposed a PDF viewer shell instead of PDF bytes. "
-                f"Browser click fallback: {click_fallback.error}"
+                f"Browser click fallback: {click_fallback.error}; "
+                f"browser-context fetch fallback: {fallback.error}; "
+                f"cookie HTTP fallback: {cookie_fallback.error}"
             ),
             warning="needs_binary_body_export",
         )
@@ -266,6 +269,19 @@ def _download_pdf_by_browser_click(
             error=str(payload.get("error") or "No PDF download control was found on the browser page."),
         )
 
+    downloaded = _wait_for_new_pdf_download(
+        watch_dirs,
+        before,
+        timeout_seconds=timeout_seconds,
+    )
+    if downloaded is not None:
+        return _archive_browser_downloaded_pdf(
+            paper,
+            pdf_url,
+            target,
+            downloaded,
+        )
+
     navigated_pdf = _wait_for_browser_pdf_navigation(
         config,
         session_name,
@@ -312,11 +328,6 @@ def _download_pdf_by_browser_click(
             if navigation_result.archived:
                 return navigation_result
 
-    downloaded = _wait_for_new_pdf_download(
-        watch_dirs,
-        before,
-        timeout_seconds=max(timeout_seconds, 5.0),
-    )
     if downloaded is None:
         clicked = payload.get("clickedHref") if isinstance(payload, dict) else None
         return AuthorizedPdfArchiveResult(
@@ -334,6 +345,15 @@ def _download_pdf_by_browser_click(
                 )
             ),
         )
+    return _archive_browser_downloaded_pdf(paper, pdf_url, target, downloaded)
+
+
+def _archive_browser_downloaded_pdf(
+    paper: PaperMetadata,
+    pdf_url: str,
+    target: Path,
+    downloaded: Path,
+) -> AuthorizedPdfArchiveResult:
     if not downloaded.read_bytes().startswith(b"%PDF"):
         return AuthorizedPdfArchiveResult(
             paper_id=paper.paper_id,
@@ -358,10 +378,11 @@ def _download_pdf_by_browser_click(
 
 def _browser_click_download_script(pdf_url: str) -> str:
     return rf"""
-(() => {{
+(async () => {{
   const normalize = (href) => {{
     try {{ return new URL(href, location.href).href; }} catch (_) {{ return null; }}
   }};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const currentText = [
     document.title || '',
     location.href || '',
@@ -378,20 +399,45 @@ def _browser_click_download_script(pdf_url: str) -> str:
   }}
   const expected = {json.dumps(pdf_url)};
   const expectedBase = expected.split('?')[0];
-  const elements = Array.from(document.querySelectorAll('a[href], button, [role="button"]'));
+  const shadowRoots = [];
+  const collectShadowRoots = (root) => {{
+    for (const element of Array.from(root.querySelectorAll('*'))) {{
+      if (element.shadowRoot) {{
+        shadowRoots.push(element.shadowRoot);
+        collectShadowRoots(element.shadowRoot);
+      }}
+    }}
+  }};
+  collectShadowRoots(document);
+  const roots = [document, ...shadowRoots];
+  const elements = roots.flatMap((root) => Array.from(root.querySelectorAll('a[href], button, [role="button"], cr-icon-button, viewer-download-controls, viewer-toolbar, embed, iframe')));
+  const embeddedPdf = elements
+    .map((element) => normalize(element.getAttribute('src') || element.getAttribute('href') || element.src || element.href || ''))
+    .find((href) => href && (
+      href.includes('/doi/pdf/') ||
+      href.includes('/doi/pdfdirect/') ||
+      href.includes('/content/articlepdf/') ||
+      href.includes('/pdfft') ||
+      href.toLowerCase().endsWith('.pdf')
+    ));
   const scored = elements.map((element) => {{
     const href = normalize(element.getAttribute('href') || element.href || '');
+    const src = normalize(element.getAttribute('src') || element.src || '');
     const text = [
       element.textContent || '',
       element.getAttribute('title') || '',
       element.getAttribute('aria-label') || '',
+      element.getAttribute('id') || '',
       element.getAttribute('class') || '',
-      href || ''
+      element.tagName || '',
+      href || '',
+      src || ''
     ].join(' ').toLowerCase();
     let score = 0;
     if (href && href === expected) score += 30;
     if (href && href.split('?')[0] === expectedBase) score += 24;
     if (href && href.includes('/doi/pdf/')) score += 16;
+    if (href && href.includes('/doi/pdfdirect/')) score += 24;
     if (href && href.includes('/pdf?')) score += 18;
     if (href && href.includes('/pdf#')) score += 14;
     if (href && href.endsWith('/pdf')) score += 14;
@@ -399,19 +445,36 @@ def _browser_click_download_script(pdf_url: str) -> str:
     if (href && href.includes('/content/articlepdf/')) score += 16;
     if (href && href.includes('/science/article/pii/') && href.includes('/pdfft')) score += 16;
     if (href && href.includes('/pdfft')) score += 14;
+    if (src && src.includes('/doi/pdfdirect/')) score += 20;
+    if (src && src.includes('/doi/pdf/')) score += 16;
+    if (text.includes('download-button')) score += 22;
+    if (text.includes('download-controls')) score += 18;
     if (text.includes('download pdf')) score += 12;
+    if (text.includes('download article pdf')) score += 14;
     if (text.includes('view pdf')) score += 8;
+    if (text.includes('download')) score += 7;
     if (text.includes('pdf')) score += 5;
-    return {{ element, href, text, score }};
+    return {{ element, href: href || src, text, score }};
   }}).filter((item) => item.score > 0);
   scored.sort((left, right) => right.score - left.score);
-  if (!scored.length) {{
+  if (!scored.length && !embeddedPdf) {{
     return JSON.stringify({{ clicked: false, error: 'no_pdf_download_control' }});
   }}
-  const best = scored[0];
-  best.element.scrollIntoView({{ block: 'center', inline: 'center' }});
+  const best = scored[0] || {{ href: embeddedPdf, text: 'embedded-pdf', score: 10 }};
+  if (best.element) {{
+    best.element.scrollIntoView({{ block: 'center', inline: 'center' }});
+  }}
   if (best.href) {{
-    location.href = best.href;
+    const anchor = document.createElement('a');
+    anchor.href = best.href;
+    anchor.download = '';
+    anchor.rel = 'noopener';
+    document.body.appendChild(anchor);
+    anchor.click();
+    await sleep(300);
+    if (!location.href.includes('/doi/pdf') && !location.href.includes('/pdfdirect/')) {{
+      location.href = best.href;
+    }}
   }} else {{
     best.element.click();
   }}
@@ -447,10 +510,11 @@ def _wait_for_browser_pdf_navigation(
 ) -> str | None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() <= deadline:
+        remaining = max(deadline - time.monotonic(), 0.1)
         result = run_browser_act(
             config,
             ["--session", session_name, "eval", "location.href || ''"],
-            timeout_seconds=5.0,
+            timeout_seconds=min(5.0, remaining),
         )
         current = _last_nonempty_line(result.stdout).strip('"').strip("'")
         if _looks_like_same_pdf_url(current, expected_pdf_url):

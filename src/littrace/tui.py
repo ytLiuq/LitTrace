@@ -162,7 +162,7 @@ def render_context_lines(workspace: LiteratureWorkspace) -> list[str]:
     if not ids:
         return ["文献上下文", "当前没有文献。", "输入：检索 MXene flexible sensor"]
     selected = set(workspace.context.selected_for_download)
-    pool_count = workspace.context.filters.get("candidate_pool_count", len(ids))
+    pool_count = getattr(workspace.context.filters, "candidate_pool_count", len(ids))
     lines = [f"文献上下文 ({len(ids)} / 候选池 {pool_count} 篇)"]
     for index, paper_id in enumerate(ids[:12], start=1):
         paper = workspace.papers[paper_id]
@@ -196,7 +196,9 @@ def wrap_text(text: str, width: int) -> list[str]:
     return lines
 
 
-def _add_clipped(screen, y: int, x: int, text: str, width: int, attr: int = curses.A_NORMAL) -> None:
+def _add_clipped(
+    screen, y: int, x: int, text: str, width: int, attr: int = curses.A_NORMAL
+) -> None:
     if width <= 0:
         return
     try:

@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 
 from littrace.access import build_download_plan, target_pdf_path
+from littrace.cdp_downloader import download_paper_via_cdp
 from littrace.config import LitTraceConfig
 from littrace.full_text import resolve_full_text_for_paper
 from littrace.models import (
@@ -22,7 +23,9 @@ async def execute_downloads(
     request: DownloadExecutionRequest,
 ) -> DownloadExecutionResult:
     selected_ids = set(request.paper_ids)
-    target_papers = [paper for paper in papers if not selected_ids or paper.paper_id in selected_ids]
+    target_papers = [
+        paper for paper in papers if not selected_ids or paper.paper_id in selected_ids
+    ]
     plan = build_download_plan(config, target_papers, selected_ids)
     items: list[DownloadExecutionItem] = []
 
@@ -36,7 +39,10 @@ async def execute_downloads(
     return DownloadExecutionResult(
         items=items,
         downloaded_count=sum(item.status == "downloaded" for item in items),
-        requires_login_count=sum(item.status == "requires_login" for item in items),
+        requires_login_count=sum(
+            item.action == "cdp_publisher_download" or item.status == "requires_login"
+            for item in items
+        ),
         skipped_count=sum(item.status == "skipped" for item in items),
     )
 
@@ -47,12 +53,26 @@ async def _execute_one(
     paper: PaperMetadata,
     dry_run: bool,
 ) -> DownloadExecutionItem:
-    if paper.access_type == AccessType.REQUIRES_LOGIN:
-        from littrace.login_flow import login_action_for_paper
-
-        item = login_action_for_paper(config, paper)
-        item.action = "request_user_authorization"
-        return item
+    if paper.access_type == AccessType.REQUIRES_LOGIN and paper.doi:
+        target_path = _target_pdf_path(config, paper)
+        if dry_run:
+            return DownloadExecutionItem(
+                paper_id=paper.paper_id,
+                action="cdp_publisher_download",
+                status="planned",
+                target_path=str(target_path),
+            )
+        result = download_paper_via_cdp(config, paper.doi, target_path)
+        return DownloadExecutionItem(
+            paper_id=paper.paper_id,
+            action="cdp_publisher_download",
+            status="downloaded"
+            if result.downloaded
+            else ("requires_login" if result.requires_user_action else "failed"),
+            target_path=str(target_path),
+            login_instructions=[result.user_action] if result.user_action else [],
+            error=result.error,
+        )
     pdf_url = paper.pdf_url
     if paper.access_type == AccessType.OPEN_ACCESS and not pdf_url:
         report = await resolve_full_text_for_paper(client, paper, config)
@@ -60,9 +80,9 @@ async def _execute_one(
     if paper.access_type != AccessType.OPEN_ACCESS or not pdf_url:
         return DownloadExecutionItem(
             paper_id=paper.paper_id,
-            action="skip",
-            status="skipped",
-            error="No open-access PDF URL is available",
+            action="download",
+            status="failed",
+            error="Full text PDF is required, but no verified PDF URL is available.",
         )
 
     target_path = _target_pdf_path(config, paper)
@@ -82,7 +102,7 @@ async def _execute_one(
             return DownloadExecutionItem(
                 paper_id=paper.paper_id,
                 action="download",
-                status="skipped",
+                status="failed",
                 target_path=str(target_path),
                 error=f"Response does not look like a PDF: {content_type}",
             )

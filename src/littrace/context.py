@@ -1,8 +1,22 @@
 from __future__ import annotations
 
-from littrace.models import ContextUpdate, LiteratureContext, LiteratureWorkspace, PaperMetadata
+from littrace.models import (
+    ContextUpdate,
+    LiteratureContext,
+    LiteratureWorkspace,
+    PaperMetadata,
+    WorkspaceFilters,
+)
 from littrace.search import select_context_papers
 from littrace.models import PaperSearchRequest
+
+
+def _merge_filters(filters: WorkspaceFilters, updates: dict | WorkspaceFilters) -> None:
+    """Merge a dict or WorkspaceFilters into an existing WorkspaceFilters in-place."""
+    if isinstance(updates, WorkspaceFilters):
+        updates = updates.model_dump(exclude_none=True)
+    for key, value in updates.items():
+        setattr(filters, key, value)
 
 
 def add_papers(workspace: LiteratureWorkspace, papers: list[PaperMetadata]) -> LiteratureWorkspace:
@@ -32,14 +46,15 @@ def add_ranked_candidate_papers(
         if paper.paper_id not in workspace.context.excluded_papers
     ]
     workspace.context.active_papers = active
-    workspace.context.filters.update(
+    _merge_filters(
+        workspace.context.filters,
         {
             "candidate_pool_ids": ranked_ids,
             "candidate_pool_count": len(ranked_ids),
             "active_context_limit": active_limit,
             "active_context_count": len(active),
             "ranking_policy": "wide_recall_rank_then_top_context",
-        }
+        },
     )
     return workspace
 
@@ -53,7 +68,7 @@ def apply_context_update(
     if update.visible_to_user is not None:
         context.visible_to_user = update.visible_to_user
     if update.filters is not None:
-        context.filters.update(update.filters)
+        _merge_filters(context.filters, update.filters)
 
     for paper_id in update.include_paper_ids:
         _remove(context.excluded_papers, paper_id)

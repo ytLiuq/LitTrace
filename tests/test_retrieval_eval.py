@@ -20,7 +20,7 @@ async def test_retrieval_golden_eval_scores_live_pipeline(monkeypatch, tmp_path)
 
     async def fake_preview(request, config):
         workspace = LiteratureWorkspace()
-        workspace.context.filters["search_mode"] = "live"
+        workspace.context.filters.search_mode = "live"
         return add_ranked_candidate_papers(
             workspace,
             [

@@ -11,6 +11,7 @@ import httpx
 
 from littrace.config import LitTraceConfig
 from littrace.models import AccessType, PaperMetadata, PaperSearchRequest, PaperSearchResult
+from littrace.retry import retry_async, RetryConfig, BackoffStrategy
 
 
 class PaperSearchClient(Protocol):
@@ -110,7 +111,9 @@ class MockMaterialsSearchClient:
             ),
         ]
         if request.year_min is not None:
-            papers = [paper for paper in papers if paper.year is None or paper.year >= request.year_min]
+            papers = [
+                paper for paper in papers if paper.year is None or paper.year >= request.year_min
+            ]
         return PaperSearchResult(request=request, papers=papers[: request.limit])
 
 
@@ -128,7 +131,9 @@ class LiveSearchClient:
         self.diagnostics.query_variants = [variant.topic for variant in requests]
         openalex_results: list[PaperMetadata] = []
         crossref_results: list[PaperMetadata] = []
-        async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout, headers=headers, follow_redirects=True
+        ) as client:
             for index, variant_request in enumerate(requests, start=1):
                 openalex, crossref = await _gather_named(
                     {
@@ -149,7 +154,9 @@ class LiveSearchClient:
                     request,
                 )
                 context_ready_so_far = [
-                    paper for paper in relevant_so_far if _context_relevance_score(request, paper) >= 0.45
+                    paper
+                    for paper in relevant_so_far
+                    if _context_relevance_score(request, paper) >= 0.45
                 ]
                 self.diagnostics.ranking_counts[f"context_ready_after_variant_{index}"] = len(
                     context_ready_so_far
@@ -220,8 +227,7 @@ class LiveSearchClient:
             source_info = source.get("source") or {}
             authorships = item.get("authorships") or []
             authors = [
-                (authorship.get("author") or {}).get("display_name")
-                for authorship in authorships
+                (authorship.get("author") or {}).get("display_name") for authorship in authorships
             ]
             source_urls = [url for url in [item.get("id"), item.get("doi")] if url]
             paper = PaperMetadata(
@@ -236,7 +242,7 @@ class LiveSearchClient:
                 citation_count=item.get("cited_by_count"),
                 source_urls=source_urls,
                 pdf_url=best_oa,
-                access_type=AccessType.OPEN_ACCESS if best_oa else AccessType.METADATA_ONLY,
+                access_type=AccessType.OPEN_ACCESS if best_oa else AccessType.UNAVAILABLE,
                 relevance_score=_bounded(item.get("relevance_score")),
             )
             papers.append(paper)
@@ -288,7 +294,7 @@ class LiveSearchClient:
                     abstract=_strip_crossref_abstract(item.get("abstract")),
                     citation_count=item.get("is-referenced-by-count"),
                     source_urls=source_urls,
-                    access_type=AccessType.METADATA_ONLY,
+                    access_type=AccessType.UNAVAILABLE,
                 )
             )
         return papers
@@ -317,7 +323,7 @@ class LiveSearchClient:
                 paper.access_type = AccessType.OPEN_ACCESS
                 if landing_url and landing_url not in [str(url) for url in paper.source_urls]:
                     paper.source_urls.append(landing_url)
-            elif paper.access_type == AccessType.METADATA_ONLY and _publisher_requires_login(paper):
+            elif paper.access_type == AccessType.UNAVAILABLE and _publisher_requires_login(paper):
                 paper.access_type = AccessType.REQUIRES_LOGIN
         return papers
 
@@ -360,7 +366,15 @@ def build_query_variants(topic: str) -> list[str]:
     if any(token in normalized for token in ["柔性", "薄膜", "压敏", "压力", "传感"]):
         expanded.extend(["flexible thin-film pressure sensor", "flexible pressure sensor"])
     if any(token in normalized for token in ["长时间", "长期", "受压", "漂移", "稳定"]):
-        expanded.extend(["long-term pressure drift", "compression drift", "signal drift", "hysteresis", "stability"])
+        expanded.extend(
+            [
+                "long-term pressure drift",
+                "compression drift",
+                "signal drift",
+                "hysteresis",
+                "stability",
+            ]
+        )
     if any(token in normalized for token in ["材料", "化学"]) or expanded:
         expanded.extend(["materials chemistry", "wearable sensor"])
 
@@ -450,25 +464,42 @@ async def _get_with_retries(
     diagnostics: SearchDiagnostics,
     attempts: int = 3,
 ) -> httpx.Response:
-    retry_statuses = {429, 500, 502, 503, 504}
-    last_exc: httpx.HTTPError | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            response = await client.get(url, params=params)
-            if response.status_code not in retry_statuses:
-                return response
-            if attempt == attempts:
-                response.raise_for_status()
-            diagnostics.errors.append(f"{source}_retry_{attempt}: HTTP {response.status_code}")
-        except httpx.HTTPError as exc:
-            last_exc = exc
-            if attempt == attempts:
-                raise
-            diagnostics.errors.append(f"{source}_retry_{attempt}: {exc.__class__.__name__}: {exc}")
-        await asyncio.sleep(0.4 * attempt)
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"{source} retry loop exited unexpectedly")
+    """Fetch a URL with unified retry via @retry_async.
+
+    The inner _single_get does one HTTP GET; retries are handled by the
+    decorator. Retry traces are recorded in retry_tracker for harness checks.
+    """
+    retry_config = RetryConfig(
+        max_attempts=attempts,
+        backoff_strategy=BackoffStrategy.LINEAR,
+        base_delay_seconds=0.4,
+        retry_status_codes=frozenset({429, 500, 502, 503, 504}),
+        retry_on=(httpx.HTTPError,),
+    )
+
+    def _on_retry(attempt: int, exc: Exception, delay: float) -> None:
+        # Preserve backward-compatible diagnostics format: "openalex_retry_1: HTTP 503"
+        status = ""
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = f" HTTP {exc.response.status_code}"
+        diagnostics.errors.append(f"{source}_retry_{attempt}:{status}")
+
+    @retry_async(
+        retry_config,
+        operation=f"search_get:{source}",
+        retry_on=(httpx.HTTPError,),
+        on_retry=_on_retry,
+    )
+    async def _single_get() -> httpx.Response:
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        return response
+
+    try:
+        return await _single_get()
+    except httpx.HTTPError as exc:
+        diagnostics.errors.append(f"{source}: {exc.__class__.__name__}: {exc}")
+        raise
 
 
 def merge_papers(papers: list[PaperMetadata]) -> list[PaperMetadata]:
@@ -595,7 +626,12 @@ def _context_relevance_score(request: PaperSearchRequest, paper: PaperMetadata) 
     ranked = paper.relevance_score or 0.0
     return min(
         1.0,
-        0.24 * ranked + 0.24 * lexical + 0.22 * title + 0.18 * concept + 0.08 * phrase + 0.04 * mandatory,
+        0.24 * ranked
+        + 0.24 * lexical
+        + 0.22 * title
+        + 0.18 * concept
+        + 0.08 * phrase
+        + 0.04 * mandatory,
     )
 
 
@@ -800,7 +836,9 @@ def _lexical_relevance_score(topic: str, paper: PaperMetadata) -> float:
         phrase_bonus += 0.2
     if "hydrogel" in topic_lowered and "hydrogel" in lowered:
         phrase_bonus += 0.2
-    if ("pressure" in topic_lowered or "压力" in topic or "压敏" in topic) and "pressure" in lowered:
+    if (
+        "pressure" in topic_lowered or "压力" in topic or "压敏" in topic
+    ) and "pressure" in lowered:
         phrase_bonus += 0.1
     if "strain" in topic_lowered and "strain" in lowered:
         phrase_bonus += 0.1
@@ -851,7 +889,9 @@ def _title_phrase_bonus(topic: str, title: str) -> float:
         bonus += 0.18
     if "fatigue" in topic_lowered and "fatigue" in title:
         bonus += 0.12
-    if "temperature" in topic_lowered and any(marker in title for marker in ["temperature", "low-temperature"]):
+    if "temperature" in topic_lowered and any(
+        marker in title for marker in ["temperature", "low-temperature"]
+    ):
         bonus += 0.08
     return min(0.45, bonus)
 
@@ -882,11 +922,17 @@ def _topical_specificity_score(topic: str, paper: PaperMetadata) -> float:
     score = 0.0
     if "hydrogel" in topic_lowered and "hydrogel" in text:
         score += 0.25
-    if "conductive" in topic_lowered and any(marker in text for marker in ["conductive", "conductivity"]):
+    if "conductive" in topic_lowered and any(
+        marker in text for marker in ["conductive", "conductivity"]
+    ):
         score += 0.2
     if "strain" in topic_lowered and "strain" in text:
         score += 0.2
-    if "temperature" in text and "strain" in text and ("hydrogel" in topic_lowered or "strain" in topic_lowered):
+    if (
+        "temperature" in text
+        and "strain" in text
+        and ("hydrogel" in topic_lowered or "strain" in topic_lowered)
+    ):
         score += 0.16
     if "wearable" in topic_lowered and any(
         marker in text for marker in ["wearable", "human motion", "motion monitoring", "flexible"]
@@ -1005,7 +1051,10 @@ def _merge_paper(left: PaperMetadata, right: PaperMetadata) -> PaperMetadata:
     data["source_urls"] = list({str(url) for url in [*left.source_urls, *right.source_urls]})
     if right.access_type == AccessType.OPEN_ACCESS:
         data["access_type"] = AccessType.OPEN_ACCESS
-    elif left.access_type != AccessType.OPEN_ACCESS and right.access_type == AccessType.REQUIRES_LOGIN:
+    elif (
+        left.access_type != AccessType.OPEN_ACCESS
+        and right.access_type == AccessType.REQUIRES_LOGIN
+    ):
         data["access_type"] = AccessType.REQUIRES_LOGIN
     return PaperMetadata.model_validate(data)
 

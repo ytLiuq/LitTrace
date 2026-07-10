@@ -1,20 +1,52 @@
 from __future__ import annotations
 
+import json
+
+from pydantic import BaseModel, Field, ValidationError
+
 from littrace.citation_guard import guard_citations, remove_unsupported_sentences
 from littrace.config import LitTraceConfig
 from littrace.harnesses import check_performance_cells, check_storyline_claims
 from littrace.llm import chat_completion
+from littrace.log import get_logger
 from littrace.models import (
     AgentCritique,
     AgentDebateRound,
     AutonomousResearchLoopReport,
     LiteratureWorkspace,
+    coerce_parsed,
 )
 from littrace.quality_report import build_quality_report
-from littrace.research_writer import fallback_evidence_answer, write_evidence_grounded_answer
+from littrace.research_writer import write_evidence_grounded_answer
 from littrace.storyline import build_storyline_from_workspace
 from littrace.parsing import parse_workspace_papers
 from littrace.tables import extract_performance_cells
+
+logger = get_logger("autonomous_loop")
+
+
+# ---------------------------------------------------------------------------
+# Schema for LLM debate critique output (Dimension 3: Schema validation)
+# ---------------------------------------------------------------------------
+
+
+class DebateCritiqueItem(BaseModel):
+    """A single critique from one LLM debate persona."""
+
+    reviewer: str = Field(description="Persona name, e.g. Method Reviewer")
+    severity: str = Field(default="warning", description="error | warning | info")
+    finding: str = Field(description="The critique text in Chinese")
+    suggested_fix: str | None = None
+
+
+class DebateCritiqueSchema(BaseModel):
+    """Validated schema for _smart_debate_critiques LLM output."""
+
+    critiques: list[DebateCritiqueItem] = Field(default_factory=list)
+
+
+# Keywords that indicate error-level severity (kept for backward compat)
+_ERROR_KEYWORDS = ("unsupported", "缺少证据", "无证据", "错误", "严重", "阻断", "cannot", "invalid")
 
 
 async def run_autonomous_research_loop(
@@ -49,13 +81,15 @@ async def run_autonomous_research_loop(
     for round_index in range(1, max_rounds + 1):
         critiques = _review_draft(final_answer, workspace, config)
         if enable_smart_debate:
-            critiques.extend(await _smart_debate_critiques(config, objective, final_answer, workspace))
+            critiques.extend(
+                await _smart_debate_critiques(config, objective, final_answer, workspace)
+            )
         revised = _revise_draft(final_answer, critiques, workspace)
         score = _round_score(critiques, workspace, config)
         replan_actions = _replan_actions(critiques, workspace)
         executed_actions: list[str] = []
         if auto_replan and replan_actions:
-            workspace, executed_actions = _execute_safe_replan_actions(
+            workspace, executed_actions = await _execute_safe_replan_actions(
                 config,
                 workspace,
                 replan_actions,
@@ -89,7 +123,9 @@ async def run_autonomous_research_loop(
         )
         final_answer = revised
         final_score = score
-        aggregate_actions.extend(action for action in replan_actions if action not in aggregate_actions)
+        aggregate_actions.extend(
+            action for action in replan_actions if action not in aggregate_actions
+        )
         aggregate_executed_actions.extend(
             action for action in executed_actions if action not in aggregate_executed_actions
         )
@@ -117,7 +153,7 @@ async def _initial_draft(
     reply = await write_evidence_grounded_answer(config, objective, workspace)
     if reply.used_llm and reply.text.strip():
         return reply.text
-    return fallback_evidence_answer(objective, workspace)
+    raise RuntimeError(f"LLM unavailable for initial draft: {reply.error}")
 
 
 def _review_draft(
@@ -221,27 +257,72 @@ async def _smart_debate_critiques(
     payload = _smart_debate_payload(objective, draft, workspace)
     system_prompt = (
         "You are a skeptical academic multi-agent review council. "
-        "Return concise Chinese critique bullets only. "
+        "Return a JSON object with a 'critiques' array. "
+        "Each critique must have: reviewer (string), severity (error|warning|info), "
+        "finding (Chinese text), suggested_fix (Chinese text or null). "
         "Use the personas: Method Reviewer, Evidence Reviewer, Synthesis Reviewer. "
         "Do not introduce new papers or facts. If evidence is insufficient, ask for replan actions."
     )
-    reply = await chat_completion(config, system_prompt, payload, workspace=None)
+    reply = await chat_completion(
+        config,
+        system_prompt,
+        payload,
+        workspace=None,
+        json_mode=True,
+    )
     if not reply.used_llm or not reply.text.strip():
         return []
+
+    # --- Schema validation (Dimension 3) ---
+    try:
+        raw = json.loads(reply.text)
+    except json.JSONDecodeError:
+        logger.warning("debate_json_parse_failed", extra={"text_len": len(reply.text)})
+        return _parse_debate_as_text(reply.text)
+
+    try:
+        validated = DebateCritiqueSchema.model_validate(raw)
+    except ValidationError as exc:
+        logger.warning(
+            "debate_schema_validation_failed",
+            extra={"errors": exc.errors()[:3]},
+        )
+        return _parse_debate_as_text(reply.text)
+
     critiques: list[AgentCritique] = []
-    for line in reply.text.splitlines():
-        text = line.strip(" -\t")
-        if not text:
+    for item in validated.critiques:
+        severity = item.severity if item.severity in ("error", "warning", "info") else "warning"
+        lowered = item.finding.lower()
+        if any(kw in lowered for kw in _ERROR_KEYWORDS):
+            severity = "error"
+        critiques.append(
+            AgentCritique(
+                reviewer=item.reviewer or "LLM Debate Reviewer",
+                severity=severity,
+                finding=item.finding,
+                suggested_fix=item.suggested_fix
+                or "用当前 workspace 证据补足，或将相关结论降级为待验证假设。",
+            )
+        )
+    return critiques[:8]
+
+
+def _parse_debate_as_text(text: str) -> list[AgentCritique]:
+    """Fallback parser for non-JSON LLM output — preserves backward compat."""
+    critiques: list[AgentCritique] = []
+    for line in text.splitlines():
+        text_line = line.strip(" -\t")
+        if not text_line:
             continue
         severity = "warning"
-        lowered = text.lower()
-        if any(token in lowered for token in ["unsupported", "缺少证据", "无证据", "错误"]):
+        lowered = text_line.lower()
+        if any(kw in lowered for kw in _ERROR_KEYWORDS):
             severity = "error"
         critiques.append(
             AgentCritique(
                 reviewer="LLM Debate Reviewer",
                 severity=severity,
-                finding=text,
+                finding=text_line,
                 suggested_fix="用当前 workspace 证据补足，或将相关结论降级为待验证假设。",
             )
         )
@@ -256,15 +337,20 @@ def _smart_debate_payload(
     lines = [f"Objective: {objective}", "", "Draft:", draft[:4000], "", "Workspace evidence:"]
     for paper_id in workspace.context.active_papers[:12]:
         paper = workspace.papers[paper_id]
-        lines.append(f"- paper={paper.paper_id}; title={paper.title}; year={paper.year}; doi={paper.doi}")
+        lines.append(
+            f"- paper={paper.paper_id}; title={paper.title}; year={paper.year}; doi={paper.doi}"
+        )
     if workspace.performance_cells:
         lines.append("Performance cells:")
         for cell in workspace.performance_cells[:12]:
-            lines.append(f"- {cell.paper_id}: {cell.metric}={cell.value} {cell.unit or ''}; evidence={cell.evidence.snippet}")
+            lines.append(
+                f"- {cell.paper_id}: {cell.metric}={cell.value} {cell.unit or ''}; evidence={cell.evidence.snippet}"
+            )
     if workspace.parsed_papers:
         lines.append("Parsed snippets:")
         for paper_id, parsed in list(workspace.parsed_papers.items())[:4]:
-            for section in (parsed.get("sections") or [])[:2]:
+            parsed = coerce_parsed(parsed)
+            for section in (parsed.sections or [])[:2]:
                 if isinstance(section, dict):
                     lines.append(f"- {paper_id}: {str(section.get('text') or '')[:500]}")
     return "\n".join(lines)
@@ -276,7 +362,9 @@ def _revise_draft(
     workspace: LiteratureWorkspace,
 ) -> str:
     citation_errors = [
-        item for item in critiques if item.reviewer == "Citation Auditor" and item.severity == "error"
+        item
+        for item in critiques
+        if item.reviewer == "Citation Auditor" and item.severity == "error"
     ]
     revised = draft
     if citation_errors:
@@ -325,7 +413,7 @@ def _replan_actions(
     return actions
 
 
-def _execute_safe_replan_actions(
+async def _execute_safe_replan_actions(
     config: LitTraceConfig,
     workspace: LiteratureWorkspace,
     actions: list[str],
@@ -333,14 +421,14 @@ def _execute_safe_replan_actions(
     executed: list[str] = []
     if "parse_full_text_with_paddleocr" in actions:
         workspace, report = parse_workspace_papers(workspace, config)
-        if report.get("parsed_count", 0) or report.get("metadata_only_count", 0):
+        if report.get("parsed_count", 0):
             executed.append("parse_full_text_with_paddleocr")
     if "extract_tables_and_structured_artifacts" in actions:
-        workspace, _ = extract_performance_cells(workspace)
+        workspace, _ = await extract_performance_cells(workspace, config)
         executed.append("extract_tables_and_structured_artifacts")
     if "rebuild_storyline_from_parsed_evidence" in actions:
         claims = build_storyline_from_workspace(workspace)
-        workspace.context.filters["storyline_claim_count"] = len(claims)
+        workspace.context.filters.storyline_claim_count = len(claims)
         executed.append("rebuild_storyline_from_parsed_evidence")
     if "rerun_citation_guard_after_revision" in actions:
         executed.append("rerun_citation_guard_after_revision")

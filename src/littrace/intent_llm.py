@@ -2,14 +2,39 @@ from __future__ import annotations
 
 import json
 
+from pydantic import BaseModel, Field, ValidationError
+
 from littrace.cache import cache_key, read_text_cache, write_text_cache
 from littrace.config import LitTraceConfig
 from littrace.intent import ChatIntent, parse_chat_intent
 from littrace.llm import chat_completion
+from littrace.log import get_logger, timed
+
+logger = get_logger("intent_llm")
 
 
 class IntentParseError(RuntimeError):
     pass
+
+
+class IntentSchema(BaseModel):
+    """Pydantic schema for validating LLM-returned intent JSON.
+
+    This ensures the LLM output conforms to the expected structure
+    before it is merged into the rule-based intent.
+    """
+
+    actions: list[str] = Field(default_factory=list)
+    topic: str | None = None
+    year_min: int | None = None
+    journals: list[str] = Field(default_factory=list)
+    skip_download: bool = False
+    select_all_downloads: bool = False
+    clear_download_selection: bool = False
+    auto_replan: bool = False
+    parse_strategy: str | None = None
+    select_indices: list[int] = Field(default_factory=list)
+    deselect_indices: list[int] = Field(default_factory=list)
 
 
 async def parse_chat_intent_semantic(
@@ -17,6 +42,7 @@ async def parse_chat_intent_semantic(
     config: LitTraceConfig,
 ) -> ChatIntent:
     rule_intent = parse_chat_intent(message)
+    logger.info("rule_intent", extra={"actions": rule_intent.actions, "topic": rule_intent.topic})
     if not config.llm.intent_parser_enabled:
         return rule_intent
     if not config.llm.enabled:
@@ -43,8 +69,17 @@ async def parse_chat_intent_semantic(
         payload = json.loads(_extract_json(reply.text))
     except (TypeError, ValueError, json.JSONDecodeError):
         raise IntentParseError("LLM 意图解析返回了无效 JSON。")
+
+    # Dimension 3: Schema validation via Pydantic model_validate
+    try:
+        validated = IntentSchema.model_validate(payload)
+    except ValidationError as exc:
+        errors = exc.errors()
+        detail = "; ".join(f"{'.'.join(str(x) for x in e['loc'])}: {e['msg']}" for e in errors[:3])
+        raise IntentParseError(f"LLM 意图解析 schema 校验失败：{detail}")
+
     write_text_cache(config, "intent-llm", cache_id, json.dumps(payload, ensure_ascii=False))
-    return _merge_intents(rule_intent, payload)
+    return _merge_intents(rule_intent, validated.model_dump())
 
 
 _INTENT_SYSTEM_PROMPT = """Parse LitTrace user intent. Return strict compact JSON only.
@@ -94,18 +129,24 @@ def _merge_intents(rule_intent: ChatIntent, payload: dict[str, object]) -> ChatI
         journals=_clean_string_list(payload.get("journals")) or rule_intent.journals,
         skip_download=bool(payload.get("skip_download")) or rule_intent.skip_download,
         show_context=rule_intent.show_context,
-        select_all_downloads=bool(payload.get("select_all_downloads")) or rule_intent.select_all_downloads,
-        clear_download_selection=bool(payload.get("clear_download_selection")) or rule_intent.clear_download_selection,
+        select_all_downloads=bool(payload.get("select_all_downloads"))
+        or rule_intent.select_all_downloads,
+        clear_download_selection=bool(payload.get("clear_download_selection"))
+        or rule_intent.clear_download_selection,
         auto_replan=bool(payload.get("auto_replan")) or rule_intent.auto_replan,
-        parse_strategy=_clean_parse_strategy(payload.get("parse_strategy")) or rule_intent.parse_strategy,
+        parse_strategy=_clean_parse_strategy(payload.get("parse_strategy"))
+        or rule_intent.parse_strategy,
         select_indices=_clean_int_list(payload.get("select_indices")) or rule_intent.select_indices,
-        deselect_indices=_clean_int_list(payload.get("deselect_indices")) or rule_intent.deselect_indices,
+        deselect_indices=_clean_int_list(payload.get("deselect_indices"))
+        or rule_intent.deselect_indices,
     )
     if rule_intent.show_context is not None:
         merged.show_context = rule_intent.show_context
     merged.actions = _dedupe([*rule_intent.actions, *merged.actions])
     if merged.skip_download:
         merged.actions = [action for action in merged.actions if action != "download"]
+    if not merged.actions and merged.topic:
+        merged.actions = ["search"]
     return merged
 
 

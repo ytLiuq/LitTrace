@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from littrace.config import LitTraceConfig
 from littrace.ocr.registry import build_ocr_tool
 from littrace.ocr.tool import OCRMode
-from littrace.models import LiteratureWorkspace
+from littrace.models import LiteratureWorkspace, coerce_parsed
 from littrace.parsing import local_pdf_path
 
 
@@ -16,7 +16,7 @@ class PDFBenchmarkReport(BaseModel):
     active_papers: int
     local_pdf_count: int
     parsed_count: int
-    metadata_only_count: int
+    failed_count: int
     parsed_with_page_evidence: int
     average_evidence_confidence: float
     local_pdf_rate: float = 0.0
@@ -43,7 +43,7 @@ def benchmark_pdf_parsing(
     active_ids = workspace.context.active_papers
     local_pdf_count = 0
     parsed_count = 0
-    metadata_only_count = 0
+    failed_count = 0
     parsed_with_page_evidence = 0
     confidences: list[float] = []
     warnings: list[str] = []
@@ -52,15 +52,16 @@ def benchmark_pdf_parsing(
         paper = workspace.papers[paper_id]
         if local_pdf_path(config, paper).exists():
             local_pdf_count += 1
-        parsed = workspace.parsed_papers.get(paper_id)
-        if not parsed:
+        _raw = workspace.parsed_papers.get(paper_id)
+        if not _raw:
             continue
-        if parsed.get("parsed"):
+        parsed = coerce_parsed(_raw)
+        if parsed.parsed:
             parsed_count += 1
         else:
-            metadata_only_count += 1
+            failed_count += 1
         has_page = False
-        for section in parsed.get("sections") or []:
+        for section in parsed.sections or []:
             if not isinstance(section, dict):
                 continue
             evidence = section.get("evidence") or {}
@@ -82,7 +83,7 @@ def benchmark_pdf_parsing(
         active_papers=len(active_ids),
         local_pdf_count=local_pdf_count,
         parsed_count=parsed_count,
-        metadata_only_count=metadata_only_count,
+        failed_count=failed_count,
         parsed_with_page_evidence=parsed_with_page_evidence,
         average_evidence_confidence=round(average, 3),
         local_pdf_rate=round(local_pdf_count / len(active_ids), 3) if active_ids else 0.0,

@@ -25,7 +25,7 @@ def test_parse_publisher_search_html_extracts_doi_records():
 
     workspace = merge_retrieval_result_into_workspace(LiteratureWorkspace(), result)
     assert result.papers[0].paper_id in workspace.context.active_papers
-    assert workspace.context.filters["publisher_retrievals"][0]["paper_count"] == 1
+    assert workspace.context.filters.publisher_retrievals[0]["paper_count"] == 1
 
 
 def test_browser_retrieval_plan_describes_safe_steps():
