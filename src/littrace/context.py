@@ -7,7 +7,8 @@ from littrace.models import (
     PaperMetadata,
     WorkspaceFilters,
 )
-from littrace.search import select_context_papers
+from littrace.identity import register_paper_identity
+from littrace.retrieval.search import select_context_papers
 from littrace.models import PaperSearchRequest
 
 
@@ -15,13 +16,18 @@ def _merge_filters(filters: WorkspaceFilters, updates: dict | WorkspaceFilters) 
     """Merge a dict or WorkspaceFilters into an existing WorkspaceFilters in-place."""
     if isinstance(updates, WorkspaceFilters):
         updates = updates.model_dump(exclude_none=True)
-    for key, value in updates.items():
-        setattr(filters, key, value)
+    unknown = sorted(set(updates) - set(WorkspaceFilters.model_fields))
+    if unknown:
+        raise ValueError(f"Unknown workspace filter keys: {', '.join(unknown)}")
+    validated = WorkspaceFilters.model_validate({**filters.model_dump(), **updates})
+    for key in updates:
+        setattr(filters, key, getattr(validated, key))
 
 
 def add_papers(workspace: LiteratureWorkspace, papers: list[PaperMetadata]) -> LiteratureWorkspace:
     for paper in papers:
         workspace.papers[paper.paper_id] = paper
+        register_paper_identity(workspace, paper)
         if (
             paper.paper_id not in workspace.context.active_papers
             and paper.paper_id not in workspace.context.excluded_papers
@@ -38,6 +44,7 @@ def add_ranked_candidate_papers(
 ) -> LiteratureWorkspace:
     for paper in papers:
         workspace.papers[paper.paper_id] = paper
+        register_paper_identity(workspace, paper)
 
     ranked_ids = [paper.paper_id for paper in papers]
     active = [

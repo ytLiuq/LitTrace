@@ -17,13 +17,12 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import os
 import sys
 import time
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any

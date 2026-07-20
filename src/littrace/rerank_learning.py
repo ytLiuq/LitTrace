@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from littrace.config import LitTraceConfig
-from littrace.retrieval_eval import RetrievalEvalReport, run_retrieval_golden_eval
+from littrace.evaluation.retrieval_eval import RetrievalEvalReport, run_retrieval_golden_eval
 
 
 class RerankWeightCandidate(BaseModel):
@@ -60,14 +60,13 @@ async def learn_rerank_policy_from_golden(
 
     candidates = candidates or DEFAULT_RERANK_CANDIDATES
     eval_report = await run_retrieval_golden_eval(config, live=live)
-    results = [
-        _score_candidate(candidate, eval_report)
-        for candidate in candidates
-    ]
+    results = [_score_candidate(candidate, eval_report) for candidate in candidates]
     best = max(results, key=lambda item: float(item["score"]), default=None)
     warnings = list(eval_report.warnings)
     if eval_report.metrics.get("active_recall", 0.0) < 0.8:
-        warnings.append("Active recall below 0.8; prefer recall_first weights or expand active_context_limit.")
+        warnings.append(
+            "Active recall below 0.8; prefer recall_first weights or expand active_context_limit."
+        )
     if eval_report.metrics.get("mrr", 0.0) < 0.5:
         warnings.append("MRR below 0.5; increase title/phrase/topical specificity signals.")
     return RerankLearningReport(
@@ -79,7 +78,9 @@ async def learn_rerank_policy_from_golden(
     )
 
 
-def _score_candidate(candidate: RerankWeightCandidate, report: RetrievalEvalReport) -> dict[str, object]:
+def _score_candidate(
+    candidate: RerankWeightCandidate, report: RetrievalEvalReport
+) -> dict[str, object]:
     metrics = report.metrics
     score = sum(
         candidate.weights.get(metric, 0.0) * float(metrics.get(metric, 0.0))

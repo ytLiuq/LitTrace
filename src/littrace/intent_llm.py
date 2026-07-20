@@ -8,7 +8,7 @@ from littrace.cache import cache_key, read_text_cache, write_text_cache
 from littrace.config import LitTraceConfig
 from littrace.intent import ChatIntent, parse_chat_intent
 from littrace.llm import chat_completion
-from littrace.log import get_logger, timed
+from littrace.log import get_logger
 
 logger = get_logger("intent_llm")
 
@@ -35,6 +35,11 @@ class IntentSchema(BaseModel):
     parse_strategy: str | None = None
     select_indices: list[int] = Field(default_factory=list)
     deselect_indices: list[int] = Field(default_factory=list)
+    confidence: float | None = None
+    ambiguous: bool | None = None
+    ambiguity_types: list[str] = Field(default_factory=list)
+    ambiguity_reasons: list[str] = Field(default_factory=list)
+    clarification_questions: list[str] = Field(default_factory=list)
 
 
 async def parse_chat_intent_semantic(
@@ -83,9 +88,9 @@ async def parse_chat_intent_semantic(
 
 
 _INTENT_SYSTEM_PROMPT = """Parse LitTrace user intent. Return strict compact JSON only.
-keys: actions, topic, year_min, journals, skip_download, select_all_downloads, clear_download_selection, auto_replan, parse_strategy, select_indices, deselect_indices.
+keys: actions, topic, year_min, journals, skip_download, select_all_downloads, clear_download_selection, auto_replan, parse_strategy, select_indices, deselect_indices, confidence, ambiguous, ambiguity_types, ambiguity_reasons, clarification_questions.
 actions allowed: search, download, select_downloads, deselect_downloads, parse, table, storyline, document, autonomous_review, list_context, agent_status, show_context, hide_context.
-Use search for literature investigation. Use storyline for routes/evolution/logic. Use table for metrics/comparison. Respect negation."""
+Use search for literature investigation. Use storyline for routes/evolution/logic. Use table for metrics/comparison. Respect negation. Set confidence from 0 to 1. Mark ambiguous when a safe next step needs clarification."""
 
 
 def _intent_user_message(message: str, rule_intent: ChatIntent) -> str:
@@ -139,6 +144,14 @@ def _merge_intents(rule_intent: ChatIntent, payload: dict[str, object]) -> ChatI
         select_indices=_clean_int_list(payload.get("select_indices")) or rule_intent.select_indices,
         deselect_indices=_clean_int_list(payload.get("deselect_indices"))
         or rule_intent.deselect_indices,
+        confidence=_clean_confidence(payload.get("confidence"), rule_intent.confidence),
+        ambiguous=bool(payload.get("ambiguous")) or rule_intent.ambiguous,
+        ambiguity_types=_clean_string_list(payload.get("ambiguity_types"))
+        or rule_intent.ambiguity_types,
+        ambiguity_reasons=_clean_string_list(payload.get("ambiguity_reasons"))
+        or rule_intent.ambiguity_reasons,
+        clarification_questions=_clean_string_list(payload.get("clarification_questions"))
+        or rule_intent.clarification_questions,
     )
     if rule_intent.show_context is not None:
         merged.show_context = rule_intent.show_context
@@ -147,6 +160,7 @@ def _merge_intents(rule_intent: ChatIntent, payload: dict[str, object]) -> ChatI
         merged.actions = [action for action in merged.actions if action != "download"]
     if not merged.actions and merged.topic:
         merged.actions = ["search"]
+        merged.confidence = max(merged.confidence, 0.55)
     return merged
 
 
@@ -199,6 +213,12 @@ def _clean_int_list(value: object) -> list[int]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, int) and item > 0]
+
+
+def _clean_confidence(value: object, fallback: float) -> float:
+    if isinstance(value, int | float):
+        return round(max(0.0, min(1.0, float(value))), 3)
+    return fallback
 
 
 def _dedupe(values: list[str]) -> list[str]:

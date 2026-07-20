@@ -3,6 +3,7 @@ import pytest
 from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.config import LLMConfig, LitTraceConfig
 from littrace.context import add_papers
+from littrace.llm import LLMReply
 from littrace.models import LiteratureWorkspace, PaperMetadata
 
 
@@ -49,7 +50,7 @@ async def test_autonomous_loop_raises_when_llm_disabled_even_with_parsed(monkeyp
         [PaperMetadata(paper_id="p1", title="Traceable Sensor Paper", year=2026)],
     )
 
-    def fake_parse(workspace, config):
+    async def fake_parse(workspace, config):
         workspace.parsed_papers["p1"] = {
             "sections": [
                 {
@@ -62,7 +63,7 @@ async def test_autonomous_loop_raises_when_llm_disabled_even_with_parsed(monkeyp
         }
         return workspace, {"parsed_count": 1, "failed_count": 0}
 
-    monkeypatch.setattr("littrace.autonomous_loop.parse_workspace_papers", fake_parse)
+    monkeypatch.setattr("littrace.autonomous_loop.parse_workspace_skill", fake_parse)
 
     with pytest.raises(RuntimeError, match="LLM unavailable"):
         await run_autonomous_research_loop(
@@ -71,3 +72,35 @@ async def test_autonomous_loop_raises_when_llm_disabled_even_with_parsed(monkeyp
             workspace,
             auto_replan=True,
         )
+
+
+@pytest.mark.anyio
+async def test_autonomous_loop_rechecks_publication_gate_before_final_answer(monkeypatch):
+    workspace = add_papers(
+        LiteratureWorkspace(
+            parsed_papers={
+                "p1": {
+                    "parsed": True,
+                    "sections": [{"name": "Results", "text": "Full text evidence."}],
+                }
+            }
+        ),
+        [PaperMetadata(paper_id="p1", title="Traceable Paper", year=2026)],
+    )
+
+    async def fake_writer(*args, **kwargs):
+        return LLMReply(text="修订前的研究结论。", used_llm=True)
+
+    monkeypatch.setattr("littrace.autonomous_loop.write_evidence_grounded_answer", fake_writer)
+    report = await run_autonomous_research_loop(
+        LitTraceConfig(llm=LLMConfig(enabled=True, api_key="test-key")),
+        "总结当前文献",
+        workspace,
+        enable_smart_debate=False,
+    )
+
+    assert not report.release_ready
+    assert not report.passed
+    assert report.release_blockers
+    assert "修订前的研究结论。" not in report.final_answer
+    assert "未通过最终发布检查" in report.final_answer

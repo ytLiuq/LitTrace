@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from littrace.models import LiteratureWorkspace
-from littrace.storyline import build_storyline_from_workspace
+from littrace.evidence.storyline import build_storyline_from_workspace
 
 
 class AgentHandoff(BaseModel):

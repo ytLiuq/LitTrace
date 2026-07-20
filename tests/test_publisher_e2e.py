@@ -77,10 +77,10 @@ async def test_interactive_publisher_e2e_uses_cdp_downloader(monkeypatch, tmp_pa
     monkeypatch.setattr("littrace.publisher_e2e.fetch_crossref_paper_by_doi", fake_fetch_crossref)
     monkeypatch.setattr("littrace.publisher_e2e.resolve_full_text_for_paper", fake_resolve)
     monkeypatch.setattr("littrace.publisher_e2e.download_paper_via_cdp", fake_download)
-    monkeypatch.setattr(
-        "littrace.publisher_e2e.parse_workspace_papers",
-        lambda workspace, _config: (workspace, {"parsed_count": 1}),
-    )
+    async def fake_parse(workspace, _config):
+        return workspace, {"parsed_count": 1}
+
+    monkeypatch.setattr("littrace.publisher_e2e.parse_workspace_skill", fake_parse)
 
     config = LitTraceConfig(
         storage=StorageConfig(

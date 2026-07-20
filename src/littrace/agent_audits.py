@@ -3,11 +3,10 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from littrace.config import LitTraceConfig
-from littrace.harnesses import check_performance_cells, check_storyline_claims
+from littrace.evaluation.harnesses import check_performance_cells, check_storyline_claims
 from littrace.models import LiteratureWorkspace
-from littrace.pdf_benchmark import benchmark_pdf_parsing
-from littrace.storyline import build_storyline_from_workspace
-from littrace.tables import build_comparison_matrices
+from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
+from littrace.skill_runner import build_comparison_matrix_skill, build_storyline_skill
 
 
 class AgentAuditReport(BaseModel):
@@ -31,7 +30,7 @@ def audit_parser_agent(config: LitTraceConfig, workspace: LiteratureWorkspace) -
 
 def audit_table_agent(workspace: LiteratureWorkspace) -> AgentAuditReport:
     harness = check_performance_cells(workspace.performance_cells)
-    matrix = build_comparison_matrices(workspace)
+    matrix = build_comparison_matrix_skill(workspace)
     findings = [*harness.errors, *harness.warnings, *matrix.warnings]
     score = harness.score if workspace.performance_cells else 0.0
     return AgentAuditReport(
@@ -43,7 +42,7 @@ def audit_table_agent(workspace: LiteratureWorkspace) -> AgentAuditReport:
 
 
 def audit_storyline_agent(workspace: LiteratureWorkspace) -> AgentAuditReport:
-    claims = build_storyline_from_workspace(workspace)
+    claims = build_storyline_skill(workspace)
     harness = check_storyline_claims(claims)
     return AgentAuditReport(
         agent="Storyline Verifier",

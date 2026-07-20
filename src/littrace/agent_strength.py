@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from littrace.agents import agent_runtime_statuses
 from littrace.config import LitTraceConfig
 from littrace.models import LiteratureWorkspace
-from littrace.quality_report import build_quality_report
+from littrace.skill_runner import build_quality_report_skill
 
 
 class AgentStrengthReport(BaseModel):
@@ -40,7 +40,7 @@ def build_agent_portfolio_report(
     config: LitTraceConfig,
     workspace: LiteratureWorkspace,
 ) -> AgentPortfolioReport:
-    quality = build_quality_report(config, workspace)
+    quality = build_quality_report_skill(config, workspace)
     agents = [
         _agent_strength(status.name, quality.metrics, bool(status.remaining_work))
         for status in agent_runtime_statuses()

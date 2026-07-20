@@ -3,10 +3,10 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from littrace.config import LitTraceConfig
-from littrace.golden_eval import evaluate_workspace_against_golden, _load_cases
+from littrace.evaluation.golden_eval import _load_cases
 from littrace.models import LiteratureWorkspace, coerce_parsed
-from littrace.pdf_benchmark import benchmark_pdf_parsing
-from littrace.storyline import build_storyline_from_workspace
+from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
+from littrace.evidence.storyline import build_storyline_from_workspace
 
 
 class EvalMetricReport(BaseModel):

@@ -51,3 +51,11 @@ def test_parse_chat_intent_understands_literature_survey_phrase():
     intent = parse_chat_intent("这个方向有什么文献和相关工作？")
 
     assert "search" in intent.actions
+
+
+def test_parse_chat_intent_marks_ambiguous_short_command():
+    intent = parse_chat_intent("继续")
+
+    assert intent.ambiguous
+    assert intent.confidence < 0.72
+    assert intent.clarification_questions

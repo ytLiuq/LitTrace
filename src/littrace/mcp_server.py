@@ -21,6 +21,7 @@ Tools exposed:
     - build_storyline: Build evidence-grounded research storyline
     - run_research: Full end-to-end research workflow
     - quality_report: Get 14-dimension quality metrics
+    - research_report: Compose an auditable research report
 """
 
 from __future__ import annotations
@@ -34,6 +35,14 @@ from mcp.types import TextContent, Tool
 
 from littrace.config import LitTraceConfig, load_config
 from littrace.log import get_logger
+from littrace.skill_runner import (
+    build_comparison_matrix_skill,
+    build_quality_report_skill,
+    build_research_report_skill,
+    build_storyline_skill,
+    extract_tables_skill,
+    parse_workspace_skill,
+)
 
 logger = get_logger("mcp_server")
 
@@ -48,7 +57,7 @@ def _get_workspace():
     """Get or create the module-level workspace."""
     global _workspace
     if _workspace is None:
-        from littrace.models import LiteratureWorkspace, coerce_parsed
+        from littrace.models import LiteratureWorkspace
 
         _workspace = LiteratureWorkspace()
     return _workspace
@@ -178,6 +187,14 @@ async def list_tools() -> list[Tool]:
                 "properties": {},
             },
         ),
+        Tool(
+            name="research_report",
+            description="Compose an auditable research report from the current workspace evidence.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
     ]
 
 
@@ -249,10 +266,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ]
 
         elif name == "parse_full_text":
-            from littrace.parsing import parse_workspace_papers
+            from littrace.models import coerce_parsed
 
             strategy = arguments.get("parse_strategy", "auto")
-            workspace, report = parse_workspace_papers(workspace, _config)
+            parse_config = _config
+            if strategy in {"text_only", "ocr"}:
+                parse_config = _config.model_copy(deep=True)
+                parse_config.parsing.parse_strategy = strategy
+            workspace, report = await parse_workspace_skill(workspace, parse_config)
             _workspace = workspace
 
             result = {
@@ -272,10 +293,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         elif name == "extract_tables":
-            from littrace.tables import extract_performance_cells, build_comparison_matrices
-
-            workspace, harness = await extract_performance_cells(workspace, _config)
-            matrix = build_comparison_matrices(workspace)
+            workspace, harness = await extract_tables_skill(workspace, _config)
+            matrix = build_comparison_matrix_skill(workspace)
             _workspace = workspace
 
             result = {
@@ -306,9 +325,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         elif name == "build_storyline":
-            from littrace.storyline import build_storyline_from_workspace
-
-            claims = build_storyline_from_workspace(workspace)
+            claims = build_storyline_skill(workspace)
             result = {
                 "claim_count": len(claims),
                 "claims": [
@@ -335,7 +352,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "run_research":
             from littrace.workflow import run_research_graph
             from littrace.models import PaperSearchRequest
-            from littrace.search import build_query_variants
+            from littrace.retrieval.search import build_query_variants
 
             topic = arguments.get("topic", "")
             year_min = arguments.get("year_min", 2023)
@@ -378,14 +395,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ]
 
         elif name == "quality_report":
-            from littrace.quality_report import build_quality_report
-
-            report = build_quality_report(_config, workspace)
+            report = build_quality_report_skill(_config, workspace)
             return [
                 TextContent(
                     type="text",
                     text=json.dumps(
                         {"metrics": report.metrics, "warnings": report.warnings},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                )
+            ]
+
+        elif name == "research_report":
+            report = await build_research_report_skill(workspace, _config)
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {"sections": len(report.sections), "warnings": report.warnings},
                         ensure_ascii=False,
                         indent=2,
                     ),

@@ -1,5 +1,5 @@
-from pathlib import Path
 
+from littrace.cdp_core import CDPBrowser, STEALTH_JS, discover_elsevier_pdf_candidates
 from littrace.cdp_downloader import (
     _same_origin_relative_url,
     check_cdp_status,
@@ -49,3 +49,52 @@ def test_check_cdp_status_reports_unavailable(monkeypatch):
 
     assert not status.available
     assert "RuntimeError" in (status.error or "")
+
+
+def test_stealth_js_contains_latest_skill_enhancements():
+    assert "hardwareConcurrency" in STEALTH_JS
+    assert "userAgentData" in STEALTH_JS
+    assert "HeadlessChrome" in STEALTH_JS
+    assert "Chrome PDF Viewer" in STEALTH_JS
+
+
+def test_prepare_stealth_context_normalizes_headless_http_ua(monkeypatch):
+    sent: list[tuple[str, dict | None]] = []
+    browser = CDPBrowser("http://127.0.0.1:19222")
+
+    def fake_send(method, params=None):
+        sent.append((method, params))
+        return {}
+
+    monkeypatch.setattr(browser, "send", fake_send)
+    monkeypatch.setattr(
+        browser,
+        "eval",
+        lambda _expr: (
+            "Mozilla/5.0 AppleWebKit/537.36 "
+            "HeadlessChrome/144.0.7559.60 Safari/537.36"
+        ),
+    )
+
+    notes = browser.prepare_stealth_context()
+
+    assert ("Page.enable", None) in sent
+    assert ("Network.enable", None) in sent
+    assert any(method == "Network.setUserAgentOverride" for method, _params in sent)
+    override = [params for method, params in sent if method == "Network.setUserAgentOverride"][0]
+    assert "HeadlessChrome" not in override["userAgent"]
+    assert "HTTP user-agent normalized" in notes[0]
+
+
+def test_discover_elsevier_pdf_candidates_prefers_sciencedirectassets(monkeypatch):
+    browser = CDPBrowser("http://127.0.0.1:19222")
+    payload = [
+        "https://www.sciencedirect.com/science/article/pii/S0008622325011558/pdfft?md5=x",
+        "https://pdf.sciencedirectassets.com/271535/1-s2.0-S0008622325011558-main.pdf?X-Amz-Security-Token=abc",
+    ]
+    monkeypatch.setattr(browser, "eval", lambda _expr: __import__("json").dumps(payload))
+
+    candidates = discover_elsevier_pdf_candidates(browser)
+
+    assert candidates[0].startswith("https://pdf.sciencedirectassets.com/")
+    assert "/pdfft" in candidates[1]

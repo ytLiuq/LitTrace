@@ -34,10 +34,20 @@ import time
 import argparse
 import subprocess
 import base64
+from pathlib import Path
+
+import requests
 
 # ──────────────────────────────────────────────
 # 尝试从 littrace.cdp_core 导入共享代码
 # ──────────────────────────────────────────────
+
+_SCRIPT_PATH = Path(__file__).resolve()
+for _parent in _SCRIPT_PATH.parents:
+    _src_dir = _parent / "src"
+    if (_src_dir / "littrace" / "cdp_core.py").exists():
+        sys.path.insert(0, str(_src_dir))
+        break
 
 try:
     from littrace.cdp_core import (
@@ -55,9 +65,13 @@ try:
         move_pdf,
         same_origin_relative_url,
         extract_pdf_url_from_page,
+        prepare_elsevier_pdf_url,
         prepare_rsc_pdf_url,
         prepare_ieee_pdf_url,
         looks_like_institutional_login_needed,
+        sciencedirect_access_status,
+        click_sciencedirect_institution_login,
+        wait_for_sciencedirect_authorization,
     )
 
     _USING_LITTRACE_CORE = True
@@ -292,6 +306,25 @@ except ImportError:
     })()
     """
 
+    ELSEVIER_PII_JS = r"""
+    (function() {
+      const haystack = [
+        location.href || '',
+        document.documentElement ? document.documentElement.outerHTML : ''
+      ].join('\n');
+      const patterns = [
+        /\/science\/article\/pii\/([A-Z0-9]+)/i,
+        /["']pii["']\s*:\s*["']([A-Z0-9]+)["']/i,
+        /PII(?:%3D|=)([A-Z0-9]+)/i
+      ];
+      for (const pattern of patterns) {
+        const match = haystack.match(pattern);
+        if (match && match[1]) return match[1];
+      }
+      return '';
+    })()
+    """
+
     def extract_pdf_url_from_page(browser, doi, publisher):
         value = browser.eval(PDF_URL_EXTRACTION_JS)
         pdf_url = str(value or "")
@@ -300,6 +333,10 @@ except ImportError:
         current = browser.get_url()
         if any(marker in current.lower() for marker in ["pdf", "silverchair"]):
             return current
+        if publisher == "elsevier":
+            pii = str(browser.eval(ELSEVIER_PII_JS) or "").strip()
+            if pii:
+                return f"https://www.sciencedirect.com/science/article/pii/{pii}/pdfft"
         if publisher == "rsc":
             article_code = doi.split("/")[-1]
             match = re.match(r"[a-z](\d)([a-z]+)", article_code)
@@ -319,6 +356,110 @@ except ImportError:
         if arnumber:
             return f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}"
         return pdf_url
+
+    def prepare_elsevier_pdf_url(browser, pdf_url, max_wait_seconds=45.0):
+        base = pdf_url.split("?", 1)[0]
+        variants = [pdf_url, base]
+        if base.endswith("/pdfft"):
+            variants.extend(
+                [
+                    f"{base}?isDTMRedir=true",
+                    f"{base}?download=true",
+                    base.removesuffix("/pdfft") + "/pdf",
+                    base.removesuffix("/pdfft") + "/pdf?download=true",
+                ]
+            )
+        current = pdf_url
+        per_attempt_wait = max(min(max_wait_seconds / max(len(variants), 1), 12.0), 4.0)
+        for variant in dict.fromkeys(variants):
+            browser.navigate(variant, wait_seconds=4.0)
+            if hasattr(browser, "wait_for_url_markers"):
+                current = browser.wait_for_url_markers(
+                    ["sciencedirectassets", "els-cdn", ".pdf"],
+                    max_wait_seconds=per_attempt_wait,
+                )
+            else:
+                current = browser.get_url()
+            if "sciencedirectassets" in current or "els-cdn" in current:
+                return current
+        return current or pdf_url
+
+    def sciencedirect_access_status(browser):
+        expression = r"""
+        (function() {
+          const body = document.body ? document.body.innerText.toLowerCase() : '';
+          const href = location.href.toLowerCase();
+          const title = document.title || '';
+          const haystack = [location.href || '', document.documentElement ? document.documentElement.outerHTML : ''].join('\n');
+          const hasPii = /\/science\/article\/pii\/([A-Z0-9]+)/i.test(haystack);
+          const pdfLink = document.querySelector('a[href*="pdfft"], a[href*="/pdf"], a[aria-label*="PDF" i], a[title*="PDF" i]');
+          if (href.includes('pdf.sciencedirectassets.com') || href.includes('els-cdn')) return 'has_access';
+          if (pdfLink || (body.includes('download') && body.includes('pdf'))) return 'has_access';
+          if (
+            body.includes('get access') ||
+            body.includes('purchase pdf') ||
+            body.includes('check for this article elsewhere') ||
+            body.includes('access through your institution') ||
+            body.includes('sign in via your institution') ||
+            body.includes('sign in to view your account details') ||
+            body.includes('not entitled') ||
+            body.includes('no access') ||
+            (title === 'ScienceDirect' && hasPii && !pdfLink)
+          ) return 'no_access';
+          return 'unknown';
+        })()
+        """
+        value = str(browser.eval(expression) or "").strip()
+        return value if value in {"has_access", "no_access", "unknown"} else "unknown"
+
+    def click_sciencedirect_institution_login(browser):
+        expression = r"""
+        (function() {
+          const candidates = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+          const needles = ['sign in via your institution', 'access through your institution', 'institution', 'get access', 'sign in'];
+          for (const node of candidates) {
+            const text = [
+              node.innerText || '',
+              node.textContent || '',
+              node.getAttribute('aria-label') || '',
+              node.getAttribute('title') || '',
+              node.getAttribute('href') || ''
+            ].join(' ').toLowerCase();
+            if (needles.some((needle) => text.includes(needle))) {
+              node.scrollIntoView({block: 'center', inline: 'center'});
+              node.click();
+              return text.slice(0, 200);
+            }
+          }
+          return '';
+        })()
+        """
+        return str(browser.eval(expression) or "")
+
+    def wait_for_sciencedirect_authorization(
+        browser,
+        landing_url,
+        timeout_seconds,
+        poll_seconds=5.0,
+    ):
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        next_revisit = time.monotonic() + max(poll_seconds * 2, 5.0)
+        last_status = sciencedirect_access_status(browser)
+        while time.monotonic() <= deadline:
+            current_url = browser.get_url()
+            last_status = sciencedirect_access_status(browser)
+            if last_status == "has_access":
+                return "has_access"
+            if "sciencedirect.com/science/article" in current_url and last_status != "no_access":
+                return last_status
+            if time.monotonic() >= next_revisit:
+                browser.navigate(landing_url, wait_seconds=8.0)
+                last_status = sciencedirect_access_status(browser)
+                if last_status == "has_access":
+                    return "has_access"
+                next_revisit = time.monotonic() + max(poll_seconds * 3, 10.0)
+            time.sleep(max(poll_seconds, 1.0))
+        return last_status or "unknown"
 
     class CDPBrowser:
         """CDP browser wrapper — fallback version (synced from littrace.cdp_core)."""
@@ -531,6 +672,41 @@ def _wait_for_user(prompt):
         time.sleep(60)
 
 
+def _surface_browser(url):
+    """Bring the local Chrome tab to the foreground for user auth/verification."""
+    if not url:
+        return
+    command = ["open", "-a", "Google Chrome", url] if sys.platform == "darwin" else [
+        "python3",
+        "-m",
+        "webbrowser",
+        url,
+    ]
+    subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _wait_for_user_action(browser, message, wait_seconds):
+    """Surface Chrome and wait while the user completes publisher auth."""
+    try:
+        current = browser.get_url()
+    except Exception:
+        current = ""
+    print(message)
+    if current:
+        print(f"  授权页面: {current[:120]}")
+    _surface_browser(current)
+    if sys.stdin.isatty():
+        input("  >>> 完成后按 Enter 继续...")
+    else:
+        print(f"  非交互模式：等待 {int(wait_seconds)} 秒后自动继续...")
+        time.sleep(max(wait_seconds, 0.0))
+
+
 # ──────────────────────────────────────────────
 # Unpaywall OA 查询
 # ──────────────────────────────────────────────
@@ -591,7 +767,22 @@ def try_curl_download(url, output_path, timeout=60):
                 pass
 
         result = subprocess.run(
-            ["curl", "-sL", "-o", tmp_path, "-w", "%{http_code}", "--max-time", str(timeout), url],
+            [
+                "curl",
+                "-sL",
+                "--http1.1",
+                "-A",
+                "Mozilla/5.0 AppleWebKit/537.36 Chrome/144.0.0.0 Safari/537.36",
+                "-H",
+                "Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                "-o",
+                tmp_path,
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                str(timeout),
+                url,
+            ],
             capture_output=True,
             text=True,
             timeout=timeout + 10,
@@ -612,13 +803,13 @@ def try_curl_download(url, output_path, timeout=60):
                     shutil.copy2(tmp_path, output_path)
                     try:
                         os.remove(tmp_path)
-                    except:
+                    except OSError:
                         pass
                 return True, os.path.getsize(output_path)
             else:
                 try:
                     os.remove(tmp_path)
-                except:
+                except OSError:
                     pass
                 return False, "下载到的是 HTML 而非 PDF（可能被 Cloudflare 拦截）"
 
@@ -632,7 +823,13 @@ def try_curl_download(url, output_path, timeout=60):
 # ──────────────────────────────────────────────
 
 
-def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAIL):
+def download_paper(
+    doi,
+    output_path,
+    cdp_url=DEFAULT_CDP_URL,
+    email=DEFAULT_EMAIL,
+    user_wait_seconds=180,
+):
     """
     通用论文下载方案
 
@@ -650,9 +847,9 @@ def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAI
     print(f"出版商: {publisher_name}")
     print(f"输出路径: {output_path}")
     if _USING_LITTRACE_CORE:
-        print(f"核心代码: littrace.cdp_core (共享模式)")
+        print("核心代码: littrace.cdp_core (共享模式)")
     else:
-        print(f"核心代码: 内置副本 (fallback 模式)")
+        print("核心代码: 内置副本 (fallback 模式)")
     print(f"{'=' * 60}\n")
 
     # ── Step 1: Unpaywall 查 OA ──────────────────────
@@ -673,14 +870,14 @@ def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAI
             print(f"  [位置 {i + 1}] {host}: {pdf_url[:80]}...")
 
             if host == "repository" or "bitstream" in pdf_url or "handle" in pdf_url:
-                print(f"  → 尝试从 repository 镜像 curl 直下...")
+                print("  → 尝试从 repository 镜像 curl 直下...")
                 success, info = try_curl_download(pdf_url, output_path)
                 if success:
                     print(f"  ✅ 下载成功! {info / 1024 / 1024:.1f}MB")
                     return True, f"repository 镜像 curl 直下 ({info / 1024 / 1024:.1f}MB)"
 
             if host == "publisher" and oa_info["is_oa"]:
-                print(f"  → 尝试从出版商 OA 链接 curl 直下...")
+                print("  → 尝试从出版商 OA 链接 curl 直下...")
                 success, info = try_curl_download(pdf_url, output_path)
                 if success:
                     print(f"  ✅ 下载成功! {info / 1024 / 1024:.1f}MB")
@@ -700,19 +897,25 @@ def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAI
         requests.get(f"{cdp_url}/json/version", timeout=5)
     except requests.exceptions.RequestException:
         print("  ✗ CDP 浏览器未运行，请先启动带 CDP 的 Chrome:")
-        print(f"    google-chrome --remote-debugging-port=19222")
+        print("    google-chrome --remote-debugging-port=19222")
         return False, "CDP 浏览器未运行"
 
     browser = CDPBrowser(cdp_url)
 
     try:
         browser.connect_new_tab()
-        print(f"  新标签页已创建")
+        print("  新标签页已创建")
 
-        browser.inject_stealth()
+        if hasattr(browser, "prepare_and_inject_stealth"):
+            notes = browser.prepare_and_inject_stealth()
+            print("  [stealth] 增强覆盖已注入")
+            for note in notes:
+                print(f"  [stealth] {note}")
+        else:
+            browser.inject_stealth()
 
         download_dir = os.path.dirname(output_path) or "."
-        browser.set_download_path(download_dir)
+        browser.set_download_path(Path(download_dir))
 
         urls = publisher_urls(normalized, publisher)
 
@@ -728,8 +931,11 @@ def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAI
 
                 if not passed:
                     print("\n[Step 3] Cloudflare Captcha 无法自动通过")
-                    print("  请在弹出的浏览器窗口中手动完成验证")
-                    _wait_for_user("  >>> 完成验证后按 Enter 继续...")
+                    _wait_for_user_action(
+                        browser,
+                        "  请在弹出的本地 Chrome 窗口中手动完成 Cloudflare 验证。",
+                        wait_seconds=user_wait_seconds,
+                    )
 
                     if browser.is_cloudflare_challenge():
                         print("  等待 Cloudflare 通过（最多 120 秒）...")
@@ -740,9 +946,36 @@ def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAI
 
             body = browser.get_body_text(1200)
             if looks_like_institutional_login_needed(body):
-                print(f"  ⚠ 检测到需要机构认证 (CARSI/Shibboleth)")
-                print(f"  请在浏览器中完成 CARSI 登录")
-                _wait_for_user("  >>> 完成登录后按 Enter 继续...")
+                print("  ⚠ 检测到需要机构认证 (CARSI/Shibboleth)")
+                _wait_for_user_action(
+                    browser,
+                    "  请在弹出的本地 Chrome 窗口中完成 CARSI/Shibboleth/机构登录。",
+                    wait_seconds=user_wait_seconds,
+                )
+
+            if publisher == "elsevier":
+                access_status = sciencedirect_access_status(browser)
+                print(f"  ScienceDirect 访问状态: {access_status}")
+                if access_status == "no_access":
+                    clicked = click_sciencedirect_institution_login(browser)
+                    if clicked:
+                        print(f"  已尝试点击机构登录入口: {clicked[:80]}")
+                        time.sleep(3)
+                    _wait_for_user_action(
+                        browser,
+                        "  ScienceDirect 当前会话没有 PDF 机构授权。请在弹出的本地 Chrome 窗口中完成机构登录/CARSI/Shibboleth 授权。",
+                        wait_seconds=0 if not sys.stdin.isatty() else user_wait_seconds,
+                    )
+                    if not sys.stdin.isatty():
+                        print(f"  正在轮询 ScienceDirect 授权状态（最多 {int(user_wait_seconds)} 秒）...")
+                    access_status = wait_for_sciencedirect_authorization(
+                        browser,
+                        landing_url,
+                        timeout_seconds=user_wait_seconds,
+                    )
+                    print(f"  登录后 ScienceDirect 访问状态: {access_status}")
+                    if access_status == "no_access":
+                        return False, "ScienceDirect 登录后仍无 PDF 机构授权"
 
             print(f"  当前页面: {browser.get_title()[:60]}")
 
@@ -754,7 +987,7 @@ def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAI
         print(f"\n  PDF URL: {pdf_url[:100]}")
 
         if publisher == "wiley":
-            print(f"  → 方法: CDP setDownloadBehavior + goto")
+            print("  → 方法: CDP setDownloadBehavior + goto")
             browser.navigate(pdf_url, wait_seconds=15.0)
             time.sleep(5)
             found = find_recent_pdf(Path(download_dir), Path(output_path))
@@ -774,30 +1007,42 @@ def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAI
             print(f"  IEEE stampPDF URL: {pdf_url[:100]}")
 
         if publisher == "elsevier" and "pdfft" in pdf_url:
-            print(f"  → Elsevier: 导航到 pdfft URL（等待 CDN 重定向）...")
-            browser.navigate(pdf_url, wait_seconds=10.0)
-            cdn_url = browser.get_url()
+            print("  → Elsevier: 导航到 pdfft URL（等待 CDN 重定向）...")
+            cdn_url = prepare_elsevier_pdf_url(browser, pdf_url, max_wait_seconds=45.0)
             if "sciencedirectassets" in cdn_url or "els-cdn" in cdn_url:
                 pdf_url = cdn_url
                 print(f"  CDN URL: {pdf_url[:100]}")
+            elif cdn_url != pdf_url:
+                pdf_url = cdn_url
+                print(f"  Elsevier 候选 PDF URL: {pdf_url[:100]}")
+            else:
+                print(f"  ⚠ 未等到 CDN PDF URL，当前页面: {cdn_url[:100]}")
 
-        print(f"  → 方法: fetch + blob + base64 回传")
-        success, info = browser.fetch_blob_to_file(pdf_url, output_path)
+        print("  → 方法: fetch + blob + base64 回传")
+        success, info = browser.fetch_blob_to_file(pdf_url, Path(output_path))
+
+        if not success and "HTTP 403" in str(info):
+            _wait_for_user_action(
+                browser,
+                "  PDF 请求返回 HTTP 403。请在弹出的本地 Chrome 窗口中完成账号/机构授权后，脚本会重试下载。",
+                wait_seconds=user_wait_seconds,
+            )
+            success, info = browser.fetch_blob_to_file(pdf_url, Path(output_path))
 
         if success:
             if isinstance(info, int):
                 print(f"  ✅ 下载成功! {info / 1024 / 1024:.1f}MB")
                 return True, f"fetch+blob ({info / 1024 / 1024:.1f}MB)"
             else:
-                print(f"  ✅ 下载成功!")
+                print("  ✅ 下载成功!")
                 return True, "fetch+blob"
 
         print(f"  fetch 失败: {info}")
-        print(f"  → 尝试 <a download> 触发浏览器下载...")
+        print("  → 尝试 <a download> 触发浏览器下载...")
         filename = os.path.basename(output_path)
         browser.trigger_anchor_download(pdf_url, filename)
 
-        print(f"  等待浏览器下载完成 (15s)...")
+        print("  等待浏览器下载完成 (15s)...")
         time.sleep(15)
 
         found = find_recent_pdf(Path(download_dir), Path(output_path))
@@ -811,7 +1056,10 @@ def download_paper(doi, output_path, cdp_url=DEFAULT_CDP_URL, email=DEFAULT_EMAI
         return False, "所有下载方法均失败"
 
     finally:
-        browser.close()
+        if hasattr(browser, "close_tab"):
+            browser.close_tab()
+        else:
+            browser.close()
 
 
 # ──────────────────────────────────────────────
@@ -853,6 +1101,12 @@ def main():
         default=DEFAULT_EMAIL,
         help=f"Unpaywall 查询邮箱 (默认: {DEFAULT_EMAIL})",
     )
+    parser.add_argument(
+        "--user-wait-seconds",
+        type=float,
+        default=180,
+        help="需要 Cloudflare/账号/机构授权时，非交互模式下等待用户操作的秒数。",
+    )
 
     args = parser.parse_args()
 
@@ -864,11 +1118,17 @@ def main():
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    success, info = download_paper(args.doi, args.output, args.cdp, args.email)
+    success, info = download_paper(
+        args.doi,
+        args.output,
+        args.cdp,
+        args.email,
+        user_wait_seconds=args.user_wait_seconds,
+    )
 
     print(f"\n{'=' * 60}")
     if success:
-        print(f"✅ 下载完成!")
+        print("✅ 下载完成!")
         print(f"   文件: {args.output}")
         print(f"   方法: {info}")
     else:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
+from math import isclose
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 
 class AccessType(StrEnum):
@@ -21,6 +24,181 @@ class LinkStatus(StrEnum):
     UNCHECKED = "unchecked"
 
 
+class ClaimStatus(StrEnum):
+    VERIFIED = "verified"
+    CORROBORATED = "corroborated"
+    SUPPORTED = "supported"
+    CANDIDATE = "candidate"
+    CONFLICTED = "conflicted"
+    UNKNOWN = "unknown"
+
+
+class ClaimKind(StrEnum):
+    QUALITATIVE = "qualitative"
+    NUMERIC = "numeric"
+    COMPARATIVE = "comparative"
+    CAUSAL = "causal"
+    FRESHNESS = "freshness"
+
+
+class EvidenceSourceKind(StrEnum):
+    PRIMARY_DOCUMENT = "primary_document"
+    STRUCTURED_TABLE = "structured_table"
+    METADATA = "metadata"
+    USER_SUPPLIED = "user_supplied"
+
+
+class VerificationReport(BaseModel):
+    claim_id: str | None = None
+    claim: str
+    status: ClaimStatus
+    evidence: list["EvidenceSpan"] = Field(default_factory=list)
+    semantic_supported: bool = False
+    support_quotes: dict[str, str] = Field(default_factory=dict)
+    freshness_checked_at: str | None = None
+    critical: bool = True
+    warnings: list[str] = Field(default_factory=list)
+    missing_requirements: list[str] = Field(default_factory=list)
+
+    @property
+    def publishable(self) -> bool:
+        """Whether the claim can appear in a released report or answer."""
+
+        return self.status in {ClaimStatus.VERIFIED, ClaimStatus.CORROBORATED}
+
+    @property
+    def draftable(self) -> bool:
+        return self.status in {
+            ClaimStatus.VERIFIED,
+            ClaimStatus.CORROBORATED,
+            ClaimStatus.SUPPORTED,
+        }
+
+
+def verify_claim(
+    claim: str,
+    evidence: list["EvidenceSpan"],
+    *,
+    requires_corroboration: bool = False,
+    metric: str | None = None,
+    claim_id: str | None = None,
+    semantic_supported: bool = False,
+    support_quotes: dict[str, str] | None = None,
+    requires_freshness: bool = False,
+    freshness_checked_at: str | None = None,
+) -> VerificationReport:
+    """Classify a claim from traceable evidence without inventing certainty.
+
+    ``observed_value`` and ``observed_unit`` on evidence spans are optional.
+    When independent sources disagree on a measurement they are being used to
+    corroborate, the claim is explicitly conflicted rather than averaged away.
+    """
+    traceable = [span for span in evidence if span.has_location]
+    source_ids = {span.source_record_id or span.paper_id for span in traceable}
+    if not evidence:
+        return VerificationReport(
+            claim_id=claim_id,
+            claim=claim,
+            status=ClaimStatus.UNKNOWN,
+            missing_requirements=["No evidence spans were provided."],
+        )
+    if not traceable:
+        return VerificationReport(
+            claim_id=claim_id,
+            claim=claim,
+            status=ClaimStatus.CANDIDATE,
+            evidence=evidence,
+            missing_requirements=["Evidence needs a page, section, table, or quoted snippet."],
+        )
+    conflicts = _measurement_conflicts(traceable, metric) if requires_corroboration else []
+    if conflicts:
+        return VerificationReport(
+            claim_id=claim_id,
+            claim=claim,
+            status=ClaimStatus.CONFLICTED,
+            evidence=traceable,
+            semantic_supported=semantic_supported,
+            support_quotes=support_quotes or {},
+            warnings=conflicts,
+            missing_requirements=[
+                "Independent evidence must agree before this claim can be released."
+            ],
+        )
+    if len(source_ids) >= 2:
+        return VerificationReport(
+            claim_id=claim_id,
+            claim=claim,
+            status=ClaimStatus.CORROBORATED,
+            evidence=traceable,
+            semantic_supported=semantic_supported,
+            support_quotes=support_quotes or {},
+            freshness_checked_at=freshness_checked_at,
+        )
+    if requires_corroboration:
+        return VerificationReport(
+            claim_id=claim_id,
+            claim=claim,
+            status=ClaimStatus.SUPPORTED,
+            evidence=traceable,
+            missing_requirements=["A second independent source is required for corroboration."],
+        )
+    missing_requirements: list[str] = []
+    if requires_freshness and not freshness_checked_at:
+        missing_requirements.append("Freshness-sensitive claim needs a retrieval cutoff time.")
+    return VerificationReport(
+        claim_id=claim_id,
+        claim=claim,
+        status=ClaimStatus.SUPPORTED if missing_requirements else ClaimStatus.VERIFIED,
+        evidence=traceable,
+        semantic_supported=semantic_supported,
+        support_quotes=support_quotes or {},
+        freshness_checked_at=freshness_checked_at,
+        missing_requirements=missing_requirements,
+    )
+
+
+def _measurement_conflicts(evidence: list["EvidenceSpan"], metric: str | None) -> list[str]:
+    """Return deterministic conflicts for numeric evidence from distinct sources."""
+
+    observations: list[tuple[str, float, str | None]] = []
+    for span in evidence:
+        if not isinstance(span.observed_value, int | float):
+            continue
+        value, unit = _normalize_observed_measurement(
+            metric, span.observed_value, span.observed_unit
+        )
+        observations.append((span.source_record_id or span.paper_id, float(value), unit))
+    source_ids = {source_id for source_id, _, _ in observations}
+    if len(source_ids) < 2:
+        return []
+
+    units = {unit for _, _, unit in observations}
+    if len(units) > 1:
+        return ["Independent evidence uses incompatible measurement units."]
+    baseline = observations[0][1]
+    if any(
+        not isclose(value, baseline, rel_tol=0.05, abs_tol=1e-12)
+        for _, value, _ in observations[1:]
+    ):
+        unit = next(iter(units)) or "unitless"
+        values = ", ".join(f"{value:g}" for _, value, _ in observations)
+        return [f"Independent evidence disagrees on the measured value ({values} {unit})."]
+    return []
+
+
+def _normalize_observed_measurement(
+    metric: str | None,
+    value: float | int,
+    unit: str | None,
+) -> tuple[float, str | None]:
+    if metric is None:
+        return float(value), unit
+    from littrace.units import normalize_metric_unit
+
+    normalized_value, normalized_unit, _ = normalize_metric_unit(metric, value, unit)
+    return float(normalized_value), normalized_unit
+
+
 class PaperMetadata(BaseModel):
     paper_id: str
     title: str
@@ -36,6 +214,49 @@ class PaperMetadata(BaseModel):
     access_type: AccessType = AccessType.UNAVAILABLE
     relevance_score: float | None = None
     recency_score: float | None = None
+
+
+class SourceRecord(BaseModel):
+    source_record_id: str
+    paper_id: str
+    source_name: str
+    source_url: str | None = None
+    retrieved_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    content_hash: str | None = None
+    raw_artifact_path: str | None = None
+    failure_class: str | None = None
+
+
+class SourceEvent(BaseModel):
+    """Immutable summary of one external-source retrieval attempt."""
+
+    event_id: str
+    source_name: str
+    request_fingerprint: str
+    request: dict[str, object] = Field(default_factory=dict)
+    response_hash: str | None = None
+    retrieved_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    status: str = "completed"
+    cache_state: str = "miss"
+    failure_class: str | None = None
+    paper_ids: list[str] = Field(default_factory=list)
+
+
+class CanonicalWork(BaseModel):
+    work_id: str
+    canonical_paper_id: str
+    doi: str | None = None
+    version_paper_ids: list[str] = Field(default_factory=list)
+
+
+class ResolutionDecision(BaseModel):
+    decision_id: str
+    canonical_work_id: str
+    candidate_paper_ids: list[str]
+    strategy: str
+    confidence: float
+    reason: str
+    decided_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
 class FullTextCandidate(BaseModel):
@@ -77,6 +298,24 @@ class PaperSearchRequest(BaseModel):
     query_variants: list[str] = Field(default_factory=list)
 
 
+class ResearchTask(BaseModel):
+    task_id: str | None = None
+    topic: str
+    requested_actions: list[str] = Field(default_factory=list)
+    year_min: int | None = None
+    journals: list[str] = Field(default_factory=list)
+    evidence_policy: str = "verified_or_corroborated"
+    requires_freshness: bool = False
+    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+    @model_validator(mode="after")
+    def _populate_task_id(self) -> "ResearchTask":
+        if self.task_id is None:
+            payload = "\0".join([self.topic, *self.requested_actions, str(self.year_min)])
+            self.task_id = f"task:{sha256(payload.encode()).hexdigest()[:16]}"
+        return self
+
+
 class PaperSearchResult(BaseModel):
     request: PaperSearchRequest
     papers: list[PaperMetadata]
@@ -87,24 +326,30 @@ class DOIBackfillRequest(BaseModel):
 
 
 class WorkspaceFilters(BaseModel):
-    """Strongly-typed filter bag for the literature workspace context.
+    """Explicit, serializable metadata describing the current workspace state."""
 
-    Known keys have explicit types and defaults; ``model_config`` allows
-    extra keys so legacy code can still set dynamic filters without breaking.
-    """
-
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     # Search-related
     search_mode: str | None = None
     topic: str | None = None
     discipline: str | None = None
     expanded_year_range_from: int | None = None
+    year_min: int | None = None
+    journals: list[str] = Field(default_factory=list)
     active_context_limit: int | None = None
+    active_context_count: int = 0
+    active_context_source: str | None = None
     candidate_pool_count: int = 0
     candidate_pool_ids: list[str] = Field(default_factory=list)
+    valid_candidate_count: int = 0
+    ranking_policy: str | None = None
+    publisher_search_plan: dict[str, object] = Field(default_factory=dict)
+    search_completed_at: str | None = None
     requires_login_candidate_ids: list[str] = Field(default_factory=list)
-    search_diagnostics: dict[str, object] = Field(default_factory=dict)
+    search_diagnostics: dict[str, object] | None = None
+    source_health: dict[str, dict[str, object]] = Field(default_factory=dict)
+    workspace_revision: int = 0
 
     # Parse-related
     parsed_full_text_count: int = 0
@@ -112,10 +357,19 @@ class WorkspaceFilters(BaseModel):
 
     # Full-text context
     full_text_context_warnings: list[str] = Field(default_factory=list)
+    full_text_context_policy: str | None = None
+    full_text_resolved_count: int = 0
+    pre_full_text_active_papers: list[str] = Field(default_factory=list)
+    pending_intent: dict[str, object] | None = None
 
     # Storyline / structured artifacts
     storyline_claim_count: int = 0
     structured_artifacts: list[dict[str, object]] = Field(default_factory=list)
+    structured_document_count: int = 0
+    structured_document_paths: dict[str, str] = Field(default_factory=dict)
+    docling_quality_reports: dict[str, dict[str, object]] = Field(default_factory=dict)
+    artifact_index: dict[str, object] = Field(default_factory=dict)
+    workspace_snapshot_count: int = 0
 
     # Reports (stored as model_dump dicts for serialization)
     document_report: dict[str, object] | None = None
@@ -145,6 +399,14 @@ class LiteratureWorkspace(BaseModel):
     supplementary_links: dict[str, list[str]] = Field(default_factory=dict)
     guard_reports: list[dict[str, object]] = Field(default_factory=list)
     full_text_reports: dict[str, FullTextResolutionReport] = Field(default_factory=dict)
+    source_records: dict[str, SourceRecord] = Field(default_factory=dict)
+    source_events: list[SourceEvent] = Field(default_factory=list)
+    canonical_works: dict[str, CanonicalWork] = Field(default_factory=dict)
+    resolution_decisions: list[ResolutionDecision] = Field(default_factory=list)
+    evidence_records: dict[str, "EvidenceSpan"] = Field(default_factory=dict)
+    claims: list["Claim"] = Field(default_factory=list)
+    claim_verification_reports: list[VerificationReport] = Field(default_factory=list)
+    release_snapshots: list["ReleaseSnapshot"] = Field(default_factory=list)
 
 
 class ContextUpdate(BaseModel):
@@ -270,6 +532,10 @@ class ChatResponse(BaseModel):
     action: str
     session_id: str | None = None
     session_root: str | None = None
+    intent_confidence: float | None = None
+    ambiguous_intent: bool = False
+    ambiguity_reasons: list[str] = Field(default_factory=list)
+    clarification_questions: list[str] = Field(default_factory=list)
     workspace: LiteratureWorkspace | None = None
     research_result: ResearchRunResult | None = None
     citations: list[CitationRecord] = Field(default_factory=list)
@@ -282,6 +548,8 @@ class ChatResponse(BaseModel):
 
 class EvidenceSpan(BaseModel):
     paper_id: str
+    evidence_id: str | None = None
+    source_record_id: str | None = None
     section: str | None = None
     page: int | None = None
     table_id: str | None = None
@@ -289,7 +557,91 @@ class EvidenceSpan(BaseModel):
     column_label: str | None = None
     snippet: str | None = None
     parser: str | None = None
+    parser_version: str | None = None
+    content_hash: str | None = None
+    captured_at: str | None = None
+    source_kind: EvidenceSourceKind = EvidenceSourceKind.PRIMARY_DOCUMENT
+    observed_value: float | str | None = None
+    observed_unit: str | None = None
+    observed_value_min: float | None = None
+    observed_value_max: float | None = None
+    observed_uncertainty: float | None = None
     confidence: float = 0.0
+
+    @model_validator(mode="after")
+    def _populate_provenance(self) -> "EvidenceSpan":
+        location = "|".join(
+            str(value or "")
+            for value in (
+                self.section,
+                self.page,
+                self.table_id,
+                self.row_label,
+                self.column_label,
+                self.snippet,
+            )
+        )
+        self.source_record_id = self.source_record_id or f"paper:{self.paper_id}"
+        self.content_hash = self.content_hash or sha256(location.encode()).hexdigest()
+        self.captured_at = self.captured_at or datetime.now(UTC).isoformat()
+        self.parser_version = self.parser_version or f"{self.parser or 'manual'}:v1"
+        self.evidence_id = self.evidence_id or (f"ev:{self.paper_id}:{self.content_hash[:16]}")
+        return self
+
+    @property
+    def has_location(self) -> bool:
+        return bool(self.snippet or self.page is not None or self.section or self.table_id)
+
+    @property
+    def provenance_complete(self) -> bool:
+        return bool(
+            self.evidence_id
+            and self.source_record_id
+            and self.content_hash
+            and self.captured_at
+            and self.parser_version
+            and self.has_location
+        )
+
+
+class Claim(BaseModel):
+    claim_id: str | None = None
+    text: str
+    claim_kind: ClaimKind = ClaimKind.QUALITATIVE
+    evidence_ids: list[str] = Field(min_length=1)
+    support_quotes: dict[str, str] = Field(default_factory=dict)
+    metric: str | None = None
+    expected_value: float | None = None
+    expected_unit: str | None = None
+    expected_value_min: float | None = None
+    expected_value_max: float | None = None
+    expected_uncertainty: float | None = None
+    requires_corroboration: bool = False
+    requires_freshness: bool = False
+    retrieval_cutoff_at: str | None = None
+    critical: bool = True
+    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+    @model_validator(mode="after")
+    def _populate_claim_id(self) -> "Claim":
+        if self.claim_id is None:
+            payload = "\0".join([self.text, *sorted(self.evidence_ids)])
+            self.claim_id = f"claim:{sha256(payload.encode()).hexdigest()[:16]}"
+        return self
+
+
+class ReleaseSnapshot(BaseModel):
+    snapshot_id: str
+    created_at: str
+    workspace_hash: str
+    claim_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    source_event_ids: list[str] = Field(default_factory=list)
+    report_hash: str | None = None
+    config_hash: str | None = None
+    release_ready: bool
+    release_blockers: list[str] = Field(default_factory=list)
+    tool_versions: dict[str, str] = Field(default_factory=dict)
 
 
 class ParsedTable(BaseModel):
@@ -303,6 +655,7 @@ class ParsedPaper(BaseModel):
     pdf_path: Path | None = None
     title: str | None = None
     abstract: str | None = None
+    structured_document: dict[str, object] = Field(default_factory=dict)
     sections: list[dict[str, object]] = Field(default_factory=list)
     tables: list[ParsedTable] = Field(default_factory=list)
     figures: list[dict[str, object]] = Field(default_factory=list)
@@ -337,7 +690,21 @@ class PerformanceCell(BaseModel):
     unit: str | None = None
     higher_is_better: bool | None = None
     method_name: str | None = None
+    conditions: "ExperimentalConditions" = Field(default_factory=lambda: ExperimentalConditions())
     evidence: EvidenceSpan
+
+
+class ExperimentalConditions(BaseModel):
+    material_system: str | None = None
+    device_structure: str | None = None
+    test_protocol: str | None = None
+    environment: str | None = None
+    loading_range: str | None = None
+    sample_count: int | None = None
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.test_protocol and self.environment)
 
 
 class StructuredArtifact(BaseModel):
@@ -359,6 +726,7 @@ class ComparisonMatrixRow(BaseModel):
     task: str | None = None
     dataset: str | None = None
     method_name: str | None = None
+    conditions: ExperimentalConditions = Field(default_factory=ExperimentalConditions)
     higher_is_better: bool | None = None
     comparable: bool = True
     warnings: list[str] = Field(default_factory=list)
@@ -387,9 +755,13 @@ class ResearchDocumentReport(BaseModel):
     markdown: str
     sections: list[ResearchDocumentSection] = Field(default_factory=list)
     citation_records: list[CitationRecord] = Field(default_factory=list)
+    verification_reports: list[VerificationReport] = Field(default_factory=list)
+    release_ready: bool = True
+    release_blockers: list[str] = Field(default_factory=list)
     evidence_count: int = 0
     quality_metrics: dict[str, float] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    release_snapshot: ReleaseSnapshot | None = None
 
 
 class AgentCritique(BaseModel):
@@ -420,6 +792,8 @@ class AutonomousResearchLoopReport(BaseModel):
     replan_actions: list[str] = Field(default_factory=list)
     executed_replan_actions: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    release_ready: bool = False
+    release_blockers: list[str] = Field(default_factory=list)
 
 
 class StorylineClaim(BaseModel):

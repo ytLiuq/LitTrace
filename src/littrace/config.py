@@ -20,6 +20,17 @@ class StorageConfig(BaseModel):
     metadata_dir: Path = Path("./data/metadata")
     cache_dir: Path = Path("./data/cache")
     sessions_dir: Path = Path("./sessions")
+    workspace_snapshot_limit: int = 30
+
+
+class CachePolicyConfig(BaseModel):
+    default_ttl_seconds: int = 86_400
+    allow_stale_on_source_failure: bool = True
+
+
+class PublicationPolicyConfig(BaseModel):
+    strict_all_claims: bool = True
+    require_publishable_claim: bool = True
 
 
 class PaperDownloadConfig(BaseModel):
@@ -81,6 +92,11 @@ class BrowserAutomationConfig(BaseModel):
 class CDPDownloaderConfig(BaseModel):
     cdp_url: str = "http://127.0.0.1:19222"
     default_output_dir: Path | None = None
+    chrome_executable: Path | None = None
+    chrome_user_data_dir: Path | None = None
+    chrome_profile_name: str = "Default"
+    remote_debugging_port: int = 19222
+    auto_launch_chrome: bool = False
     cloudflare_wait_seconds: float = 60.0
     user_action_wait_seconds: float = 30.0
     command_timeout_seconds: float = 60.0
@@ -219,6 +235,8 @@ class LitTraceConfig(BaseModel):
     schema_validation: SchemaValidationConfig = Field(default_factory=SchemaValidationConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     citation_guard: CitationGuardConfig = Field(default_factory=CitationGuardConfig)
+    cache_policy: CachePolicyConfig = Field(default_factory=CachePolicyConfig)
+    publication_policy: PublicationPolicyConfig = Field(default_factory=PublicationPolicyConfig)
 
 
 def load_config(path: str | Path = "config.yaml") -> LitTraceConfig:
@@ -259,6 +277,25 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     config.cdp_downloader.cdp_url = (
         os.environ.get("LITTRACE_CDP_URL") or config.cdp_downloader.cdp_url
     )
+    chrome_executable = os.environ.get("LITTRACE_CHROME_EXECUTABLE")
+    if chrome_executable:
+        config.cdp_downloader.chrome_executable = Path(chrome_executable).expanduser()
+    chrome_user_data_dir = os.environ.get("LITTRACE_CHROME_USER_DATA_DIR")
+    if chrome_user_data_dir:
+        config.cdp_downloader.chrome_user_data_dir = Path(chrome_user_data_dir).expanduser()
+    config.cdp_downloader.chrome_profile_name = (
+        os.environ.get("LITTRACE_CHROME_PROFILE_NAME") or config.cdp_downloader.chrome_profile_name
+    )
+    remote_port = os.environ.get("LITTRACE_REMOTE_DEBUGGING_PORT")
+    if remote_port:
+        try:
+            config.cdp_downloader.remote_debugging_port = int(remote_port)
+        except ValueError:
+            pass
+        else:
+            config.cdp_downloader.cdp_url = (
+                f"http://127.0.0.1:{config.cdp_downloader.remote_debugging_port}"
+            )
     fallback_models = os.environ.get("LITTRACE_LLM_FALLBACK_MODELS")
     if fallback_models:
         config.llm.fallback_models = [

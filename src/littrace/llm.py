@@ -9,7 +9,7 @@ import httpx
 from littrace.config import LitTraceConfig, RateLimitConfig
 from littrace.log import get_logger, metrics, timed, cost_tracker
 from littrace.models import LiteratureWorkspace
-from littrace.rate_limit import RateLimiter, RateLimitSlot, rate_limiter
+from littrace.rate_limit import RateLimitSlot, rate_limiter
 from littrace.retry import retry_async, RetryConfig, BackoffStrategy, retry_tracker
 
 logger = get_logger("llm")

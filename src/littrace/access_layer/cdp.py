@@ -1,0 +1,51 @@
+from __future__ import annotations
+
+from littrace.access_layer.cdp_core import (
+    CDPBrowser,
+    click_sciencedirect_institution_login,
+    discover_elsevier_pdf_candidates,
+    extract_pdf_url_from_page,
+    find_recent_pdf,
+    identify_publisher,
+    is_pdf_file,
+    looks_like_institutional_login_needed,
+    move_pdf,
+    normalize_doi,
+    prepare_elsevier_pdf_url,
+    prepare_ieee_pdf_url,
+    prepare_rsc_pdf_url,
+    publisher_urls,
+    same_origin_relative_url,
+    sciencedirect_access_status,
+    wait_for_sciencedirect_authorization,
+)
+from littrace.access_layer.cdp_downloader import (
+    CDPDownloadResult,
+    CDPStatus,
+    check_cdp_status,
+    download_paper_via_cdp,
+)
+
+__all__ = [
+    "CDPBrowser",
+    "CDPDownloadResult",
+    "CDPStatus",
+    "check_cdp_status",
+    "click_sciencedirect_institution_login",
+    "discover_elsevier_pdf_candidates",
+    "download_paper_via_cdp",
+    "extract_pdf_url_from_page",
+    "find_recent_pdf",
+    "identify_publisher",
+    "is_pdf_file",
+    "looks_like_institutional_login_needed",
+    "move_pdf",
+    "normalize_doi",
+    "prepare_elsevier_pdf_url",
+    "prepare_ieee_pdf_url",
+    "prepare_rsc_pdf_url",
+    "publisher_urls",
+    "same_origin_relative_url",
+    "sciencedirect_access_status",
+    "wait_for_sciencedirect_authorization",
+]

@@ -1,9 +1,9 @@
 import pytest
 
 from littrace.config import LLMConfig, LitTraceConfig
-from littrace.llm import LLMReply
 from littrace.models import PaperSearchRequest
 from littrace.workflow import run_research_graph
+from littrace.tool_contracts import ToolExecutionLedger
 
 
 @pytest.mark.anyio
@@ -43,6 +43,22 @@ async def test_run_research_graph_can_skip_optional_nodes():
     assert result.publisher_routes is not None
     assert result.workflow_trace is not None
     assert any(step.next_node == "route_publishers" for step in result.workflow_trace.steps)
+
+
+@pytest.mark.anyio
+async def test_run_research_graph_uses_supplied_task_ledger():
+    ledger = ToolExecutionLedger()
+
+    await run_research_graph(
+        PaperSearchRequest(topic="MXene flexible sensor", live=False),
+        LitTraceConfig(),
+        audit_citations_enabled=False,
+        plan_downloads_enabled=False,
+        route_publishers_enabled=False,
+        tool_ledger=ledger,
+    )
+
+    assert any(key.startswith("search_papers:v1:search_papers:") for key in ledger.cached_results)
 
 
 @pytest.mark.anyio

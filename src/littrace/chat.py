@@ -1,20 +1,30 @@
 from __future__ import annotations
 
-from littrace.access import build_download_plan
-from littrace.agents import agent_runtime_statuses
 from littrace.autonomous_loop import run_autonomous_research_loop
 from littrace.citation_guard import guard_citations, remove_unsupported_sentences
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
 from littrace.context import apply_context_update, _merge_filters
-from littrace.document_composer import build_research_document_report
-from littrace.harnesses import (
+from littrace.coordinator import LitTraceCoordinator
+from littrace.evaluation.harnesses import (
     check_hallucination_grounding,
     HallucinationCheckItem,
 )
-from littrace.intent import ChatIntent, parse_chat_intent
-from littrace.intent_llm import IntentParseError, parse_chat_intent_semantic
-from littrace.log import get_logger, timed, cost_tracker
+from littrace.intent import ChatIntent
+from littrace.log import get_logger, timed
+from littrace.chat_parts.formatting import (
+    format_agent_status,
+    format_current_papers,
+    format_search_result_reply,
+)
+from littrace.chat_parts.policies import (
+    insufficient_real_evidence_reply,
+    is_analysis_request,
+    mock_context_refusal,
+    workspace_evidence_quality,
+    workspace_has_real_minimum_evidence,
+    workspace_is_mock,
+)
 from littrace.models import (
     ChatRequest,
     ChatResponse,
@@ -22,19 +32,26 @@ from littrace.models import (
     LiteratureWorkspace,
     PaperSearchRequest,
     WorkflowTraceStep,
-    coerce_parsed,
 )
-from littrace.parsing import parse_workspace_papers
 from littrace.research_writer import (
     write_evidence_grounded_answer,
     write_storyline_narrative,
 )
-from littrace.storyline import build_storyline_from_workspace
-from littrace.tables import build_comparison_matrices, extract_performance_cells
+from littrace.runtime.memory import SessionMemory
+from littrace.skill_runner import (
+    build_comparison_matrix_skill,
+    build_download_plan_skill,
+    build_research_report_skill,
+    build_storyline_skill,
+    extract_tables_skill,
+    parse_workspace_skill,
+)
+from littrace.tool_contracts import ToolCallContext
 from littrace.workflow import run_research_graph
-from littrace.search import build_query_variants
+from littrace.retrieval.search import build_query_variants
 
 logger = get_logger("chat")
+coordinator = LitTraceCoordinator()
 
 
 MIN_ANALYSIS_PAPERS = 5
@@ -44,60 +61,76 @@ async def handle_chat(
     request: ChatRequest,
     workspace: LiteratureWorkspace,
     config: LitTraceConfig,
+    session_memory: SessionMemory | None = None,
 ) -> tuple[ChatResponse, LiteratureWorkspace]:
     message = request.message.strip()
     with timed("intent_parse"):
-        try:
-            intent = await parse_chat_intent_semantic(message, config)
-        except IntentParseError as exc:
-            logger.warning(
-                "intent_parse_failed", extra={"msg_preview": message[:200], "error": str(exc)}
-            )
-            return (
-                ChatResponse(
-                    reply=(
-                        f"{exc}\n\n"
-                        "我没有继续执行，也没有回退到关键词规则。请检查 .env.local/config.yaml "
-                        "里的 LLM 配置，或显式关闭 llm.intent_parser_enabled。"
-                    ),
-                    action="intent_parse_error",
-                    workspace=workspace,
-                    warnings=[str(exc)],
-                ),
-                workspace,
-            )
+        turn = await coordinator.prepare_turn(
+            request,
+            workspace,
+            config,
+            session_memory=session_memory,
+        )
+    if turn.early_response is not None:
+        logger.info(
+            "coordinator_early_response",
+            extra={
+                "action": turn.early_response.action,
+                "topic": turn.intent.topic if turn.intent else None,
+            },
+        )
+        return turn.early_response, turn.workspace
+    intent = turn.intent or ChatIntent()
+    workspace = turn.workspace
     logger.info(
         "intent_parsed",
-        extra={"actions": intent.actions, "topic": intent.topic, "year_min": intent.year_min},
+        extra={
+            "actions": intent.actions,
+            "topic": intent.topic,
+            "year_min": intent.year_min,
+            "confidence": intent.confidence,
+            "ambiguous": intent.ambiguous,
+            "memory_purpose": turn.memory_view.purpose,
+            "memory_warnings": turn.memory_view.warnings,
+        },
     )
 
     if "show_context" in intent.actions:
         workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=True))
-        return _response("已显示当前文献上下文。", "show_context", workspace), workspace
+        return _with_intent(
+            _response("已显示当前文献上下文。", "show_context", workspace), intent
+        ), workspace
 
     if "hide_context" in intent.actions:
         workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=False))
-        return _response(
-            "已隐藏当前文献上下文，后续对话会保持简洁。", "hide_context", workspace
+        return _with_intent(
+            _response("已隐藏当前文献上下文，后续对话会保持简洁。", "hide_context", workspace),
+            intent,
         ), workspace
 
     if intent.actions == ["list_context"]:
         return (
-            ChatResponse(
-                reply=_format_current_papers(workspace),
-                action="list_context",
-                workspace=workspace,
-                citations=_active_citations(workspace),
+            _with_intent(
+                ChatResponse(
+                    reply=_format_current_papers(workspace),
+                    action="list_context",
+                    workspace=workspace,
+                    citations=_active_citations(workspace),
+                ),
+                intent,
             ),
             workspace,
         )
 
     if intent.actions == ["agent_status"]:
         return (
-            ChatResponse(
-                reply=_format_agent_status(),
-                action="agent_status",
-                workspace=workspace,
+            _with_intent(
+                ChatResponse(
+                    reply=_format_agent_status(),
+                    action="agent_status",
+                    workspace=workspace,
+                ),
+                intent,
             ),
             workspace,
         )
@@ -105,11 +138,14 @@ async def handle_chat(
     if any(action in intent.actions for action in ["select_downloads", "deselect_downloads"]):
         workspace, reply = _apply_download_selection(workspace, intent)
         return (
-            ChatResponse(
-                reply=reply,
-                action="select_downloads",
-                workspace=workspace,
-                citations=_active_citations(workspace),
+            _with_intent(
+                ChatResponse(
+                    reply=reply,
+                    action="select_downloads",
+                    workspace=workspace,
+                    citations=_active_citations(workspace),
+                ),
+                intent,
             ),
             workspace,
         )
@@ -121,12 +157,15 @@ async def handle_chat(
     if _is_analysis_request(message) and _workspace_is_mock(workspace):
         logger.warning("blocked_mock_context", extra={"msg_preview": message[:200]})
         return (
-            ChatResponse(
-                reply=_mock_context_refusal(),
-                action="blocked_mock_context",
-                workspace=workspace,
-                citations=[],
-                warnings=["当前上下文来自 mock/开发样例，已禁止生成研究结论。"],
+            _with_intent(
+                ChatResponse(
+                    reply=_mock_context_refusal(),
+                    action="blocked_mock_context",
+                    workspace=workspace,
+                    citations=[],
+                    warnings=["当前上下文来自 mock/开发样例，已禁止生成研究结论。"],
+                ),
+                intent,
             ),
             workspace,
         )
@@ -143,12 +182,15 @@ async def handle_chat(
             },
         )
         return (
-            ChatResponse(
-                reply=_insufficient_real_evidence_reply(workspace),
-                action="insufficient_real_evidence",
-                workspace=workspace,
-                citations=_active_citations(workspace),
-                warnings=[f"真实相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已拒绝生成分析型结论。"],
+            _with_intent(
+                ChatResponse(
+                    reply=_insufficient_real_evidence_reply(workspace),
+                    action="insufficient_real_evidence",
+                    workspace=workspace,
+                    citations=_active_citations(workspace),
+                    warnings=[f"真实相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已拒绝生成分析型结论。"],
+                ),
+                intent,
             ),
             workspace,
         )
@@ -177,12 +219,15 @@ async def handle_chat(
         )
 
         return (
-            ChatResponse(
-                reply=reply_text,
-                action="llm_chat",
-                workspace=workspace,
-                citations=_active_citations(workspace),
-                warnings=guard.warnings + guard.unsupported_sentences[:3] + extra_warnings,
+            _with_intent(
+                ChatResponse(
+                    reply=reply_text,
+                    action="llm_chat",
+                    workspace=workspace,
+                    citations=_active_citations(workspace),
+                    warnings=guard.warnings + guard.unsupported_sentences[:3] + extra_warnings,
+                ),
+                intent,
             ),
             workspace,
         )
@@ -190,27 +235,33 @@ async def handle_chat(
     if workspace.context.active_papers:
         logger.error("llm_unavailable", extra={"error": llm_reply.error})
         return (
-            ChatResponse(
-                reply=(
-                    f"LLM 调用失败，无法生成回答。错误：{llm_reply.error}\n\n"
-                    "请检查 LLM 配置（DEEPSEEK_API_KEY / base_url / model）后重试。"
+            _with_intent(
+                ChatResponse(
+                    reply=(
+                        f"LLM 调用失败，无法生成回答。错误：{llm_reply.error}\n\n"
+                        "请检查 LLM 配置（DEEPSEEK_API_KEY / base_url / model）后重试。"
+                    ),
+                    action="llm_error",
+                    workspace=workspace,
+                    citations=_active_citations(workspace),
+                    warnings=[llm_reply.error or "llm_unavailable"],
                 ),
-                action="llm_error",
-                workspace=workspace,
-                citations=_active_citations(workspace),
-                warnings=[llm_reply.error or "llm_unavailable"],
+                intent,
             ),
             workspace,
         )
 
     return (
-        ChatResponse(
-            reply=(
-                "我可以用对话方式帮你检索论文、显示/隐藏文献上下文、规划下载、解析全文、"
-                "抽取性能表格，或生成有证据约束的发展脉络。你可以说：检索 2024 年后的 AFM 和 ACS Nano，先别下载，生成性能对比表。"
+        _with_intent(
+            ChatResponse(
+                reply=(
+                    "我可以用对话方式帮你检索论文、显示/隐藏文献上下文、规划下载、解析全文、"
+                    "抽取性能表格，或生成有证据约束的发展脉络。你可以说：检索 2024 年后的 AFM 和 ACS Nano，先别下载，生成性能对比表。"
+                ),
+                action="help",
+                workspace=workspace,
             ),
-            action="help",
-            workspace=workspace,
+            intent,
         ),
         workspace,
     )
@@ -400,22 +451,36 @@ async def _run_composite_intent(
         if intent.parse_strategy:
             parse_config = config.model_copy(deep=True)
             parse_config.parsing.parse_strategy = intent.parse_strategy
-        workspace, report = parse_workspace_papers(workspace, parse_config)
-        replies.append(
-            f"已尝试解析全文：成功解析 {report['parsed_count']} 篇，失败 {report['failed_count']} 篇。"
-        )
-        warnings.append(str(report))
-        action = "parse_full_text" if action == "composite" else action
+        try:
+            workspace, report = await parse_workspace_skill(
+                workspace,
+                parse_config,
+                context=_tool_context("chat.composite", intent, request),
+            )
+            replies.append(
+                f"已尝试解析全文：成功解析 {report['parsed_count']} 篇，失败 {report['failed_count']} 篇。"
+            )
+            warnings.append(str(report))
+            action = "parse_full_text" if action == "composite" else action
+        except RuntimeError as exc:
+            warnings.append(str(exc))
 
     evidence_quality = _workspace_evidence_quality(workspace)
     if "table" in intent.actions and has_minimum_evidence:
-        workspace, harness = await extract_performance_cells(workspace, config)
-        matrix = build_comparison_matrices(workspace)
-        replies.append(
-            f"已生成性能对比表：抽取 {len(workspace.performance_cells)} 个指标单元，形成 {len(matrix.matrices)} 个指标矩阵。"
-        )
-        warnings.extend([*harness.errors, *harness.warnings, *matrix.warnings])
-        action = "build_table" if action == "composite" else action
+        try:
+            workspace, harness = await extract_tables_skill(
+                workspace,
+                config,
+                context=_tool_context("chat.composite", intent, request),
+            )
+            matrix = build_comparison_matrix_skill(workspace)
+            replies.append(
+                f"已生成性能对比表：抽取 {len(workspace.performance_cells)} 个指标单元，形成 {len(matrix.matrices)} 个指标矩阵。"
+            )
+            warnings.extend([*harness.errors, *harness.warnings, *matrix.warnings])
+            action = "build_table" if action == "composite" else action
+        except RuntimeError as exc:
+            warnings.append(str(exc))
     elif "table" in intent.actions and not has_minimum_evidence:
         warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过性能对比表。")
 
@@ -427,7 +492,7 @@ async def _run_composite_intent(
             warnings.append(
                 "当前没有可用全文解析证据，已禁止基于题录/摘要生成强结论；请先获取并解析 PDF 全文。"
             )
-        storyline = build_storyline_from_workspace(workspace)
+        storyline = build_storyline_skill(workspace)
         if not storyline:
             replies.append("当前证据不足以生成真实的发展脉络。建议先检索并解析全文。")
         else:
@@ -476,15 +541,25 @@ async def _run_composite_intent(
     if "document" in intent.actions and has_minimum_evidence:
         if evidence_quality["parsed_count"] == 0:
             warnings.append("当前缺少全文解析证据，已禁止基于题录/摘要生成报告。")
-        report = build_research_document_report(workspace, config)
-        workspace.context.filters.document_report = report.model_dump(mode="json")
-        replies.append(
-            f"已生成可审计研究报告：{len(report.sections)} 个章节，"
-            f"{report.evidence_count} 条证据锚点，{len(report.citation_records)} 条引用。"
-        )
-        if report.warnings:
-            warnings.extend(report.warnings[:5])
-        action = "compose_document" if action == "composite" else action
+        try:
+            report = await build_research_report_skill(
+                workspace,
+                config,
+                context=_tool_context("chat.composite", intent, request),
+            )
+            workspace.context.filters.document_report = report.model_dump(mode="json")
+            if report.release_ready:
+                replies.append(
+                    f"已生成可发布的研究报告：{len(report.sections)} 个章节，"
+                    f"{report.evidence_count} 条证据锚点，{len(report.citation_records)} 条引用。"
+                )
+            else:
+                replies.append("已生成研究报告草稿，但发布门禁未通过；仅可作为待补证草稿。")
+            if report.warnings:
+                warnings.extend(report.warnings[:5])
+            action = "compose_document" if action == "composite" else action
+        except RuntimeError as exc:
+            warnings.append(str(exc))
     elif "document" in intent.actions and not has_minimum_evidence:
         warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过报告生成。")
 
@@ -500,19 +575,27 @@ async def _run_composite_intent(
             f"已完成多 agent 审稿/反驳/修订循环：{len(loop_report.rounds)} 轮，"
             f"score={loop_report.score:.3f}，passed={loop_report.passed}。"
         )
-        replies.append(loop_report.final_answer)
+        if loop_report.release_ready:
+            replies.append(loop_report.final_answer)
+        else:
+            replies.append("自主审查结果未通过最终发布门禁，未输出修订后的研究结论。")
+            warnings.extend(loop_report.release_blockers[:3])
         warnings.extend(loop_report.warnings[:5])
         action = "autonomous_review" if action == "composite" else action
 
     if "download" in intent.actions and not intent.skip_download:
-        papers = _active_papers(workspace)
-        download_plan = build_download_plan(
-            config, papers, set(workspace.context.selected_for_download)
-        )
-        replies.append(
-            f"已生成下载计划：{download_plan.downloadable_count} 篇可处理，其中 {download_plan.requires_login_count} 篇需要登录。"
-        )
-        action = "plan_downloads" if action == "composite" else action
+        try:
+            download_plan = await build_download_plan_skill(
+                config,
+                workspace,
+                context=_tool_context("chat.composite", intent, request),
+            )
+            replies.append(
+                f"已生成下载计划：{download_plan.downloadable_count} 篇可处理，其中 {download_plan.requires_login_count} 篇需要登录。"
+            )
+            action = "plan_downloads" if action == "composite" else action
+        except RuntimeError as exc:
+            warnings.append(str(exc))
 
     if not replies and "search" in intent.actions:
         replies.append(_format_search_result_reply(intent.topic or request.message, workspace))
@@ -520,16 +603,19 @@ async def _run_composite_intent(
         replies.append("已理解你的指令，但当前没有可执行动作。")
 
     return (
-        ChatResponse(
-            reply="\n".join(replies),
-            action=action,
-            workspace=workspace,
-            research_result=research_result,
-            citations=_active_citations(workspace),
-            download_plan=download_plan,
-            publisher_routes=publisher_routes,
-            comparison_matrix=matrix,
-            warnings=warnings,
+        _with_intent(
+            ChatResponse(
+                reply="\n".join(replies),
+                action=action,
+                workspace=workspace,
+                research_result=research_result,
+                citations=_active_citations(workspace),
+                download_plan=download_plan,
+                publisher_routes=publisher_routes,
+                comparison_matrix=matrix,
+                warnings=warnings,
+            ),
+            intent,
         ),
         workspace,
     )
@@ -537,6 +623,27 @@ async def _run_composite_intent(
 
 def _response(reply: str, action: str, workspace: LiteratureWorkspace) -> ChatResponse:
     return ChatResponse(reply=reply, action=action, workspace=workspace)
+
+
+def _with_intent(response: ChatResponse, intent: ChatIntent) -> ChatResponse:
+    response.intent_confidence = intent.confidence
+    response.ambiguous_intent = intent.ambiguous
+    response.ambiguity_reasons = list(intent.ambiguity_reasons)
+    response.clarification_questions = list(intent.clarification_questions)
+    return response
+
+
+def _tool_context(caller: str, intent: ChatIntent, request: ChatRequest) -> ToolCallContext:
+    return ToolCallContext(
+        caller=caller,
+        session_id=request.session_id,
+        intent=",".join(intent.actions),
+        metadata={
+            "topic": intent.topic,
+            "confidence": intent.confidence,
+            "ambiguous": intent.ambiguous,
+        },
+    )
 
 
 def _active_papers(workspace: LiteratureWorkspace):
@@ -548,37 +655,15 @@ def _active_citations(workspace: LiteratureWorkspace):
 
 
 def _workspace_is_mock(workspace: LiteratureWorkspace) -> bool:
-    if getattr(workspace.context.filters, "search_mode", None) == "mock":
-        return True
-    return any((paper.doi or "").lower().find(".mock") >= 0 for paper in _active_papers(workspace))
+    return workspace_is_mock(workspace, _active_papers(workspace))
 
 
 def _workspace_has_real_minimum_evidence(workspace: LiteratureWorkspace) -> bool:
-    return (
-        getattr(workspace.context.filters, "search_mode", None) == "live"
-        and not _workspace_is_mock(workspace)
-        and len(workspace.context.active_papers) >= MIN_ANALYSIS_PAPERS
-    )
+    return workspace_has_real_minimum_evidence(workspace, _active_papers(workspace))
 
 
 def _workspace_evidence_quality(workspace: LiteratureWorkspace) -> dict[str, int]:
-    active = set(workspace.context.active_papers)
-    parsed_count = sum(
-        bool(coerce_parsed(parsed).parsed)
-        for paper_id, parsed in workspace.parsed_papers.items()
-        if paper_id in active
-    )
-    full_text_count = sum(1 for paper_id in active if paper_id in workspace.full_text_reports)
-    performance_count = len(workspace.performance_cells)
-    return {
-        "active_count": len(active),
-        "full_text_report_count": full_text_count,
-        "parsed_count": parsed_count,
-        "performance_cell_count": performance_count,
-        "candidate_pool_count": getattr(
-            workspace.context.filters, "candidate_pool_count", len(active)
-        ),
-    }
+    return workspace_evidence_quality(workspace)
 
 
 def _is_search_only_intent(intent: ChatIntent) -> bool:
@@ -595,53 +680,19 @@ def _is_search_only_intent(intent: ChatIntent) -> bool:
 
 
 def _is_analysis_request(message: str) -> bool:
-    lowered = message.lower()
-    return any(
-        token in lowered
-        for token in [
-            "总结",
-            "主要路线",
-            "研究路线",
-            "技术路线",
-            "脉络",
-            "发展",
-            "故事",
-            "综述",
-            "比较",
-            "分析",
-            "summarize",
-            "route",
-            "storyline",
-            "review",
-        ]
-    )
+    return is_analysis_request(message)
 
 
 def _mock_context_refusal() -> str:
-    return (
-        "当前文献上下文来自 mock/开发样例，不是真实联网文献。我不能基于这些内容总结研究路线或生成结论。\n\n"
-        "请先重新进行真实联网检索；当 live search 返回至少 5 篇真实相关文献后，我再按证据总结主要路线。"
-    )
+    return mock_context_refusal()
 
 
 def _insufficient_real_evidence_reply(workspace: LiteratureWorkspace) -> str:
-    count = len(workspace.context.active_papers)
-    mode = getattr(workspace.context.filters, "search_mode", None) or "unknown"
-    return (
-        f"当前只有 {count} 篇候选文献，检索模式为 {mode}；还没有达到 "
-        f"{MIN_ANALYSIS_PAPERS} 篇真实相关文献的分析门槛。\n\n"
-        "我先不做总结型结论。请先继续真实联网检索、扩大关键词，或解析 PDF 全文后再总结主要路线。"
-    )
+    return insufficient_real_evidence_reply(workspace)
 
 
 def _format_agent_status() -> str:
-    lines = ["当前 Agent 开发状态："]
-    for status in agent_runtime_statuses():
-        flag = "可执行" if status.implemented else "待开发"
-        node = f"，节点：{status.workflow_node}" if status.workflow_node else ""
-        remaining = "；剩余：" + " / ".join(status.remaining_work) if status.remaining_work else ""
-        lines.append(f"- {status.name}: {flag}，runtime: {status.runtime}{node}{remaining}")
-    return "\n".join(lines)
+    return format_agent_status()
 
 
 def _apply_download_selection(
@@ -709,16 +760,7 @@ def _apply_literature_filters(
 
 
 def _format_current_papers(workspace: LiteratureWorkspace) -> str:
-    if not workspace.context.active_papers:
-        return "当前上下文还没有文献。你可以先让我检索一个主题。"
-    lines = ["当前上下文文献："]
-    for index, paper_id in enumerate(workspace.context.active_papers, start=1):
-        paper = workspace.papers[paper_id]
-        year = paper.year or "n.d."
-        journal = paper.journal or paper.publisher or "unknown source"
-        selected = "，已选下载" if paper_id in workspace.context.selected_for_download else ""
-        lines.append(f"{index}. {paper.title} ({year}, {journal}{selected})")
-    return "\n".join(lines)
+    return format_current_papers(workspace)
 
 
 def _format_search_result_reply(
@@ -727,40 +769,7 @@ def _format_search_result_reply(
     expanded_year_range: bool = False,
     original_year_min: int | None = None,
 ) -> str:
-    search_mode = getattr(workspace.context.filters, "search_mode", None)
-    lines = [
-        f"我已围绕“{topic}”检索并尝试获取全文。",
-    ]
-    if search_mode == "mock":
-        lines.append(
-            "- 当前是 mock/开发样例检索，不是真实联网文献；这些结果只能用于验证流程和界面。"
-        )
-        lines.append(
-            "- 真实调研需要启用 live search 后重新检索，达到 5 篇真实文献后我再做分析型结论。"
-        )
-        return "\n".join(lines)
-    if expanded_year_range:
-        lines.append(f"最近年份范围（{original_year_min} 年以来）证据不足，已自动扩大检索年限。")
-    if not workspace.context.active_papers:
-        login_ids = getattr(workspace.context.filters, "requires_login_candidate_ids", None) or []
-        lines.append(
-            "目前还没有可进入上下文的已下载全文文献，因此我不会基于题录或摘要给出分析结论。"
-        )
-        if login_ids:
-            lines.append("部分相关文献可能需要 publisher 登录授权后才能下载全文。")
-        return "\n".join(lines)
-    if len(workspace.context.active_papers) < MIN_ANALYSIS_PAPERS:
-        lines.append(f"当前全文证据还不足 {MIN_ANALYSIS_PAPERS} 篇，我先不做分析型结论。")
-        lines.append("可以继续扩大关键词/年份，或完成需要授权的 publisher 登录后再继续。")
-        return "\n".join(lines)
-
-    lines.append("全文证据已达到最低门槛，可以继续提出分析问题。")
-    for index, paper_id in enumerate(workspace.context.active_papers, start=1):
-        paper = workspace.papers[paper_id]
-        year = paper.year or "n.d."
-        source = paper.journal or paper.publisher or "unknown source"
-        lines.append(f"{index}. {paper.title} ({year}, {source})")
-    return "\n".join(lines)
+    return format_search_result_reply(topic, workspace, expanded_year_range, original_year_min)
 
 
 def _append_chat_trace_step(

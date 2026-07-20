@@ -5,12 +5,12 @@ import re
 
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig, load_config
-from littrace.document_composer import build_research_document_report
-from littrace.models import LiteratureWorkspace
-from littrace.quality_report import build_quality_report
+from littrace.models import LiteratureWorkspace, ResearchDocumentReport
+from littrace.publication import draft_notice, evaluate_publication
+from littrace.evaluation.quality_report import build_quality_report
 from littrace.session import ChatSession
-from littrace.storyline import build_storyline_from_workspace
-from littrace.tables import build_comparison_matrices
+from littrace.evidence.storyline import build_storyline_from_workspace
+from littrace.evidence.tables import build_comparison_matrices
 
 
 def export_session_bundle(
@@ -20,9 +20,8 @@ def export_session_bundle(
 ) -> dict[str, str]:
     config = config or load_config()
     session.artifacts_dir.mkdir(parents=True, exist_ok=True)
-    markdown_path = session.artifacts_dir / "research_brief.md"
-    report_path = session.artifacts_dir / "research_report.md"
-    report_json_path = session.artifacts_dir / "research_report.json"
+    draft_path = session.artifacts_dir / "research_report_draft.md"
+    draft_json_path = session.artifacts_dir / "research_report_draft.json"
     autonomous_path = session.artifacts_dir / "autonomous_review.json"
     bibtex_path = session.artifacts_dir / "references.bib"
     ris_path = session.artifacts_dir / "references.ris"
@@ -32,10 +31,24 @@ def export_session_bundle(
     si_path = session.artifacts_dir / "supplementary_links.json"
     json_path = session.artifacts_dir / "workspace_export.json"
 
-    markdown_path.write_text(render_markdown_brief(workspace), encoding="utf-8")
-    report = build_research_document_report(workspace, config)
-    report_path.write_text(report.markdown, encoding="utf-8")
-    report_json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    report = evaluate_publication(workspace, config)
+    brief_name = "research_brief.md" if report.release_ready else "research_brief_draft.md"
+    markdown_path = session.artifacts_dir / brief_name
+    markdown_path.write_text(
+        render_markdown_brief(workspace, config=config, report=report), encoding="utf-8"
+    )
+    draft_path.write_text(report.markdown, encoding="utf-8")
+    draft_json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    released_paths: dict[str, str] = {}
+    if report.release_ready:
+        report_path = session.artifacts_dir / "research_report.md"
+        report_json_path = session.artifacts_dir / "research_report.json"
+        report_path.write_text(report.markdown, encoding="utf-8")
+        report_json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+        released_paths = {
+            "research_report": str(report_path),
+            "research_report_json": str(report_json_path),
+        }
     autonomous_path.write_text(
         json.dumps(
             getattr(workspace.context.filters, "autonomous_loop_report", {}),
@@ -61,10 +74,18 @@ def export_session_bundle(
         encoding="utf-8",
     )
 
+    brief_paths = (
+        {"markdown": str(markdown_path)}
+        if report.release_ready
+        else {"markdown_draft": str(markdown_path)}
+    )
     return {
-        "markdown": str(markdown_path),
-        "research_report": str(report_path),
-        "research_report_json": str(report_json_path),
+        **brief_paths,
+        "research_report_draft": str(draft_path),
+        "research_report_draft_json": str(draft_json_path),
+        "release_ready": str(report.release_ready).lower(),
+        "release_blockers": "; ".join(report.release_blockers),
+        **released_paths,
         "autonomous_review": str(autonomous_path),
         "bibtex": str(bibtex_path),
         "ris": str(ris_path),
@@ -76,13 +97,23 @@ def export_session_bundle(
     }
 
 
-def render_markdown_brief(workspace: LiteratureWorkspace) -> str:
+def render_markdown_brief(
+    workspace: LiteratureWorkspace,
+    config: LitTraceConfig | None = None,
+    *,
+    report: ResearchDocumentReport | None = None,
+) -> str:
+    """Render a release-labelled brief for every direct export path."""
+
+    report = report or evaluate_publication(workspace, config or LitTraceConfig())
     papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
     citations = citation_records_for_papers(papers)
     matrix = build_comparison_matrices(workspace)
     storyline = build_storyline_from_workspace(workspace)
 
     lines = ["# LitTrace Research Brief", ""]
+    if not report.release_ready:
+        lines.extend([draft_notice(report), ""])
     lines.append("## Literature Context")
     if not papers:
         lines.append("No active papers.")

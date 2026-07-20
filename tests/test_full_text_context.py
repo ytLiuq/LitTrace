@@ -73,8 +73,9 @@ async def test_full_text_context_keeps_only_downloaded_and_parsed_papers(tmp_pat
             )
         return reports
 
-    async def fake_execute(_config, selected, _request):
-        for paper in selected:
+    async def fake_execute(_config, workspace_arg, _request):
+        for paper_id in _request.paper_ids:
+            paper = workspace_arg.papers[paper_id]
             path = local_pdf_path(_config, paper)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"%PDF-1.4")
@@ -84,7 +85,7 @@ async def test_full_text_context_keeps_only_downloaded_and_parsed_papers(tmp_pat
 
         return Result()
 
-    def fake_parse(workspace, _config):
+    async def fake_parse(workspace, _config):
         workspace.parsed_papers["good"] = {
             "parsed": True,
             "sections": [
@@ -97,8 +98,8 @@ async def test_full_text_context_keeps_only_downloaded_and_parsed_papers(tmp_pat
         return workspace, {"parsed_count": 1, "failed_count": 0, "missing_pdf_count": 0}
 
     monkeypatch.setattr("littrace.full_text_context.resolve_full_text_for_papers", fake_resolve)
-    monkeypatch.setattr("littrace.full_text_context.execute_downloads", fake_execute)
-    monkeypatch.setattr("littrace.full_text_context.parse_workspace_papers", fake_parse)
+    monkeypatch.setattr("littrace.full_text_context.execute_downloads_skill", fake_execute)
+    monkeypatch.setattr("littrace.full_text_context.parse_workspace_skill", fake_parse)
 
     result = await build_full_text_context(workspace, request, config)
 

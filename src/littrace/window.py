@@ -8,7 +8,7 @@ from littrace.chat import handle_chat
 from littrace.auto_resume import auto_resume_downloaded_pdfs
 from littrace.config import load_config
 from littrace.intent import parse_chat_intent
-from littrace.login_flow import (
+from littrace.access_layer import (
     browser_login_session_for_paper,
     fetch_authorized_pdf_after_user_auth,
     open_browser_login_session,
@@ -25,7 +25,7 @@ from littrace.session import (
     load_workspace,
     save_workspace,
 )
-from littrace.tables import decide_artifact_extraction_need
+from littrace.evidence.tables import decide_artifact_extraction_need
 from littrace.tui import render_context_lines
 
 
@@ -261,8 +261,12 @@ class LitTraceWindow:
             font=_font("caption"),
             spacing3=8,
         )
-        self.trace_text.tag_configure("trace_node", foreground=DESIGN["ink"], font=_font("body_strong"))
-        self.trace_text.tag_configure("trace_body", foreground=DESIGN["ink_muted"], font=_font("caption"))
+        self.trace_text.tag_configure(
+            "trace_node", foreground=DESIGN["ink"], font=_font("body_strong")
+        )
+        self.trace_text.tag_configure(
+            "trace_body", foreground=DESIGN["ink_muted"], font=_font("caption")
+        )
         self.trace_text.grid(row=1, column=0, sticky="nsew")
 
         self.ttk.Label(self.trace_frame, text="历史 Session", style="TileHeader.TLabel").grid(
@@ -374,7 +378,9 @@ class LitTraceWindow:
             row=0, column=1, padx=(12, 0)
         )
 
-        self.context_frame = self.ttk.Frame(self.pane, style="Tile.TFrame", padding=(18, 18, 18, 16))
+        self.context_frame = self.ttk.Frame(
+            self.pane, style="Tile.TFrame", padding=(18, 18, 18, 16)
+        )
         self.context_frame.columnconfigure(0, weight=1)
         self.context_frame.rowconfigure(1, weight=1)
         self.pane.add(self.context_frame, minsize=300)
@@ -398,9 +404,9 @@ class LitTraceWindow:
         )
         self.context_text.grid(row=1, column=0, sticky="nsew")
         self.status_var = self.tk.StringVar(value=f"Session: {self.session.session_id}")
-        self.ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w").grid(
-            row=2, column=0, sticky="ew", padx=32, pady=(0, 10)
-        )
+        self.ttk.Label(
+            self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w"
+        ).grid(row=2, column=0, sticky="ew", padx=32, pady=(0, 10))
 
     def _configure_copy_bindings(self) -> None:
         self.copy_menu = self.tk.Menu(self.root, tearoff=0)
@@ -559,7 +565,9 @@ class LitTraceWindow:
             if step.next_node:
                 self.trace_text.insert(self.tk.END, f"下一步: {step.next_node}\n", ("trace_body",))
             if step.next_reason:
-                self.trace_text.insert(self.tk.END, f"选择原因: {step.next_reason}\n", ("trace_body",))
+                self.trace_text.insert(
+                    self.tk.END, f"选择原因: {step.next_reason}\n", ("trace_body",)
+                )
             self.trace_text.insert(self.tk.END, "\n", ("trace_body",))
 
     def _refresh_context(self) -> None:
@@ -620,12 +628,12 @@ class LitTraceWindow:
         frame = self.ttk.Frame(self.ocr_popup, style="Tile.TFrame", padding=24)
         frame.pack(fill=self.tk.BOTH, expand=True)
         self.ttk.Label(frame, text="选择 PDF 解析方式", style="TileHeader.TLabel").pack(anchor="w")
-        self.ttk.Label(frame, text=f"建议: {report.recommended_parse_strategy}", style="Caption.TLabel").pack(
-            anchor="w", pady=(10, 0)
-        )
-        self.ttk.Label(frame, text=report.reason, style="Caption.TLabel", wraplength=470, justify=self.tk.LEFT).pack(
-            anchor="w", pady=(4, 12)
-        )
+        self.ttk.Label(
+            frame, text=f"建议: {report.recommended_parse_strategy}", style="Caption.TLabel"
+        ).pack(anchor="w", pady=(10, 0))
+        self.ttk.Label(
+            frame, text=report.reason, style="Caption.TLabel", wraplength=470, justify=self.tk.LEFT
+        ).pack(anchor="w", pady=(4, 12))
         button_frame = self.ttk.Frame(frame, style="Tile.TFrame")
         button_frame.pack(fill=self.tk.X)
         self.ttk.Button(
@@ -640,9 +648,9 @@ class LitTraceWindow:
             style="Primary.TButton",
             command=lambda: self._set_parse_strategy("ocr"),
         ).pack(side=self.tk.LEFT, padx=(8, 0))
-        self.ttk.Button(button_frame, text="关闭", style="Secondary.TButton", command=self._close_ocr_popup).pack(
-            side=self.tk.RIGHT
-        )
+        self.ttk.Button(
+            button_frame, text="关闭", style="Secondary.TButton", command=self._close_ocr_popup
+        ).pack(side=self.tk.RIGHT)
 
     def _close_ocr_popup(self) -> None:
         if self.ocr_popup is not None:
@@ -677,18 +685,20 @@ class LitTraceWindow:
         outer.pack(fill=self.tk.BOTH, expand=True)
         header = self.ttk.Frame(outer, style="Tile.TFrame")
         header.pack(fill=self.tk.X)
-        self.ttk.Label(header, text="当前文献上下文", style="TileHeader.TLabel").pack(side=self.tk.LEFT)
-        self.ttk.Button(header, text="全部选择下载", style="Primary.TButton", command=self._select_all_downloads).pack(
-            side=self.tk.RIGHT
+        self.ttk.Label(header, text="当前文献上下文", style="TileHeader.TLabel").pack(
+            side=self.tk.LEFT
         )
-        self.ttk.Button(header, text="清空选择", style="Secondary.TButton", command=self._clear_downloads).pack(
-            side=self.tk.RIGHT, padx=(0, 8)
-        )
+        self.ttk.Button(
+            header, text="全部选择下载", style="Primary.TButton", command=self._select_all_downloads
+        ).pack(side=self.tk.RIGHT)
+        self.ttk.Button(
+            header, text="清空选择", style="Secondary.TButton", command=self._clear_downloads
+        ).pack(side=self.tk.RIGHT, padx=(0, 8))
 
         if not self.workspace.context.active_papers:
-            self.ttk.Label(outer, text="当前没有文献。先在主窗口输入检索任务。", style="Caption.TLabel").pack(
-                anchor="w", pady=(16, 0)
-            )
+            self.ttk.Label(
+                outer, text="当前没有文献。先在主窗口输入检索任务。", style="Caption.TLabel"
+            ).pack(anchor="w", pady=(16, 0))
             return
 
         list_frame = self.ttk.Frame(outer, style="Tile.TFrame")
@@ -722,9 +732,9 @@ class LitTraceWindow:
             year = paper.year or "n.d."
             source = paper.journal or paper.publisher or "unknown"
             text = f"{index}. {paper.title}\n{year} | {source}"
-            self.ttk.Label(row, text=text, style="Caption.TLabel", wraplength=650, justify=self.tk.LEFT).pack(
-                side=self.tk.LEFT, fill=self.tk.X, expand=True
-            )
+            self.ttk.Label(
+                row, text=text, style="Caption.TLabel", wraplength=650, justify=self.tk.LEFT
+            ).pack(side=self.tk.LEFT, fill=self.tk.X, expand=True)
 
     def _toggle_download_selection(self, paper_id: str, value) -> None:
         selected = list(self.workspace.context.selected_for_download)
@@ -753,7 +763,9 @@ class LitTraceWindow:
     def _open_login_popup(self, download_plan: DownloadPlan | None = None) -> None:
         plan = download_plan or self.last_download_plan
         if plan is None:
-            self._append_message("assistant", "当前还没有下载计划。请先说“选择第 N 篇下载”或“生成下载计划”。")
+            self._append_message(
+                "assistant", "当前还没有下载计划。请先说“选择第 N 篇下载”或“生成下载计划”。"
+            )
             return
         login_items = [item for item in plan.items if item.requires_login]
         if not login_items:
@@ -786,9 +798,9 @@ class LitTraceWindow:
             row = self.ttk.Frame(outer, style="Tile.TFrame", padding=(0, 6))
             row.pack(fill=self.tk.X, anchor="w")
             title = paper.title if paper else item.title
-            self.ttk.Label(row, text=title, style="Caption.TLabel", wraplength=560, justify=self.tk.LEFT).pack(
-                side=self.tk.LEFT, fill=self.tk.X, expand=True
-            )
+            self.ttk.Label(
+                row, text=title, style="Caption.TLabel", wraplength=560, justify=self.tk.LEFT
+            ).pack(side=self.tk.LEFT, fill=self.tk.X, expand=True)
             self.ttk.Button(
                 row,
                 text="打开登录页",
@@ -812,7 +824,9 @@ class LitTraceWindow:
             self.workspace.full_text_reports.get(paper_id),
             browser_session_name=publisher_window_session_name_for_chat(self.session.session_id),
         )
-        self._render_planned_trace(["打开授权窗口", "等待用户完成授权", "后台获取 PDF", "归档并解析"])
+        self._render_planned_trace(
+            ["打开授权窗口", "等待用户完成授权", "后台获取 PDF", "归档并解析"]
+        )
         if plan.error or not plan.browser_act_command:
             self._append_message("system", plan.error or "无法打开授权浏览器。")
             return
@@ -842,7 +856,10 @@ class LitTraceWindow:
         if not result.opened:
             self.root.after(
                 0,
-                lambda: self._append_message("system", f"授权浏览器打开失败：{result.error or result.stderr or result.stdout}"),
+                lambda: self._append_message(
+                    "system",
+                    f"授权浏览器打开失败：{result.error or result.stderr or result.stdout}",
+                ),
             )
             return
         if result.fallback_used:
@@ -910,7 +927,9 @@ class LitTraceWindow:
         popup.lift()
         outer = self.ttk.Frame(popup, style="Tile.TFrame", padding=20)
         outer.pack(fill=self.tk.BOTH, expand=True)
-        self.ttk.Label(outer, text="请完成浏览器中的真人验证", style="TileHeader.TLabel").pack(anchor="w")
+        self.ttk.Label(outer, text="请完成浏览器中的真人验证", style="TileHeader.TLabel").pack(
+            anchor="w"
+        )
         self.ttk.Label(
             outer,
             text="ACS/Cloudflare 需要你确认是真人。请在已打开的授权浏览器窗口中完成验证，并保持窗口打开，直到 LitTrace 显示 PDF 已归档。",
@@ -923,7 +942,7 @@ class LitTraceWindow:
     def _close_browser_session_silently(self, session_name: str | None) -> None:
         if not session_name:
             return
-        from littrace.browser import run_browser_act
+        from littrace.access_layer.browser_sessions import run_browser_act
 
         run_browser_act(
             self.config,
@@ -948,8 +967,12 @@ class LitTraceWindow:
             self.session_history_text.tag_add(tag, start, end)
             self.session_history_text.tag_configure(
                 tag,
-                foreground=DESIGN["primary"] if item.session_id != self.session.session_id else DESIGN["ink"],
-                background="#eef6ff" if item.session_id == self.session.session_id else DESIGN["canvas"],
+                foreground=DESIGN["primary"]
+                if item.session_id != self.session.session_id
+                else DESIGN["ink"],
+                background="#eef6ff"
+                if item.session_id == self.session.session_id
+                else DESIGN["canvas"],
                 lmargin1=3,
                 lmargin2=3,
                 rmargin=3,
@@ -999,7 +1022,9 @@ class LitTraceWindow:
                 text = _message_text(content)
                 if text and (role == "你" or _is_user_effective_reply(text)):
                     bubble_role = "user" if role == "你" else "assistant"
-                    self.chat_text.insert(self.tk.END, f"{text}\n\n", (_chat_bubble_tag(bubble_role),))
+                    self.chat_text.insert(
+                        self.tk.END, f"{text}\n\n", (_chat_bubble_tag(bubble_role),)
+                    )
         self.chat_text.see(self.tk.END)
 
     def _open_help_popup(self) -> None:

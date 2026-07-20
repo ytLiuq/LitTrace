@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from littrace.auto_resume import BrowserSessionDownloadTestResult, run_browser_session_download_handoff_test
+from littrace.auto_resume import (
+    BrowserSessionDownloadTestResult,
+    run_browser_session_download_handoff_test,
+)
 from littrace.config import LitTraceConfig
-from littrace.login_flow import (
+from littrace.access_layer.browser_sessions import (
     AuthorizedPdfFetchResult,
     BrowserLoginSessionPlan,
     browser_login_session_plans_for_workspace,
@@ -35,7 +38,9 @@ def build_publisher_session_e2e_report(
     publisher_family: str | None = None,
     timeout_seconds: float = 5.0,
 ) -> tuple[LiteratureWorkspace, PublisherSessionE2EReport]:
-    browser_session_name = publisher_window_session_name_for_chat(session.session_id if session else None)
+    browser_session_name = publisher_window_session_name_for_chat(
+        session.session_id if session else None
+    )
     plans = browser_login_session_plans_for_workspace(
         config,
         workspace,

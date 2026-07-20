@@ -8,41 +8,53 @@ from littrace.attachments import attach_pdf_to_paper, check_download_presence
 from littrace.agent_interactions import build_agent_interaction_report
 from littrace.agent_audits import audit_parser_agent, audit_storyline_agent, audit_table_agent
 from littrace.agent_strength import build_agent_portfolio_report
-from littrace.auto_resume import auto_resume_downloaded_pdfs
-from littrace.cdp_downloader import check_cdp_status
-from littrace.chat import handle_chat
-from littrace.config import load_config
-from littrace.config_wizard import write_config_template
-from littrace.export import export_session_bundle
-from littrace.full_text import (
-    backfill_workspace_by_dois,
-    full_text_config_warnings,
-    resolve_workspace_full_text,
-)
-from littrace.golden_eval import run_golden_eval
-from littrace.login_flow import (
+from littrace.auto_resume import auto_resume_downloaded_pdfs_async
+from littrace.access_layer import (
     browser_login_session_for_paper,
+    check_cdp_status,
     launch_login_for_paper,
     publisher_window_session_name_for_chat,
 )
+from littrace.chat import handle_chat
+from littrace.chrome_profiles import (
+    build_browser_setup_report,
+    discover_chrome_profiles,
+    format_shell_command,
+    launch_chrome_for_cdp,
+)
+from littrace.config import load_config
+from littrace.config_wizard import write_config_template
+from littrace.skill_runner import (
+    build_quality_report_skill,
+    build_research_plan_skill,
+    export_session_bundle_skill,
+    resolve_workspace_full_text_skill,
+)
+from littrace.retrieval.full_text import (
+    backfill_workspace_by_dois,
+    full_text_config_warnings,
+)
+from littrace.evaluation.golden_eval import run_golden_eval
 from littrace.models import ChatRequest, LiteratureWorkspace
-from littrace.pdf_benchmark import benchmark_pdf_parsing
+from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
 from littrace.publisher_connectors import build_publisher_search_plan
 from littrace.publisher_retrieval import (
     fetch_publisher_search_results,
     merge_retrieval_result_into_workspace,
 )
-from littrace.quality_report import build_quality_report
 from littrace.publisher_session import build_publisher_session_e2e_report
 from littrace.publisher_e2e import run_interactive_publisher_e2e
 from littrace.rerank_learning import learn_rerank_policy_from_golden
-from littrace.retrieval_eval import run_retrieval_golden_eval
-from littrace.research_planner import build_research_plan
+from littrace.evaluation.retrieval_eval import run_retrieval_golden_eval
+from littrace.sentinel.cli import access_review as sentinel_access_review
+from littrace.sentinel.cli import init_sentinel, run_sentinel
+from littrace.sentinel.cli import resume_after_login as sentinel_resume_after_login
+from littrace.sentinel.storage import get_sentinel_store, load_sentinel_state
 from littrace.session import append_message, create_chat_session, save_workspace
-from littrace.storyline import render_structured_storyline_report
-from littrace.storyline_review import review_storyline
+from littrace.publication import render_publication_storyline
+from littrace.evidence.storyline_review import review_storyline
 from littrace.supplementary import attach_supplementary_file
-from littrace.tables import decide_artifact_extraction_need
+from littrace.evidence.tables import decide_artifact_extraction_need
 
 
 @dataclass
@@ -54,9 +66,21 @@ class ShellState:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "sentinel":
+        config = load_config()
+        asyncio.run(_run_sentinel_command(config))
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         config = load_config()
         _print_doctor(config)
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "setup-browser":
+        config = load_config()
+        profile = _arg_value("--profile")
+        launch = "--no-launch" not in sys.argv and (
+            "--launch" in sys.argv or config.cdp_downloader.auto_launch_chrome
+        )
+        _print_browser_setup(config, profile_name=profile, launch=launch)
         return
     if len(sys.argv) > 2 and sys.argv[1] == "publisher-e2e":
         config = load_config()
@@ -105,10 +129,14 @@ async def _run_publisher_e2e_command(
         user_action_timeout_seconds=user_action_timeout,
         max_browser_reopens=max_browser_reopens,
     )
-    print(f"Publisher E2E: completed={report.completed}, downloaded={report.downloaded_pdf}, parsed={report.parsed_full_text}")
+    print(
+        f"Publisher E2E: completed={report.completed}, downloaded={report.downloaded_pdf}, parsed={report.parsed_full_text}"
+    )
     print(f"session={report.session_name}")
     print(f"target={report.target_path}")
-    print(f"attempts={report.attempts}, elapsed={report.elapsed_seconds}s, access={report.last_access_state}")
+    print(
+        f"attempts={report.attempts}, elapsed={report.elapsed_seconds}s, access={report.last_access_state}"
+    )
     if report.institutional_login_opened:
         print("institutional_login_opened=true")
     if report.needs_user_action and report.user_action_message:
@@ -117,6 +145,59 @@ async def _run_publisher_e2e_command(
         print(f"error={report.last_error}")
     if report.warnings:
         print("warnings=" + "；".join(report.warnings))
+
+
+async def _run_sentinel_command(config) -> None:
+    if len(sys.argv) < 3:
+        print("用法：littrace sentinel init|run|status|access-review|resume-after-login ...")
+        return
+    action = sys.argv[2]
+    watchlist_id = _arg_value("--watchlist") or _arg_value("--watchlist-id") or "mxene_sensor"
+    topic = _arg_value("--topic") or _arg_value("--objective") or watchlist_id
+
+    if action == "init":
+        root = init_sentinel(config, watchlist_id, topic)
+        print(f"sentinel initialized: {root}")
+        return
+    if action == "run":
+        result = await run_sentinel(config, watchlist_id, topic)
+        print(f"run_id: {result.summary.run_id}")
+        print(f"watchlist: {result.summary.watchlist_id}")
+        print(f"topic: {result.summary.topic}")
+        print(f"new_candidates: {result.summary.new_candidates_count}")
+        print(f"downloaded: {result.summary.downloaded_count}")
+        print(f"parsed: {result.summary.parsed_count}")
+        print(f"access_tasks: {result.summary.access_task_count}")
+        if result.summary.digest_path:
+            print(f"digest: {result.summary.digest_path}")
+        if result.summary.warnings:
+            print("warnings: " + "；".join(result.summary.warnings))
+        return
+    if action == "status":
+        store = get_sentinel_store(config, watchlist_id)
+        state = load_sentinel_state(store)
+        print(f"watchlist: {state.watchlist.watchlist_id}")
+        print(f"topic: {state.watchlist.topic}")
+        print(f"last_run_at: {state.last_run_at or 'never'}")
+        print(f"seen: {len(state.seen_paper_ids)}")
+        print(f"access_tasks: {len(state.access_queue)}")
+        print(f"retry_tasks: {len(state.retry_queue)}")
+        print(f"digest_history: {len(state.digest_history)}")
+        return
+    if action == "access-review":
+        tasks = sentinel_access_review(config, watchlist_id, topic)
+        print(f"access_tasks: {len(tasks)}")
+        for task in tasks[:20]:
+            print(f"- {task.paper_id}: {task.reason} | {task.title}")
+        return
+    if action == "resume-after-login":
+        result = await sentinel_resume_after_login(config, watchlist_id, topic)
+        print(f"resumed run_id: {result.summary.run_id}")
+        print(f"downloaded: {result.summary.downloaded_count}")
+        print(f"parsed: {result.summary.parsed_count}")
+        print(f"remaining_access_tasks: {result.summary.access_task_count}")
+        return
+    print(f"未知 sentinel 动作: {action}")
 
 
 def _arg_float(name: str, default: float) -> float:
@@ -139,6 +220,16 @@ def _arg_float_or_none(name: str) -> float | None:
         return None
 
 
+def _arg_value(name: str) -> str | None:
+    if name not in sys.argv:
+        return None
+    index = sys.argv.index(name)
+    try:
+        return sys.argv[index + 1]
+    except IndexError:
+        return None
+
+
 async def run_shell() -> None:
     config = load_config()
     session = create_chat_session(config)
@@ -151,7 +242,7 @@ async def run_shell() -> None:
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /browser-login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /quality /agents /agent-flow /agent-audits /plan topic /init-config /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /retrieval-eval /rerank-learn /publisher-session-test /export /quit"
+        "/dashboard /doctor /setup-browser /quality /agents /agent-flow /agent-audits /plan topic /init-config /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /retrieval-eval /rerank-learn /publisher-session-test /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -190,8 +281,15 @@ async def run_shell() -> None:
         if message == "/doctor":
             _print_doctor(config)
             continue
+        if message == "/setup-browser":
+            _print_browser_setup(
+                config,
+                profile_name=None,
+                launch=config.cdp_downloader.auto_launch_chrome,
+            )
+            continue
         if message == "/quality":
-            report = build_quality_report(config, state.workspace)
+            report = build_quality_report_skill(config, state.workspace)
             print("Quality metrics:")
             for name, value in report.metrics.items():
                 print(f"- {name}: {value}")
@@ -237,14 +335,16 @@ async def run_shell() -> None:
                 audit_table_agent(state.workspace),
                 audit_storyline_agent(state.workspace),
             ]:
-                print(f"- {report.agent}: {'passed' if report.passed else 'needs work'} ({report.score})")
+                print(
+                    f"- {report.agent}: {'passed' if report.passed else 'needs work'} ({report.score})"
+                )
                 for finding in report.findings[:3]:
                     print(f"  - {finding}")
             continue
         if message == "/full-text":
             for warning in full_text_config_warnings(config):
                 print(f"配置建议: {warning}")
-            state.workspace = await resolve_workspace_full_text(state.workspace, config)
+            state.workspace = await resolve_workspace_full_text_skill(state.workspace, config)
             save_workspace(session, state.workspace)
             print(f"Full-text reports: {len(state.workspace.full_text_reports)}")
             for paper_id in state.workspace.context.active_papers[:12]:
@@ -274,7 +374,7 @@ async def run_shell() -> None:
             continue
         if message.startswith("/plan "):
             topic = message.removeprefix("/plan ").strip()
-            plan = build_research_plan(topic, state.workspace)
+            plan = await build_research_plan_skill(topic, state.workspace)
             print(f"Research plan: {plan.topic}")
             for index, step in enumerate(plan.steps, start=1):
                 print(f"{index}. [{step.agent}] {step.action} -> {step.expected_output}")
@@ -294,7 +394,8 @@ async def run_shell() -> None:
         if message == "/storyline":
             message = "生成当前文献发展脉络"
         if message == "/storyline-report":
-            print(render_structured_storyline_report(state.workspace))
+            markdown, _ = render_publication_storyline(state.workspace, config)
+            print(markdown)
             continue
         if message == "/storyline-review":
             report = review_storyline(state.workspace)
@@ -404,8 +505,7 @@ async def run_shell() -> None:
         if message == "/check-downloads":
             report = check_download_presence(config, state.workspace)
             print(
-                f"PDF 检测：{report.ready_to_parse_count} 篇已就绪，"
-                f"{report.missing_count} 篇缺失。"
+                f"PDF 检测：{report.ready_to_parse_count} 篇已就绪，{report.missing_count} 篇缺失。"
             )
             for item in report.items[:12]:
                 marker = "ok" if item.exists else "missing"
@@ -414,7 +514,9 @@ async def run_shell() -> None:
                 print("可运行 /resume-downloads 自动解析已就绪 PDF 并写入 artifacts。")
             continue
         if message == "/resume-downloads":
-            state.workspace, result = auto_resume_downloaded_pdfs(config, state.workspace, session)
+            state.workspace, result = await auto_resume_downloaded_pdfs_async(
+                config, state.workspace, session
+            )
             save_workspace(session, state.workspace)
             print(
                 f"自动恢复：ready={result.ready_to_parse_count}, parsed={result.parsed_count}, "
@@ -465,7 +567,9 @@ async def run_shell() -> None:
             continue
         if message == "/rerank-learn":
             report = await learn_rerank_policy_from_golden(config, live=True)
-            print(f"Rerank learning: candidates={report.candidate_count}, best={report.best_candidate}, score={report.best_score}")
+            print(
+                f"Rerank learning: candidates={report.candidate_count}, best={report.best_candidate}, score={report.best_score}"
+            )
             for item in report.results:
                 print(f"- {item['name']}: score={item['score']} metrics={item['metrics']}")
             if report.warnings:
@@ -491,7 +595,7 @@ async def run_shell() -> None:
                 print("注意：" + "；".join(report.warnings))
             continue
         if message == "/export":
-            paths = export_session_bundle(session, state.workspace)
+            paths = await export_session_bundle_skill(session, state.workspace, config)
             print("已导出研究包：")
             for name, path in paths.items():
                 print(f"- {name}: {path}")
@@ -564,7 +668,60 @@ def _print_doctor(config) -> None:
         print("websocket: available")
     if status.error:
         print(f"error: {status.error}")
-        print("start chrome: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=19222")
+    setup = build_browser_setup_report(config)
+    if setup.discovery.executable:
+        print(f"chrome: {setup.discovery.executable}")
+    if setup.discovery.user_data_dir:
+        print(f"user data dir: {setup.discovery.user_data_dir}")
+    if setup.selected_profile:
+        cookies = ", ".join(setup.selected_profile.publisher_cookie_domains) or "none detected"
+        print(
+            f"profile: {setup.selected_profile.name} "
+            f"({setup.selected_profile.display_name or 'unnamed'}), publisher cookies: {cookies}"
+        )
+    if setup.warnings:
+        for warning in setup.warnings:
+            print(f"warning: {warning}")
+    if setup.instructions:
+        print("browser setup:")
+        for instruction in setup.instructions:
+            print(f"- {instruction}")
+
+
+def _print_browser_setup(config, profile_name: str | None, launch: bool) -> None:
+    discovery = discover_chrome_profiles(config)
+    selected_name = profile_name or config.cdp_downloader.chrome_profile_name
+    print("Chrome profiles:")
+    print(f"platform: {discovery.platform}")
+    print(f"executable: {discovery.executable or 'not found'}")
+    print(f"user data dir: {discovery.user_data_dir or 'not found'}")
+    if discovery.profiles:
+        for profile in discovery.profiles:
+            marker = "*" if profile.name == selected_name else " "
+            cookies = ", ".join(profile.publisher_cookie_domains) or "none detected"
+            print(
+                f"{marker} {profile.name} ({profile.display_name or 'unnamed'}), cookies={cookies}"
+            )
+    else:
+        print("profiles: none found")
+    for warning in discovery.warnings:
+        print(f"warning: {warning}")
+    if launch:
+        result = launch_chrome_for_cdp(config, profile_name=profile_name)
+        if result.already_available:
+            print("cdp: already available")
+        elif result.launched:
+            print("cdp: launched and available")
+        else:
+            print("cdp: launch failed")
+            if result.error:
+                print(f"error: {result.error}")
+        if result.command:
+            print("command: " + format_shell_command(result.command))
+    else:
+        report = build_browser_setup_report(config)
+        if report.launch_plan:
+            print("start command: " + format_shell_command(report.launch_plan.command))
 
 
 def format_dashboard(state: ShellState) -> str:
@@ -581,7 +738,7 @@ def format_dashboard(state: ShellState) -> str:
         f"context: {active} papers, panel={visible}, selected_downloads={selected}",
         f"parsing: {parsed} parsed records, performance_cells={cells}",
         "commands: /context /login N /attach N path.pdf /attach-si N path /check-downloads "
-        "/resume-downloads /parse /table /storyline-report /storyline-review /benchmark /export",
+        "/resume-downloads /parse /table /doctor /setup-browser /storyline-report /storyline-review /benchmark /export",
     ]
     return "\n".join(lines)
 

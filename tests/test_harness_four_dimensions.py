@@ -7,7 +7,6 @@ import pytest
 
 from littrace.harnesses import (
     HarnessConfig,
-    HarnessReport,
     Severity,
     registry,
     check_retry_health,
@@ -27,7 +26,6 @@ from littrace.retry import (
     RetryAttempt,
     compute_delay,
     retry_async,
-    retry_tracker,
 )
 from littrace.log import cost_tracker, CostTracker
 

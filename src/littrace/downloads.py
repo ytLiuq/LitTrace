@@ -4,10 +4,10 @@ from pathlib import Path
 
 import httpx
 
-from littrace.access import build_download_plan, target_pdf_path
-from littrace.cdp_downloader import download_paper_via_cdp
+from littrace.access_layer.cdp import download_paper_via_cdp
+from littrace.access_layer.paths import build_download_plan, target_pdf_path
 from littrace.config import LitTraceConfig
-from littrace.full_text import resolve_full_text_for_paper
+from littrace.retrieval.full_text import resolve_full_text_for_paper
 from littrace.models import (
     AccessType,
     DownloadExecutionItem,

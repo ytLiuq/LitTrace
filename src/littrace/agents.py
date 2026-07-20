@@ -60,7 +60,7 @@ LITTRACE_CREW_ROLES = [
         name="PDF/OCR Parser",
         goal="Parse downloaded or user-provided PDFs into traceable text, table, and page evidence.",
         backstory="A document parser that treats page-aware evidence as the unit of trust.",
-        tools=["parse_workspace_papers", "docling", "paddleocr"],
+        tools=["parse_workspace_papers", "docling", "paddleocr", "ToolContract", "ToolResult"],
     ),
     AgentRoleSpec(
         name="Table Extractor",
@@ -71,8 +71,8 @@ LITTRACE_CREW_ROLES = [
     AgentRoleSpec(
         name="Research Planner",
         goal="Turn a user research question into an evidence-first multi-agent plan.",
-        backstory="A workflow strategist that chooses when to retrieve, parse, compare, and narrate.",
-        tools=["build_research_plan", "route_sources", "build_publisher_search_plan"],
+        backstory="A ReAct-style workflow strategist that chooses when to retrieve, parse, compare, and narrate.",
+        tools=["build_research_plan", "route_sources", "build_publisher_search_plan", "react_trace"],
     ),
     AgentRoleSpec(
         name="Research Writer",
@@ -112,8 +112,74 @@ LITTRACE_CREW_ROLES = [
 ]
 
 
+RUNTIME_AGENT_ROLES = [
+    AgentRoleSpec(
+        name="Planner Agent",
+        goal="Understand the user objective and produce an evidence-first execution plan.",
+        backstory="A coordinator that decides which retrieval, access, evidence, synthesis, and evaluation steps should run.",
+        tools=["build_research_plan", "route_sources", "AgentRuntime.send", "react_trace"],
+    ),
+    AgentRoleSpec(
+        name="Retrieval + Access + Parsing Agent",
+        goal="Find literature, resolve authorized full text, plan compliant access, and parse PDFs into artifacts.",
+        backstory="A document acquisition agent that owns search, source routing, full-text resolution, download planning, browser handoff, and OCR parsing.",
+        tools=[
+            "route_sources",
+            "LiveSearchClient",
+            "MockMaterialsSearchClient",
+            "build_publisher_search_plan",
+            "backfill_workspace_by_dois",
+            "resolve_workspace_full_text",
+            "build_download_plan",
+            "launch_login_for_paper",
+            "download_paper_via_cdp",
+            "parse_workspace_papers",
+            "extract_performance_cells",
+        ],
+    ),
+    AgentRoleSpec(
+        name="Evidence Agent",
+        goal="Audit citations and enforce evidence grounding before claims leave the system.",
+        backstory="A skeptical verifier that turns unsupported statements into warnings or removals.",
+        tools=[
+            "audit_citation_links",
+            "guard_citations",
+            "check_hallucination_grounding",
+            "check_storyline_claims",
+        ],
+    ),
+    AgentRoleSpec(
+        name="Synthesis Agent",
+        goal="Compose comparison matrices, storylines, research answers, and auditable reports.",
+        backstory="A careful scientific writer that only synthesizes from parsed evidence and verified artifacts.",
+        tools=[
+            "build_comparison_matrices",
+            "build_storyline_from_workspace",
+            "write_evidence_grounded_answer",
+            "build_research_document_report",
+        ],
+    ),
+    AgentRoleSpec(
+        name="Evaluation Agent",
+        goal="Measure retrieval, parsing, evidence, storyline, and end-to-end quality.",
+        backstory="A regression-focused evaluator that keeps the research workflow measurable.",
+        tools=[
+            "build_quality_report",
+            "run_golden_eval",
+            "retrieval_metrics",
+            "parsing_metrics",
+            "storyline_metrics",
+        ],
+    ),
+]
+
+
 def crew_role_specs() -> list[AgentRoleSpec]:
     return LITTRACE_CREW_ROLES
+
+
+def runtime_agent_role_specs() -> list[AgentRoleSpec]:
+    return RUNTIME_AGENT_ROLES
 
 
 def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
@@ -182,10 +248,8 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             runtime="LangGraph",
             implemented=True,
             workflow_node="parse_full_text",
-            callable_tools=["parse_workspace_papers", "docling", "paddleocr"],
-            remaining_work=[
-                "Expand the benchmark from session metrics to a curated golden PDF set."
-            ],
+            callable_tools=["parse_workspace_papers", "docling", "paddleocr", "ToolContract", "ToolResult"],
+            remaining_work=["Persist Docling structured-document exports inside session workspace."],
         ),
         AgentRuntimeStatus(
             name="Table Extractor",
@@ -204,8 +268,8 @@ def agent_runtime_statuses() -> list[AgentRuntimeStatus]:
             runtime="Local deterministic planner",
             implemented=True,
             workflow_node=None,
-            callable_tools=["build_research_plan"],
-            remaining_work=["Learn from successful traces to prioritize steps automatically."],
+            callable_tools=["build_research_plan", "react_trace"],
+            remaining_work=["Learn from successful ReAct/tool traces to prioritize steps automatically."],
         ),
         AgentRuntimeStatus(
             name="Research Writer",

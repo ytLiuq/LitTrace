@@ -3,6 +3,15 @@ storage:
   metadata_dir: "./data/metadata"
   cache_dir: "./data/cache"
   sessions_dir: "./sessions"
+  workspace_snapshot_limit: 30
+
+cache_policy:
+  default_ttl_seconds: 86400
+  allow_stale_on_source_failure: true
+
+publication_policy:
+  strict_all_claims: true
+  require_publishable_claim: true
 
 api:
   user_agent: "LitTrace/0.1 mailto:your-email@example.com"
@@ -14,6 +23,11 @@ api:
 
 cdp_downloader:
   cdp_url: "http://127.0.0.1:19222"
+  chrome_executable: null
+  chrome_user_data_dir: null
+  chrome_profile_name: "Default"
+  remote_debugging_port: 19222
+  auto_launch_chrome: true
   cloudflare_wait_seconds: 60
   user_action_wait_seconds: 30
   command_timeout_seconds: 60

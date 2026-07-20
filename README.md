@@ -5,14 +5,20 @@ workflows. It helps researchers search papers, manage the active literature
 context, optionally download PDFs, parse full text with OCR tools, build
 evidence-grounded comparison tables, and generate truthful research storylines.
 
-LitTrace is intentionally a **LangGraph** project:
+LitTrace uses a **Single Coordinator + Skills/ToolContracts + Session
+Workspace** architecture:
 
-- **LangGraph** is the primary stateful workflow engine for source routing,
-  search, citation auditing, download planning, OCR parsing, and later
-  storyline/table verification.
-- **13 Agent roles** (defined in `agents.py`) describe the system's
-  organizational structure and tool ownership. They are executed as LangGraph
-  nodes or direct Python function calls—not via an external agent framework.
+- The **Coordinator** owns user-facing intent parsing, ambiguity handling, and
+  memory-view preparation.
+- **Skills/ToolContracts** are the stable execution surface for search,
+  download planning, PDF parsing, table extraction, storyline/report
+  synthesis, exports, and quality checks.
+- **Session workspace** files are the source of truth for papers, structured
+  documents, artifacts, snapshots, and runtime memory.
+- **LangGraph** is kept for bounded research workflows and traceable state
+  transitions, not as the whole product architecture.
+- Optional runtime agents and the Autonomous Review Council are quality/review
+  layers; they do not own the main execution path.
 
 ## Product Principles
 
@@ -51,21 +57,30 @@ cd LitTrace
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,parsers]"
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=19222
+littrace setup-browser --launch
 littrace doctor
 littrace-window
 ```
 
 Publisher-authenticated full-text access uses a local Chrome CDP connection,
-not BrowserAct. Start Chrome with a remote debugging port before running real
-publisher downloads:
+not BrowserAct. The setup command discovers local Chrome profiles, reports
+whether publisher cookies are already present, and can launch Chrome with a
+remote debugging port:
 
 ```yaml
 cdp_downloader:
   cdp_url: "http://127.0.0.1:19222"
+  chrome_profile_name: "Default"
+  auto_launch_chrome: true
 ```
 
-You can override the CDP endpoint with `LITTRACE_CDP_URL`.
+You can override the CDP endpoint with `LITTRACE_CDP_URL`, the Chrome binary
+with `LITTRACE_CHROME_EXECUTABLE`, the user-data directory with
+`LITTRACE_CHROME_USER_DATA_DIR`, and the selected profile with
+`LITTRACE_CHROME_PROFILE_NAME`. BrowserAct settings remain for the legacy
+interactive login handoff path and fallback diagnostics; publisher PDF download
+primarily uses the CDP downloader.
+Use `littrace setup-browser --no-launch` for diagnostics without opening Chrome.
 
 For the Codex-style local interactive app, start the native popup window:
 

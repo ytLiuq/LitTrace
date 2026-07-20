@@ -5,14 +5,17 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from littrace.attachments import check_download_presence
-from littrace.access import target_pdf_path
+from littrace.access_layer.browser_sessions import browser_login_session_plans_for_workspace
+from littrace.access_layer.download_planning import check_download_presence, target_pdf_path
 from littrace.config import LitTraceConfig
-from littrace.export import export_session_bundle
 from littrace.models import LiteratureWorkspace
-from littrace.parsing import parse_workspace_papers
 from littrace.session import ChatSession
-from littrace.tables import build_comparison_matrices, extract_performance_cells
+from littrace.skill_runner import (
+    build_comparison_matrix_skill,
+    export_session_bundle_skill,
+    extract_tables_skill,
+    parse_workspace_skill,
+)
 
 
 class AutoResumeResult(BaseModel):
@@ -39,27 +42,25 @@ class BrowserSessionDownloadTestResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-def auto_resume_downloaded_pdfs(
+async def auto_resume_downloaded_pdfs_async(
     config: LitTraceConfig,
     workspace: LiteratureWorkspace,
     session: ChatSession | None = None,
 ) -> tuple[LiteratureWorkspace, AutoResumeResult]:
-    import asyncio
-
     archived_count, archive_warnings = auto_archive_login_downloads(config, workspace)
     presence = check_download_presence(config, workspace)
     warnings = [*archive_warnings, *presence.warnings]
     if presence.ready_to_parse_count:
-        workspace, parse_report = parse_workspace_papers(workspace, config)
-        workspace, table_harness = asyncio.run(extract_performance_cells(workspace, config))
-        matrix = build_comparison_matrices(workspace)
+        workspace, parse_report = await parse_workspace_skill(workspace, config)
+        workspace, table_harness = await extract_tables_skill(workspace, config)
+        matrix = build_comparison_matrix_skill(workspace)
         warnings.extend(parse_report.get("warnings", []))
-        warnings.extend(table_harness.warnings)
-        warnings.extend(matrix.warnings)
+        warnings.extend(getattr(table_harness, "warnings", []))
+        warnings.extend(getattr(matrix, "warnings", []))
     else:
         parse_report = {"parsed_count": 0}
 
-    artifacts = export_session_bundle(session, workspace) if session else {}
+    artifacts = await export_session_bundle_skill(session, workspace, config) if session else {}
     result = AutoResumeResult(
         ready_to_parse_count=presence.ready_to_parse_count,
         auto_archived_count=archived_count,
@@ -71,6 +72,23 @@ def auto_resume_downloaded_pdfs(
     return workspace, result
 
 
+def auto_resume_downloaded_pdfs(
+    config: LitTraceConfig,
+    workspace: LiteratureWorkspace,
+    session: ChatSession | None = None,
+) -> tuple[LiteratureWorkspace, AutoResumeResult]:
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(auto_resume_downloaded_pdfs_async(config, workspace, session))
+    raise RuntimeError(
+        "auto_resume_downloaded_pdfs() is synchronous-only; use auto_resume_downloaded_pdfs_async() "
+        "inside async contexts."
+    )
+
+
 def watch_and_resume_downloads(
     config: LitTraceConfig,
     workspace: LiteratureWorkspace,
@@ -78,12 +96,41 @@ def watch_and_resume_downloads(
     timeout_seconds: float = 60.0,
     poll_interval_seconds: float = 2.0,
 ) -> tuple[LiteratureWorkspace, DownloadWatchResult]:
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            watch_and_resume_downloads_async(
+                config,
+                workspace,
+                session=session,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        )
+    raise RuntimeError(
+        "watch_and_resume_downloads() is synchronous-only; use watch_and_resume_downloads_async() "
+        "inside async contexts."
+    )
+
+
+async def watch_and_resume_downloads_async(
+    config: LitTraceConfig,
+    workspace: LiteratureWorkspace,
+    session: ChatSession | None = None,
+    timeout_seconds: float = 60.0,
+    poll_interval_seconds: float = 2.0,
+) -> tuple[LiteratureWorkspace, DownloadWatchResult]:
+    import asyncio
+
     start = time.monotonic()
     attempts = 0
     last_result: AutoResumeResult | None = None
     while True:
         attempts += 1
-        workspace, last_result = auto_resume_downloaded_pdfs(config, workspace, session)
+        workspace, last_result = await auto_resume_downloaded_pdfs_async(config, workspace, session)
         if (
             last_result.ready_to_parse_count
             or last_result.auto_archived_count
@@ -103,7 +150,7 @@ def watch_and_resume_downloads(
                 elapsed_seconds=round(elapsed, 3),
                 resume_result=last_result,
             )
-        time.sleep(max(poll_interval_seconds, 0.1))
+        await asyncio.sleep(max(poll_interval_seconds, 0.1))
 
 
 def run_browser_session_download_handoff_test(
@@ -113,8 +160,6 @@ def run_browser_session_download_handoff_test(
     timeout_seconds: float = 5.0,
     poll_interval_seconds: float = 1.0,
 ) -> tuple[LiteratureWorkspace, BrowserSessionDownloadTestResult]:
-    from littrace.login_flow import browser_login_session_plans_for_workspace
-
     plans = browser_login_session_plans_for_workspace(config, workspace)
     workspace, watch = watch_and_resume_downloads(
         config,

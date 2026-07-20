@@ -1,30 +1,39 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from typing import TypedDict
+from uuid import uuid4
 
-from littrace.access import build_download_plan
 from littrace.agent_interactions import build_agent_interaction_report
 from littrace.autonomous_loop import run_autonomous_research_loop
-from littrace.citations import audit_citation_links
-from littrace.context import add_papers, add_ranked_candidate_papers, _merge_filters
+from littrace.context import add_ranked_candidate_papers, _merge_filters
 from littrace.config import LitTraceConfig, load_config
-from littrace.document_composer import build_research_document_report
-from littrace.full_text_context import build_full_text_context
+from littrace.retrieval.full_text_context import build_full_text_context
 from littrace.log import get_logger, timed
 from littrace.models import (
     LiteratureWorkspace,
-    PaperSearchResult,
     PaperSearchRequest,
     ResearchRunResult,
     WorkflowTrace,
     WorkflowTraceStep,
 )
-from littrace.parsing import parse_workspace_papers
 from littrace.publisher_connectors import build_publisher_route_report, build_publisher_search_plan
-from littrace.search import LiveSearchClient, MockMaterialsSearchClient
-from littrace.source_router import SourceRoute, route_sources
-from littrace.storyline import build_storyline_from_workspace, verify_storyline_preview
-from littrace.tables import build_comparison_matrices, extract_performance_cells
+from littrace.skill_runner import (
+    SearchSkillResult,
+    audit_citation_links_skill,
+    build_comparison_matrix_skill,
+    build_download_plan_skill,
+    build_research_report_skill,
+    build_storyline_skill,
+    extract_tables_skill,
+    parse_workspace_skill,
+    search_papers_skill,
+)
+from littrace.retrieval.source_router import SourceRoute, route_sources
+from littrace.retrieval.adapters import record_search_provenance
+from littrace.evidence.storyline import verify_storyline_preview
+from littrace.tool_contracts import ToolCallContext, ToolExecutionLedger, ToolExecutionPolicy
 
 logger = get_logger("workflow")
 
@@ -32,6 +41,9 @@ logger = get_logger("workflow")
 class ResearchWorkflowState(TypedDict, total=False):
     request: PaperSearchRequest
     config: LitTraceConfig
+    tool_context: ToolCallContext
+    tool_ledger: ToolExecutionLedger
+    tool_policy: ToolExecutionPolicy | None
     audit_citations_enabled: bool
     plan_downloads_enabled: bool
     route_publishers_enabled: bool
@@ -57,25 +69,87 @@ class ResearchWorkflowState(TypedDict, total=False):
     workflow_trace: WorkflowTrace
 
 
-async def run_search_preview(
+def _workflow_tool_context(state: ResearchWorkflowState, node: str) -> ToolCallContext:
+    context = state["tool_context"]
+    return context.model_copy(update={"metadata": {**context.metadata, "workflow_node": node}})
+
+
+def _workflow_idempotency_key(request: PaperSearchRequest, node: str) -> str:
+    payload = json.dumps(request.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return f"{node}:{payload}"
+
+
+_OPTIONAL_NODES: tuple[tuple[str, str], ...] = (
+    ("audit_citations_enabled", "audit_citations"),
+    ("plan_downloads_enabled", "plan_downloads"),
+    ("route_publishers_enabled", "route_publishers"),
+    ("parse_full_text_enabled", "parse_full_text"),
+    ("extract_tables_enabled", "extract_tables"),
+    ("build_storyline_enabled", "build_storyline"),
+    ("compose_document_enabled", "compose_document"),
+    ("autonomous_review_enabled", "autonomous_review"),
+)
+
+
+def _next_after(state: ResearchWorkflowState, completed_node: str | None) -> tuple[str | None, str]:
+    candidates = _OPTIONAL_NODES
+    if completed_node:
+        completed_index = next(
+            (index for index, (_, node) in enumerate(candidates) if node == completed_node),
+            len(candidates),
+        )
+        candidates = candidates[completed_index + 1 :]
+    for flag, node in candidates:
+        if state.get(flag, False):
+            return node, f"{flag}=True，因此进入 {node}。"
+    return None, "后续可选节点均未启用，流程结束。"
+
+
+def _trace_step(
+    state: ResearchWorkflowState,
+    node: str,
+    status: str,
+    reason: str,
+    *,
+    inputs: dict[str, object] | None = None,
+    outputs: dict[str, object] | None = None,
+    next_node: str | None = None,
+    next_reason: str | None = None,
+) -> None:
+    state.setdefault("workflow_trace", WorkflowTrace()).steps.append(
+        WorkflowTraceStep(
+            node=node,
+            status=status,
+            reason=reason,
+            inputs=inputs or {},
+            outputs=outputs or {},
+            next_node=next_node,
+            next_reason=next_reason,
+        )
+    )
+
+
+async def _build_search_workspace(
     request: PaperSearchRequest,
-    config: LitTraceConfig | None = None,
-) -> LiteratureWorkspace:
-    config = config or load_config()
-    routes = route_sources(request.discipline, request.wants_recent)
-    use_live = config.api.enable_live_search if request.live is None else request.live
-    if use_live:
-        live_client = LiveSearchClient(config)
-        try:
-            result = await live_client.search(request)
-            diagnostics = live_client.diagnostics
-        except Exception as exc:
-            result = PaperSearchResult(request=request, papers=[])
-            diagnostics = live_client.diagnostics
-            diagnostics.errors.append(f"live_search: {exc.__class__.__name__}: {exc}")
-    else:
-        result = await MockMaterialsSearchClient().search(request)
-        diagnostics = None
+    config: LitTraceConfig,
+    *,
+    routes=None,
+    context: ToolCallContext | None = None,
+    ledger: ToolExecutionLedger | None = None,
+    policy: ToolExecutionPolicy | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[LiteratureWorkspace, SearchSkillResult]:
+    routes = (
+        routes if routes is not None else route_sources(request.discipline, request.wants_recent)
+    )
+    search = await search_papers_skill(
+        request,
+        config,
+        context=context,
+        ledger=ledger,
+        policy=policy,
+        idempotency_key=idempotency_key,
+    )
     workspace = LiteratureWorkspace()
     _merge_filters(
         workspace.context.filters,
@@ -84,28 +158,70 @@ async def run_search_preview(
             "year_min": request.year_min,
             "source_routes": [route.name for route in routes],
             "publisher_search_plan": build_publisher_search_plan(request.topic).model_dump(),
-            "search_mode": "live" if use_live else "mock",
-            "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
+            "search_mode": "live" if search.use_live else "mock",
+            "search_completed_at": datetime.now(UTC).isoformat(),
+            "search_diagnostics": (
+                {
+                    **search.diagnostics.__dict__,
+                    "source_health": {
+                        name: health.model_dump(mode="json")
+                        for name, health in search.diagnostics.source_health.items()
+                    },
+                }
+                if search.diagnostics
+                else None
+            ),
         },
     )
     workspace = add_ranked_candidate_papers(
         workspace,
-        result.papers,
+        search.result.papers,
         request,
         active_limit=config.literature_context.active_context_limit,
     )
-    if use_live:
-        context_result = await build_full_text_context(workspace, request, config)
+    if search.diagnostics:
+        record_search_provenance(
+            workspace,
+            request,
+            search.result.papers,
+            search.diagnostics.source_health,
+        )
+    if search.use_live:
+        context_result = await build_full_text_context(
+            workspace,
+            request,
+            config,
+            context=context,
+            ledger=ledger,
+            policy=policy,
+        )
         workspace = context_result.workspace
         workspace.context.filters.full_text_context_warnings = context_result.warnings
+    return workspace, search
+
+
+async def run_search_preview(
+    request: PaperSearchRequest,
+    config: LitTraceConfig | None = None,
+    *,
+    tool_context: ToolCallContext | None = None,
+    tool_ledger: ToolExecutionLedger | None = None,
+    tool_policy: ToolExecutionPolicy | None = None,
+) -> LiteratureWorkspace:
+    context = tool_context or ToolCallContext(caller="workflow.preview", task_id=uuid4().hex)
+    workspace, _ = await _build_search_workspace(
+        request,
+        config or load_config(),
+        context=context,
+        ledger=tool_ledger or ToolExecutionLedger(),
+        policy=tool_policy,
+        idempotency_key=_workflow_idempotency_key(request, "search_papers"),
+    )
     return workspace
 
 
 def build_littrace_graph():
-    try:
-        from langgraph.graph import END, StateGraph
-    except ImportError:
-        return None
+    from langgraph.graph import END, StateGraph
 
     async def plan_sources(state: ResearchWorkflowState) -> ResearchWorkflowState:
         with timed("plan_sources"):
@@ -133,49 +249,23 @@ def build_littrace_graph():
     async def search_papers(state: ResearchWorkflowState) -> ResearchWorkflowState:
         request = state["request"]
         config = state.get("config") or load_config()
-        use_live = config.api.enable_live_search if request.live is None else request.live
-        if use_live:
-            live_client = LiveSearchClient(config)
-            try:
-                result = await live_client.search(request)
-                diagnostics = live_client.diagnostics
-            except Exception as exc:
-                result = PaperSearchResult(request=request, papers=[])
-                diagnostics = live_client.diagnostics
-                diagnostics.errors.append(f"live_search: {exc.__class__.__name__}: {exc}")
-        else:
-            result = await MockMaterialsSearchClient().search(request)
-            diagnostics = None
-        workspace = LiteratureWorkspace()
-        _merge_filters(
-            workspace.context.filters,
-            {
-                "discipline": request.discipline,
-                "year_min": request.year_min,
-                "source_routes": [route.name for route in state.get("routes", [])],
-                "publisher_search_plan": build_publisher_search_plan(request.topic).model_dump(),
-                "search_mode": "live" if use_live else "mock",
-                "search_diagnostics": diagnostics.__dict__ if diagnostics else None,
-            },
-        )
-        workspace = add_ranked_candidate_papers(
-            workspace,
-            result.papers,
+        workspace, search = await _build_search_workspace(
             request,
-            active_limit=config.literature_context.active_context_limit,
+            config,
+            routes=state.get("routes", []),
+            context=_workflow_tool_context(state, "search_papers"),
+            ledger=state["tool_ledger"],
+            policy=state.get("tool_policy"),
+            idempotency_key=_workflow_idempotency_key(request, "search_papers"),
         )
-        if use_live:
-            context_result = await build_full_text_context(workspace, request, config)
-            workspace = context_result.workspace
-            workspace.context.filters.full_text_context_warnings = context_result.warnings
         state["workspace"] = workspace
-        next_node, next_reason = _next_after_search(state)
+        next_node, next_reason = _next_after(state, None)
         _trace_step(
             state,
             "search_papers",
             "completed",
             "用户请求检索/调研文献，因此执行候选论文检索。",
-            inputs={"topic": request.topic, "live": use_live, "year_min": request.year_min},
+            inputs={"topic": request.topic, "live": search.use_live, "year_min": request.year_min},
             outputs={
                 "paper_count": len(state["workspace"].context.active_papers),
                 "candidate_pool_count": getattr(
@@ -193,7 +283,7 @@ def build_littrace_graph():
                 "active_context_limit": getattr(
                     state["workspace"].context.filters, "active_context_limit", None
                 ),
-                "search_mode": "live" if use_live else "mock",
+                "search_mode": "live" if search.use_live else "mock",
             },
             next_node=next_node,
             next_reason=next_reason,
@@ -204,8 +294,15 @@ def build_littrace_graph():
         config = state.get("config") or load_config()
         workspace = state["workspace"]
         papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
-        state["citation_audit"] = await audit_citation_links(papers, config)
-        next_node, next_reason = _next_after_audit(state)
+        state["citation_audit"] = await audit_citation_links_skill(
+            papers,
+            config,
+            context=_workflow_tool_context(state, "audit_citations"),
+            ledger=state["tool_ledger"],
+            policy=state.get("tool_policy"),
+            idempotency_key="audit_citations",
+        )
+        next_node, next_reason = _next_after(state, "audit_citations")
         _trace_step(
             state,
             "audit_citations",
@@ -226,8 +323,15 @@ def build_littrace_graph():
         workspace = state["workspace"]
         selected_ids = set(workspace.context.selected_for_download)
         papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
-        state["download_plan"] = build_download_plan(config, papers, selected_ids)
-        next_node, next_reason = _next_after_download_plan(state)
+        state["download_plan"] = await build_download_plan_skill(
+            config,
+            workspace,
+            context=_workflow_tool_context(state, "plan_downloads"),
+            ledger=state["tool_ledger"],
+            policy=state.get("tool_policy"),
+            idempotency_key="plan_downloads",
+        )
+        next_node, next_reason = _next_after(state, "plan_downloads")
         _trace_step(
             state,
             "plan_downloads",
@@ -247,7 +351,7 @@ def build_littrace_graph():
         workspace = state["workspace"]
         papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
         state["publisher_routes"] = build_publisher_route_report(papers).model_dump()
-        next_node, next_reason = _next_after_publisher_routes(state)
+        next_node, next_reason = _next_after(state, "route_publishers")
         _trace_step(
             state,
             "route_publishers",
@@ -262,10 +366,16 @@ def build_littrace_graph():
 
     async def build_storyline(state: ResearchWorkflowState) -> ResearchWorkflowState:
         workspace = state["workspace"]
-        claims = build_storyline_from_workspace(workspace)
+        claims = build_storyline_skill(
+            workspace,
+            context=_workflow_tool_context(state, "build_storyline"),
+            ledger=state["tool_ledger"],
+            policy=state.get("tool_policy"),
+            idempotency_key="build_storyline",
+        )
         state["storyline"] = claims
         state["storyline_harness"] = verify_storyline_preview(claims)
-        next_node, next_reason = _next_after_storyline(state)
+        next_node, next_reason = _next_after(state, "build_storyline")
         _trace_step(
             state,
             "build_storyline",
@@ -280,19 +390,28 @@ def build_littrace_graph():
 
     async def compose_document(state: ResearchWorkflowState) -> ResearchWorkflowState:
         config = state.get("config") or load_config()
-        report = build_research_document_report(state["workspace"], config)
+        report = await build_research_report_skill(
+            state["workspace"],
+            config,
+            context=_workflow_tool_context(state, "compose_document"),
+            ledger=state["tool_ledger"],
+            policy=state.get("tool_policy"),
+            idempotency_key="compose_document",
+        )
         state["workspace"].context.filters.document_report = report.model_dump(mode="json")
         state["document_report"] = report
-        next_node, next_reason = _next_after_document(state)
+        next_node, next_reason = _next_after(state, "compose_document")
         _trace_step(
             state,
             "compose_document",
-            "completed",
+            "completed" if report.release_ready else "blocked",
             "compose_document_enabled=True，需要生成学术化可审计报告。",
             inputs={"paper_count": len(state["workspace"].context.active_papers)},
             outputs={
                 "section_count": len(report.sections),
                 "evidence_count": report.evidence_count,
+                "release_ready": report.release_ready,
+                "release_blocker_count": len(report.release_blockers),
             },
             next_node=next_node,
             next_reason=next_reason,
@@ -328,10 +447,16 @@ def build_littrace_graph():
 
     async def parse_full_text(state: ResearchWorkflowState) -> ResearchWorkflowState:
         config = state.get("config") or load_config()
-        workspace, report = parse_workspace_papers(state["workspace"], config)
+        workspace, report = await parse_workspace_skill(
+            state["workspace"],
+            config,
+            context=_workflow_tool_context(state, "parse_full_text"),
+            ledger=state["tool_ledger"],
+            policy=state.get("tool_policy"),
+        )
         state["workspace"] = workspace
         state["parse_report"] = report
-        next_node, next_reason = _next_after_parse(state)
+        next_node, next_reason = _next_after(state, "parse_full_text")
         _trace_step(
             state,
             "parse_full_text",
@@ -350,11 +475,23 @@ def build_littrace_graph():
 
     async def extract_tables(state: ResearchWorkflowState) -> ResearchWorkflowState:
         config = state.get("config") or load_config()
-        workspace, harness = await extract_performance_cells(state["workspace"], config)
+        workspace, harness = await extract_tables_skill(
+            state["workspace"],
+            config,
+            context=_workflow_tool_context(state, "extract_tables"),
+            ledger=state["tool_ledger"],
+            policy=state.get("tool_policy"),
+        )
         state["workspace"] = workspace
         state["table_harness"] = harness.model_dump()
-        state["comparison_matrix"] = build_comparison_matrices(workspace)
-        next_node, next_reason = _next_after_extract_tables(state)
+        state["comparison_matrix"] = build_comparison_matrix_skill(
+            workspace,
+            context=_workflow_tool_context(state, "extract_tables.comparison_matrix"),
+            ledger=state["tool_ledger"],
+            policy=state.get("tool_policy"),
+            idempotency_key="extract_tables.comparison_matrix",
+        )
+        next_node, next_reason = _next_after(state, "extract_tables")
         _trace_step(
             state,
             "extract_tables",
@@ -370,37 +507,12 @@ def build_littrace_graph():
         )
         return state
 
-    def after_search(state: ResearchWorkflowState) -> str:
-        node, _reason = _next_after_search(state)
-        return node or END
+    def _next_node(router):
+        def select(state: ResearchWorkflowState) -> str:
+            node, _reason = router(state)
+            return node or END
 
-    def after_audit(state: ResearchWorkflowState) -> str:
-        node, _reason = _next_after_audit(state)
-        return node or END
-
-    def after_download_plan(state: ResearchWorkflowState) -> str:
-        node, _reason = _next_after_download_plan(state)
-        return node or END
-
-    def after_publisher_routes(state: ResearchWorkflowState) -> str:
-        node, _reason = _next_after_publisher_routes(state)
-        return node or END
-
-    def after_parse(state: ResearchWorkflowState) -> str:
-        node, _reason = _next_after_parse(state)
-        return node or END
-
-    def after_extract_tables(state: ResearchWorkflowState) -> str:
-        node, _reason = _next_after_extract_tables(state)
-        return node or END
-
-    def after_storyline(state: ResearchWorkflowState) -> str:
-        node, _reason = _next_after_storyline(state)
-        return node or END
-
-    def after_document(state: ResearchWorkflowState) -> str:
-        node, _reason = _next_after_document(state)
-        return node or END
+        return select
 
     def _wrap_node(name: str, fn):
         """Wrap a LangGraph node with timed logging."""
@@ -436,14 +548,28 @@ def build_littrace_graph():
     graph.add_node("autonomous_review", _wrap_node("autonomous_review", autonomous_review))
     graph.set_entry_point("plan_sources")
     graph.add_edge("plan_sources", "search_papers")
-    graph.add_conditional_edges("search_papers", after_search)
-    graph.add_conditional_edges("audit_citations", after_audit)
-    graph.add_conditional_edges("plan_downloads", after_download_plan)
-    graph.add_conditional_edges("route_publishers", after_publisher_routes)
-    graph.add_conditional_edges("parse_full_text", after_parse)
-    graph.add_conditional_edges("extract_tables", after_extract_tables)
-    graph.add_conditional_edges("build_storyline", after_storyline)
-    graph.add_conditional_edges("compose_document", after_document)
+    graph.add_conditional_edges("search_papers", _next_node(lambda state: _next_after(state, None)))
+    graph.add_conditional_edges(
+        "audit_citations", _next_node(lambda state: _next_after(state, "audit_citations"))
+    )
+    graph.add_conditional_edges(
+        "plan_downloads", _next_node(lambda state: _next_after(state, "plan_downloads"))
+    )
+    graph.add_conditional_edges(
+        "route_publishers", _next_node(lambda state: _next_after(state, "route_publishers"))
+    )
+    graph.add_conditional_edges(
+        "parse_full_text", _next_node(lambda state: _next_after(state, "parse_full_text"))
+    )
+    graph.add_conditional_edges(
+        "extract_tables", _next_node(lambda state: _next_after(state, "extract_tables"))
+    )
+    graph.add_conditional_edges(
+        "build_storyline", _next_node(lambda state: _next_after(state, "build_storyline"))
+    )
+    graph.add_conditional_edges(
+        "compose_document", _next_node(lambda state: _next_after(state, "compose_document"))
+    )
     graph.add_edge("autonomous_review", END)
     return graph.compile()
 
@@ -460,16 +586,22 @@ async def run_research_graph(
     compose_document_enabled: bool = False,
     autonomous_review_enabled: bool = False,
     auto_replan_enabled: bool = False,
+    *,
+    tool_context: ToolCallContext | None = None,
+    tool_ledger: ToolExecutionLedger | None = None,
+    tool_policy: ToolExecutionPolicy | None = None,
 ) -> ResearchRunResult:
     config = config or load_config()
     workflow_trace = WorkflowTrace()
+    context = tool_context or ToolCallContext(caller="workflow", task_id=uuid4().hex)
+    ledger = tool_ledger or ToolExecutionLedger()
     graph = build_littrace_graph()
     logger.info(
         "run_research_graph_start",
         extra={
             "topic": request.topic,
             "live": request.live,
-            "langgraph_available": graph is not None,
+            "runtime": "langgraph",
             "flags": {
                 "audit": audit_citations_enabled,
                 "downloads": plan_downloads_enabled,
@@ -482,152 +614,14 @@ async def run_research_graph(
             },
         },
     )
-    if graph is None:
-        workspace = await run_search_preview(request, config)
-        _trace_direct(
-            workflow_trace,
-            "search_papers",
-            "LangGraph 不可用，使用顺序 fallback 执行检索。",
-            inputs={"topic": request.topic, "live": request.live, "year_min": request.year_min},
-            outputs={
-                "paper_count": len(workspace.context.active_papers),
-                "candidate_pool_count": getattr(
-                    workspace.context.filters, "candidate_pool_count", 0
-                ),
-                "active_context_limit": getattr(
-                    workspace.context.filters, "active_context_limit", None
-                ),
-            },
-        )
-        papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
-        citation_audit = (
-            await audit_citation_links(papers, config) if audit_citations_enabled else None
-        )
-        if citation_audit is not None:
-            _trace_direct(
-                workflow_trace,
-                "audit_citations",
-                "audit_citations_enabled=True，检查引用链接。",
-                inputs={"paper_count": len(papers)},
-                outputs={"passed": citation_audit.passed, "score": citation_audit.score},
-            )
-        else:
-            _trace_direct(
-                workflow_trace,
-                "audit_citations",
-                "audit_citations_enabled=False，跳过引用审计。",
-                status="skipped",
-            )
-        download_plan = (
-            build_download_plan(config, papers, set(workspace.context.selected_for_download))
-            if plan_downloads_enabled
-            else None
-        )
-        if download_plan is not None:
-            _trace_direct(
-                workflow_trace,
-                "plan_downloads",
-                "plan_downloads_enabled=True，生成下载计划。",
-                outputs={
-                    "downloadable_count": download_plan.downloadable_count,
-                    "requires_login_count": download_plan.requires_login_count,
-                },
-            )
-        publisher_routes = (
-            build_publisher_route_report(papers).model_dump() if route_publishers_enabled else None
-        )
-        if publisher_routes is not None:
-            _trace_direct(
-                workflow_trace,
-                "route_publishers",
-                "route_publishers_enabled=True，识别出版商路线。",
-                outputs={"route_count": len(publisher_routes.get("routes", []))},
-            )
-        parse_report = None
-        if parse_full_text_enabled:
-            workspace, parse_report = parse_workspace_papers(workspace, config)
-            _trace_direct(
-                workflow_trace,
-                "parse_full_text",
-                "parse_full_text_enabled=True，解析全文。",
-                inputs={"parse_strategy": config.parsing.parse_strategy},
-                outputs={
-                    "parsed_count": parse_report.get("parsed_count"),
-                    "failed_count": parse_report.get("failed_count"),
-                    "missing_pdf_count": parse_report.get("missing_pdf_count"),
-                },
-            )
-        table_harness = None
-        comparison_matrix = None
-        if extract_tables_enabled:
-            workspace, harness = await extract_performance_cells(workspace, config)
-            table_harness = harness.model_dump()
-            comparison_matrix = build_comparison_matrices(workspace)
-            _trace_direct(
-                workflow_trace,
-                "extract_tables",
-                "extract_tables_enabled=True，抽取性能指标。",
-                outputs={"cell_count": len(workspace.performance_cells)},
-            )
-        storyline = build_storyline_from_workspace(workspace) if build_storyline_enabled else None
-        if storyline is not None:
-            _trace_direct(
-                workflow_trace,
-                "build_storyline",
-                "build_storyline_enabled=True，构建发展脉络。",
-                outputs={"claim_count": len(storyline)},
-            )
-        document_report = None
-        if compose_document_enabled:
-            document_report = build_research_document_report(workspace, config)
-            workspace.context.filters.document_report = document_report.model_dump(mode="json")
-            _trace_direct(
-                workflow_trace,
-                "compose_document",
-                "compose_document_enabled=True，生成报告。",
-                outputs={"section_count": len(document_report.sections)},
-            )
-        autonomous_loop_report = None
-        if autonomous_review_enabled:
-            autonomous_loop_report = await run_autonomous_research_loop(
-                config,
-                request.topic,
-                workspace,
-                auto_replan=auto_replan_enabled,
-            )
-            workspace.context.filters.autonomous_loop_report = autonomous_loop_report.model_dump(
-                mode="json"
-            )
-            _trace_direct(
-                workflow_trace,
-                "autonomous_review",
-                "autonomous_review_enabled=True，执行多 Agent 复核。",
-                outputs={"round_count": len(autonomous_loop_report.rounds)},
-            )
-        logger.info(
-            "run_research_graph_done",
-            extra={"path": "fallback", "papers": len(workspace.context.active_papers)},
-        )
-        return ResearchRunResult(
-            workspace=workspace,
-            citation_audit=citation_audit,
-            download_plan=download_plan,
-            publisher_routes=publisher_routes,
-            agent_interactions=build_agent_interaction_report(workspace),
-            parse_report=parse_report,
-            table_harness=table_harness,
-            comparison_matrix=comparison_matrix,
-            storyline=storyline,
-            document_report=document_report,
-            autonomous_loop_report=autonomous_loop_report,
-            workflow_trace=workflow_trace,
-        )
-
     with timed("graph_ainvoke"):
         state = await graph.ainvoke(
             {
                 "request": request,
                 "config": config,
+                "tool_context": context,
+                "tool_ledger": ledger,
+                "tool_policy": tool_policy,
                 "audit_citations_enabled": audit_citations_enabled,
                 "plan_downloads_enabled": plan_downloads_enabled,
                 "route_publishers_enabled": route_publishers_enabled,
@@ -658,148 +652,3 @@ async def run_research_graph(
         autonomous_loop_report=state.get("autonomous_loop_report"),
         workflow_trace=state.get("workflow_trace"),
     )
-
-
-def _trace_step(
-    state: ResearchWorkflowState,
-    node: str,
-    status: str,
-    reason: str,
-    inputs: dict[str, object] | None = None,
-    outputs: dict[str, object] | None = None,
-    next_node: str | None = None,
-    next_reason: str | None = None,
-) -> None:
-    trace = state.setdefault("workflow_trace", WorkflowTrace())
-    trace.steps.append(
-        WorkflowTraceStep(
-            node=node,
-            status=status,
-            reason=reason,
-            inputs=inputs or {},
-            outputs=outputs or {},
-            next_node=next_node,
-            next_reason=next_reason,
-        )
-    )
-
-
-def _trace_direct(
-    trace: WorkflowTrace,
-    node: str,
-    reason: str,
-    status: str = "completed",
-    inputs: dict[str, object] | None = None,
-    outputs: dict[str, object] | None = None,
-) -> None:
-    trace.steps.append(
-        WorkflowTraceStep(
-            node=node,
-            status=status,
-            reason=reason,
-            inputs=inputs or {},
-            outputs=outputs or {},
-        )
-    )
-
-
-def _first_enabled(
-    state: ResearchWorkflowState, candidates: list[tuple[str, str]]
-) -> tuple[str | None, str]:
-    for flag, node in candidates:
-        if state.get(flag, False):
-            return node, f"{flag}=True，因此进入 {node}。"
-    return None, "后续可选节点均未启用，流程结束。"
-
-
-def _next_after_search(state: ResearchWorkflowState) -> tuple[str | None, str]:
-    return _first_enabled(
-        state,
-        [
-            ("audit_citations_enabled", "audit_citations"),
-            ("plan_downloads_enabled", "plan_downloads"),
-            ("route_publishers_enabled", "route_publishers"),
-            ("parse_full_text_enabled", "parse_full_text"),
-            ("extract_tables_enabled", "extract_tables"),
-            ("build_storyline_enabled", "build_storyline"),
-            ("compose_document_enabled", "compose_document"),
-            ("autonomous_review_enabled", "autonomous_review"),
-        ],
-    )
-
-
-def _next_after_audit(state: ResearchWorkflowState) -> tuple[str | None, str]:
-    return _first_enabled(
-        state,
-        [
-            ("plan_downloads_enabled", "plan_downloads"),
-            ("route_publishers_enabled", "route_publishers"),
-            ("parse_full_text_enabled", "parse_full_text"),
-            ("extract_tables_enabled", "extract_tables"),
-            ("build_storyline_enabled", "build_storyline"),
-            ("compose_document_enabled", "compose_document"),
-            ("autonomous_review_enabled", "autonomous_review"),
-        ],
-    )
-
-
-def _next_after_download_plan(state: ResearchWorkflowState) -> tuple[str | None, str]:
-    return _first_enabled(
-        state,
-        [
-            ("route_publishers_enabled", "route_publishers"),
-            ("parse_full_text_enabled", "parse_full_text"),
-            ("compose_document_enabled", "compose_document"),
-            ("autonomous_review_enabled", "autonomous_review"),
-        ],
-    )
-
-
-def _next_after_publisher_routes(state: ResearchWorkflowState) -> tuple[str | None, str]:
-    return _first_enabled(
-        state,
-        [
-            ("parse_full_text_enabled", "parse_full_text"),
-            ("extract_tables_enabled", "extract_tables"),
-            ("build_storyline_enabled", "build_storyline"),
-            ("compose_document_enabled", "compose_document"),
-            ("autonomous_review_enabled", "autonomous_review"),
-        ],
-    )
-
-
-def _next_after_parse(state: ResearchWorkflowState) -> tuple[str | None, str]:
-    return _first_enabled(
-        state,
-        [
-            ("extract_tables_enabled", "extract_tables"),
-            ("build_storyline_enabled", "build_storyline"),
-            ("compose_document_enabled", "compose_document"),
-            ("autonomous_review_enabled", "autonomous_review"),
-        ],
-    )
-
-
-def _next_after_extract_tables(state: ResearchWorkflowState) -> tuple[str | None, str]:
-    return _first_enabled(
-        state,
-        [
-            ("build_storyline_enabled", "build_storyline"),
-            ("compose_document_enabled", "compose_document"),
-            ("autonomous_review_enabled", "autonomous_review"),
-        ],
-    )
-
-
-def _next_after_storyline(state: ResearchWorkflowState) -> tuple[str | None, str]:
-    return _first_enabled(
-        state,
-        [
-            ("compose_document_enabled", "compose_document"),
-            ("autonomous_review_enabled", "autonomous_review"),
-        ],
-    )
-
-
-def _next_after_document(state: ResearchWorkflowState) -> tuple[str | None, str]:
-    return _first_enabled(state, [("autonomous_review_enabled", "autonomous_review")])

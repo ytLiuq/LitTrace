@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi import APIRouter
+
+from littrace.eval_api import (
+    EvalMetricReport,
+    full_text_metrics_from_workspace,
+    parsing_metrics,
+    retrieval_metrics,
+    storyline_metrics,
+)
+from littrace.evaluation.golden_eval import GoldenEvalReport, run_golden_eval
+from littrace.evaluation.pdf_benchmark import (
+    LivePDFBenchmarkReport,
+    PDFBenchmarkReport,
+    benchmark_pdf_parsing,
+    benchmark_single_pdf,
+)
+from littrace.rerank_learning import RerankLearningReport, learn_rerank_policy_from_golden
+from littrace.evaluation.quality_report import QualityReport
+from littrace.evaluation.retrieval_eval import RetrievalEvalReport, run_retrieval_golden_eval
+from littrace.skill_runner import build_quality_report_skill
+
+
+class _AppProxy:
+    def __getattr__(self, name: str):
+        from littrace.api import app as api_app
+
+        return getattr(api_app, name)
+
+
+api_app = _AppProxy()
+
+router = APIRouter()
+
+
+@router.post("/eval/retrieval", response_model=EvalMetricReport)
+def eval_retrieval(topic: str | None = None) -> EvalMetricReport:
+    config = api_app.load_config()
+    return EvalMetricReport(
+        run_id="preview",
+        topic=topic,
+        metrics=retrieval_metrics(workspace=api_app.WORKSPACE, config=config),
+    )
+
+
+@router.post("/eval/pdf-parsing", response_model=EvalMetricReport)
+def eval_pdf_parsing(topic: str | None = None) -> EvalMetricReport:
+    config = api_app.load_config()
+    return EvalMetricReport(
+        run_id="preview",
+        topic=topic,
+        metrics=parsing_metrics(workspace=api_app.WORKSPACE, config=config),
+    )
+
+
+@router.get("/eval/pdf-benchmark", response_model=PDFBenchmarkReport)
+def eval_pdf_benchmark() -> PDFBenchmarkReport:
+    return benchmark_pdf_parsing(api_app.WORKSPACE, api_app.load_config())
+
+
+@router.post("/eval/pdf-benchmark/file", response_model=LivePDFBenchmarkReport)
+def eval_pdf_benchmark_file(path: str, parse_strategy: str | None = None) -> LivePDFBenchmarkReport:
+    return benchmark_single_pdf(Path(path), api_app.load_config(), parse_strategy=parse_strategy)
+
+
+@router.get("/eval/full-text", response_model=EvalMetricReport)
+def eval_full_text() -> EvalMetricReport:
+    return EvalMetricReport(
+        run_id="preview", metrics=full_text_metrics_from_workspace(api_app.WORKSPACE)
+    )
+
+
+@router.post("/eval/storyline", response_model=EvalMetricReport)
+def eval_storyline(topic: str | None = None) -> EvalMetricReport:
+    return EvalMetricReport(
+        run_id="preview", topic=topic, metrics=storyline_metrics(workspace=api_app.WORKSPACE)
+    )
+
+
+@router.post("/eval/end-to-end", response_model=EvalMetricReport)
+def eval_end_to_end(topic: str | None = None) -> EvalMetricReport:
+    config = api_app.load_config()
+    metrics = {}
+    metrics.update(retrieval_metrics(workspace=api_app.WORKSPACE, config=config))
+    metrics.update(parsing_metrics(workspace=api_app.WORKSPACE, config=config))
+    metrics.update(storyline_metrics(workspace=api_app.WORKSPACE))
+    metrics.update(full_text_metrics_from_workspace(api_app.WORKSPACE))
+    return EvalMetricReport(run_id="preview", topic=topic, metrics=metrics)
+
+
+@router.get("/eval/golden", response_model=GoldenEvalReport)
+def eval_golden() -> GoldenEvalReport:
+    return run_golden_eval(api_app.load_config(), api_app.WORKSPACE)
+
+
+@router.get("/eval/retrieval-golden", response_model=RetrievalEvalReport)
+async def eval_retrieval_golden(live: bool = True) -> RetrievalEvalReport:
+    return await run_retrieval_golden_eval(api_app.load_config(), live=live)
+
+
+@router.get("/eval/rerank-learn", response_model=RerankLearningReport)
+async def eval_rerank_learn(live: bool = True) -> RerankLearningReport:
+    return await learn_rerank_policy_from_golden(api_app.load_config(), live=live)
+
+
+@router.get("/quality", response_model=QualityReport)
+def quality() -> QualityReport:
+    return build_quality_report_skill(api_app.load_config(), api_app.WORKSPACE)

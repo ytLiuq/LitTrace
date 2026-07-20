@@ -6,7 +6,7 @@ from html import unescape
 import httpx
 from pydantic import BaseModel, Field, HttpUrl
 
-from littrace.cache import cache_key, read_text_cache, write_text_cache
+from littrace.cache import cache_key, read_cached_text, write_text_cache
 from littrace.config import LitTraceConfig
 from littrace.context import add_papers
 from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata
@@ -64,9 +64,9 @@ async def fetch_publisher_search_results(
     plan: PublisherSearchPlan,
 ) -> PublisherRetrievalResult:
     key = cache_key(str(plan.query_url))
-    cached = read_text_cache(config, "publisher_search", key)
-    if cached is not None:
-        return parse_publisher_search_html(plan, cached)
+    cached = read_cached_text(config, "publisher_search", key)
+    if cached.value is not None:
+        return parse_publisher_search_html(plan, cached.value)
 
     timeout = httpx.Timeout(config.api.request_timeout_seconds)
     headers = {"User-Agent": config.api.user_agent}
@@ -77,6 +77,16 @@ async def fetch_publisher_search_results(
             response = await client.get(str(plan.query_url))
             response.raise_for_status()
     except httpx.HTTPError as exc:
+        stale = read_cached_text(
+            config,
+            "publisher_search",
+            key,
+            allow_stale=config.cache_policy.allow_stale_on_source_failure,
+        )
+        if stale.value is not None:
+            result = parse_publisher_search_html(plan, stale.value)
+            result.warnings.append("source_unavailable; returned stale cached response")
+            return result
         return PublisherRetrievalResult(
             publisher_family=plan.publisher_family,
             query_url=plan.query_url,

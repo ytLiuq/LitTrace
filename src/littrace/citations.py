@@ -7,7 +7,7 @@ import httpx
 
 from littrace.cache import cache_key, read_text_cache, write_text_cache
 from littrace.config import LitTraceConfig
-from littrace.harnesses import check_citations
+from littrace.evaluation.harnesses import check_citations
 from littrace.models import CitationAudit, CitationRecord, LinkStatus, PaperMetadata
 
 
@@ -37,7 +37,9 @@ async def audit_citation_links(
     records = citation_records_for_papers(papers)
     timeout = httpx.Timeout(config.api.request_timeout_seconds)
     headers = {"User-Agent": config.api.user_agent}
-    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout, headers=headers, follow_redirects=False
+    ) as client:
         checked_records = [await check_link(client, record, config) for record in records]
     result = check_citations(checked_records)
     return CitationAudit(

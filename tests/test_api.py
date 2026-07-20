@@ -97,7 +97,9 @@ def test_search_context_and_download_plan_api(monkeypatch):
     assert response.status_code == 200
     assert response.json()["plans"]
 
-    response = client.get("/publishers/browser-plan", params={"topic": "MXene sensor", "family": "acs"})
+    response = client.get(
+        "/publishers/browser-plan", params={"topic": "MXene sensor", "family": "acs"}
+    )
     assert response.status_code == 200
     assert response.json()["extract_selectors"]
 
@@ -177,6 +179,8 @@ def test_search_context_and_download_plan_api(monkeypatch):
     response = client.get("/storyline/report")
     assert response.status_code == 200
     assert "markdown" in response.json()
+    assert response.json()["release_ready"] is False
+    assert "DRAFT - NOT FOR PUBLICATION" in response.json()["markdown"]
 
     response = client.get("/storyline/review")
     assert response.status_code == 200
@@ -198,13 +202,18 @@ def test_search_context_and_download_plan_api(monkeypatch):
 
     response = client.post(f"/sessions/{session_id}/export")
     assert response.status_code == 200
-    assert "markdown" in response.json()
+    export = response.json()
+    assert export["release_ready"] == "false"
+    assert "markdown_draft" in export
+    assert "research_report" not in export
 
 
 def test_chat_api_reports_missing_intent_parser_key(monkeypatch):
     monkeypatch.setattr(
         "littrace.api.app.load_config",
-        lambda: LitTraceConfig(llm=LLMConfig(api_key=None, enabled=True, intent_parser_enabled=True)),
+        lambda: LitTraceConfig(
+            llm=LLMConfig(api_key=None, enabled=True, intent_parser_enabled=True)
+        ),
     )
     client = TestClient(app)
 

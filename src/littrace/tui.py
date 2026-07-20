@@ -9,7 +9,7 @@ from littrace.chat import handle_chat
 from littrace.config import load_config
 from littrace.models import ChatRequest, LiteratureWorkspace
 from littrace.session import append_message, create_chat_session, save_workspace
-from littrace.tables import decide_artifact_extraction_need
+from littrace.evidence.tables import decide_artifact_extraction_need
 
 
 @dataclass

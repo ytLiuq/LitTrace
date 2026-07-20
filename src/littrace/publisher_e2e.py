@@ -6,13 +6,14 @@ import time
 import httpx
 from pydantic import BaseModel, Field
 
-from littrace.cdp_downloader import CDPDownloadResult, download_paper_via_cdp
+from littrace.access_layer.cdp import CDPDownloadResult, download_paper_via_cdp
 from littrace.config import LitTraceConfig
 from littrace.context import add_papers
-from littrace.full_text import fetch_crossref_paper_by_doi, resolve_full_text_for_paper
-from littrace.golden_eval import _load_cases
-from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata
-from littrace.parsing import local_pdf_path, parse_workspace_papers
+from littrace.retrieval.full_text import fetch_crossref_paper_by_doi, resolve_full_text_for_paper
+from littrace.evaluation.golden_eval import _load_cases
+from littrace.models import AccessType, LiteratureWorkspace
+from littrace.evidence.parsing import local_pdf_path
+from littrace.skill_runner import parse_workspace_skill
 
 
 class PublisherE2EPaperResult(BaseModel):
@@ -134,7 +135,7 @@ async def run_interactive_publisher_e2e(
         if download.downloaded:
             workspace = add_papers(LiteratureWorkspace(), [paper])
             workspace.full_text_reports[paper.paper_id] = report
-            workspace, parse_report = parse_workspace_papers(workspace, config)
+            workspace, parse_report = await parse_workspace_skill(workspace, config)
             return _interactive_report(
                 doi=doi,
                 download=download,
@@ -170,7 +171,9 @@ async def _run_one_publisher_e2e(
 ) -> PublisherE2EPaperResult:
     paper = await fetch_crossref_paper_by_doi(client, doi)
     if paper is None:
-        return PublisherE2EPaperResult(case_id=case_id, doi=doi, error="Crossref DOI lookup failed.")
+        return PublisherE2EPaperResult(
+            case_id=case_id, doi=doi, error="Crossref DOI lookup failed."
+        )
     report = await resolve_full_text_for_paper(client, paper, config)
     paper.pdf_url = report.best_pdf_url or paper.pdf_url
 
@@ -191,7 +194,7 @@ async def _run_one_publisher_e2e(
             warnings=[*report.warnings, *download.warnings],
         )
 
-    workspace, parse_report = parse_workspace_papers(workspace, config)
+    workspace, parse_report = await parse_workspace_skill(workspace, config)
     parsed = bool(parse_report.get("parsed_count"))
     return PublisherE2EPaperResult(
         case_id=case_id,

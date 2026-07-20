@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from littrace.chat import _format_search_result_reply, handle_chat
@@ -6,8 +8,11 @@ from littrace.context import add_papers
 from littrace.llm import LLMReply
 from littrace.models import (
     ChatRequest,
+    AutonomousResearchLoopReport,
+    EvidenceSpan,
     LiteratureWorkspace,
     PaperMetadata,
+    PerformanceCell,
     ResearchRunResult,
     WorkflowTrace,
 )
@@ -15,6 +20,26 @@ from littrace.models import (
 
 def _mock_llm_reply(monkeypatch, text="这是一个包含引用与访问链接的研究回答。", used_llm=True):
     async def _fake_chat(config, system_prompt, user_message, workspace=None, **kwargs):
+        if "LitTrace Research Writer" in system_prompt:
+            evidence_id = next(
+                line.split("evidence_id=", 1)[1].split(";", 1)[0]
+                for line in user_message.splitlines()
+                if "evidence_id=metric:" in line
+            )
+            return LLMReply(
+                text=json.dumps(
+                    {
+                        "claims": [
+                            {
+                                "text": text,
+                                "evidence_ids": [evidence_id],
+                                "support_quotes": {evidence_id: "Sensitivity reached 12.5 kPa-1."},
+                            }
+                        ]
+                    }
+                ),
+                used_llm=used_llm,
+            )
         return LLMReply(text=text, used_llm=used_llm)
 
     monkeypatch.setattr("littrace.research_writer.chat_completion", _fake_chat)
@@ -68,6 +93,49 @@ async def test_chat_research_request_runs_search_instead_of_help():
     assert response.action == "search"
     assert workspace.context.active_papers
     assert "mock/开发样例检索" in response.reply
+
+
+@pytest.mark.anyio
+async def test_chat_merges_pending_ambiguous_intent():
+    response, workspace = await handle_chat(
+        ChatRequest(message="检索", live=False),
+        LiteratureWorkspace(),
+        _offline_config(),
+    )
+
+    assert response.action == "clarify_intent"
+    assert workspace.context.filters.pending_intent is not None
+
+    response, workspace = await handle_chat(
+        ChatRequest(message="MXene 柔性压力传感器", live=False),
+        workspace,
+        _offline_config(),
+    )
+
+    assert response.action == "search"
+    assert response.intent_confidence is not None
+    assert response.intent_confidence >= 0.76
+    assert workspace.context.filters.pending_intent is None
+
+
+@pytest.mark.anyio
+async def test_chat_can_cancel_pending_intent():
+    response, workspace = await handle_chat(
+        ChatRequest(message="检索", live=False),
+        LiteratureWorkspace(),
+        _offline_config(),
+    )
+
+    assert response.action == "clarify_intent"
+
+    response, workspace = await handle_chat(
+        ChatRequest(message="取消", live=False),
+        workspace,
+        _offline_config(),
+    )
+
+    assert response.action == "cancel_pending_intent"
+    assert workspace.context.filters.pending_intent is None
 
 
 def test_search_reply_mentions_expanded_year_range():
@@ -131,6 +199,19 @@ async def test_search_only_with_full_text_evidence_returns_answer_not_metrics(mo
             "parsed": True,
             "sections": [{"name": "Results", "text": "Full text evidence."}],
         }
+    workspace.performance_cells.append(
+        PerformanceCell(
+            paper_id="p1",
+            metric="sensitivity",
+            value=12.5,
+            unit="kPa-1",
+            evidence=EvidenceSpan(
+                paper_id="p1",
+                page=4,
+                snippet="Sensitivity reached 12.5 kPa-1.",
+            ),
+        )
+    )
 
     async def fake_run_research_graph(*_args, **_kwargs):
         return ResearchRunResult(workspace=workspace, workflow_trace=WorkflowTrace())
@@ -318,6 +399,19 @@ async def test_chat_runs_autonomous_review_loop(monkeypatch):
         "sections": [{"name": "Results", "text": "Key evidence for review."}],
     }
     workspace.context.filters.search_mode = "live"
+    workspace.performance_cells.append(
+        PerformanceCell(
+            paper_id="p1",
+            metric="sensitivity",
+            value=12.5,
+            unit="kPa-1",
+            evidence=EvidenceSpan(
+                paper_id="p1",
+                page=4,
+                snippet="Sensitivity reached 12.5 kPa-1.",
+            ),
+        )
+    )
 
     _mock_llm_reply(monkeypatch, text="多 agent 审稿后的研究结论。")
 
@@ -332,3 +426,31 @@ async def test_chat_runs_autonomous_review_loop(monkeypatch):
     assert response.action == "autonomous_review"
     assert "多 agent 审稿" in response.reply
     assert workspace.context.filters.autonomous_loop_report is not None
+    assert "未输出修订后的研究结论" in response.reply
+    assert "多 agent 审稿后的研究结论。" not in response.reply
+    assert workspace.context.filters.autonomous_loop_report["release_ready"] is False
+
+
+@pytest.mark.anyio
+async def test_chat_hides_unreleased_autonomous_answer(monkeypatch):
+    async def fake_autonomous_loop(*args, **kwargs):
+        return AutonomousResearchLoopReport(
+            objective="复核",
+            final_answer="不应直接展示的未发布结论。",
+            passed=False,
+            score=0.1,
+            release_ready=False,
+            release_blockers=["Claim verification blocks release."],
+        )
+
+    monkeypatch.setattr("littrace.chat.run_autonomous_research_loop", fake_autonomous_loop)
+    response, workspace = await handle_chat(
+        ChatRequest(message="请多轮反驳并修订当前结论"),
+        LiteratureWorkspace(),
+        LitTraceConfig(llm=LLMConfig(intent_parser_enabled=False)),
+    )
+
+    assert response.action == "autonomous_review"
+    assert "自主审查结果未通过最终发布门禁" in response.reply
+    assert "不应直接展示的未发布结论。" not in response.reply
+    assert workspace.context.filters.autonomous_loop_report["release_ready"] is False

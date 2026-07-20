@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from littrace.models import LiteratureWorkspace, PaperMetadata
+from littrace.models import EvidenceSpan, LiteratureWorkspace, PaperMetadata, PerformanceCell
 from littrace.tables import (
     build_comparison_matrices,
     decide_artifact_extraction_need,
@@ -254,6 +254,62 @@ def test_build_comparison_matrices_marks_mixed_units_not_comparable():
     assert not any("Mixed units" in warning for warning in report.matrices[0].warnings)
     assert report.matrices[0].rows[0].unit == "ms"
     assert report.matrices[0].rows[1].value == 1000.0
+
+
+def test_comparison_matrix_reports_missing_experimental_conditions():
+    workspace = LiteratureWorkspace(
+        performance_cells=[
+            PerformanceCell(
+                paper_id="p1",
+                metric="sensitivity",
+                value=12.5,
+                unit="kPa-1",
+                evidence=EvidenceSpan(
+                    paper_id="p1", page=2, snippet="Sensitivity reached 12.5 kPa-1."
+                ),
+            )
+        ]
+    )
+
+    report = build_comparison_matrices(workspace)
+
+    assert any(
+        "Experimental conditions are incomplete" in warning
+        for warning in report.matrices[0].warnings
+    )
+
+
+def test_comparison_matrix_marks_mixed_conditions_and_tasks_not_comparable():
+    workspace = LiteratureWorkspace(
+        performance_cells=[
+            PerformanceCell(
+                paper_id="p1",
+                metric="sensitivity",
+                value=12.0,
+                unit="kPa-1",
+                task="pressure sensing",
+                conditions={"test_protocol": "cyclic loading", "environment": "room temperature"},
+                evidence=EvidenceSpan(paper_id="p1", page=2, snippet="Sensitivity was 12 kPa-1."),
+            ),
+            PerformanceCell(
+                paper_id="p2",
+                metric="sensitivity",
+                value=20.0,
+                unit="kPa-1",
+                task="strain sensing",
+                conditions={"test_protocol": "tensile test", "environment": "humidity-controlled"},
+                evidence=EvidenceSpan(paper_id="p2", page=2, snippet="Sensitivity was 20 kPa-1."),
+            ),
+        ]
+    )
+
+    report = build_comparison_matrices(workspace)
+
+    assert all(not row.comparable for row in report.matrices[0].rows)
+    assert any("Mixed tasks" in warning for warning in report.matrices[0].warnings)
+    assert any(
+        "Experimental conditions differ" in warning for warning in report.matrices[0].warnings
+    )
 
 
 def test_extract_materials_chemistry_metrics(monkeypatch):

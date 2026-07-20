@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from littrace.citation_guard import guard_citations, remove_unsupported_sentences
 from littrace.config import LitTraceConfig
-from littrace.harnesses import check_performance_cells, check_storyline_claims
+from littrace.evaluation.harnesses import check_performance_cells, check_storyline_claims
 from littrace.llm import chat_completion
 from littrace.log import get_logger
 from littrace.models import (
@@ -16,11 +16,14 @@ from littrace.models import (
     LiteratureWorkspace,
     coerce_parsed,
 )
-from littrace.quality_report import build_quality_report
+from littrace.publication import evaluate_publication
 from littrace.research_writer import write_evidence_grounded_answer
-from littrace.storyline import build_storyline_from_workspace
-from littrace.parsing import parse_workspace_papers
-from littrace.tables import extract_performance_cells
+from littrace.skill_runner import (
+    build_quality_report_skill,
+    build_storyline_skill,
+    extract_tables_skill,
+    parse_workspace_skill,
+)
 
 logger = get_logger("autonomous_loop")
 
@@ -133,15 +136,32 @@ async def run_autonomous_research_loop(
         if passed:
             break
 
+    publication = evaluate_publication(workspace, config)
+    final_citation_report = guard_citations(final_answer, workspace)
+    release_blockers = list(publication.release_blockers)
+    if not final_citation_report.passed:
+        release_blockers.append(
+            "Final autonomous answer has unsupported citation-bearing sentences."
+        )
+    release_ready = not release_blockers
+    if not release_ready:
+        final_answer = (
+            "当前多 agent 修订结果未通过最终发布检查，不能作为研究结论输出。"
+            "请根据以下阻断项补充或核对证据：\n"
+            + "\n".join(f"- {blocker}" for blocker in release_blockers[:5])
+        )
+
     return AutonomousResearchLoopReport(
         objective=objective,
         final_answer=final_answer,
         rounds=rounds,
-        passed=passed,
+        passed=passed and release_ready,
         score=round(final_score, 3),
         replan_actions=aggregate_actions,
         executed_replan_actions=aggregate_executed_actions,
-        warnings=aggregate_warnings,
+        warnings=[*aggregate_warnings, *final_citation_report.warnings],
+        release_ready=release_ready,
+        release_blockers=release_blockers,
     )
 
 
@@ -173,7 +193,7 @@ def _review_draft(
             )
         )
 
-    storyline_claims = build_storyline_from_workspace(workspace)
+    storyline_claims = build_storyline_skill(workspace)
     storyline_harness = check_storyline_claims(storyline_claims)
     for finding in storyline_harness.errors:
         critiques.append(
@@ -224,7 +244,7 @@ def _review_draft(
                 )
             )
 
-    quality = build_quality_report(config, workspace)
+    quality = build_quality_report_skill(config, workspace)
     if quality.metrics.get("parsed_rate", 0.0) == 0 and workspace.context.active_papers:
         critiques.append(
             AgentCritique(
@@ -384,7 +404,7 @@ def _round_score(
     workspace: LiteratureWorkspace,
     config: LitTraceConfig,
 ) -> float:
-    quality = build_quality_report(config, workspace)
+    quality = build_quality_report_skill(config, workspace)
     score = 0.62
     score += 0.12 * quality.metrics.get("citation_guard_pass", 0.0)
     score += 0.08 * quality.metrics.get("parsed_rate", 0.0)
@@ -420,14 +440,14 @@ async def _execute_safe_replan_actions(
 ) -> tuple[LiteratureWorkspace, list[str]]:
     executed: list[str] = []
     if "parse_full_text_with_paddleocr" in actions:
-        workspace, report = parse_workspace_papers(workspace, config)
+        workspace, report = await parse_workspace_skill(workspace, config)
         if report.get("parsed_count", 0):
             executed.append("parse_full_text_with_paddleocr")
     if "extract_tables_and_structured_artifacts" in actions:
-        workspace, _ = await extract_performance_cells(workspace, config)
+        workspace, _ = await extract_tables_skill(workspace, config)
         executed.append("extract_tables_and_structured_artifacts")
     if "rebuild_storyline_from_parsed_evidence" in actions:
-        claims = build_storyline_from_workspace(workspace)
+        claims = build_storyline_skill(workspace)
         workspace.context.filters.storyline_claim_count = len(claims)
         executed.append("rebuild_storyline_from_parsed_evidence")
     if "rerun_citation_guard_after_revision" in actions:

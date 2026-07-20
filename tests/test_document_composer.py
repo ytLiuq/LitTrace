@@ -1,7 +1,14 @@
-from littrace.config import LitTraceConfig
+from littrace.config import LitTraceConfig, PublicationPolicyConfig
 from littrace.context import add_papers
 from littrace.document_composer import build_research_document_report
-from littrace.models import EvidenceSpan, LiteratureWorkspace, PaperMetadata, PerformanceCell
+from littrace.models import (
+    ClaimStatus,
+    EvidenceSpan,
+    LiteratureWorkspace,
+    PaperMetadata,
+    ParsedPaper,
+    PerformanceCell,
+)
 
 
 def test_document_report_is_citation_and_evidence_backed():
@@ -62,8 +69,100 @@ def test_document_report_is_citation_and_evidence_backed():
     assert "## 方法与证据来源" in report.markdown
     assert "## 多 Agent 复核与修订" in report.markdown
     assert "Evidence Reviewer" in report.markdown
+    assert "修订后的保守结论。" not in report.markdown
     assert "## 局限性与下一步" in report.markdown
     assert "https://doi.org/10.1021/example" in report.markdown
     assert "sensitivity reached 12.5" in report.markdown
     assert report.evidence_count >= 2
     assert report.citation_records[0].paper_id == "p1"
+    assert report.release_ready
+    assert report.quality_metrics["verified_claim_count"] == 1.0
+    assert "## Claim Verification" in report.markdown
+    assert "**verified**" in report.markdown
+    assert report.release_snapshot is not None
+    assert report.release_snapshot.release_ready
+    assert report.release_snapshot.report_hash
+    assert report.release_snapshot.config_hash
+
+
+def test_document_report_marks_single_source_storyline_as_supported():
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [PaperMetadata(paper_id="p1", title="Method Paper", year=2025)],
+    )
+    workspace.parsed_papers["p1"] = ParsedPaper(
+        parsed=True,
+        sections=[
+            {
+                "name": "Methods",
+                "text": "The fabrication method was optimized for a flexible sensor.",
+                "evidence": {"page": 3, "parser": "pymupdf"},
+            }
+        ],
+    )
+
+    report = build_research_document_report(workspace, LitTraceConfig())
+
+    assert not report.release_ready
+    assert any(item.status == ClaimStatus.SUPPORTED for item in report.verification_reports)
+    assert "Automatic semantic verification requires an exact asserted quote" in report.markdown
+    assert "DRAFT - NOT FOR PUBLICATION" in report.markdown
+
+
+def test_document_report_blocks_untraceable_metric_claims():
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [PaperMetadata(paper_id="p1", title="Untraceable Metric", year=2025)],
+    )
+    workspace.performance_cells.append(
+        PerformanceCell(
+            paper_id="p1",
+            metric="sensitivity",
+            value=4.2,
+            evidence=EvidenceSpan(paper_id="p1"),
+        )
+    )
+
+    report = build_research_document_report(workspace, LitTraceConfig())
+
+    assert not report.release_ready
+    assert report.verification_reports[0].status == ClaimStatus.CANDIDATE
+    assert report.release_blockers
+    assert report.quality_metrics["non_publishable_claim_count"] == 1.0
+    assert "Release gate: **blocked**" in report.markdown
+
+
+def test_non_strict_policy_can_publish_verified_sections_with_withheld_claims():
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [PaperMetadata(paper_id="p1", title="Method Paper", year=2025)],
+    )
+    workspace.performance_cells.append(
+        PerformanceCell(
+            paper_id="p1",
+            metric="sensitivity",
+            value=4.2,
+            unit="kPa-1",
+            evidence=EvidenceSpan(paper_id="p1", page=4, snippet="Sensitivity reached 4.2 kPa-1."),
+        )
+    )
+    workspace.parsed_papers["p1"] = ParsedPaper(
+        parsed=True,
+        sections=[
+            {
+                "name": "Methods",
+                "text": "The fabrication method was optimized for a flexible sensor.",
+                "evidence": {"page": 3, "parser": "pymupdf"},
+            }
+        ],
+    )
+
+    report = build_research_document_report(
+        workspace,
+        LitTraceConfig(publication_policy=PublicationPolicyConfig(strict_all_claims=False)),
+    )
+
+    assert report.release_ready
+    assert any(not item.publishable for item in report.verification_reports)
+    assert "fabrication method was optimized" not in report.markdown
+    assert "Publication: withheld pending verification" in report.markdown
