@@ -20,6 +20,7 @@ from littrace.sentinel.storage import (
     timestamp_run_id,
     touch_run_dir,
 )
+from littrace.retrieval.rag_refresh import refresh_session_rag_index
 from littrace.skill_runner import (
     build_quality_report_skill,
     execute_downloads_skill,
@@ -108,12 +109,13 @@ class LiteratureSentinelAgent:
         workspace, parse_report = await parse_workspace_skill(workspace, self.config)
         workspace, table_harness = await extract_tables_skill(workspace, self.config)
         quality_report = build_quality_report_skill(self.config, workspace)
-
         quality_warnings = [
             *quality_report.warnings,
             *table_harness.warnings,
             *parse_report.get("warnings", []),
         ]
+        _, rag_refresh_report = await refresh_session_rag_index(self.config, self.store, workspace)
+        quality_warnings = [*quality_warnings, *rag_refresh_report.warnings]
         resource_pack = build_resource_pack(
             workspace,
             state,
@@ -126,7 +128,7 @@ class LiteratureSentinelAgent:
         finished_at = datetime.now().isoformat(timespec="seconds")
         state.last_run_at = finished_at
         state.warnings = quality_warnings
-        save_sentinel_workspace(self.store, workspace)
+        save_sentinel_workspace(self.store, workspace, config=self.config)
         save_sentinel_state(self.store, state)
 
         summary = SentinelRunSummary(
@@ -185,9 +187,11 @@ class LiteratureSentinelAgent:
         if completed_ids:
             state.access_queue = [task for task in state.access_queue if task.paper_id not in completed_ids]
         state.warnings = [*state.warnings, *parse_report.get("warnings", [])]
+        _, rag_refresh_report = await refresh_session_rag_index(self.config, self.store, workspace)
+        state.warnings.extend(rag_refresh_report.warnings)
         finished_at = datetime.now().isoformat(timespec="seconds")
         state.last_run_at = finished_at
-        save_sentinel_workspace(self.store, workspace)
+        save_sentinel_workspace(self.store, workspace, config=self.config)
         save_sentinel_state(self.store, state)
         resource_pack = build_resource_pack(workspace, state, quality_warnings=list(state.warnings))
         resource_pack_file = save_resource_pack(self.store.root, resource_pack, run_id=run_id)

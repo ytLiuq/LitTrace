@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from littrace.models import LiteratureWorkspace, coerce_parsed
 from littrace.runtime.messages import AgentRunResult, ReActTrace
+from littrace.state_db import state_store_from_config
 
 if TYPE_CHECKING:
     from littrace.session import ChatSession
@@ -39,6 +40,8 @@ class WorkingMemory(BaseModel):
     selected_for_download: list[str] = Field(default_factory=list)
     search_mode: str | None = None
     topic: str | None = None
+    research_background: str | None = None
+    research_background_status: str | None = None
     structured_document_count: int = 0
     workspace_snapshot_count: int = 0
 
@@ -139,10 +142,25 @@ def save_session_memory(session: "ChatSession", memory: SessionMemory) -> Path:
         os.fsync(handle.fileno())
         temporary_path = Path(handle.name)
     os.replace(temporary_path, path)
+    store = _session_state_store(session)
+    if store is not None:
+        store.upsert_memory(
+            session.session_id,
+            user_id=session.user_id,
+            memory_json=memory.model_dump(mode="json"),
+        )
     return path
 
 
 def load_session_memory(session: "ChatSession") -> SessionMemory:
+    store = _session_state_store(session)
+    if store is not None:
+        loaded = store.load_memory(session.session_id, user_id=session.user_id)
+        if isinstance(loaded, dict):
+            try:
+                return SessionMemory.model_validate(loaded)
+            except Exception:
+                pass
     path = memory_path_for_session(session)
     if not path.exists():
         return SessionMemory(session_id=session.session_id)
@@ -150,6 +168,24 @@ def load_session_memory(session: "ChatSession") -> SessionMemory:
         return SessionMemory.model_validate_json(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return SessionMemory(session_id=session.session_id)
+
+
+def _session_state_store(session: "ChatSession"):
+    backend = getattr(session, "metadata_store_backend", "local_json")
+    dsn = getattr(session, "metadata_postgres_dsn", None)
+    schema_name = getattr(session, "metadata_schema_name", "littrace")
+    if backend != "postgres" or not dsn:
+        return None
+    config = {
+        "metadata_store": {
+            "backend": backend,
+            "postgres_dsn": dsn,
+            "schema_name": schema_name,
+        }
+    }
+    from littrace.config import LitTraceConfig
+
+    return state_store_from_config(LitTraceConfig.model_validate(config))
 
 
 def append_episode_from_agent_result(
@@ -169,6 +205,8 @@ def _working_memory_from_workspace(workspace: LiteratureWorkspace) -> WorkingMem
         selected_for_download=list(workspace.context.selected_for_download),
         search_mode=filters.search_mode,
         topic=filters.topic,
+        research_background=filters.research_background,
+        research_background_status=filters.research_background_status,
         structured_document_count=filters.structured_document_count,
         workspace_snapshot_count=filters.workspace_snapshot_count,
     )
@@ -228,6 +266,9 @@ def _preference_values_from_workspace(workspace: LiteratureWorkspace) -> dict[st
         values["download_selection_mode"] = "selected"
     if filters.search_mode:
         values["last_search_mode"] = filters.search_mode
+    if filters.research_background:
+        values["research_background"] = filters.research_background
+        values["research_topic"] = filters.topic
     if filters.source_routes:
         values["preferred_source_routes"] = list(filters.source_routes)
     if filters.docling_quality_reports:

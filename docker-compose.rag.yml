@@ -1,0 +1,29 @@
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: littrace-pgvector
+    environment:
+      POSTGRES_DB: littrace
+      POSTGRES_USER: littrace
+      POSTGRES_PASSWORD: littrace
+    ports:
+      - "5433:5432"
+    volumes:
+      - littrace_pgvector_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: littrace-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: littrace
+      MINIO_ROOT_PASSWORD: littrace123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - littrace_minio_data:/data
+
+volumes:
+  littrace_pgvector_data:
+  littrace_minio_data:

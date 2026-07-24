@@ -34,6 +34,14 @@ from littrace.retrieval.full_text import (
     backfill_workspace_by_dois,
     full_text_config_warnings,
 )
+from littrace.retrieval.rag_refresh import refresh_session_rag_index
+from littrace.retrieval.rag_search import search_session_rag
+from littrace.rag_jobs import (
+    iter_sentinel_watchlist_ids,
+    iter_workspace_session_ids,
+    run_daily_rag_daemon,
+    run_daily_rag_maintenance,
+)
 from littrace.evaluation.golden_eval import run_golden_eval
 from littrace.models import ChatRequest, LiteratureWorkspace
 from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
@@ -50,7 +58,13 @@ from littrace.sentinel.cli import access_review as sentinel_access_review
 from littrace.sentinel.cli import init_sentinel, run_sentinel
 from littrace.sentinel.cli import resume_after_login as sentinel_resume_after_login
 from littrace.sentinel.storage import get_sentinel_store, load_sentinel_state
-from littrace.session import append_message, create_chat_session, save_workspace
+from littrace.session import (
+    append_message,
+    create_chat_session,
+    load_or_create_session,
+    load_workspace,
+    save_workspace,
+)
 from littrace.publication import render_publication_storyline
 from littrace.evidence.storyline_review import review_storyline
 from littrace.supplementary import attach_supplementary_file
@@ -69,6 +83,10 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "sentinel":
         config = load_config()
         asyncio.run(_run_sentinel_command(config))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "rag":
+        config = load_config()
+        asyncio.run(_run_rag_command(config))
         return
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         config = load_config()
@@ -200,6 +218,119 @@ async def _run_sentinel_command(config) -> None:
     print(f"未知 sentinel 动作: {action}")
 
 
+async def _run_rag_command(config) -> None:
+    if len(sys.argv) < 3:
+        print("用法：littrace rag refresh --session SESSION_ID | refresh-all")
+        return
+    action = sys.argv[2]
+    if action == "refresh":
+        session_id = _arg_value("--session")
+        if session_id is None and len(sys.argv) > 3 and not sys.argv[3].startswith("--"):
+            session_id = sys.argv[3]
+        if not session_id:
+            print("用法：littrace rag refresh --session SESSION_ID")
+            return
+        session = load_or_create_session(config, session_id)
+        workspace = load_workspace(session)
+        _, report = await refresh_session_rag_index(config, session, workspace)
+        save_workspace(session, workspace, config=config)
+        _print_rag_refresh_report(report)
+        return
+    if action == "search":
+        session_id = _arg_value("--session")
+        query = _arg_value("--query")
+        if not session_id or not query:
+            print("用法：littrace rag search --session SESSION_ID --query QUERY")
+            return
+        session = load_or_create_session(config, session_id)
+        result = await search_session_rag(config, session, query, top_k=_arg_int("--top-k", 5))
+        if result is None:
+            print("rag search: no session profile or rag is disabled")
+            return
+        print(f"rag profile: {result.profile.profile_id}")
+        print(f"hits: {len(result.hits)}")
+        for idx, hit in enumerate(result.hits, start=1):
+            section = f" section={hit.section}" if hit.section else ""
+            page = f" page={hit.page}" if hit.page is not None else ""
+            print(f"{idx}. score={hit.score:.4f} paper={hit.paper_id}{section}{page}")
+            print(f"   {hit.text[:240]}")
+        return
+    if action == "refresh-all":
+        root = config.storage.sessions_dir
+        if not root.exists():
+            print("rag refresh-all: sessions_dir does not exist")
+            return
+        refreshed = 0
+        failed = 0
+        for session_dir in sorted(root.iterdir()):
+            if not session_dir.is_dir() or session_dir.name == "sentinel":
+                continue
+            if not (session_dir / "workspace.json").exists():
+                continue
+            try:
+                session = load_or_create_session(config, session_dir.name)
+                workspace = load_workspace(session)
+                _, report = await refresh_session_rag_index(config, session, workspace)
+                save_workspace(session, workspace, config=config)
+                refreshed += 1
+                print(
+                    f"{session.session_id}: chunks={report.chunk_count}, upserted={report.upserted_count}, skipped={report.skipped}"
+                )
+            except Exception as exc:
+                failed += 1
+                print(f"{session_dir.name}: failed: {exc.__class__.__name__}: {exc}")
+        print(f"rag refresh-all: refreshed={refreshed}, failed={failed}")
+        return
+    if action == "daily":
+        report = await run_daily_rag_maintenance(config)
+        _print_daily_rag_report(report)
+        return
+    if action == "daemon":
+        interval_hours = _arg_float("--interval-hours", 24.0)
+        run_immediately = "--no-immediate-run" not in sys.argv
+        print(
+            f"rag daemon starting: watchlists={len(iter_sentinel_watchlist_ids(config.storage.sessions_dir))}, "
+            f"sessions={len(iter_workspace_session_ids(config.storage.sessions_dir))}, "
+            f"interval_hours={interval_hours}, run_immediately={run_immediately}"
+        )
+        await run_daily_rag_daemon(
+            config,
+            interval_hours=interval_hours,
+            run_immediately=run_immediately,
+        )
+        return
+    print(f"未知 rag 动作: {action}")
+
+
+def _print_rag_refresh_report(report) -> None:
+    print(f"rag profile: {report.profile_id}")
+    print(f"user: {report.user_id}")
+    print(f"session: {report.session_id}")
+    print(f"collection: {report.collection_name}")
+    print(f"backend: {report.backend}")
+    print(f"chunks: {report.chunk_count}")
+    print(f"upserted: {report.upserted_count}")
+    if report.skipped:
+        print("skipped: true")
+    if getattr(report, "skip_reason", None):
+        print(f"skip_reason: {report.skip_reason}")
+    if report.warnings:
+        print("warnings: " + "；".join(report.warnings))
+
+
+def _print_daily_rag_report(report) -> None:
+    print(f"started_at: {report.started_at}")
+    if report.finished_at:
+        print(f"finished_at: {report.finished_at}")
+    print(f"sentinel_watchlists: {report.sentinel_watchlists}")
+    print(f"sentinel_failed: {report.sentinel_failed}")
+    print(f"sessions_refreshed: {report.sessions_refreshed}")
+    print(f"sessions_skipped: {report.sessions_skipped}")
+    print(f"sessions_failed: {report.sessions_failed}")
+    if report.warnings:
+        print("warnings: " + "；".join(report.warnings))
+
+
 def _arg_float(name: str, default: float) -> float:
     if name not in sys.argv:
         return default
@@ -218,6 +349,16 @@ def _arg_float_or_none(name: str) -> float | None:
         return float(sys.argv[index + 1])
     except (IndexError, ValueError):
         return None
+
+
+def _arg_int(name: str, default: int) -> int:
+    if name not in sys.argv:
+        return default
+    index = sys.argv.index(name)
+    try:
+        return int(sys.argv[index + 1])
+    except (IndexError, ValueError):
+        return default
 
 
 def _arg_value(name: str) -> str | None:
@@ -345,7 +486,7 @@ async def run_shell() -> None:
             for warning in full_text_config_warnings(config):
                 print(f"配置建议: {warning}")
             state.workspace = await resolve_workspace_full_text_skill(state.workspace, config)
-            save_workspace(session, state.workspace)
+            save_workspace(session, state.workspace, config=config)
             print(f"Full-text reports: {len(state.workspace.full_text_reports)}")
             for paper_id in state.workspace.context.active_papers[:12]:
                 report = state.workspace.full_text_reports.get(paper_id)
@@ -368,7 +509,7 @@ async def run_shell() -> None:
             dois = [item.strip() for item in raw.replace(",", " ").split() if item.strip()]
             before = len(state.workspace.context.active_papers)
             state.workspace = await backfill_workspace_by_dois(state.workspace, dois, config)
-            save_workspace(session, state.workspace)
+            save_workspace(session, state.workspace, config=config)
             added = len(state.workspace.context.active_papers) - before
             print(f"DOI backfill: added {added} papers.")
             continue
@@ -465,7 +606,7 @@ async def run_shell() -> None:
             print(f"目标路径: {result.target_path}")
             if result.error:
                 print(f"错误: {result.error}")
-            save_workspace(session, state.workspace)
+            save_workspace(session, state.workspace, config=config)
             continue
         if message.startswith("/attach-si "):
             parsed = _parse_attach_args(message.replace("/attach-si", "/attach", 1))
@@ -483,7 +624,7 @@ async def run_shell() -> None:
                 print(f"目标路径: {result.target_path}")
             if result.error:
                 print(f"错误: {result.error}")
-            save_workspace(session, state.workspace)
+            save_workspace(session, state.workspace, config=config)
             continue
         if message.startswith("/publisher-retrieve "):
             parsed = _parse_publisher_retrieve_args(message)
@@ -497,7 +638,7 @@ async def run_shell() -> None:
                 continue
             result = await fetch_publisher_search_results(config, plan_report.plans[0])
             state.workspace = merge_retrieval_result_into_workspace(state.workspace, result)
-            save_workspace(session, state.workspace)
+            save_workspace(session, state.workspace, config=config)
             print(f"Publisher retrieval: {family}, 新增/合并 {len(result.papers)} 篇。")
             if result.warnings:
                 print("注意：" + "；".join(result.warnings))
@@ -517,7 +658,7 @@ async def run_shell() -> None:
             state.workspace, result = await auto_resume_downloaded_pdfs_async(
                 config, state.workspace, session
             )
-            save_workspace(session, state.workspace)
+            save_workspace(session, state.workspace, config=config)
             print(
                 f"自动恢复：ready={result.ready_to_parse_count}, parsed={result.parsed_count}, "
                 f"performance_cells={result.performance_cell_count}"
@@ -584,7 +725,7 @@ async def run_shell() -> None:
                 publisher_family=family,
                 timeout_seconds=5.0,
             )
-            save_workspace(session, state.workspace)
+            save_workspace(session, state.workspace, config=config)
             print(
                 f"Publisher session E2E: planned={report.planned_count}, "
                 f"completed={report.completed}, parsed={report.parsed_count}"
@@ -610,7 +751,7 @@ async def run_shell() -> None:
         response.session_root = state.session_root
         state.workspace = workspace
         state.context_visible = state.workspace.context.visible_to_user
-        save_workspace(session, state.workspace)
+        save_workspace(session, state.workspace, config=config)
         append_message(session, "user", message)
         append_message(session, "assistant", response)
         print()

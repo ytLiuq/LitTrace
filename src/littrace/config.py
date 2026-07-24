@@ -21,6 +21,54 @@ class StorageConfig(BaseModel):
     cache_dir: Path = Path("./data/cache")
     sessions_dir: Path = Path("./sessions")
     workspace_snapshot_limit: int = 30
+    default_user_id: str = "local-user"
+
+
+class ArtifactStorageConfig(BaseModel):
+    backend: str = "local"
+    local_root: Path = Path("./data/artifacts")
+    bucket: str | None = None
+    endpoint_url: str | None = None
+    region: str | None = None
+    path_prefix: str = ""
+
+
+ObjectStoreConfig = ArtifactStorageConfig
+
+
+class MetadataStoreConfig(BaseModel):
+    backend: str = "local_json"
+    postgres_dsn: str | None = None
+    schema_name: str = "littrace"
+
+
+class RagConfig(BaseModel):
+    enabled: bool = False
+    backend: str = "pgvector"
+    postgres_dsn: str | None = None
+    schema_name: str = "littrace_rag"
+    collection_prefix: str = "littrace"
+    embedding_provider: str = "openai-compatible"
+    embedding_base_url: str | None = None
+    embedding_api_key: str | None = None
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimension: int = 1536
+    chunk_target_tokens: int = 700
+    chunk_overlap_tokens: int = 120
+    top_k: int = 12
+    refresh_frequency: str = "daily"
+    auto_refresh_enabled: bool = False
+    auto_download_open_access: bool = True
+    login_required_policy: str = "queue_only"
+
+
+class DownloadRetryConfig(BaseModel):
+    enabled: bool = True
+    background_worker_enabled: bool = False
+    interval_seconds: float = 30.0
+    batch_size: int = 10
+    max_attempts: int = 3
+    base_delay_seconds: float = 60.0
 
 
 class CachePolicyConfig(BaseModel):
@@ -221,6 +269,10 @@ class CitationGuardConfig(BaseModel):
 
 class LitTraceConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    artifact_storage: ArtifactStorageConfig = Field(default_factory=ArtifactStorageConfig)
+    metadata_store: MetadataStoreConfig = Field(default_factory=MetadataStoreConfig)
+    rag: RagConfig = Field(default_factory=RagConfig)
+    download_retry: DownloadRetryConfig = Field(default_factory=DownloadRetryConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     browser: BrowserAutomationConfig = Field(default_factory=BrowserAutomationConfig)
     cdp_downloader: CDPDownloaderConfig = Field(default_factory=CDPDownloaderConfig)
@@ -237,6 +289,14 @@ class LitTraceConfig(BaseModel):
     citation_guard: CitationGuardConfig = Field(default_factory=CitationGuardConfig)
     cache_policy: CachePolicyConfig = Field(default_factory=CachePolicyConfig)
     publication_policy: PublicationPolicyConfig = Field(default_factory=PublicationPolicyConfig)
+
+    @property
+    def object_store(self) -> ArtifactStorageConfig:
+        return self.artifact_storage
+
+    @object_store.setter
+    def object_store(self, value: ArtifactStorageConfig) -> None:
+        self.artifact_storage = value
 
 
 def load_config(path: str | Path = "config.yaml") -> LitTraceConfig:
@@ -310,4 +370,92 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     config.llm.fallback_model = (
         os.environ.get("LITTRACE_FALLBACK_LLM_MODEL") or config.llm.fallback_model
     )
+    config.storage.default_user_id = (
+        os.environ.get("LITTRACE_USER_ID") or config.storage.default_user_id
+    )
+    config.artifact_storage.backend = (
+        os.environ.get("LITTRACE_ARTIFACT_STORAGE_BACKEND") or config.artifact_storage.backend
+    )
+    artifact_root = os.environ.get("LITTRACE_ARTIFACT_LOCAL_ROOT")
+    if artifact_root:
+        config.artifact_storage.local_root = Path(artifact_root).expanduser()
+    config.artifact_storage.bucket = (
+        os.environ.get("LITTRACE_ARTIFACT_BUCKET") or config.artifact_storage.bucket
+    )
+    config.artifact_storage.endpoint_url = (
+        os.environ.get("LITTRACE_ARTIFACT_ENDPOINT_URL")
+        or config.artifact_storage.endpoint_url
+    )
+    config.artifact_storage.region = (
+        os.environ.get("LITTRACE_ARTIFACT_REGION") or config.artifact_storage.region
+    )
+    config.artifact_storage.path_prefix = (
+        os.environ.get("LITTRACE_ARTIFACT_PATH_PREFIX") or config.artifact_storage.path_prefix
+    )
+    config.metadata_store.backend = (
+        os.environ.get("LITTRACE_METADATA_BACKEND") or config.metadata_store.backend
+    )
+    config.metadata_store.postgres_dsn = (
+        os.environ.get("LITTRACE_POSTGRES_DSN") or config.metadata_store.postgres_dsn
+    )
+    config.metadata_store.schema_name = (
+        os.environ.get("LITTRACE_POSTGRES_SCHEMA") or config.metadata_store.schema_name
+    )
+    config.rag.enabled = _env_bool("LITTRACE_RAG_ENABLED", config.rag.enabled)
+    config.rag.backend = os.environ.get("LITTRACE_RAG_BACKEND") or config.rag.backend
+    config.rag.postgres_dsn = (
+        os.environ.get("LITTRACE_RAG_POSTGRES_DSN") or config.rag.postgres_dsn
+    )
+    config.rag.schema_name = (
+        os.environ.get("LITTRACE_RAG_SCHEMA") or config.rag.schema_name
+    )
+    config.rag.collection_prefix = (
+        os.environ.get("LITTRACE_RAG_COLLECTION_PREFIX") or config.rag.collection_prefix
+    )
+    config.rag.embedding_provider = (
+        os.environ.get("LITTRACE_RAG_EMBEDDING_PROVIDER") or config.rag.embedding_provider
+    )
+    config.rag.embedding_base_url = (
+        os.environ.get("LITTRACE_RAG_EMBEDDING_BASE_URL") or config.rag.embedding_base_url
+    )
+    config.rag.embedding_api_key = (
+        os.environ.get("LITTRACE_RAG_EMBEDDING_API_KEY") or config.rag.embedding_api_key
+    )
+    config.rag.embedding_model = (
+        os.environ.get("LITTRACE_RAG_EMBEDDING_MODEL") or config.rag.embedding_model
+    )
+    embedding_dimension = os.environ.get("LITTRACE_RAG_EMBEDDING_DIMENSION")
+    if embedding_dimension:
+        try:
+            config.rag.embedding_dimension = int(embedding_dimension)
+        except ValueError:
+            pass
+    config.rag.auto_refresh_enabled = _env_bool(
+        "LITTRACE_RAG_AUTO_REFRESH", config.rag.auto_refresh_enabled
+    )
+    config.download_retry.enabled = _env_bool(
+        "LITTRACE_DOWNLOAD_RETRY_ENABLED", config.download_retry.enabled
+    )
+    config.download_retry.background_worker_enabled = _env_bool(
+        "LITTRACE_DOWNLOAD_RETRY_WORKER", config.download_retry.background_worker_enabled
+    )
+    retry_interval = os.environ.get("LITTRACE_DOWNLOAD_RETRY_INTERVAL_SECONDS")
+    if retry_interval:
+        try:
+            config.download_retry.interval_seconds = float(retry_interval)
+        except ValueError:
+            pass
+    retry_attempts = os.environ.get("LITTRACE_DOWNLOAD_RETRY_MAX_ATTEMPTS")
+    if retry_attempts:
+        try:
+            config.download_retry.max_attempts = int(retry_attempts)
+        except ValueError:
+            pass
     return config
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}

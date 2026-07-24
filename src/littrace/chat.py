@@ -29,6 +29,7 @@ from littrace.models import (
     ChatRequest,
     ChatResponse,
     ContextUpdate,
+    EvidenceSpan,
     LiteratureWorkspace,
     PaperSearchRequest,
     WorkflowTraceStep,
@@ -36,6 +37,10 @@ from littrace.models import (
 from littrace.research_writer import (
     write_evidence_grounded_answer,
     write_storyline_narrative,
+)
+from littrace.retrieval.rag_search import (
+    rag_hits_to_evidence_spans,
+    search_workspace_rag,
 )
 from littrace.runtime.memory import SessionMemory
 from littrace.skill_runner import (
@@ -195,7 +200,13 @@ async def handle_chat(
             workspace,
         )
 
-    llm_reply = await write_evidence_grounded_answer(config, message, workspace)
+    rag_evidence, rag_warnings = await _rag_evidence_for_workspace(config, request, workspace)
+    llm_reply = await write_evidence_grounded_answer(
+        config,
+        message,
+        workspace,
+        rag_evidence=rag_evidence,
+    )
     if llm_reply.used_llm:
         claim_hints = config.citation_guard.claim_hints or None
         guard = guard_citations(llm_reply.text, workspace, claim_hints=claim_hints)
@@ -225,7 +236,12 @@ async def handle_chat(
                     action="llm_chat",
                     workspace=workspace,
                     citations=_active_citations(workspace),
-                    warnings=guard.warnings + guard.unsupported_sentences[:3] + extra_warnings,
+                    warnings=(
+                        rag_warnings
+                        + guard.warnings
+                        + guard.unsupported_sentences[:3]
+                        + extra_warnings
+                    ),
                 ),
                 intent,
             ),
@@ -402,13 +418,24 @@ async def _run_composite_intent(
         _append_evidence_quality_trace(research_result, workspace)
         if _is_search_only_intent(intent):
             if has_minimum_evidence:
-                llm_reply = await write_evidence_grounded_answer(config, request.message, workspace)
+                rag_evidence, rag_warnings = await _rag_evidence_for_workspace(
+                    config,
+                    request,
+                    workspace,
+                )
+                llm_reply = await write_evidence_grounded_answer(
+                    config,
+                    request.message,
+                    workspace,
+                    rag_evidence=rag_evidence,
+                )
                 if llm_reply.used_llm:
                     claim_hints = config.citation_guard.claim_hints or None
                     guard = guard_citations(llm_reply.text, workspace, claim_hints=claim_hints)
                     cleaned = remove_unsupported_sentences(llm_reply.text, guard)
                     workspace.guard_reports.append(guard.model_dump())
                     replies.append(cleaned)
+                    warnings.extend(rag_warnings)
                     warnings.extend(guard.warnings)
                     warnings.extend(guard.unsupported_sentences[:3])
 
@@ -564,13 +591,20 @@ async def _run_composite_intent(
         warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过报告生成。")
 
     if "autonomous_review" in intent.actions:
+        rag_evidence, rag_warnings = await _rag_evidence_for_workspace(
+            config,
+            request,
+            workspace,
+        )
         loop_report = await run_autonomous_research_loop(
             config,
             intent.topic or request.message,
             workspace,
             auto_replan=intent.auto_replan,
+            rag_evidence=rag_evidence,
         )
         workspace.context.filters.autonomous_loop_report = loop_report.model_dump(mode="json")
+        warnings.extend(rag_warnings)
         replies.append(
             f"已完成多 agent 审稿/反驳/修订循环：{len(loop_report.rounds)} 轮，"
             f"score={loop_report.score:.3f}，passed={loop_report.passed}。"
@@ -909,3 +943,33 @@ def _paper_id_for_index(active_ids: list[str], index: int) -> str | None:
     if position < 0 or position >= len(active_ids):
         return None
     return active_ids[position]
+
+
+async def _rag_evidence_for_workspace(
+    config: LitTraceConfig,
+    request: ChatRequest,
+    workspace: LiteratureWorkspace,
+) -> tuple[list[EvidenceSpan], list[str]]:
+    warnings: list[str] = []
+    if not config.rag.enabled or config.rag.backend != "pgvector":
+        return [], warnings
+    try:
+        result = await search_workspace_rag(
+            config,
+            workspace,
+            request.message,
+            top_k=config.rag.top_k,
+        )
+    except Exception as exc:
+        warnings.append(f"rag_search_failed:{exc.__class__.__name__}")
+        return [], warnings
+    if result is None:
+        return [], warnings
+    rag_evidence = rag_hits_to_evidence_spans(result.profile, result.hits, query=request.message)
+    workspace.context.filters.rag_profile = result.profile.model_dump(mode="json")
+    workspace.context.filters.rag_enabled = True
+    workspace.context.filters.rag_backend = result.profile.backend
+    workspace.context.filters.rag_last_query = request.message
+    workspace.context.filters.rag_last_hit_count = len(rag_evidence)
+    workspace.context.filters.rag_source_routes = list(result.profile.source_routes)
+    return rag_evidence, warnings

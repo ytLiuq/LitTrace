@@ -9,6 +9,23 @@ def test_load_config_reads_env_local_without_config_file(monkeypatch, tmp_path):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
     monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
+    for name in [
+        "LITTRACE_LLM_FALLBACK_MODELS",
+        "LITTRACE_FALLBACK_LLM_API_KEY",
+        "LITTRACE_FALLBACK_LLM_BASE_URL",
+        "LITTRACE_FALLBACK_LLM_MODEL",
+        "LITTRACE_RAG_ENABLED",
+        "LITTRACE_RAG_BACKEND",
+        "LITTRACE_RAG_POSTGRES_DSN",
+        "LITTRACE_RAG_SCHEMA",
+        "LITTRACE_RAG_COLLECTION_PREFIX",
+        "LITTRACE_RAG_EMBEDDING_BASE_URL",
+        "LITTRACE_RAG_EMBEDDING_API_KEY",
+        "LITTRACE_RAG_EMBEDDING_MODEL",
+        "LITTRACE_RAG_EMBEDDING_DIMENSION",
+        "LITTRACE_RAG_AUTO_REFRESH",
+    ]:
+        monkeypatch.delenv(name, raising=False)
     Path(".env.local").write_text(
         "\n".join(
             [
@@ -19,6 +36,16 @@ def test_load_config_reads_env_local_without_config_file(monkeypatch, tmp_path):
                 "LITTRACE_FALLBACK_LLM_API_KEY=fallback-key",
                 "LITTRACE_FALLBACK_LLM_BASE_URL=https://fallback.example.com",
                 "LITTRACE_FALLBACK_LLM_MODEL=fallback-model",
+                "LITTRACE_RAG_ENABLED=true",
+                "LITTRACE_RAG_BACKEND=pgvector",
+                "LITTRACE_RAG_POSTGRES_DSN=postgresql://user:pass@localhost:5432/littrace",
+                "LITTRACE_RAG_SCHEMA=littrace_test_rag",
+                "LITTRACE_RAG_COLLECTION_PREFIX=test_littrace",
+                "LITTRACE_RAG_EMBEDDING_BASE_URL=https://embeddings.example.com/v1",
+                "LITTRACE_RAG_EMBEDDING_API_KEY=rag-key",
+                "LITTRACE_RAG_EMBEDDING_MODEL=text-embedding-3-large",
+                "LITTRACE_RAG_EMBEDDING_DIMENSION=3072",
+                "LITTRACE_RAG_AUTO_REFRESH=true",
             ]
         ),
         encoding="utf-8",
@@ -33,6 +60,16 @@ def test_load_config_reads_env_local_without_config_file(monkeypatch, tmp_path):
     assert config.llm.fallback_api_key == "fallback-key"
     assert config.llm.fallback_base_url == "https://fallback.example.com"
     assert config.llm.fallback_model == "fallback-model"
+    assert config.rag.enabled is True
+    assert config.rag.backend == "pgvector"
+    assert config.rag.postgres_dsn == "postgresql://user:pass@localhost:5432/littrace"
+    assert config.rag.schema_name == "littrace_test_rag"
+    assert config.rag.collection_prefix == "test_littrace"
+    assert config.rag.embedding_base_url == "https://embeddings.example.com/v1"
+    assert config.rag.embedding_api_key == "rag-key"
+    assert config.rag.embedding_model == "text-embedding-3-large"
+    assert config.rag.embedding_dimension == 3072
+    assert config.rag.auto_refresh_enabled is True
 
 
 def test_write_config_template_creates_yaml(tmp_path):

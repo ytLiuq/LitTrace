@@ -30,6 +30,11 @@ class SentinelStore:
     access_queue_path: Path
     digest_dir: Path
     evidence_base_dir: Path
+    user_id: str = "local-user"
+
+    @property
+    def session_id(self) -> str:
+        return self.watchlist_id
 
 
 def sentinel_root(config: LitTraceConfig, watchlist_id: str) -> Path:
@@ -61,6 +66,7 @@ def get_sentinel_store(config: LitTraceConfig, watchlist_id: str) -> SentinelSto
         access_queue_path=root / "access_queue.json",
         digest_dir=root / "digests",
         evidence_base_dir=evidence_base_dir,
+        user_id=config.storage.default_user_id,
     )
     return store
 
@@ -153,12 +159,17 @@ def save_access_queue(store: SentinelStore, tasks: list[AccessTask]) -> Path:
     return store.access_queue_path
 
 
-def save_sentinel_workspace(store: SentinelStore, workspace: LiteratureWorkspace) -> None:
+def save_sentinel_workspace(
+    store: SentinelStore,
+    workspace: LiteratureWorkspace,
+    config: LitTraceConfig | None = None,
+) -> None:
     session_like = type(
         "SentinelWorkspaceSession",
         (),
         {
             "session_id": store.watchlist_id,
+            "user_id": store.user_id,
             "root": store.root,
             "workspace_dir": store.workspace_dir,
             "workspace_path": store.workspace_path,
@@ -169,11 +180,12 @@ def save_sentinel_workspace(store: SentinelStore, workspace: LiteratureWorkspace
             "structured_documents_dir": store.structured_documents_dir,
             "evidence_dir": store.evidence_dir,
             "releases_dir": store.releases_dir,
+            "rag_dir": store.workspace_dir / "rag",
         },
     )()
     from littrace.session import save_workspace
 
-    save_workspace(session_like, workspace)
+    save_workspace(session_like, workspace, config=config)
 
 
 def load_sentinel_workspace(store: SentinelStore) -> LiteratureWorkspace:
@@ -182,6 +194,7 @@ def load_sentinel_workspace(store: SentinelStore) -> LiteratureWorkspace:
         (),
         {
             "session_id": store.watchlist_id,
+            "user_id": store.user_id,
             "root": store.root,
             "workspace_dir": store.workspace_dir,
             "workspace_path": store.workspace_path,
@@ -192,6 +205,7 @@ def load_sentinel_workspace(store: SentinelStore) -> LiteratureWorkspace:
             "structured_documents_dir": store.structured_documents_dir,
             "evidence_dir": store.evidence_dir,
             "releases_dir": store.releases_dir,
+            "rag_dir": store.workspace_dir / "rag",
         },
     )()
     from littrace.session import load_workspace

@@ -28,6 +28,13 @@ parsers = [
 mcp = [
   "mcp>=1.0",
 ]
+rag = [
+  "psycopg[binary]>=3.2",
+  "pgvector>=0.3",
+]
+storage = [
+  "boto3>=1.34",
+]
 dev = [
   "pytest>=8.2",
   "ruff>=0.6",

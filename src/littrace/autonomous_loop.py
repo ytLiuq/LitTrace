@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 
 from pydantic import BaseModel, Field, ValidationError
@@ -13,10 +14,12 @@ from littrace.models import (
     AgentCritique,
     AgentDebateRound,
     AutonomousResearchLoopReport,
+    EvidenceSpan,
     LiteratureWorkspace,
     coerce_parsed,
 )
 from littrace.publication import evaluate_publication
+from littrace.retrieval.rag_search import rag_hits_to_evidence_spans, search_workspace_rag
 from littrace.research_writer import write_evidence_grounded_answer
 from littrace.skill_runner import (
     build_quality_report_skill,
@@ -59,6 +62,7 @@ async def run_autonomous_research_loop(
     max_rounds: int = 2,
     enable_smart_debate: bool = True,
     auto_replan: bool = False,
+    rag_evidence: list[EvidenceSpan] | None = None,
 ) -> AutonomousResearchLoopReport:
     """Run a bounded writer/reviewer/reviser/replanner loop over current evidence."""
 
@@ -72,7 +76,9 @@ async def run_autonomous_research_loop(
             warnings=["empty_workspace"],
         )
 
-    draft = await _initial_draft(config, objective, workspace)
+    if rag_evidence is None:
+        rag_evidence = await _rag_evidence_for_workspace(config, objective, workspace)
+    draft = await _initial_draft(config, objective, workspace, rag_evidence=rag_evidence)
     rounds: list[AgentDebateRound] = []
     final_answer = draft
     final_score = 0.0
@@ -169,11 +175,49 @@ async def _initial_draft(
     config: LitTraceConfig,
     objective: str,
     workspace: LiteratureWorkspace,
+    rag_evidence: list[EvidenceSpan] | None = None,
 ) -> str:
-    reply = await write_evidence_grounded_answer(config, objective, workspace)
+    write_fn = write_evidence_grounded_answer
+    if "rag_evidence" in inspect.signature(write_fn).parameters:
+        reply = await write_fn(
+            config,
+            objective,
+            workspace,
+            rag_evidence=rag_evidence,
+        )
+    else:
+        reply = await write_fn(config, objective, workspace)
     if reply.used_llm and reply.text.strip():
         return reply.text
     raise RuntimeError(f"LLM unavailable for initial draft: {reply.error}")
+
+
+async def _rag_evidence_for_workspace(
+    config: LitTraceConfig,
+    objective: str,
+    workspace: LiteratureWorkspace,
+) -> list[EvidenceSpan]:
+    if not config.rag.enabled or config.rag.backend != "pgvector":
+        return []
+    try:
+        result = await search_workspace_rag(
+            config,
+            workspace,
+            objective,
+            top_k=config.rag.top_k,
+        )
+    except Exception:
+        return []
+    if result is None:
+        return []
+    evidence = rag_hits_to_evidence_spans(result.profile, result.hits, query=objective)
+    workspace.context.filters.rag_profile = result.profile.model_dump(mode="json")
+    workspace.context.filters.rag_enabled = True
+    workspace.context.filters.rag_backend = result.profile.backend
+    workspace.context.filters.rag_last_query = objective
+    workspace.context.filters.rag_last_hit_count = len(evidence)
+    workspace.context.filters.rag_source_routes = list(result.profile.source_routes)
+    return evidence
 
 
 def _review_draft(

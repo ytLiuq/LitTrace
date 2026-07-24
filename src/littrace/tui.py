@@ -91,7 +91,7 @@ async def _handle_input(text: str, state: TUIState, config, session) -> None:
     )
     state.workspace = workspace
     state.context_visible = workspace.context.visible_to_user
-    save_workspace(session, state.workspace)
+    save_workspace(session, state.workspace, config=config)
     append_message(session, "user", text)
     append_message(session, "assistant", response)
     state.messages.append(("LitTrace", response.reply))

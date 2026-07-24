@@ -1,3 +1,5 @@
+import json
+
 from littrace.config import LitTraceConfig, StorageConfig
 from littrace.document_composer import build_research_document_report
 from littrace.models import (
@@ -14,6 +16,7 @@ from littrace.session import (
     create_chat_session,
     list_chat_sessions,
     load_workspace,
+    load_or_create_session,
     save_workspace,
     load_artifact_index,
 )
@@ -45,6 +48,52 @@ def test_session_folder_persists_workspace_and_messages(tmp_path):
     assert summaries[0].topic == "hello"
     assert summaries[0].message_count == 1
     assert summaries[0].paper_count == 0
+
+
+def test_session_persists_user_scoped_rag_profile(tmp_path):
+    config = LitTraceConfig(
+        storage=StorageConfig(sessions_dir=tmp_path, default_user_id="u1")
+    )
+    config.rag.enabled = True
+    config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5432/littrace"
+    session = create_chat_session(config)
+    workspace = LiteratureWorkspace()
+    workspace.context.filters.topic = "MXene pressure sensor"
+
+    save_workspace(session, workspace, config=config)
+
+    profile_path = session.workspace_dir / "rag" / "profile.json"
+    manifest_path = session.workspace_dir / "manifest.json"
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    assert profile["user_id"] == "u1"
+    assert profile["session_id"] == session.session_id
+    assert profile["backend"] == "pgvector"
+    assert profile["topic"] == "MXene pressure sensor"
+    assert profile["collection_name"].startswith("littrace_u1_")
+    assert manifest["rag_enabled"] is True
+    assert manifest["rag"]["profile_id"] == profile["profile_id"]
+    assert workspace.context.filters.rag_profile["profile_id"] == profile["profile_id"]
+
+
+def test_load_or_create_session_recovers_user_id_from_manifest(tmp_path):
+    config = LitTraceConfig(
+        storage=StorageConfig(sessions_dir=tmp_path, default_user_id="fallback-user")
+    )
+    session = create_chat_session(config)
+    workspace = LiteratureWorkspace()
+    save_workspace(session, workspace, config=config)
+
+    manifest_path = session.workspace_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["user_id"] = "u2"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    loaded = load_or_create_session(config, session.session_id)
+
+    assert loaded.user_id == "u2"
+    assert loaded.session_id == session.session_id
 
 
 def test_session_persists_structured_documents_in_workspace(tmp_path):

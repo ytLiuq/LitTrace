@@ -42,6 +42,7 @@ import httpx
 DOI_PREFIX_MAP: dict[str, str] = {
     "10.1002": "wiley",
     "10.1038": "springer_nature",
+    "10.1007": "springer_nature",
     "10.3390": "mdpi",
     "10.1109": "ieee",
     "10.1021": "acs",
@@ -224,6 +225,11 @@ def publisher_urls(doi: str, publisher: str) -> dict[str, str | None]:
             "pdf": f"https://pubs.acs.org/doi/pdf/{doi}",
         }
     if publisher == "springer_nature":
+        if doi.startswith("10.1007/"):
+            return {
+                "landing": f"https://link.springer.com/article/{doi}",
+                "pdf": f"https://link.springer.com/content/pdf/{doi}.pdf",
+            }
         # nature.com articles: /articles/{article_id}.pdf
         # doi 10.1038/srep14751 → article_id = srep14751
         article_id = doi.split("/")[-1] if "/" in doi else doi

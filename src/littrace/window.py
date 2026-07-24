@@ -511,7 +511,7 @@ class LitTraceWindow:
         def apply_response() -> None:
             self.workspace = workspace
             self.context_visible = workspace.context.visible_to_user
-            save_workspace(self.session, self.workspace)
+            save_workspace(self.session, self.workspace, config=self.config)
             append_message(self.session, "user", message)
             append_message(self.session, "assistant", response)
             if _is_user_effective_reply(response.reply):
@@ -744,19 +744,19 @@ class LitTraceWindow:
         if not enabled and paper_id in selected:
             selected.remove(paper_id)
         self.workspace.context.selected_for_download = selected
-        save_workspace(self.session, self.workspace)
+        save_workspace(self.session, self.workspace, config=self.config)
         self._refresh_context()
         self.status_var.set(f"已选择下载 {len(selected)} 篇 | Session: {self.session.session_id}")
 
     def _select_all_downloads(self) -> None:
         self.workspace.context.selected_for_download = list(self.workspace.context.active_papers)
-        save_workspace(self.session, self.workspace)
+        save_workspace(self.session, self.workspace, config=self.config)
         self._refresh_context()
         self._refresh_context_popup()
 
     def _clear_downloads(self) -> None:
         self.workspace.context.selected_for_download = []
-        save_workspace(self.session, self.workspace)
+        save_workspace(self.session, self.workspace, config=self.config)
         self._refresh_context()
         self._refresh_context_popup()
 
@@ -902,7 +902,7 @@ class LitTraceWindow:
         )
 
         def apply_result() -> None:
-            save_workspace(self.session, self.workspace)
+            save_workspace(self.session, self.workspace, config=self.config)
             self._refresh_context()
             self._refresh_context_popup()
             if fetch.error:

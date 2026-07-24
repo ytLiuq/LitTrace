@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,10 @@ from littrace.models import (
     ResearchRunResult,
     WorkflowTrace,
 )
+from littrace.retrieval.pgvector_store import RagSearchHit
+from littrace.retrieval.rag_profile import RagProfile
+from littrace.retrieval.rag_search import RagSearchResult
+from littrace.session import create_chat_session
 
 
 def _mock_llm_reply(monkeypatch, text="这是一个包含引用与访问链接的研究回答。", used_llm=True):
@@ -346,6 +351,107 @@ async def test_chat_search_trace_includes_evidence_quality_gate():
         step.node == "evidence_quality_gate"
         for step in response.research_result.workflow_trace.steps
     )
+
+
+@pytest.mark.anyio
+async def test_chat_passes_rag_hits_into_writer(monkeypatch, tmp_path):
+    config = LitTraceConfig(
+        storage={"sessions_dir": tmp_path, "default_user_id": "u1"},
+        llm=LLMConfig(enabled=True, api_key="fake-key", intent_parser_enabled=False),
+    )
+    config.rag.enabled = True
+    config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5433/littrace"
+    session = create_chat_session(config)
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [PaperMetadata(paper_id=f"p{i}", title=f"Paper {i}") for i in range(5)],
+    )
+    workspace.context.filters.search_mode = "live"
+    workspace.context.filters.parsed_full_text_count = 5
+    workspace.context.filters.downloaded_full_text_count = 5
+    for paper_id in workspace.context.active_papers:
+        workspace.parsed_papers[paper_id] = {
+            "parsed": True,
+            "sections": [{"name": "Results", "text": "Full text evidence."}],
+        }
+    captured: dict[str, object] = {}
+
+    profile = RagProfile(
+        profile_id="rag:123",
+        user_id="u1",
+        session_id=session.session_id,
+        namespace=f"u1.{session.session_id}",
+        topic="MXene pressure sensor",
+        query_variants=["MXene pressure sensor"],
+        source_routes=["crossref", "openalex"],
+        backend="pgvector",
+        postgres_schema="littrace_rag",
+        collection_name="littrace_u1_s1",
+        embedding_provider="openai-compatible",
+        embedding_model="text-embedding-v3",
+        embedding_dimension=1024,
+        chunk_target_tokens=700,
+        chunk_overlap_tokens=120,
+        top_k=12,
+        refresh_frequency="daily",
+        auto_refresh_enabled=True,
+        auto_download_open_access=True,
+        login_required_policy="queue_only",
+    )
+
+    async def fake_search_workspace_rag(config_arg, workspace_arg, question, top_k=None):
+        captured["search_question"] = question
+        return RagSearchResult(
+            profile=profile,
+            hits=[
+                RagSearchHit(
+                    chunk_id="chunk:1",
+                    paper_id="p0",
+                    text="RAG says the sensor reached high sensitivity.",
+                    score=0.91,
+                    chunk_hash="hash:1",
+                    section="Results",
+                )
+            ],
+        )
+
+    async def fake_writer(config_arg, question, workspace_arg, rag_evidence=None):
+        captured["rag_evidence"] = rag_evidence or []
+        return LLMReply(text="writer-called", used_llm=False, error="writer-test")
+
+    monkeypatch.setattr("littrace.chat.search_workspace_rag", fake_search_workspace_rag)
+    monkeypatch.setattr("littrace.chat.write_evidence_grounded_answer", fake_writer)
+
+    async def fake_prepare_turn(request_arg, workspace_arg, config_arg, session_memory=None):
+        return SimpleNamespace(
+            intent=SimpleNamespace(
+                actions=[],
+                topic=None,
+                year_min=None,
+                confidence=1.0,
+                ambiguous=False,
+                ambiguity_reasons=[],
+                clarification_questions=[],
+            ),
+            workspace=workspace_arg,
+            memory_view=SimpleNamespace(purpose="synthesis", warnings=[]),
+            early_response=None,
+        )
+
+    monkeypatch.setattr("littrace.chat.coordinator.prepare_turn", fake_prepare_turn)
+
+    response, _ = await handle_chat(
+        ChatRequest(message="请分析一下这批论文", session_id=session.session_id),
+        workspace,
+        config,
+    )
+
+    assert response.action == "llm_error"
+    assert captured["search_question"] == "请分析一下这批论文"
+    assert len(captured["rag_evidence"]) == 1
+    assert captured["rag_evidence"][0].parser == "rag"
+    assert workspace.context.filters.rag_last_hit_count == 1
+    assert workspace.context.filters.rag_source_routes == ["crossref", "openalex"]
 
 
 @pytest.mark.anyio

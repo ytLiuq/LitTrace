@@ -89,7 +89,7 @@ async def downloads_resume(session_id: str | None = None) -> AutoResumeResult:
     workspace, result = await auto_resume_downloaded_pdfs_async(config, api_app.WORKSPACE, session)
     api_app._set_workspace(workspace)
     if session:
-        save_workspace(session, api_app.WORKSPACE)
+        save_workspace(session, api_app.WORKSPACE, config=config)
     return result
 
 
@@ -110,7 +110,7 @@ async def downloads_watch(
     )
     api_app._set_workspace(workspace)
     if session:
-        save_workspace(session, api_app.WORKSPACE)
+        save_workspace(session, api_app.WORKSPACE, config=config)
     return result
 
 
@@ -126,7 +126,7 @@ def attach_si(paper_id: str, source_path: str, session_id: str | None = None):
     config = api_app.load_config()
     session = load_or_create_session(config, session_id)
     result = attach_supplementary_file(api_app.WORKSPACE, session, paper_id, source_path)
-    save_workspace(session, api_app.WORKSPACE)
+    save_workspace(session, api_app.WORKSPACE, config=config)
     return result
 
 

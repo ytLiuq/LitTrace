@@ -116,8 +116,10 @@ async def write_evidence_grounded_answer(
     config: LitTraceConfig,
     question: str,
     workspace: LiteratureWorkspace,
+    rag_evidence: list[EvidenceSpan] | None = None,
 ) -> LLMReply:
-    if not workspace.context.active_papers:
+    selected_papers = _selected_papers_for_answer(workspace, rag_evidence)
+    if not selected_papers:
         return LLMReply(
             text="当前还没有文献上下文。请先检索论文，再让我总结、比较或讲发展脉络。",
             used_llm=False,
@@ -132,7 +134,7 @@ async def write_evidence_grounded_answer(
             used_llm=False,
             error="mock_workspace",
         )
-    if not _has_parsed_full_text(workspace):
+    if not _has_parsed_full_text(workspace) and not rag_evidence:
         return LLMReply(
             text="当前没有可用的 PDF 全文解析证据。metadata/abstract fallback 已禁用，请先获取并解析全文。",
             used_llm=False,
@@ -142,7 +144,11 @@ async def write_evidence_grounded_answer(
     if release_block is not None:
         return release_block
 
-    user_message, evidence_registry = _writer_payload(question, workspace)
+    user_message, evidence_registry = _writer_payload(
+        question,
+        workspace,
+        rag_evidence=rag_evidence,
+    )
     return await _validated_research_completion(
         config, _WRITER_SYSTEM_PROMPT, user_message, evidence_registry, workspace
     )
@@ -201,11 +207,14 @@ async def write_storyline_narrative(
 
 
 def _writer_payload(
-    question: str, workspace: LiteratureWorkspace
+    question: str,
+    workspace: LiteratureWorkspace,
+    rag_evidence: list[EvidenceSpan] | None = None,
 ) -> tuple[str, dict[str, EvidenceSpan]]:
     lines = [f"User question: {question}", "", "Papers:"]
     evidence_registry: dict[str, EvidenceSpan] = {}
-    papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
+    selected_papers = _selected_papers_for_answer(workspace, rag_evidence)
+    papers = [workspace.papers[paper_id] for paper_id in selected_papers if paper_id in workspace.papers]
     citations = citation_records_for_papers(papers)
     for paper in papers:
         lines.append(
@@ -260,6 +269,26 @@ def _writer_payload(
                 f"unit={cell.unit}; evidence={cell.evidence.snippet}"
             )
 
+    if rag_evidence:
+        lines.append("")
+        lines.append("RAG evidence:")
+        for span in rag_evidence:
+            if not span.evidence_id:
+                continue
+            evidence_registry[span.evidence_id] = span
+            location = []
+            if span.section:
+                location.append(f"section={span.section}")
+            if span.page is not None:
+                location.append(f"page={span.page}")
+            if span.table_id:
+                location.append(f"table_id={span.table_id}")
+            loc_text = "; ".join(location)
+            location_part = f"; {loc_text}" if loc_text else ""
+            lines.append(
+                f"- evidence_id={span.evidence_id}; paper={span.paper_id}{location_part}; text={span.snippet or ''}"
+            )
+
     lines.append("")
     lines.append("Citation records:")
     for record in citations:
@@ -268,6 +297,17 @@ def _writer_payload(
         )
     register_evidence(workspace, list(evidence_registry.values()))
     return "\n".join(lines), evidence_registry
+
+
+def _selected_papers_for_answer(
+    workspace: LiteratureWorkspace,
+    rag_evidence: list[EvidenceSpan] | None = None,
+) -> list[str]:
+    selected = list(workspace.context.active_papers)
+    for span in rag_evidence or []:
+        if span.paper_id not in selected:
+            selected.append(span.paper_id)
+    return selected
 
 
 def _workspace_is_mock(workspace: LiteratureWorkspace) -> bool:

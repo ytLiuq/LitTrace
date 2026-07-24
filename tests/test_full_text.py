@@ -248,3 +248,29 @@ async def test_verify_candidate_marks_forbidden_as_login_required():
     assert not warnings
     assert verified[0].requires_login
     assert verified[0].note == "http_auth_or_forbidden"
+
+
+@pytest.mark.anyio
+async def test_verify_candidate_demotes_html_seed_pdf_to_landing_page():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html; charset=utf-8"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        verified, warnings = await verify_full_text_candidates(
+            client,
+            [
+                FullTextCandidate(
+                    paper_id="p1",
+                    url="https://example.org/article",
+                    source="paper.pdf_url",
+                    content_type="pdf",
+                    is_pdf=True,
+                    access_type=AccessType.OPEN_ACCESS,
+                )
+            ],
+        )
+
+    assert not warnings
+    assert not verified[0].is_pdf
+    assert verified[0].content_type == "landing_page"
+    assert verified[0].note == "verified_non_pdf_landing_page"

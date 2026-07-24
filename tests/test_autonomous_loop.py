@@ -5,6 +5,9 @@ from littrace.config import LLMConfig, LitTraceConfig
 from littrace.context import add_papers
 from littrace.llm import LLMReply
 from littrace.models import LiteratureWorkspace, PaperMetadata
+from littrace.retrieval.pgvector_store import RagSearchHit
+from littrace.retrieval.rag_profile import RagProfile
+from littrace.retrieval.rag_search import RagSearchResult
 
 
 @pytest.mark.anyio
@@ -92,8 +95,13 @@ async def test_autonomous_loop_rechecks_publication_gate_before_final_answer(mon
         return LLMReply(text="修订前的研究结论。", used_llm=True)
 
     monkeypatch.setattr("littrace.autonomous_loop.write_evidence_grounded_answer", fake_writer)
+    config = LitTraceConfig(llm=LLMConfig(enabled=True, api_key="test-key"))
+    config.rag.enabled = True
+    config.rag.backend = "pgvector"
+    config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5433/littrace"
+
     report = await run_autonomous_research_loop(
-        LitTraceConfig(llm=LLMConfig(enabled=True, api_key="test-key")),
+        config,
         "总结当前文献",
         workspace,
         enable_smart_debate=False,
@@ -104,3 +112,83 @@ async def test_autonomous_loop_rechecks_publication_gate_before_final_answer(mon
     assert report.release_blockers
     assert "修订前的研究结论。" not in report.final_answer
     assert "未通过最终发布检查" in report.final_answer
+
+
+@pytest.mark.anyio
+async def test_autonomous_loop_passes_rag_evidence_into_writer(monkeypatch):
+    workspace = add_papers(
+        LiteratureWorkspace(
+            parsed_papers={
+                "p1": {
+                    "parsed": True,
+                    "sections": [{"name": "Results", "text": "Full text evidence."}],
+                }
+            }
+        ),
+        [PaperMetadata(paper_id="p1", title="Traceable Paper", year=2026)],
+    )
+    workspace.context.filters.search_mode = "live"
+    workspace.context.filters.parsed_full_text_count = 1
+    workspace.context.filters.downloaded_full_text_count = 1
+    profile = RagProfile(
+        profile_id="rag:123",
+        user_id="u1",
+        session_id="s1",
+        namespace="u1.s1",
+        topic="Traceable Paper",
+        query_variants=["Traceable Paper"],
+        source_routes=["crossref"],
+        backend="pgvector",
+        postgres_schema="littrace_rag",
+        collection_name="littrace_u1_s1",
+        embedding_provider="openai-compatible",
+        embedding_model="text-embedding-v3",
+        embedding_dimension=1024,
+        chunk_target_tokens=700,
+        chunk_overlap_tokens=120,
+        top_k=12,
+        refresh_frequency="daily",
+        auto_refresh_enabled=True,
+        auto_download_open_access=True,
+        login_required_policy="queue_only",
+    )
+    workspace.context.filters.rag_profile = profile.model_dump(mode="json")
+    captured: dict[str, object] = {}
+    config = LitTraceConfig(llm=LLMConfig(enabled=True, api_key="test-key"))
+    config.rag.enabled = True
+    config.rag.backend = "pgvector"
+    config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5433/littrace"
+
+    async def fake_search_workspace_rag(config_arg, workspace_arg, objective, top_k=None):
+        captured["objective"] = objective
+        return RagSearchResult(
+            profile=profile,
+            hits=[
+                RagSearchHit(
+                    chunk_id="chunk:1",
+                    paper_id="p1",
+                    text="RAG says the sensor reached high sensitivity.",
+                    score=0.93,
+                    chunk_hash="hash:1",
+                    section="Results",
+                )
+            ],
+        )
+
+    async def fake_writer(config_arg, objective, workspace_arg, rag_evidence=None):
+        captured["rag_evidence"] = rag_evidence or []
+        return LLMReply(text='{"claims":[],"answer":"ok"}', used_llm=True)
+
+    monkeypatch.setattr("littrace.autonomous_loop.search_workspace_rag", fake_search_workspace_rag)
+    monkeypatch.setattr("littrace.autonomous_loop.write_evidence_grounded_answer", fake_writer)
+
+    await run_autonomous_research_loop(
+        config,
+        "总结当前文献",
+        workspace,
+        enable_smart_debate=False,
+    )
+
+    assert captured["objective"] == "总结当前文献"
+    assert len(captured["rag_evidence"]) == 1
+    assert captured["rag_evidence"][0].parser == "rag"

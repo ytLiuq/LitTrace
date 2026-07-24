@@ -11,6 +11,7 @@ from littrace.config import CDPDownloaderConfig, LitTraceConfig
 
 def test_identify_publisher_from_doi_prefix():
     assert identify_publisher("10.1002/adfm.202316712") == "wiley"
+    assert identify_publisher("10.1007/s10853-025-11937-9") == "springer_nature"
     assert identify_publisher("10.1021/acsnano.6c02465") == "acs"
     assert identify_publisher("10.1039/d5nr04405g") == "rsc"
     assert identify_publisher("10.9999/example") == "unknown"
@@ -23,6 +24,15 @@ def test_wiley_uses_pdfdirect_download_url():
     assert urls["pdf"] == (
         "https://advanced.onlinelibrary.wiley.com/doi/pdfdirect/"
         "10.1002/adfm.202316712?download=true"
+    )
+
+
+def test_springer_1007_uses_link_springer_pdf_url():
+    urls = publisher_urls("10.1007/s10853-025-11937-9", "springer_nature")
+
+    assert urls["landing"] == "https://link.springer.com/article/10.1007/s10853-025-11937-9"
+    assert urls["pdf"] == (
+        "https://link.springer.com/content/pdf/10.1007/s10853-025-11937-9.pdf"
     )
 
 

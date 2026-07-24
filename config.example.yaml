@@ -4,6 +4,34 @@ storage:
   cache_dir: "./data/cache"
   sessions_dir: "./sessions"
   workspace_snapshot_limit: 30
+  default_user_id: "local-user"
+
+artifact_storage:
+  backend: "local"  # local | s3 (MinIO-compatible)
+  local_root: "./data/artifacts"
+  bucket: null
+  endpoint_url: null
+  region: null
+  path_prefix: ""
+
+rag:
+  enabled: false
+  backend: "pgvector"
+  postgres_dsn: "postgresql://littrace:littrace@localhost:5433/littrace"
+  schema_name: "littrace_rag"
+  collection_prefix: "littrace"
+  embedding_provider: "openai-compatible"
+  embedding_base_url: "https://api.openai.com/v1"
+  embedding_api_key: "your-openai-api-key"
+  embedding_model: "text-embedding-3-small"
+  embedding_dimension: 1536
+  chunk_target_tokens: 700
+  chunk_overlap_tokens: 120
+  top_k: 12
+  refresh_frequency: "daily"
+  auto_refresh_enabled: false
+  auto_download_open_access: true
+  login_required_policy: "queue_only"
 
 cache_policy:
   default_ttl_seconds: 86400

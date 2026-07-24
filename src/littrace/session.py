@@ -2,21 +2,46 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from hashlib import sha256
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from littrace.artifact_registry import ArtifactRecord, artifact_registry_from_config
+from littrace.artifact_store import (
+    ArtifactKeyContext,
+    BlobRef,
+    artifact_store_from_config,
+    build_artifact_object_key,
+)
 from littrace.config import LitTraceConfig
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
+from littrace.state_db import (
+    EmbeddingJobRecord,
+    SessionMessageRecord,
+    SessionPermissionGrant,
+    SessionStateRecord,
+    state_store_from_config,
+)
+from littrace.retrieval.pgvector_store import PgvectorRagStore
+from littrace.retrieval.rag_profile import (
+    load_session_rag_profile,
+    save_session_rag_profile,
+    session_rag_profile_path,
+)
 from littrace.runtime.memory import build_session_memory, load_session_memory, save_session_memory
 
 
 class ChatSession(BaseModel):
     session_id: str
+    user_id: str = "local-user"
+    metadata_store_backend: str = "local_json"
+    metadata_postgres_dsn: str | None = None
+    metadata_schema_name: str = "littrace"
     root: Path
     workspace_dir: Path
     workspace_path: Path
@@ -27,6 +52,7 @@ class ChatSession(BaseModel):
     structured_documents_dir: Path
     evidence_dir: Path
     releases_dir: Path
+    rag_dir: Path
     snapshot_limit: int = 30
 
     @classmethod
@@ -34,12 +60,18 @@ class ChatSession(BaseModel):
         cls,
         root: Path,
         session_id: str | None = None,
+        user_id: str = "local-user",
         snapshot_limit: int = 30,
+        config: LitTraceConfig | None = None,
     ) -> "ChatSession":
         root = Path(root)
         workspace_dir = root / "workspace"
         return cls(
             session_id=session_id or root.name,
+            user_id=user_id,
+            metadata_store_backend=config.metadata_store.backend if config is not None else "local_json",
+            metadata_postgres_dsn=config.metadata_store.postgres_dsn if config is not None else None,
+            metadata_schema_name=config.metadata_store.schema_name if config is not None else "littrace",
             root=root,
             workspace_dir=workspace_dir,
             workspace_path=root / "workspace.json",
@@ -50,6 +82,7 @@ class ChatSession(BaseModel):
             structured_documents_dir=workspace_dir / "structured_documents",
             evidence_dir=workspace_dir / "evidence",
             releases_dir=workspace_dir / "releases",
+            rag_dir=workspace_dir / "rag",
             snapshot_limit=snapshot_limit,
         )
 
@@ -73,31 +106,79 @@ def create_chat_session(config: LitTraceConfig) -> ChatSession:
     snapshots_dir = workspace_dir / "snapshots"
     (workspace_dir / "evidence").mkdir(parents=True, exist_ok=True)
     (workspace_dir / "releases").mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "rag").mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     structured_documents_dir.mkdir(parents=True, exist_ok=True)
     snapshots_dir.mkdir(parents=True, exist_ok=True)
     session = ChatSession.from_root(
         root,
         session_id,
+        user_id=config.storage.default_user_id,
         snapshot_limit=config.storage.workspace_snapshot_limit,
+        config=config,
     )
-    save_workspace(session, LiteratureWorkspace())
+    save_workspace(session, LiteratureWorkspace(), config=config)
     return session
 
 
 def load_or_create_session(config: LitTraceConfig, session_id: str | None = None) -> ChatSession:
+    state_store = state_store_from_config(config)
     if session_id:
         root = config.storage.sessions_dir / session_id
         if root.exists():
+            user_id = _load_session_user_id(root, config.storage.default_user_id)
             return ChatSession.from_root(
                 root,
                 session_id,
+                user_id=user_id,
                 snapshot_limit=config.storage.workspace_snapshot_limit,
+                config=config,
             )
+        if state_store is not None:
+            record = state_store.get_session(session_id)
+            if record is not None:
+                return ChatSession.from_root(
+                    Path(record.root_path),
+                    session_id,
+                    user_id=record.user_id,
+                    snapshot_limit=config.storage.workspace_snapshot_limit,
+                    config=config,
+                )
     return create_chat_session(config)
 
 
+def load_existing_session(config: LitTraceConfig, session_id: str) -> ChatSession | None:
+    root = config.storage.sessions_dir / session_id
+    if root.exists():
+        user_id = _load_session_user_id(root, config.storage.default_user_id)
+        return ChatSession.from_root(
+            root,
+            session_id,
+            user_id=user_id,
+            snapshot_limit=config.storage.workspace_snapshot_limit,
+            config=config,
+        )
+    state_store = state_store_from_config(config)
+    if state_store is not None:
+        record = state_store.get_session(session_id)
+        if record is not None:
+            return ChatSession.from_root(
+                Path(record.root_path),
+                session_id,
+                user_id=record.user_id,
+                snapshot_limit=config.storage.workspace_snapshot_limit,
+                config=config,
+            )
+    return None
+
+
 def load_workspace(session: ChatSession) -> LiteratureWorkspace:
+    record = _load_session_record(session)
+    if record is not None:
+        try:
+            return LiteratureWorkspace.model_validate(record.workspace_json)
+        except Exception:
+            pass
     if not session.workspace_path.exists():
         return LiteratureWorkspace()
     raw = session.workspace_path.read_text(encoding="utf-8")
@@ -115,33 +196,52 @@ def load_workspace(session: ChatSession) -> LiteratureWorkspace:
     return LiteratureWorkspace.model_validate_json(raw)
 
 
-def save_workspace(session: ChatSession, workspace: LiteratureWorkspace) -> None:
+def save_workspace(
+    session: ChatSession,
+    workspace: LiteratureWorkspace,
+    config: LitTraceConfig | None = None,
+) -> None:
     session.root.mkdir(parents=True, exist_ok=True)
     session.workspace_dir.mkdir(parents=True, exist_ok=True)
     session.structured_documents_dir.mkdir(parents=True, exist_ok=True)
     session.snapshots_dir.mkdir(parents=True, exist_ok=True)
     session.evidence_dir.mkdir(parents=True, exist_ok=True)
     session.releases_dir.mkdir(parents=True, exist_ok=True)
+    session.rag_dir.mkdir(parents=True, exist_ok=True)
     workspace.context.filters.workspace_revision = _next_workspace_revision(session)
     _persist_structured_documents(session, workspace)
     _persist_evidence_and_releases(session, workspace)
+    rag_profile = save_session_rag_profile(config, session, workspace) if config is not None else None
+    if rag_profile is not None:
+        workspace.context.filters.rag_profile = rag_profile.model_dump(mode="json")
+        workspace.context.filters.rag_enabled = config.rag.enabled
+        workspace.context.filters.rag_backend = config.rag.backend
+        workspace.context.filters.rag_source_routes = list(rag_profile.source_routes)
+        workspace.context.filters.rag_last_refreshed_at = rag_profile.last_refreshed_at
+    workspace_json = workspace.model_dump_json(indent=2)
+    _atomic_write(session.workspace_path, workspace_json)
     snapshot_path = _persist_workspace_snapshot(session, workspace)
-    artifact_index = _build_artifact_index(session, workspace, snapshot_path)
+    artifact_index = _build_artifact_index(session, workspace, snapshot_path, config=config)
     workspace.context.filters.artifact_index = artifact_index
+    workspace_json = workspace.model_dump_json(indent=2)
+    _atomic_write(session.workspace_path, workspace_json)
     memory = build_session_memory(
         workspace,
         session_id=session.session_id,
         artifact_index=artifact_index,
     )
-    workspace_json = workspace.model_dump_json(indent=2)
-    _atomic_write(session.workspace_path, workspace_json)
+    save_session_memory(session, memory)
     manifest = {
         "schema": "littrace.session_workspace.v2",
         "session_id": session.session_id,
+        "user_id": getattr(session, "user_id", "local-user"),
         "revision": workspace.context.filters.workspace_revision,
         "workspace_sha256": sha256(workspace_json.encode("utf-8")).hexdigest(),
         "storage_mode": "session-workspace",
-        "rag_enabled": False,
+        "artifact_storage": artifact_index.get("storage"),
+        "rag_enabled": bool(rag_profile and config and config.rag.enabled),
+        "rag": rag_profile.model_dump(mode="json") if rag_profile is not None else None,
+        "rag_profile_path": str(session_rag_profile_path(session)),
         "workspace_path": str(session.workspace_path),
         "structured_documents_dir": str(session.structured_documents_dir),
         "artifact_index_path": str(session.artifact_index_path),
@@ -153,12 +253,13 @@ def save_workspace(session: ChatSession, workspace: LiteratureWorkspace) -> None
         session.artifact_index_path,
         json.dumps(artifact_index, ensure_ascii=False, indent=2),
     )
-    save_session_memory(session, memory)
     # Manifest is the commit marker and is written only after every artifact.
     _atomic_write(
         session.workspace_dir / "manifest.json",
         json.dumps(manifest, ensure_ascii=False, indent=2),
     )
+    _register_artifacts(session, artifact_index, config, rag_profile=rag_profile)
+    _sync_session_state(session, workspace, manifest, artifact_index, memory, rag_profile, config)
 
 
 def append_message(
@@ -176,9 +277,55 @@ def append_message(
     }
     with session.messages_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    state_store = _session_state_store(session)
+    if state_store is not None:
+        content_json = content if isinstance(content, dict) else {"message": content}
+        content_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+        state_store.upsert_message(
+            SessionMessageRecord(
+                session_id=session.session_id,
+                user_id=session.user_id,
+                role=role,
+                content_json=content_json if isinstance(content_json, dict) else {},
+                content_text=content_text,
+                created_at=record["time"],
+                updated_at=record["time"],
+            )
+        )
 
 
 def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSessionSummary]:
+    state_store = state_store_from_config(config)
+    if state_store is not None:
+        summaries: list[ChatSessionSummary] = []
+        for record in state_store.list_sessions(limit=limit):
+            topic = "未命名主题"
+            workspace = record.workspace_json if isinstance(record.workspace_json, dict) else {}
+            filters = workspace.get("context", {}).get("filters", {}) if isinstance(workspace, dict) else {}
+            if isinstance(filters, dict):
+                topic_value = filters.get("topic")
+                if isinstance(topic_value, str) and topic_value.strip():
+                    topic = topic_value
+            if topic == "未命名主题":
+                for message in state_store.list_messages(record.session_id, user_id=record.user_id):
+                    if message.role != "user":
+                        continue
+                    content = message.content_text or message.content_json.get("message")
+                    if isinstance(content, str) and content.strip():
+                        topic = _summarize_topic(content)
+                        break
+            summaries.append(
+                ChatSessionSummary(
+                    session_id=record.session_id,
+                    root=Path(record.root_path),
+                    updated_at=record.updated_at,
+                    topic=topic,
+                    message_count=len(state_store.list_messages(record.session_id, user_id=record.user_id)),
+                    paper_count=len(workspace.get("papers", {})) if isinstance(workspace, dict) else 0,
+                )
+            )
+        summaries.sort(key=lambda item: item.updated_at, reverse=True)
+        return summaries[:limit]
     root = config.storage.sessions_dir
     if not root.exists():
         return []
@@ -222,7 +369,11 @@ def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSess
                 break
         if workspace_path.exists():
             try:
-                summary_session = ChatSession.from_root(session_dir)
+                summary_session = ChatSession.from_root(
+                    session_dir,
+                    user_id=config.storage.default_user_id,
+                    snapshot_limit=config.storage.workspace_snapshot_limit,
+                )
                 paper_count = len(load_workspace(summary_session).context.active_papers)
             except Exception:
                 paper_count = 0
@@ -337,38 +488,129 @@ def _build_artifact_index(
     session: ChatSession,
     workspace: LiteratureWorkspace,
     snapshot_path: Path,
+    config: LitTraceConfig | None = None,
 ) -> dict[str, object]:
+    store = artifact_store_from_config(config) if config is not None else None
+    user_id = getattr(session, "user_id", "local-user")
+
+    def artifact_entry(
+        *,
+        kind: str,
+        artifact_id: str,
+        path: Path | None = None,
+        format: str | None = None,
+        filename: str | None = None,
+    ) -> dict[str, object]:
+        entry: dict[str, object] = {
+            "kind": kind,
+            "id": artifact_id,
+        }
+        if path is not None:
+            entry["path"] = str(path)
+        if format is not None:
+            entry["format"] = format
+        if store is not None and path is not None and path.exists():
+            object_key = build_artifact_object_key(
+                config,
+                ArtifactKeyContext(
+                    user_id=user_id,
+                    session_id=session.session_id,
+                    kind=kind,
+                    artifact_id=artifact_id,
+                    filename=filename or path.name,
+                ),
+            )
+            ref = store.ref_for_path(
+                path,
+                object_key,
+                content_type=_content_type_for_format(format),
+                metadata={
+                    "user_id": user_id,
+                    "session_id": session.session_id,
+                    "kind": kind,
+                    "artifact_id": artifact_id,
+                },
+            )
+            entry["storage_ref"] = ref.model_dump(mode="json")
+        return entry
+
     artifacts: list[dict[str, object]] = [
-        {
-            "kind": "workspace",
-            "id": "current",
-            "path": str(session.workspace_path),
-            "format": "json",
-        },
-        {
-            "kind": "workspace_snapshot",
-            "id": snapshot_path.stem,
-            "path": str(snapshot_path),
-            "format": "json",
-        },
+        artifact_entry(
+            kind="workspace",
+            artifact_id="current",
+            path=session.workspace_path,
+            format="json",
+            filename="current.json",
+        ),
+        artifact_entry(
+            kind="workspace_snapshot",
+            artifact_id=snapshot_path.stem,
+            path=snapshot_path,
+            format="json",
+            filename=snapshot_path.name,
+        ),
     ]
     if session.messages_path.exists():
         artifacts.append(
-            {
-                "kind": "messages",
-                "id": "messages",
-                "path": str(session.messages_path),
-                "format": "jsonl",
-            }
+            artifact_entry(
+                kind="messages",
+                artifact_id="messages",
+                path=session.messages_path,
+                format="jsonl",
+                filename="messages.jsonl",
+            )
+        )
+    memory_path = session.workspace_dir / "memory.json"
+    if memory_path.exists():
+        artifacts.append(
+            artifact_entry(
+                kind="memory",
+                artifact_id="memory",
+                path=memory_path,
+                format="json",
+                filename="memory.json",
+            )
         )
     for paper_id, path in workspace.context.filters.structured_document_paths.items():
         artifacts.append(
-            {
-                "kind": "structured_document",
-                "id": paper_id,
-                "path": path,
-                "format": "json",
-            }
+            artifact_entry(
+                kind="structured_document",
+                artifact_id=paper_id,
+                path=Path(path),
+                format="json",
+                filename=f"{_safe_filename(paper_id)}.json",
+            )
+        )
+    rag_profile_path = session_rag_profile_path(session)
+    if rag_profile_path.exists():
+        artifacts.append(
+            artifact_entry(
+                kind="rag_profile",
+                artifact_id="profile",
+                path=rag_profile_path,
+                format="json",
+                filename="rag/profile.json",
+            )
+        )
+    for evidence_path in sorted(session.evidence_dir.glob("*.json")):
+        artifacts.append(
+            artifact_entry(
+                kind="evidence",
+                artifact_id=evidence_path.stem,
+                path=evidence_path,
+                format="json",
+                filename=f"evidence/{evidence_path.name}",
+            )
+        )
+    for release_path in sorted(session.releases_dir.glob("*.json")):
+        artifacts.append(
+            artifact_entry(
+                kind="release_snapshot",
+                artifact_id=release_path.stem,
+                path=release_path,
+                format="json",
+                filename=f"releases/{release_path.name}",
+            )
         )
     if workspace.context.filters.document_report:
         artifacts.append({"kind": "document_report", "id": "latest", "format": "inline"})
@@ -377,7 +619,12 @@ def _build_artifact_index(
     return {
         "schema": "littrace.session_artifact_index.v1",
         "session_id": session.session_id,
+        "user_id": user_id,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "storage": {
+            "backend": config.artifact_storage.backend if config is not None else "local",
+            "path_prefix": config.artifact_storage.path_prefix if config is not None else "",
+        },
         "artifacts": artifacts,
         "counts": {
             "artifacts": len(artifacts),
@@ -387,7 +634,22 @@ def _build_artifact_index(
     }
 
 
+def _content_type_for_format(format: str | None) -> str | None:
+    if format == "json":
+        return "application/json"
+    if format == "jsonl":
+        return "application/x-ndjson"
+    if format == "pdf":
+        return "application/pdf"
+    return None
+
+
 def load_artifact_index(session: ChatSession) -> dict[str, object]:
+    state_store = _session_state_store(session)
+    if state_store is not None:
+        record = state_store.get_session(session.session_id, user_id=session.user_id)
+        if record is not None and isinstance(record.artifact_index_json, dict):
+            return record.artifact_index_json
     if not session.artifact_index_path.exists():
         return {}
     try:
@@ -404,5 +666,301 @@ def _safe_filename(value: str) -> str:
     )
 
 
+def _load_session_user_id(root: Path, default_user_id: str) -> str:
+    manifest_path = root / "workspace" / "manifest.json"
+    for candidate_path in (
+        manifest_path,
+        root / "workspace" / "rag" / "profile.json",
+    ):
+        try:
+            raw = json.loads(candidate_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        user_id = raw.get("user_id")
+        if isinstance(user_id, str) and user_id.strip():
+            return user_id
+    return default_user_id
+
+
 def load_memory(session: ChatSession):
     return load_session_memory(session)
+
+
+class SessionDeleteReport(BaseModel):
+    session_id: str
+    user_id: str
+    root_path: str
+    deleted: bool = False
+    artifact_count: int = 0
+    embedded_chunk_count: int = 0
+    state_record_count: int = 0
+    object_deleted_count: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
+def delete_chat_session(config: LitTraceConfig, session_id: str) -> SessionDeleteReport:
+    session = load_existing_session(config, session_id)
+    if session is None:
+        return SessionDeleteReport(
+            session_id=session_id,
+            user_id=config.storage.default_user_id,
+            root_path=str(config.storage.sessions_dir / session_id),
+            deleted=False,
+            warnings=["session_not_found"],
+        )
+
+    artifact_registry = artifact_registry_from_config(config)
+    artifact_store = artifact_store_from_config(config)
+    state_store = _session_state_store(session, config)
+    artifact_records = artifact_registry.list_for_session(
+        user_id=session.user_id,
+        session_id=session.session_id,
+    )
+    object_deleted_count = 0
+    for record in artifact_records:
+        try:
+            artifact_store.delete(
+                BlobRef(
+                    backend=record.backend,
+                    bucket=record.bucket,
+                    object_key=record.object_key,
+                    uri=None,
+                    sha256=record.sha256,
+                    size_bytes=record.size_bytes,
+                    content_type=record.content_type,
+                    metadata={},
+                )
+            )
+            object_deleted_count += 1
+        except Exception:
+            continue
+
+    artifact_deleted = artifact_registry.delete_for_session(
+        user_id=session.user_id,
+        session_id=session.session_id,
+    )
+
+    embedded_chunk_count = 0
+    profile = load_session_rag_profile(session)
+    if profile is not None and config.rag.backend == "pgvector" and config.rag.postgres_dsn:
+        try:
+            embedded_chunk_count = PgvectorRagStore(config, profile).delete_session()
+        except Exception:
+            pass
+
+    state_record_count = 0
+    if state_store is not None:
+        try:
+            state_record_count = state_store.delete_session(
+                session.session_id,
+                user_id=session.user_id,
+            )
+        except Exception:
+            pass
+
+    if session.root.exists():
+        shutil.rmtree(session.root, ignore_errors=True)
+
+    return SessionDeleteReport(
+        session_id=session.session_id,
+        user_id=session.user_id,
+        root_path=str(session.root),
+        deleted=True,
+        artifact_count=artifact_deleted,
+        embedded_chunk_count=embedded_chunk_count,
+        state_record_count=state_record_count,
+        object_deleted_count=object_deleted_count,
+        warnings=[],
+    )
+
+
+def _register_artifacts(
+    session: ChatSession,
+    artifact_index: dict[str, object],
+    config: LitTraceConfig | None,
+    *,
+    rag_profile=None,
+) -> None:
+    if config is None:
+        return
+    registry = artifact_registry_from_config(config)
+    state_store = _session_state_store(session, config)
+    if state_store is not None:
+        state_store.grant_permission(
+            SessionPermissionGrant(
+                scope="session",
+                resource_key=session.session_id,
+                owner_user_id=session.user_id,
+                grantee_user_id=session.user_id,
+                role="owner",
+                granted_by=session.user_id,
+            )
+        )
+    artifacts = artifact_index.get("artifacts")
+    if not isinstance(artifacts, list):
+        return
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("storage_ref")
+        if not isinstance(ref, dict):
+            continue
+        artifact_id = str(item.get("id") or "")
+        kind = str(item.get("kind") or "artifact")
+        if not artifact_id:
+            continue
+        blob_ref = BlobRef.model_validate(ref)
+        record = ArtifactRecord.from_blob_ref(
+            blob_ref,
+            artifact_id=artifact_id,
+            user_id=session.user_id,
+            session_id=session.session_id,
+            kind=kind,
+            paper_id=str(item.get("paper_id")) if item.get("paper_id") else None,
+            revision=str(item.get("revision")) if item.get("revision") else None,
+        )
+        registry.upsert(record)
+        if state_store is not None:
+            resource_key = f"{session.session_id}:{artifact_id}"
+            state_store.grant_permission(
+                SessionPermissionGrant(
+                    scope="artifact",
+                    resource_key=resource_key,
+                    owner_user_id=session.user_id,
+                    grantee_user_id=session.user_id,
+                    role="owner",
+                    granted_by=session.user_id,
+                    metadata={"kind": kind},
+                )
+            )
+            _enqueue_embedding_job_if_needed(state_store, session, item, record, config, rag_profile)
+
+
+def _enqueue_embedding_job_if_needed(
+    state_store,
+    session: ChatSession,
+    item: dict[str, object],
+    record: ArtifactRecord,
+    config: LitTraceConfig,
+    rag_profile,
+) -> None:
+    if not config.rag.enabled:
+        return
+    kind = str(item.get("kind") or "")
+    if kind not in {"structured_document", "paper_pdf", "supplementary"}:
+        return
+    profile_id = str(getattr(rag_profile, "profile_id", "") or f"{session.user_id}:{session.session_id}")
+    state_store.enqueue_embedding_job(
+        EmbeddingJobRecord(
+            job_id=_embedding_job_id(
+                session.user_id,
+                session.session_id,
+                record.artifact_id,
+                record.sha256,
+                record.revision,
+            ),
+            profile_id=profile_id,
+            user_id=session.user_id,
+            session_id=session.session_id,
+            artifact_id=record.artifact_id,
+            source_revision=record.revision,
+            content_sha256=record.sha256,
+        )
+    )
+
+
+def _embedding_job_id(
+    user_id: str,
+    session_id: str,
+    artifact_id: str,
+    content_sha256: str | None,
+    source_revision: str | None,
+) -> str:
+    digest = sha256(
+        "\0".join(
+            [
+                user_id,
+                session_id,
+                artifact_id,
+                content_sha256 or "",
+                source_revision or "",
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"emb:{digest}"
+
+
+def _sync_session_state(
+    session: ChatSession,
+    workspace: LiteratureWorkspace,
+    manifest: dict[str, object],
+    artifact_index: dict[str, object],
+    memory,
+    rag_profile,
+    config: LitTraceConfig | None,
+) -> None:
+    state_store = _session_state_store(session, config)
+    if state_store is None:
+        return
+    workspace_json = json.loads(workspace.model_dump_json())
+    state_store.upsert_session(
+        SessionStateRecord(
+            session_id=session.session_id,
+            user_id=session.user_id,
+            root_path=str(session.root),
+            workspace_sha256=manifest.get("workspace_sha256"),
+            workspace_json=workspace_json if isinstance(workspace_json, dict) else {},
+            manifest_json=manifest,
+            artifact_index_json=artifact_index,
+            memory_json=memory.model_dump(mode="json") if hasattr(memory, "model_dump") else {},
+            rag_profile_json=rag_profile.model_dump(mode="json") if rag_profile is not None else {},
+            revision=int(manifest.get("revision", 0) or 0),
+            structured_document_count=workspace.context.filters.structured_document_count,
+            workspace_snapshot_count=workspace.context.filters.workspace_snapshot_count,
+        )
+    )
+
+
+def _load_session_record(session: ChatSession) -> SessionStateRecord | None:
+    state_store = _session_state_store(session)
+    if state_store is None:
+        return None
+    return state_store.get_session(session.session_id, user_id=session.user_id)
+
+
+def _session_state_store(
+    session: ChatSession,
+    config: LitTraceConfig | None = None,
+):
+    backend = (
+        config.metadata_store.backend
+        if config is not None
+        else getattr(session, "metadata_store_backend", "local_json")
+    )
+    dsn = (
+        config.metadata_store.postgres_dsn
+        if config is not None
+        else getattr(session, "metadata_postgres_dsn", None)
+    )
+    schema_name = (
+        config.metadata_store.schema_name
+        if config is not None
+        else getattr(session, "metadata_schema_name", "littrace")
+    )
+    if backend != "postgres":
+        return None
+    if not dsn:
+        return None
+    return state_store_from_config(
+        LitTraceConfig.model_validate(
+            {
+                "metadata_store": {
+                    "backend": backend,
+                    "postgres_dsn": dsn,
+                    "schema_name": schema_name,
+                }
+            }
+        )
+    )

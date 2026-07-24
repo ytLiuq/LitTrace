@@ -30,6 +30,11 @@ def write_config_template(path: str | Path = "config.yaml", overwrite: bool = Fa
     raw["cdp_downloader"]["auto_launch_chrome"] = True
     raw["browser"]["browser_act_path"] = "browser-act"
     raw["browser"]["required"] = False
+    raw["rag"]["enabled"] = False
+    raw["rag"]["backend"] = "pgvector"
+    raw["rag"]["postgres_dsn"] = "postgresql://littrace:littrace@localhost:5433/littrace"
+    raw["rag"]["embedding_base_url"] = "https://api.openai.com/v1"
+    raw["rag"]["embedding_api_key"] = "your-openai-api-key"
     raw["parsing"]["default_parser"] = "docling"
     target.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return ConfigWizardResult(path=str(target), created=True)

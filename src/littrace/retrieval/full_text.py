@@ -357,6 +357,10 @@ async def _verify_candidate(
     if "pdf" in content_type.lower():
         update["is_pdf"] = True
         update["content_type"] = content_type
+    elif 200 <= response.status_code < 400 and _is_html_like_content_type(content_type):
+        update["is_pdf"] = False
+        update["content_type"] = "landing_page"
+        update["note"] = "verified_non_pdf_landing_page"
     if "xml" in content_type.lower():
         update["is_xml"] = True
         update["content_type"] = content_type
@@ -485,6 +489,19 @@ def _content_type_from_url(url: str) -> str:
     return "landing_page"
 
 
+def _is_html_like_content_type(content_type: str) -> bool:
+    lowered = content_type.lower()
+    return any(
+        marker in lowered
+        for marker in {
+            "text/html",
+            "application/xhtml",
+            "text/plain",
+            "application/json",
+        }
+    )
+
+
 def _has_open_access_evidence(candidate: FullTextCandidate) -> bool:
     if candidate.access_type == AccessType.OPEN_ACCESS and candidate.source.startswith("unpaywall"):
         return True
@@ -517,5 +534,6 @@ def _looks_gated(url: str, paper: PaperMetadata) -> bool:
         "nature.com",
         "sciencedirect.com",
         "springer",
+        "link.springer.com",
     ]
     return any(marker in lowered for marker in gated_markers)

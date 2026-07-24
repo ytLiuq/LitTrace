@@ -333,6 +333,13 @@ class WorkspaceFilters(BaseModel):
     # Search-related
     search_mode: str | None = None
     topic: str | None = None
+    research_background: str | None = None
+    research_background_status: str | None = None
+    research_background_rejection_reason: str | None = None
+    research_background_set_at: str | None = None
+    research_background_last_sync_at: str | None = None
+    research_background_last_downloaded_count: int = 0
+    research_background_last_parsed_count: int = 0
     discipline: str | None = None
     expanded_year_range_from: int | None = None
     year_min: int | None = None
@@ -370,6 +377,17 @@ class WorkspaceFilters(BaseModel):
     docling_quality_reports: dict[str, dict[str, object]] = Field(default_factory=dict)
     artifact_index: dict[str, object] = Field(default_factory=dict)
     workspace_snapshot_count: int = 0
+    rag_profile: dict[str, object] | None = None
+    rag_enabled: bool = False
+    rag_backend: str | None = None
+    rag_last_refreshed_at: str | None = None
+    rag_chunk_count: int = 0
+    rag_stale_chunk_count: int = 0
+    rag_paper_count: int = 0
+    rag_last_query: str | None = None
+    rag_last_hit_count: int = 0
+    rag_source_routes: list[str] = Field(default_factory=list)
+    rag_refresh_report: dict[str, object] | None = None
 
     # Reports (stored as model_dump dicts for serialization)
     document_report: dict[str, object] | None = None
@@ -440,6 +458,8 @@ class DownloadPlan(BaseModel):
 class DownloadExecutionRequest(BaseModel):
     paper_ids: list[str] = Field(default_factory=list)
     dry_run: bool = False
+    user_id: str | None = None
+    session_id: str | None = None
 
 
 class DownloadExecutionItem(BaseModel):
@@ -447,6 +467,8 @@ class DownloadExecutionItem(BaseModel):
     action: str
     status: str
     target_path: str | None = None
+    task_id: str | None = None
+    storage_ref: dict[str, object] | None = None
     login_url: HttpUrl | None = None
     login_instructions: list[str] = Field(default_factory=list)
     error: str | None = None
@@ -525,6 +547,7 @@ class ChatRequest(BaseModel):
     message: str
     live: bool | None = None
     session_id: str | None = None
+    research_background: str | None = None
 
 
 class ChatResponse(BaseModel):

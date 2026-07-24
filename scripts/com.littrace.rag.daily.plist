@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.littrace.rag.daily</string>
+  <key>WorkingDirectory</key>
+  <string>/path/to/LitTrace</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/path/to/LitTrace/scripts/run_rag_daily.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LITTRACE_VENV_BIN</key>
+    <string>/path/to/LitTrace/.venv/bin</string>
+    <key>LITTRACE_LOG_DIR</key>
+    <string>/path/to/LitTrace/logs</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/path/to/LitTrace/logs/rag-daily.log</string>
+  <key>StandardErrorPath</key>
+  <string>/path/to/LitTrace/logs/rag-daily.err</string>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>

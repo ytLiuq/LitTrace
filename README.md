@@ -148,6 +148,17 @@ When the current chat has literature context, it also scores DOI recall,
 recent-paper ratio, publisher coverage, table-metric recall, storyline evidence
 coverage, citation coverage, and agent handoff progress.
 
+RAG maintenance commands run outside the interactive shell:
+
+```bash
+docker compose -f docker-compose.rag.yml up -d
+littrace rag daily
+littrace rag refresh --session SESSION_ID
+littrace rag daemon --interval-hours 24
+```
+
+See `docs/rag_automation.md` for cron and macOS launchd examples.
+
 Conversation examples:
 
 ```text
@@ -189,6 +200,12 @@ To enable the optional Docling parser backend:
 
 ```bash
 pip install -e ".[parsers]"
+```
+
+To enable RAG plus object storage support:
+
+```bash
+pip install -e ".[rag,storage]"
 ```
 
 Then set one of:

@@ -11,6 +11,12 @@ from littrace.models import (
     ResearchRunRequest,
     ResearchRunResult,
 )
+from littrace.research_background import (
+    assess_research_background,
+    mark_workspace_research_background_rejected,
+    set_workspace_research_background,
+    workspace_has_research_background,
+)
 from littrace.session import (
     append_message,
     load_memory,
@@ -69,6 +75,20 @@ async def chat(request: ChatRequest) -> ChatResponse:
     config = api_app.load_config()
     session = load_or_create_session(config, request.session_id)
     session_workspace = load_workspace(session)
+    background_response = await _research_background_gate(request, session_workspace, config)
+    if background_response is not None:
+        api_app._set_workspace(session_workspace)
+        background_response.session_id = session.session_id
+        background_response.session_root = str(session.root)
+        save_workspace(session, session_workspace, config=config)
+        append_message(session, "user", request)
+        append_message(session, "assistant", background_response)
+        api_app.append_trace(
+            config,
+            "chat",
+            {"action": background_response.action, "session_id": session.session_id},
+        )
+        return background_response
     session_memory = load_memory(session)
     response, session_workspace = await handle_chat(
         request,
@@ -79,7 +99,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
     api_app._set_workspace(session_workspace)
     response.session_id = session.session_id
     response.session_root = str(session.root)
-    save_workspace(session, api_app.WORKSPACE)
+    try:
+        save_workspace(session, api_app.WORKSPACE, config=config)
+    except TypeError:
+        save_workspace(session, api_app.WORKSPACE)
     append_message(session, "user", request)
     append_message(session, "assistant", response)
     api_app.append_trace(config, "chat", {"action": response.action, "session_id": session.session_id})
@@ -92,3 +115,45 @@ async def export_session(session_id: str) -> dict[str, str]:
     session = load_or_create_session(config, session_id)
     workspace = load_workspace(session)
     return await export_session_bundle_skill(session, workspace, config)
+
+
+async def _research_background_gate(
+    request: ChatRequest,
+    workspace: LiteratureWorkspace,
+    config,
+) -> ChatResponse | None:
+    explicit_background = request.research_background
+    if workspace_has_research_background(workspace) and not explicit_background:
+        return None
+    candidate = explicit_background or (
+        request.message if not workspace_has_research_background(workspace) else None
+    )
+    assessment = await assess_research_background(candidate, config)
+    if not assessment.accepted:
+        if not workspace_has_research_background(workspace):
+            mark_workspace_research_background_rejected(
+                workspace, assessment.reason or "invalid"
+            )
+        return ChatResponse(
+            reply=(
+                "这个 session 需要先设置一个明确的研究背景，我暂时不会把当前内容作为长期科研主题。\n\n"
+                + "\n".join(f"- {item}" for item in assessment.suggestions)
+            ),
+            action="research_background_required",
+            workspace=workspace,
+            warnings=[assessment.reason or "invalid_research_background"],
+        )
+    set_workspace_research_background(
+        workspace,
+        assessment.background or str(candidate or ""),
+        topic=assessment.topic,
+    )
+    return ChatResponse(
+        reply=(
+            "已记录这个 session 的研究背景，并会把它作为长期记忆用于每日文献检索、PDF 下载和 RAG 更新。\n\n"
+            f"研究主题：{workspace.context.filters.topic}\n\n"
+            "接下来你可以告诉我具体要检索、下载、比较或分析什么。"
+        ),
+        action="research_background_set",
+        workspace=workspace,
+    )
