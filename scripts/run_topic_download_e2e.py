@@ -8,12 +8,11 @@ import asyncio
 import json
 import os
 import sys
-import threading
 import time
 from datetime import UTC, datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from littrace.access_layer.cdp import check_cdp_status
 from littrace.artifact_registry import artifact_registry_from_config
 from littrace.artifact_store import BlobRef, artifact_store_from_config
 from littrace.config import ArtifactStorageConfig, LitTraceConfig, MetadataStoreConfig, StorageConfig, load_config
@@ -29,43 +28,10 @@ from littrace.models import (
 from littrace.rag_jobs import run_pending_embedding_jobs
 from littrace.retrieval.rag_profile import load_session_rag_profile
 from littrace.retrieval.rag_search import search_session_rag
-from littrace.search import build_query_variants
+from littrace.retrieval.search import build_query_variants
 from littrace.session import create_chat_session, save_workspace
 from littrace.skill_runner import parse_workspace_skill, search_papers_skill
 from littrace.state_db import state_store_from_config
-
-
-class _EmbeddingHandler(BaseHTTPRequestHandler):
-    def do_POST(self):  # noqa: N802
-        if self.path != "/v1/embeddings":
-            self.send_response(404)
-            self.end_headers()
-            return
-        length = int(self.headers.get("content-length", "0"))
-        payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        inputs = payload.get("input") or []
-        if not isinstance(inputs, list):
-            inputs = [inputs]
-        data = [
-            {"index": index, "embedding": [0.1 + index * 0.01, 0.2 + index * 0.01, 0.3 + index * 0.01]}
-            for index, _ in enumerate(inputs)
-        ]
-        body = json.dumps({"data": data}).encode("utf-8")
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_args):  # noqa: D401
-        return
-
-
-def _start_embedding_server() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _EmbeddingHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, thread, f"http://127.0.0.1:{server.server_address[1]}/v1"
 
 
 def _ensure_bucket(config: LitTraceConfig) -> None:
@@ -97,7 +63,6 @@ async def _execute_downloads_with_progress(
     config: LitTraceConfig,
     papers: list[PaperMetadata],
     *,
-    user_id: str,
     session_id: str,
 ) -> list[DownloadExecutionItem]:
     items: list[DownloadExecutionItem] = []
@@ -124,7 +89,6 @@ async def _execute_downloads_with_progress(
             [paper],
             DownloadExecutionRequest(
                 paper_ids=[paper.paper_id],
-                user_id=user_id,
                 session_id=session_id,
                 dry_run=False,
             ),
@@ -165,7 +129,6 @@ async def _run(topic: str, limit: int) -> int:
         metadata_dir=work_root / "metadata",
         cache_dir=work_root / "cache",
         sessions_dir=work_root / "sessions",
-        default_user_id="e2e-user",
     )
     config.artifact_storage = ArtifactStorageConfig(
         backend="s3",
@@ -184,25 +147,45 @@ async def _run(topic: str, limit: int) -> int:
     config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5433/littrace"
     config.rag.schema_name = "littrace_rag_e2e"
     config.rag.collection_prefix = "littrace_e2e"
-    config.rag.embedding_provider = "openai-compatible"
-    config.rag.embedding_dimension = 3
     config.rag.auto_refresh_enabled = False
-    config.rag.embedding_api_key = "test-key"
+    # Keep the E2E bounded, while preserving DOI metadata so blocked publisher
+    # requests can enter the normal CDP / repository fallback path.
+    config.api.request_timeout_seconds = min(config.api.request_timeout_seconds, 12.0)
+    config.download_retry.max_attempts = 1
     config.api.enable_live_search = True
+    config.cdp_downloader.auto_launch_chrome = True
     config.cdp_downloader.cloudflare_wait_seconds = 12.0
     config.cdp_downloader.user_action_wait_seconds = 8.0
     config.cdp_downloader.command_timeout_seconds = 20.0
 
     _configure_minio_env()
     _ensure_bucket(config)
-    server, thread, embedding_base_url = _start_embedding_server()
-    config.rag.embedding_base_url = embedding_base_url
+    cdp_status = check_cdp_status(config)
+    print(
+        json.dumps(
+            {
+                "stage": "cdp_preflight",
+                "available": cdp_status.available,
+                "cdp_url": cdp_status.cdp_url,
+                "browser": cdp_status.browser,
+                "error": cdp_status.error,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+    if not config.rag.embedding_base_url or not config.rag.embedding_api_key:
+        raise RuntimeError(
+            "A real embedding endpoint is required. Configure "
+            "LITTRACE_RAG_EMBEDDING_BASE_URL and LITTRACE_RAG_EMBEDDING_API_KEY."
+        )
 
     try:
         request = PaperSearchRequest(
             topic=topic,
             year_min=2021,
-            limit=limit,
+            # Search a wider pool, then select exactly `limit` real OA PDFs.
+            limit=max(limit * 3, 50),
             wants_recent=True,
             live=True,
             query_variants=build_query_variants(topic),
@@ -210,14 +193,22 @@ async def _run(topic: str, limit: int) -> int:
         search = await search_papers_skill(request, config)
         papers = search.result.papers
         eligible = [
-            paper for paper in papers if paper.access_type in {AccessType.OPEN_ACCESS, AccessType.REQUIRES_LOGIN}
+            paper
+            for paper in papers
+            if paper.access_type == AccessType.OPEN_ACCESS and paper.pdf_url
         ]
+        selected = eligible[:limit]
+        if len(selected) < limit:
+            raise RuntimeError(
+                f"Real source search returned only {len(selected)} open PDF candidates; need {limit}."
+            )
         print(
             json.dumps(
                 {
                     "stage": "search",
                     "searched": len(papers),
                     "eligible": len(eligible),
+                    "selected_for_download": len(selected),
                     "open_access": sum(paper.access_type == AccessType.OPEN_ACCESS for paper in papers),
                     "requires_login": sum(paper.access_type == AccessType.REQUIRES_LOGIN for paper in papers),
                     "titles": [
@@ -236,16 +227,15 @@ async def _run(topic: str, limit: int) -> int:
         )
         session = create_chat_session(config)
         workspace = LiteratureWorkspace()
-        workspace.papers = {paper.paper_id: paper for paper in papers}
-        workspace.context.active_papers = [paper.paper_id for paper in papers]
+        workspace.papers = {paper.paper_id: paper for paper in selected}
+        workspace.context.active_papers = [paper.paper_id for paper in selected]
         workspace.context.filters.research_background = topic
         workspace.context.filters.topic = topic
         save_workspace(session, workspace, config=config)
 
         download_items = await _execute_downloads_with_progress(
             config,
-            eligible,
-            user_id=session.user_id,
+            selected,
             session_id=session.session_id,
         )
         print(
@@ -255,6 +245,13 @@ async def _run(topic: str, limit: int) -> int:
                     "downloaded_count": sum(item.status == "downloaded" for item in download_items),
                     "requires_login_count": sum(
                         item.action == "cdp_publisher_download" or item.status == "requires_login"
+                        for item in download_items
+                    ),
+                    "cdp_attempted_count": sum(
+                        item.action == "cdp_publisher_download" for item in download_items
+                    ),
+                    "cdp_downloaded_count": sum(
+                        item.action == "cdp_publisher_download" and item.status == "downloaded"
                         for item in download_items
                     ),
                     "items": [item.model_dump(mode="json") for item in download_items],
@@ -300,6 +297,13 @@ async def _run(topic: str, limit: int) -> int:
                 item.action == "cdp_publisher_download" or item.status == "requires_login"
                 for item in download_items
             ),
+            "cdp_attempted_count": sum(
+                item.action == "cdp_publisher_download" for item in download_items
+            ),
+            "cdp_downloaded_count": sum(
+                item.action == "cdp_publisher_download" and item.status == "downloaded"
+                for item in download_items
+            ),
             "storage_refs": storage_refs,
             "object_exists": [
                 object_store.exists(BlobRef.model_validate(ref))
@@ -307,7 +311,7 @@ async def _run(topic: str, limit: int) -> int:
             ],
             "registry_count": len(
                 artifact_registry_from_config(config).list_for_session(
-                    user_id=session.user_id, session_id=session.session_id
+                    session_id=session.session_id
                 )
             ),
             "parsed_count": parse_report.get("parsed_count"),
@@ -319,8 +323,7 @@ async def _run(topic: str, limit: int) -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
     finally:
-        server.shutdown()
-        thread.join(timeout=2.0)
+        pass
 
 
 def main() -> int:

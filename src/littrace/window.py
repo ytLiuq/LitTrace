@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import threading
 
 from littrace.chat import handle_chat
@@ -25,6 +24,7 @@ from littrace.session import (
     load_workspace,
     save_workspace,
 )
+from littrace.state_db import state_store_from_config
 from littrace.evidence.tables import decide_artifact_extraction_need
 from littrace.tui import render_context_lines
 
@@ -1011,20 +1011,15 @@ class LitTraceWindow:
 
     def _render_session_messages(self) -> None:
         self.chat_text.delete("1.0", self.tk.END)
-        if self.session.messages_path.exists():
-            for raw_line in self.session.messages_path.read_text(encoding="utf-8").splitlines():
-                try:
-                    record = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                role = "你" if record.get("role") == "user" else "LitTrace"
-                content = record.get("content")
-                text = _message_text(content)
-                if text and (role == "你" or _is_user_effective_reply(text)):
-                    bubble_role = "user" if role == "你" else "assistant"
-                    self.chat_text.insert(
-                        self.tk.END, f"{text}\n\n", (_chat_bubble_tag(bubble_role),)
-                    )
+        for record in state_store_from_config(self.config).list_messages(self.session.session_id):
+            role = "你" if record.role == "user" else "LitTrace"
+            content = record.content_json or record.content_text
+            text = _message_text(content)
+            if text and (role == "你" or _is_user_effective_reply(text)):
+                bubble_role = "user" if role == "你" else "assistant"
+                self.chat_text.insert(
+                    self.tk.END, f"{text}\n\n", (_chat_bubble_tag(bubble_role),)
+                )
         self.chat_text.see(self.tk.END)
 
     def _open_help_popup(self) -> None:
@@ -1081,7 +1076,7 @@ def _execution_steps_for_message(message: str) -> list[str]:
     if "document" in intent.actions:
         steps.append("组织学术化报告")
     if "autonomous_review" in intent.actions:
-        steps.append("启动多 Agent 复核与修订")
+        steps.append("运行质量门与可选 Reviewer 审查")
     if len(steps) == 1:
         steps.append("基于当前上下文直接回答")
     return steps

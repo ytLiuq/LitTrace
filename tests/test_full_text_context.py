@@ -2,7 +2,7 @@ import pytest
 
 from littrace.config import LitTraceConfig, StorageConfig
 from littrace.context import add_ranked_candidate_papers
-from littrace.full_text_context import build_full_text_context
+from littrace.retrieval.full_text_context import build_full_text_context
 from littrace.models import (
     AccessType,
     FullTextCandidate,
@@ -11,7 +11,7 @@ from littrace.models import (
     PaperMetadata,
     PaperSearchRequest,
 )
-from littrace.parsing import local_pdf_path
+from littrace.evidence.parsing import local_pdf_path
 
 
 @pytest.mark.anyio
@@ -97,9 +97,9 @@ async def test_full_text_context_keeps_only_downloaded_and_parsed_papers(tmp_pat
         }
         return workspace, {"parsed_count": 1, "failed_count": 0, "missing_pdf_count": 0}
 
-    monkeypatch.setattr("littrace.full_text_context.resolve_full_text_for_papers", fake_resolve)
-    monkeypatch.setattr("littrace.full_text_context.execute_downloads_skill", fake_execute)
-    monkeypatch.setattr("littrace.full_text_context.parse_workspace_skill", fake_parse)
+    monkeypatch.setattr("littrace.retrieval.full_text_context.resolve_full_text_for_papers", fake_resolve)
+    monkeypatch.setattr("littrace.retrieval.full_text_context.execute_downloads_skill", fake_execute)
+    monkeypatch.setattr("littrace.retrieval.full_text_context.parse_workspace_skill", fake_parse)
 
     result = await build_full_text_context(workspace, request, config)
 

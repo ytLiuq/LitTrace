@@ -321,6 +321,16 @@ class PaperSearchResult(BaseModel):
     papers: list[PaperMetadata]
 
 
+class TopicRetrievalPolicy(BaseModel):
+    """LLM-derived, session-scoped constraints for literature discovery."""
+
+    canonical_topic: str
+    query_variants: list[str] = Field(default_factory=list)
+    required_concept_groups: list[list[str]] = Field(default_factory=list)
+    excluded_concepts: list[str] = Field(default_factory=list)
+    boost_concepts: list[str] = Field(default_factory=list)
+
+
 class DOIBackfillRequest(BaseModel):
     dois: list[str] = Field(default_factory=list)
 
@@ -334,6 +344,7 @@ class WorkspaceFilters(BaseModel):
     search_mode: str | None = None
     topic: str | None = None
     research_background: str | None = None
+    research_retrieval_policy: TopicRetrievalPolicy | None = None
     research_background_status: str | None = None
     research_background_rejection_reason: str | None = None
     research_background_set_at: str | None = None
@@ -458,7 +469,6 @@ class DownloadPlan(BaseModel):
 class DownloadExecutionRequest(BaseModel):
     paper_ids: list[str] = Field(default_factory=list)
     dry_run: bool = False
-    user_id: str | None = None
     session_id: str | None = None
 
 
@@ -479,6 +489,17 @@ class DownloadExecutionResult(BaseModel):
     downloaded_count: int = 0
     requires_login_count: int = 0
     skipped_count: int = 0
+
+
+class PublisherDownloadProgress(BaseModel):
+    publisher: str
+    total: int = 0
+    queued: int = 0
+    active: int = 0
+    completed: int = 0
+    requires_login: int = 0
+    failed: int = 0
+    percent: float = 0.0
 
 
 class CitationRecord(BaseModel):
@@ -533,13 +554,13 @@ class ResearchRunResult(BaseModel):
     citation_audit: CitationAudit | None = None
     download_plan: DownloadPlan | None = None
     publisher_routes: object | None = None
-    agent_interactions: object | None = None
+    workflow_status: object | None = None
     parse_report: dict[str, object] | None = None
     table_harness: dict[str, object] | None = None
     comparison_matrix: "ComparisonMatrixReport | None" = None
     storyline: list["StorylineClaim"] | None = None
     document_report: "ResearchDocumentReport | None" = None
-    autonomous_loop_report: "AutonomousResearchLoopReport | None" = None
+    autonomous_loop_report: "ReviewLoopReport | None" = None
     workflow_trace: WorkflowTrace | None = None
 
 
@@ -643,6 +664,9 @@ class Claim(BaseModel):
     requires_freshness: bool = False
     retrieval_cutoff_at: str | None = None
     critical: bool = True
+    # Answer claims may be faithful translations of a verbatim source quote.
+    # Derived claims retain stricter semantic verification.
+    claim_origin: str = "derived"
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     @model_validator(mode="after")
@@ -787,7 +811,7 @@ class ResearchDocumentReport(BaseModel):
     release_snapshot: ReleaseSnapshot | None = None
 
 
-class AgentCritique(BaseModel):
+class ReviewFinding(BaseModel):
     reviewer: str
     severity: str = "info"
     finding: str
@@ -795,10 +819,10 @@ class AgentCritique(BaseModel):
     suggested_fix: str | None = None
 
 
-class AgentDebateRound(BaseModel):
+class ReviewRound(BaseModel):
     round_index: int
     writer_draft: str
-    critiques: list[AgentCritique] = Field(default_factory=list)
+    critiques: list[ReviewFinding] = Field(default_factory=list)
     revised_draft: str
     passed: bool
     score: float
@@ -806,10 +830,10 @@ class AgentDebateRound(BaseModel):
     executed_replan_actions: list[str] = Field(default_factory=list)
 
 
-class AutonomousResearchLoopReport(BaseModel):
+class ReviewLoopReport(BaseModel):
     objective: str
     final_answer: str
-    rounds: list[AgentDebateRound] = Field(default_factory=list)
+    rounds: list[ReviewRound] = Field(default_factory=list)
     passed: bool
     score: float
     replan_actions: list[str] = Field(default_factory=list)

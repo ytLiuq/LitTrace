@@ -4,7 +4,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
-from littrace.models import EvidenceSpan, ParsedPaper, ParsedTable  # noqa: F401
+from littrace.models import ParsedPaper
 
 
 class OCRMode(StrEnum):
@@ -13,10 +13,6 @@ class OCRMode(StrEnum):
     TABLES = "tables"
     EQUATIONS = "equations"
     FIGURES = "figures"
-
-
-# Re-export for backward compatibility
-__all__ = ["OCRMode", "ParsedTable", "ParsedPaper", "OCRTool"]
 
 
 class OCRTool(Protocol):

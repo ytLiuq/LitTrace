@@ -8,7 +8,7 @@ from littrace.auto_resume import (
     run_browser_session_download_handoff_test,
     watch_and_resume_downloads,
 )
-from littrace.access import target_pdf_path
+from littrace.access_layer.paths import target_pdf_path
 from littrace.config import LitTraceConfig, StorageConfig
 from littrace.context import add_papers
 from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata

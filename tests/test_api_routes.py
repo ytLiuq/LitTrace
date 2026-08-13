@@ -284,7 +284,7 @@ def test_api_starts_and_stops_download_retry_worker(monkeypatch):
 
 def test_artifact_download_link_checks_registry_scope(monkeypatch, tmp_path):
     from littrace.api.routes import artifacts as routes
-    from littrace.artifact_registry import ArtifactRecord, LocalArtifactRegistry
+    from littrace.artifact_registry import ArtifactRecord
     from littrace.artifact_store import BlobRef
     from littrace.config import LitTraceConfig, ArtifactStorageConfig, StorageConfig
 
@@ -292,37 +292,69 @@ def test_artifact_download_link_checks_registry_scope(monkeypatch, tmp_path):
         storage=StorageConfig(metadata_dir=tmp_path / "metadata"),
         artifact_storage=ArtifactStorageConfig(local_root=tmp_path / "objects"),
     )
-    registry = LocalArtifactRegistry(config.storage.metadata_dir / "artifacts.json")
-    registry.upsert(
-        ArtifactRecord.from_blob_ref(
+    record = ArtifactRecord.from_blob_ref(
             BlobRef(
                 backend="local",
-                object_key="users/u1/sessions/s1/papers/p1/paper.pdf",
+                object_key="sessions/s1/papers/p1/paper.pdf",
                 content_type="application/pdf",
             ),
             artifact_id="paper_pdf:p1",
-            user_id="u1",
             session_id="s1",
             kind="paper_pdf",
             paper_id="p1",
-        )
     )
+
+    class FakeRegistry:
+        def find_in_session(self, artifact_id, *, session_id):
+            if artifact_id == record.artifact_id and session_id == record.session_id:
+                return record
+            return None
+
+    registry = FakeRegistry()
     fake_api = SimpleNamespace(load_config=lambda: config)
     monkeypatch.setattr(routes, "api_app", fake_api)
+    monkeypatch.setattr(routes, "artifact_registry_from_config", lambda _config: registry)
 
-    ok = routes.artifact_download_link("paper_pdf:p1", user_id="u1", session_id="s1")
-    denied = routes.artifact_download_link("paper_pdf:p1", user_id="u2", session_id="s1")
+    ok = routes.artifact_download_link(
+        "paper_pdf:p1",
+        session_id="s1",
+        x_littrace_session_id="s1",
+    )
+    denied = routes.artifact_download_link(
+        "paper_pdf:p1",
+        session_id="s2",
+        x_littrace_session_id="s2",
+    )
 
     assert ok["authorized"] is True
     assert ok["download_url"].startswith("file://")
     assert denied == {"found": False, "authorized": False, "artifact_id": "paper_pdf:p1"}
 
 
+def test_artifact_download_link_rejects_conflicting_session_header(monkeypatch, tmp_path):
+    from fastapi import HTTPException
+    from littrace.api.routes import artifacts as routes
+    from littrace.config import LitTraceConfig, StorageConfig
+
+    config = LitTraceConfig(storage=StorageConfig(metadata_dir=tmp_path / "metadata"))
+    fake_api = SimpleNamespace(load_config=lambda: config)
+    monkeypatch.setattr(routes, "api_app", fake_api)
+
+    try:
+        routes.artifact_download_link(
+            "paper_pdf:p1",
+            session_id="s1",
+            x_littrace_session_id="s2",
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 403
+    else:
+        raise AssertionError("expected conflicting session scope to be rejected")
+
+
 def test_session_delete_route_calls_cleanup(monkeypatch):
     from littrace.api.routes import sessions as routes
     from littrace.session import SessionDeleteReport
-
-    captured: dict[str, object] = {}
 
     fake_api = SimpleNamespace(load_config=lambda: object())
     monkeypatch.setattr(routes, "api_app", fake_api)
@@ -331,7 +363,6 @@ def test_session_delete_route_calls_cleanup(monkeypatch):
         "delete_chat_session",
         lambda config, session_id: SessionDeleteReport(
             session_id=session_id,
-            user_id="u1",
             root_path="/tmp/session",
             deleted=True,
             artifact_count=2,
@@ -345,3 +376,45 @@ def test_session_delete_route_calls_cleanup(monkeypatch):
 
     assert result.deleted is True
     assert result.session_id == "s1"
+
+
+def test_session_metrics_route_resolves_session_scope(monkeypatch):
+    from littrace.api.routes import sessions as routes
+    from littrace.session_metrics import SessionMetric, SessionKnowledgeMetricsReport
+
+    fake_api = SimpleNamespace(load_config=lambda: object())
+    monkeypatch.setattr(routes, "api_app", fake_api)
+
+    def fake_metrics(config, session_id, artifact_limit=200):
+        return SessionKnowledgeMetricsReport(
+            session_id=session_id,
+            readiness="search_ready",
+            discovery=SessionMetric(
+                name="discovery",
+                value=3,
+            ),
+            acquisition=SessionMetric(
+                name="acquisition",
+                value=0.5,
+            ),
+            rag=SessionMetric(
+                name="rag",
+                value=0.0,
+                stale_count=3,
+            ),
+            consistency=SessionMetric(
+                name="consistency",
+                value=1.0,
+                missing_count=0,
+            ),
+        )
+
+    monkeypatch.setattr(routes, "build_session_knowledge_metrics", fake_metrics)
+
+    result = routes.session_metrics(
+        "s1",
+        x_littrace_session_id="s1",
+    )
+
+    assert result.session_id == "s1"
+    assert result.readiness == "search_ready"

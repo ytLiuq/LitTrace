@@ -5,9 +5,8 @@ import sys
 from dataclasses import dataclass
 
 from littrace.attachments import attach_pdf_to_paper, check_download_presence
-from littrace.agent_interactions import build_agent_interaction_report
-from littrace.agent_audits import audit_parser_agent, audit_storyline_agent, audit_table_agent
-from littrace.agent_strength import build_agent_portfolio_report
+from littrace.workflow_status import build_workflow_status
+from littrace.quality_audits import audit_parser, audit_storyline, audit_tables
 from littrace.auto_resume import auto_resume_downloaded_pdfs_async
 from littrace.access_layer import (
     browser_login_session_for_paper,
@@ -41,7 +40,15 @@ from littrace.rag_jobs import (
     iter_workspace_session_ids,
     run_daily_rag_daemon,
     run_daily_rag_maintenance,
+    run_pending_embedding_jobs,
 )
+from littrace.rag_ops import (
+    build_rag_jobs_status_report,
+    requeue_dead_rag_jobs,
+    run_rag_doctor,
+)
+from littrace.session_metrics import build_session_knowledge_metrics
+from littrace.artifact_ops import reconcile_session_artifacts
 from littrace.evaluation.golden_eval import run_golden_eval
 from littrace.models import ChatRequest, LiteratureWorkspace
 from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
@@ -91,6 +98,10 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         config = load_config()
         _print_doctor(config)
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "metrics":
+        config = load_config()
+        _run_metrics_command(config)
         return
     if len(sys.argv) > 1 and sys.argv[1] == "setup-browser":
         config = load_config()
@@ -171,10 +182,10 @@ async def _run_sentinel_command(config) -> None:
         return
     action = sys.argv[2]
     watchlist_id = _arg_value("--watchlist") or _arg_value("--watchlist-id") or "mxene_sensor"
-    topic = _arg_value("--topic") or _arg_value("--objective") or watchlist_id
+    topic = _arg_value("--topic") or _arg_value("--objective")
 
     if action == "init":
-        root = init_sentinel(config, watchlist_id, topic)
+        root = init_sentinel(config, watchlist_id, topic or watchlist_id)
         print(f"sentinel initialized: {root}")
         return
     if action == "run":
@@ -220,7 +231,7 @@ async def _run_sentinel_command(config) -> None:
 
 async def _run_rag_command(config) -> None:
     if len(sys.argv) < 3:
-        print("用法：littrace rag refresh --session SESSION_ID | refresh-all")
+        print("用法：littrace rag refresh --session SESSION_ID | refresh-all | daily | daemon | jobs | doctor")
         return
     action = sys.argv[2]
     if action == "refresh":
@@ -285,6 +296,50 @@ async def _run_rag_command(config) -> None:
         report = await run_daily_rag_maintenance(config)
         _print_daily_rag_report(report)
         return
+    if action == "jobs":
+        subaction = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else "status"
+        if subaction == "status":
+            report = build_rag_jobs_status_report(
+                config,
+                status=_arg_value("--status"),
+                session_id=_arg_value("--session"),
+                limit=_arg_int("--limit", 20),
+            )
+            _print_rag_jobs_status_report(report)
+            return
+        if subaction == "run":
+            report = await run_pending_embedding_jobs(config, limit=_arg_int("--limit", 20))
+            print(f"processed: {report.processed}")
+            print(f"failed: {report.failed}")
+            print(f"skipped: {report.skipped}")
+            if report.job_ids:
+                print("job_ids: " + ", ".join(report.job_ids))
+            if report.warnings:
+                print("warnings: " + "；".join(report.warnings))
+            return
+        if subaction == "requeue-dead":
+            count = requeue_dead_rag_jobs(
+                config,
+                session_id=_arg_value("--session"),
+                limit=_arg_int("--limit", 20),
+            )
+            print(f"requeued: {count}")
+            return
+        if subaction == "reconcile":
+            session_id = _arg_value("--session")
+            if not session_id:
+                print("rag jobs reconcile requires --session SESSION_ID")
+                return
+            report = reconcile_session_artifacts(config, session_id, limit=_arg_int("--limit", 200))
+            print(f"checked: {report.checked}; missing: {report.missing}; requeued: {report.requeued}")
+            if report.warnings:
+                print("warnings: " + "；".join(report.warnings))
+            return
+        print("用法：littrace rag jobs [status|run|requeue-dead|reconcile] [--session SESSION_ID] [--status STATUS] [--limit N]")
+        return
+    if action == "doctor":
+        _print_rag_doctor_report(run_rag_doctor(config))
+        return
     if action == "daemon":
         interval_hours = _arg_float("--interval-hours", 24.0)
         run_immediately = "--no-immediate-run" not in sys.argv
@@ -302,9 +357,56 @@ async def _run_rag_command(config) -> None:
     print(f"未知 rag 动作: {action}")
 
 
+def _run_metrics_command(config) -> None:
+    if len(sys.argv) < 3 or sys.argv[2] != "session":
+        print("用法：littrace metrics session --session SESSION_ID")
+        return
+    session_id = _arg_value("--session")
+    if session_id is None and len(sys.argv) > 3 and not sys.argv[3].startswith("--"):
+        session_id = sys.argv[3]
+    if not session_id:
+        print("用法：littrace metrics session --session SESSION_ID")
+        return
+    report = build_session_knowledge_metrics(
+        config,
+        session_id,
+        artifact_limit=_arg_int("--artifact-limit", 200),
+    )
+    print(f"session: {report.session_id}")
+    print(f"readiness: {report.readiness}")
+    discovery = report.discovery
+    acquisition = report.acquisition
+    rag = report.rag
+    consistency = report.consistency
+    print(f"Discovery: 今日相关新增 {discovery.value} 篇 [{discovery.status}]")
+    print(
+        "Acquisition: PDF 获取率 "
+        f"{_format_metric_percent(acquisition.value)} "
+        f"({acquisition.numerator}/{acquisition.denominator}) [{acquisition.status}]"
+    )
+    print(
+        "RAG: freshness "
+        f"{_format_metric_percent(rag.value)}，stale {rag.stale_count} "
+        f"({rag.numerator}/{rag.denominator}) [{rag.status}]"
+    )
+    print(
+        "Consistency: pass "
+        f"{_format_metric_percent(consistency.value)}，missing {consistency.missing_count} "
+        f"({consistency.numerator}/{consistency.denominator}) [{consistency.status}]"
+    )
+    if report.artifact_audit is not None:
+        audit = report.artifact_audit
+        print(
+            "artifact_audit: "
+            f"artifacts={audit.artifact_count}, checked={audit.checked_count}, "
+            f"missing={audit.missing_object_count}, size_bytes={audit.total_size_bytes}"
+        )
+    if report.warnings:
+        print("warnings: " + "；".join(report.warnings))
+
+
 def _print_rag_refresh_report(report) -> None:
     print(f"rag profile: {report.profile_id}")
-    print(f"user: {report.user_id}")
     print(f"session: {report.session_id}")
     print(f"collection: {report.collection_name}")
     print(f"backend: {report.backend}")
@@ -327,8 +429,45 @@ def _print_daily_rag_report(report) -> None:
     print(f"sessions_refreshed: {report.sessions_refreshed}")
     print(f"sessions_skipped: {report.sessions_skipped}")
     print(f"sessions_failed: {report.sessions_failed}")
+    print(f"artifacts_reconciled: {report.artifacts_reconciled}")
+    print(f"missing_artifacts: {report.missing_artifacts}")
+    print(f"embedding_requeued: {report.embedding_requeued}")
+    print(f"outbox_dispatched: {report.outbox_dispatched}")
+    print(f"outbox_failed: {report.outbox_failed}")
     if report.warnings:
         print("warnings: " + "；".join(report.warnings))
+
+
+def _print_rag_jobs_status_report(report) -> None:
+    print(f"configured: {report.configured}")
+    if report.queue is not None:
+        queue = report.queue
+        print(
+            "queue: "
+            f"total={queue.total}, queued={queue.queued}, running={queue.running}, "
+            f"failed={queue.failed}, dead={queue.dead}, completed={queue.completed}, "
+            f"ready={queue.ready_to_claim}, reclaimable={queue.reclaimable_running}"
+        )
+        if queue.oldest_ready_at:
+            print(f"oldest_ready_at: {queue.oldest_ready_at}")
+        if queue.latest_error:
+            print(f"latest_error: {queue.latest_error}")
+    for job in report.jobs:
+        suffix = f" error={job.last_error}" if job.last_error else ""
+        print(
+            f"{job.job_id} status={job.status} session={job.session_id} "
+            f"artifact={job.artifact_id} attempts={job.attempt_count}{suffix}"
+        )
+    if report.warnings:
+        print("warnings: " + "；".join(report.warnings))
+
+
+def _print_rag_doctor_report(report) -> None:
+    print(f"ok: {report.ok}")
+    for check in report.checks:
+        latency = f" ({check.latency_ms}ms)" if check.latency_ms is not None else ""
+        detail = f": {check.detail}" if check.detail else ""
+        print(f"{check.name}: {check.status}{latency}{detail}")
 
 
 def _arg_float(name: str, default: float) -> float:
@@ -361,6 +500,12 @@ def _arg_int(name: str, default: int) -> int:
         return default
 
 
+def _format_metric_percent(value: float | int | str | None) -> str:
+    if isinstance(value, (float, int)):
+        return f"{value * 100:.1f}%"
+    return "N/A"
+
+
 def _arg_value(name: str) -> str | None:
     if name not in sys.argv:
         return None
@@ -383,7 +528,7 @@ async def run_shell() -> None:
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /browser-login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /doctor /setup-browser /quality /agents /agent-flow /agent-audits /plan topic /init-config /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /retrieval-eval /rerank-learn /publisher-session-test /export /quit"
+        "/dashboard /doctor /setup-browser /quality /agents /workflow /quality-audits /plan topic /init-config /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /retrieval-eval /rerank-learn /publisher-session-test /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -450,34 +595,26 @@ async def run_shell() -> None:
                 print(f"  {button['description']}")
             print("你也可以直接输入：只看文字层解析PDF / 强制OCR解析")
             continue
-        if message == "/agents":
-            report = build_agent_portfolio_report(config, state.workspace)
-            print(f"Agent portfolio average: {report.average_score}")
-            for agent in report.agents:
-                print(f"- {agent.name}: {agent.level} ({agent.score})")
-            if report.recommendations:
-                print("建议：" + "；".join(report.recommendations))
-            continue
-        if message == "/agent-flow":
-            report = build_agent_interaction_report(state.workspace)
+        if message == "/workflow":
+            report = build_workflow_status(state.workspace)
             print(
-                f"Agent handoffs: ready={report.ready_count}, blocked={report.blocked_count}, complete={report.complete_count}"
+                f"Workflow: ready={report.ready_count}, blocked={report.blocked_count}, complete={report.complete_count}"
             )
-            for handoff in report.handoffs:
+            for transition in report.transitions:
                 print(
-                    f"- {handoff.from_agent} -> {handoff.to_agent}: {handoff.status} | {handoff.artifact}"
+                    f"- {transition.source} -> {transition.target}: {transition.status} | {transition.artifact}"
                 )
-            if report.recommended_next_agents:
-                print("下一步建议：" + "，".join(report.recommended_next_agents))
+            if report.recommended_next_steps:
+                print("下一步建议：" + "，".join(report.recommended_next_steps))
             continue
-        if message == "/agent-audits":
+        if message == "/quality-audits":
             for report in [
-                audit_parser_agent(config, state.workspace),
-                audit_table_agent(state.workspace),
-                audit_storyline_agent(state.workspace),
+                audit_parser(config, state.workspace),
+                audit_tables(state.workspace),
+                audit_storyline(state.workspace),
             ]:
                 print(
-                    f"- {report.agent}: {'passed' if report.passed else 'needs work'} ({report.score})"
+                    f"- {report.component}: {'passed' if report.passed else 'needs work'} ({report.score})"
                 )
                 for finding in report.findings[:3]:
                     print(f"  - {finding}")
@@ -518,7 +655,7 @@ async def run_shell() -> None:
             plan = await build_research_plan_skill(topic, state.workspace)
             print(f"Research plan: {plan.topic}")
             for index, step in enumerate(plan.steps, start=1):
-                print(f"{index}. [{step.agent}] {step.action} -> {step.expected_output}")
+                print(f"{index}. [{step.component}] {step.action} -> {step.expected_output}")
             if plan.warnings:
                 print("注意：" + "；".join(plan.warnings))
             continue

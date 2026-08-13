@@ -30,6 +30,7 @@ from littrace.skill_runner import (
     search_papers_skill,
 )
 from littrace.context import add_ranked_candidate_papers
+from littrace.evidence.tables import extract_structured_artifacts
 
 
 @dataclass
@@ -43,7 +44,7 @@ class SentinelRunResult:
     run_dir: str | None = None
 
 
-class LiteratureSentinelAgent:
+class LiteratureSentinel:
     def __init__(self, config: LitTraceConfig, watchlist: Watchlist):
         self.config = config
         self.watchlist = watchlist
@@ -87,7 +88,24 @@ class LiteratureSentinelAgent:
         for paper in new_candidates:
             state.seen_paper_ids.append(paper.paper_id)
 
-        workspace = await resolve_workspace_full_text_skill(workspace, self.config)
+        # Full-text resolution is incremental. Re-probing every publisher URL on
+        # every daily tick causes needless 429s/timeouts for papers already seen.
+        unresolved_ids = [
+            paper_id
+            for paper_id in workspace.context.active_papers
+            if paper_id not in workspace.full_text_reports
+        ]
+        if unresolved_ids:
+            probe_workspace = workspace.model_copy(deep=True)
+            probe_workspace.context.active_papers = unresolved_ids
+            probe_workspace = await resolve_workspace_full_text_skill(
+                probe_workspace, self.config
+            )
+            for paper_id in unresolved_ids:
+                workspace.full_text_reports[paper_id] = probe_workspace.full_text_reports[
+                    paper_id
+                ]
+                workspace.papers[paper_id] = probe_workspace.papers[paper_id]
 
         access_tasks = _build_access_tasks(workspace, state)
         state.access_queue = _merge_access_tasks(state.access_queue, access_tasks)
@@ -106,16 +124,40 @@ class LiteratureSentinelAgent:
             )
             downloaded_count = download_result.downloaded_count
 
-        workspace, parse_report = await parse_workspace_skill(workspace, self.config)
-        workspace, table_harness = await extract_tables_skill(workspace, self.config)
+        if self.config.sentinel.parse_on_daily:
+            workspace, parse_report = await parse_workspace_skill(workspace, self.config)
+            # Table metrics are an optional enrichment step. A missing, unavailable, or
+            # timing-out LLM must not discard the metadata/search results of a daily run.
+            try:
+                workspace, table_harness = await extract_tables_skill(workspace, self.config)
+            except Exception as exc:
+                workspace, table_harness = extract_structured_artifacts(workspace)
+                table_harness.warnings.append(
+                    f"Performance metric extraction skipped: {exc.__class__.__name__}: {exc}"
+                )
+        else:
+            parse_report = {
+                "parsed_count": 0,
+                "warnings": [
+                    "Daily OCR is deferred; run the parse workflow separately for local PDFs."
+                ],
+            }
+            workspace, table_harness = extract_structured_artifacts(workspace)
         quality_report = build_quality_report_skill(self.config, workspace)
         quality_warnings = [
             *quality_report.warnings,
             *table_harness.warnings,
             *parse_report.get("warnings", []),
         ]
-        _, rag_refresh_report = await refresh_session_rag_index(self.config, self.store, workspace)
-        quality_warnings = [*quality_warnings, *rag_refresh_report.warnings]
+        try:
+            _, rag_refresh_report = await refresh_session_rag_index(
+                self.config, self.store, workspace
+            )
+            quality_warnings = [*quality_warnings, *rag_refresh_report.warnings]
+        except Exception as exc:
+            quality_warnings.append(
+                f"RAG refresh skipped: {exc.__class__.__name__}: {exc}"
+            )
         resource_pack = build_resource_pack(
             workspace,
             state,

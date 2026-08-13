@@ -89,7 +89,7 @@ async def parse_chat_intent_semantic(
 
 _INTENT_SYSTEM_PROMPT = """Parse LitTrace user intent. Return strict compact JSON only.
 keys: actions, topic, year_min, journals, skip_download, select_all_downloads, clear_download_selection, auto_replan, parse_strategy, select_indices, deselect_indices, confidence, ambiguous, ambiguity_types, ambiguity_reasons, clarification_questions.
-actions allowed: search, download, select_downloads, deselect_downloads, parse, table, storyline, document, autonomous_review, list_context, agent_status, show_context, hide_context.
+actions allowed: search, download, select_downloads, deselect_downloads, parse, table, storyline, document, autonomous_review, list_context, component_status, show_context, hide_context.
 Use search for literature investigation. Use storyline for routes/evolution/logic. Use table for metrics/comparison. Respect negation. Set confidence from 0 to 1. Mark ambiguous when a safe next step needs clarification."""
 
 
@@ -176,7 +176,7 @@ def _clean_actions(value: object, fallback: list[str]) -> list[str]:
         "document",
         "autonomous_review",
         "list_context",
-        "agent_status",
+        "component_status",
         "show_context",
         "hide_context",
     }

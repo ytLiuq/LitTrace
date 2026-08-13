@@ -8,7 +8,8 @@ from typing import Any
 
 from littrace.config import PaddleOCRParserConfig
 from littrace.models import EvidenceSpan
-from littrace.ocr.tool import OCRMode, ParsedPaper
+from littrace.models import ParsedPaper
+from littrace.ocr.tool import OCRMode
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}

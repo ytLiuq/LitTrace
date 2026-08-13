@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from littrace.access_layer.download_planning import build_download_plan
 from littrace.citations import audit_citation_links
@@ -108,9 +108,10 @@ async def search_papers_skill(
     ledger: ToolExecutionLedger | None = None,
     policy: ToolExecutionPolicy | None = None,
     idempotency_key: str | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> SearchSkillResult:
     use_live = config.api.enable_live_search if request.live is None else request.live
-    client = LiveSearchClient(config) if use_live else MockMaterialsSearchClient()
+    client = LiveSearchClient(config, progress_callback=progress_callback) if use_live else MockMaterialsSearchClient()
     result = await _run_async_skill(
         "search_papers",
         client.fetch,

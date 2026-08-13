@@ -1,6 +1,6 @@
 """CDP-based paper PDF downloader — project-integrated version.
 
-This module wraps :mod:`littrace.cdp_core` (the shared CDP constants and
+This module wraps :mod:`littrace.access_layer.cdp_core` (the shared CDP constants and
 browser automation primitives) and adds LitTrace-specific concerns:
 
 - ``LitTraceConfig`` integration (CDP URL, timeouts, email)
@@ -10,7 +10,7 @@ browser automation primitives) and adds LitTrace-specific concerns:
 - Publisher-specific download orchestration (Wiley, RSC, IEEE, etc.)
 
 The standalone ``universal_paper_downloader.py`` SKILL script shares the
-same core logic via :mod:`littrace.cdp_core`.
+same core logic via :mod:`littrace.access_layer.cdp_core`.
 """
 
 from __future__ import annotations
@@ -38,28 +38,10 @@ from littrace.access_layer.cdp_core import (
     prepare_ieee_pdf_url,
     prepare_rsc_pdf_url,
     publisher_urls,
-    same_origin_relative_url,
     sciencedirect_access_status,
     wait_for_sciencedirect_authorization,
 )
 from littrace.config import LitTraceConfig
-
-# Backward-compatible aliases — these functions used to have underscore prefixes
-# in cdp_downloader.py; they now live in cdp_core without the prefix.
-# Kept so existing ``from littrace.cdp_downloader import _normalize_doi`` etc. work.
-_same_origin_relative_url = same_origin_relative_url
-_normalize_doi = normalize_doi
-_is_pdf_file = is_pdf_file
-_find_recent_pdf = find_recent_pdf
-_move_pdf = move_pdf
-_identify_publisher = identify_publisher
-_publisher_urls = publisher_urls
-_looks_like_institutional_login_needed = looks_like_institutional_login_needed
-_extract_pdf_url_from_page = extract_pdf_url_from_page
-_prepare_elsevier_pdf_url = prepare_elsevier_pdf_url
-_prepare_rsc_pdf_url = prepare_rsc_pdf_url
-_prepare_ieee_pdf_url = prepare_ieee_pdf_url
-
 
 # ---------------------------------------------------------------------------
 # Result models (project-specific)
@@ -140,7 +122,12 @@ def download_paper_via_cdp(
 
     if email:
         result.steps.append("unpaywall")
-        oa_downloaded = _try_unpaywall_download(normalized_doi, email, target_path)
+        oa_downloaded = _try_unpaywall_download(
+            normalized_doi,
+            email,
+            target_path,
+            timeout_seconds=config.cdp_downloader.repository_download_timeout_seconds,
+        )
         if oa_downloaded[0]:
             size = target_path.stat().st_size
             result.downloaded = True
@@ -154,6 +141,17 @@ def download_paper_via_cdp(
         result.warnings.append("No Unpaywall email configured; skipped OA repository lookup.")
 
     status = check_cdp_status(config)
+    if not status.available and config.cdp_downloader.auto_launch_chrome:
+        # Import lazily: chrome_profiles uses the shared cdp module for status
+        # models, while this module is itself imported by that module.
+        from littrace.chrome_profiles import launch_chrome_for_cdp
+
+        launch = launch_chrome_for_cdp(
+            config,
+            profile_name=config.cdp_downloader.chrome_profile_name,
+        )
+        if launch.cdp_status is not None:
+            status = launch.cdp_status
     if not status.available:
         result.error = (
             f"CDP browser is not available at {status.cdp_url}. "
@@ -315,6 +313,8 @@ def _try_unpaywall_download(
     doi: str,
     email: str,
     target_path: Path,
+    *,
+    timeout_seconds: float = 120.0,
 ) -> tuple[bool, str | None, str | None]:
     """Query Unpaywall for OA PDF mirrors and try curl download."""
     try:
@@ -341,7 +341,7 @@ def _try_unpaywall_download(
         host_type = location.get("host_type")
         if host_type != "repository" and not data.get("is_oa"):
             continue
-        ok, info = _curl_pdf(url, target_path)
+        ok, info = _curl_pdf(url, target_path, timeout_seconds=timeout_seconds)
         if ok:
             method = (
                 "unpaywall_repository_curl"

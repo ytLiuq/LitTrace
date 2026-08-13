@@ -22,7 +22,6 @@ from littrace.retrieval.rag_profile import (
 class RagRefreshReport(BaseModel):
     schema_version: str = "littrace.rag_refresh_report.v1"
     profile_id: str
-    user_id: str
     session_id: str
     collection_name: str
     backend: str
@@ -54,6 +53,8 @@ async def refresh_session_rag_index(
     config: LitTraceConfig,
     session: object,
     workspace: LiteratureWorkspace | None = None,
+    *,
+    artifact_ids: set[str] | None = None,
 ) -> tuple[RagProfile | None, RagRefreshReport]:
     if not config.rag.enabled or config.rag.backend != "pgvector":
         profile = _build_profile_if_possible(config, session, workspace)
@@ -84,12 +85,11 @@ async def refresh_session_rag_index(
         workspace = load_workspace(session)
 
     profile = save_session_rag_profile(config, session, workspace)
-    drafts = build_rag_chunk_drafts(workspace, profile)
+    drafts = build_rag_chunk_drafts(workspace, profile, artifact_ids=artifact_ids)
     warnings: list[str] = []
     if not drafts:
         report = RagRefreshReport(
             profile_id=profile.profile_id,
-            user_id=profile.user_id,
             session_id=profile.session_id,
             collection_name=profile.collection_name,
             backend=profile.backend,
@@ -125,6 +125,9 @@ async def refresh_session_rag_index(
     store = PgvectorRagStore(config, profile)
     embedding_client = embedding_client_from_config(config, profile)
     embeddings = await embedding_client.embed_texts([draft.text for draft in drafts])
+    stale_deleted = 0
+    if artifact_ids:
+        stale_deleted = store.delete_paper_chunks({draft.paper_id for draft in drafts})
     upserted = store.upsert_chunks(
         [
             RagChunkRecord(
@@ -142,10 +145,10 @@ async def refresh_session_rag_index(
             for draft, embedding in zip(drafts, embeddings, strict=True)
         ]
     )
-    stale_deleted = store.delete_missing_chunks(draft.chunk_id for draft in drafts)
+    if not artifact_ids:
+        stale_deleted = store.delete_missing_chunks(draft.chunk_id for draft in drafts)
     report = RagRefreshReport(
         profile_id=profile.profile_id,
-        user_id=profile.user_id,
         session_id=profile.session_id,
         collection_name=profile.collection_name,
         backend=profile.backend,
@@ -183,11 +186,19 @@ async def refresh_session_rag_index(
 def build_rag_chunk_drafts(
     workspace: LiteratureWorkspace,
     profile: RagProfile,
+    *,
+    artifact_ids: set[str] | None = None,
 ) -> list[RagChunkDraft]:
     drafts: list[RagChunkDraft] = []
+    allowed_papers = artifact_ids if artifact_ids else None
     for paper_id, parsed_value in workspace.parsed_papers.items():
+        if allowed_papers is not None and paper_id not in allowed_papers:
+            continue
         parsed = coerce_parsed(parsed_value)
         if not parsed.parsed:
+            continue
+        quality = workspace.context.filters.docling_quality_reports.get(paper_id)
+        if isinstance(quality, dict) and quality.get("rag_eligible") is False:
             continue
         source_index = 0
         for section in parsed.sections:
@@ -223,22 +234,6 @@ def build_rag_chunk_drafts(
                 )
             source_index += 1
 
-        markdown = _structured_markdown(parsed)
-        if markdown:
-            for chunk_index, chunk_text in enumerate(
-                _chunk_text(markdown, profile.chunk_target_tokens, profile.chunk_overlap_tokens)
-            ):
-                drafts.append(
-                    _build_chunk_draft(
-                        profile,
-                        paper_id=paper_id,
-                        source_key=f"markdown:{chunk_index}",
-                        text=chunk_text,
-                        section="structured_document",
-                        metadata={"source": "structured_document"},
-                    )
-                )
-
         for table_index, table in enumerate(parsed.tables):
             table_text = _table_text(table)
             if not table_text:
@@ -252,6 +247,59 @@ def build_rag_chunk_drafts(
                     section="table",
                     table_id=getattr(table, "table_id", None),
                     metadata={"source": "table", "table_index": table_index},
+                )
+            )
+
+        for equation_index, equation in enumerate(parsed.equations):
+            equation_text = str(
+                equation.get("latex") or equation.get("text") or ""
+            ).strip()
+            if not equation_text:
+                continue
+            drafts.append(
+                _build_chunk_draft(
+                    profile,
+                    paper_id=paper_id,
+                    source_key=f"equation:{equation_index}",
+                    text=equation_text,
+                    section="equation",
+                    metadata={"source": "equation", "equation_id": equation.get("equation_id")},
+                )
+            )
+
+        for figure_index, figure in enumerate(parsed.figures):
+            if not isinstance(figure, dict):
+                continue
+            context_confirmed = (
+                figure.get("enrichment_status") == "accepted"
+                and figure.get("context_confirmed") is True
+            )
+            summary_source = figure.get("summary") if context_confirmed else figure.get("caption")
+            summary = str(summary_source or "").strip()
+            if not summary:
+                continue
+            drafts.append(
+                _build_chunk_draft(
+                    profile,
+                    paper_id=paper_id,
+                    source_key=f"figure:{figure_index}",
+                    text=summary,
+                    section="figure",
+                    metadata={
+                        "source": (
+                            "figure_multimodal_summary"
+                            if context_confirmed
+                            else "figure_summary"
+                        ),
+                        "figure_id": figure.get("figure_id"),
+                        "asset_ref": figure.get("asset_ref"),
+                        "enrichment_status": figure.get("enrichment_status"),
+                        "enrichment_confidence": figure.get("enrichment_confidence"),
+                        "context_confirmed": figure.get("context_confirmed", False),
+                        "context_confirmation_confidence": figure.get(
+                            "context_confirmation_confidence"
+                        ),
+                    },
                 )
             )
 
@@ -284,7 +332,6 @@ def _build_chunk_draft(
         table_id=table_id,
         metadata={
             "profile_id": profile.profile_id,
-            "user_id": profile.user_id,
             "session_id": profile.session_id,
             **(metadata or {}),
         },
@@ -363,14 +410,13 @@ def _skipped_report(
     if profile is None:
         profile = RagProfile(
             profile_id=f"rag:{getattr(session, 'session_id', 'session')}",
-            user_id=str(getattr(session, "user_id", config.storage.default_user_id)),
             session_id=str(getattr(session, "session_id", "session")),
-            namespace=f"{getattr(session, 'user_id', config.storage.default_user_id)}.{getattr(session, 'session_id', 'session')}",
+            namespace=str(getattr(session, "session_id", "session")),
             topic=None,
             query_variants=[],
             backend=config.rag.backend,
             postgres_schema=config.rag.schema_name,
-            collection_name=f"{config.rag.collection_prefix}_{getattr(session, 'user_id', config.storage.default_user_id)}_{getattr(session, 'session_id', 'session')}",
+            collection_name=f"{config.rag.collection_prefix}_{getattr(session, 'session_id', 'session')}",
             embedding_provider=config.rag.embedding_provider,
             embedding_model=config.rag.embedding_model,
             embedding_dimension=config.rag.embedding_dimension,
@@ -384,7 +430,6 @@ def _skipped_report(
         )
     return RagRefreshReport(
         profile_id=profile.profile_id,
-        user_id=profile.user_id,
         session_id=profile.session_id,
         collection_name=profile.collection_name,
         backend=profile.backend,

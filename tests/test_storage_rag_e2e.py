@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -11,61 +8,36 @@ from littrace.artifact_registry import artifact_registry_from_config
 from littrace.artifact_store import BlobRef, artifact_store_from_config
 from littrace.config import ArtifactStorageConfig, LitTraceConfig, MetadataStoreConfig, StorageConfig
 from littrace.downloads import execute_downloads
-from littrace.models import AccessType, DownloadExecutionRequest, LiteratureWorkspace, PaperMetadata
+from littrace.models import (
+    AccessType,
+    DownloadExecutionRequest,
+    LiteratureWorkspace,
+    PaperMetadata,
+    ParsedPaper,
+)
 from littrace.rag_jobs import run_pending_embedding_jobs
+from littrace.session_metrics import build_session_knowledge_metrics
 from littrace.retrieval.pgvector_store import PgvectorRagStore
+from littrace.retrieval.embeddings import embedding_client_from_config
 from littrace.retrieval.rag_profile import load_session_rag_profile
 from littrace.session import create_chat_session, save_workspace
-from littrace.skill_runner import parse_workspace_skill
 
 
-SKIP = os.environ.get("RUN_STORAGE_RAG_E2E") != "1"
-skip_reason = "Set RUN_STORAGE_RAG_E2E=1 to run the storage/RAG integration test."
-
-
-class _EmbeddingHandler(BaseHTTPRequestHandler):
-    def do_POST(self):  # noqa: N802
-        if self.path != "/v1/embeddings":
-            self.send_response(404)
-            self.end_headers()
-            return
-        length = int(self.headers.get("content-length", "0"))
-        payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        inputs = payload.get("input") or []
-        if not isinstance(inputs, list):
-            inputs = [inputs]
-        data = [
-            {"index": index, "embedding": [0.1 + index * 0.01, 0.2 + index * 0.01, 0.3 + index * 0.01]}
-            for index, _ in enumerate(inputs)
-        ]
-        body = json.dumps({"data": data}).encode("utf-8")
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_args):  # noqa: D401
-        return
-
-
-@pytest.fixture
-def embedding_server():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _EmbeddingHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}/v1"
-    finally:
-        server.shutdown()
-        thread.join(timeout=2.0)
+SKIP = (
+    os.environ.get("RUN_STORAGE_RAG_E2E") != "1"
+    or not os.environ.get("LITTRACE_E2E_EMBEDDING_BASE_URL")
+    or not os.environ.get("LITTRACE_E2E_EMBEDDING_API_KEY")
+)
+skip_reason = (
+    "Set RUN_STORAGE_RAG_E2E=1 and configure a real LITTRACE_E2E_EMBEDDING_BASE_URL "
+    "and LITTRACE_E2E_EMBEDDING_API_KEY to run this integration test."
+)
 
 
 @pytest.mark.anyio
 @pytest.mark.skipif(SKIP, reason=skip_reason)
 async def test_download_to_object_storage_and_refresh_rag_embeddings(
     tmp_path,
-    embedding_server,
 ):
     pytest.importorskip("boto3")
 
@@ -74,7 +46,6 @@ async def test_download_to_object_storage_and_refresh_rag_embeddings(
             paper_library_dir=tmp_path / "papers",
             metadata_dir=tmp_path / "metadata",
             sessions_dir=tmp_path / "sessions",
-            default_user_id="e2e-user",
         ),
         artifact_storage=ArtifactStorageConfig(
             backend="s3",
@@ -93,49 +64,64 @@ async def test_download_to_object_storage_and_refresh_rag_embeddings(
     config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5433/littrace"
     config.rag.schema_name = "littrace_rag_e2e"
     config.rag.collection_prefix = "littrace_e2e"
-    config.rag.embedding_base_url = embedding_server
-    config.rag.embedding_api_key = "test-key"
-    config.rag.embedding_dimension = 3
+    config.rag.embedding_base_url = os.environ["LITTRACE_E2E_EMBEDDING_BASE_URL"]
+    config.rag.embedding_api_key = os.environ["LITTRACE_E2E_EMBEDDING_API_KEY"]
+    config.rag.embedding_model = os.environ.get("LITTRACE_E2E_EMBEDDING_MODEL", "text-embedding-3-small")
+    config.rag.embedding_dimension = int(os.environ.get("LITTRACE_E2E_EMBEDDING_DIMENSION", "1536"))
     config.rag.auto_refresh_enabled = False
+    config.download_retry.max_attempts = 1
 
-    paper = PaperMetadata(
-        paper_id="arxiv1706",
-        title="Attention Is All You Need",
-        year=2017,
-        doi=None,
-        pdf_url="https://arxiv.org/pdf/1706.03762.pdf",
-        access_type=AccessType.OPEN_ACCESS,
-    )
+    papers = [
+        PaperMetadata(paper_id="arxiv1706", title="Attention Is All You Need", year=2017, pdf_url="https://arxiv.org/pdf/1706.03762.pdf", access_type=AccessType.OPEN_ACCESS),
+        PaperMetadata(paper_id="arxiv1810", title="BERT", year=2018, pdf_url="https://arxiv.org/pdf/1810.04805.pdf", access_type=AccessType.OPEN_ACCESS),
+        PaperMetadata(paper_id="arxiv2005", title="Language Models are Few-Shot Learners", year=2020, pdf_url="https://arxiv.org/pdf/2005.14165.pdf", access_type=AccessType.OPEN_ACCESS),
+    ]
+    papers.extend([
+        PaperMetadata(paper_id="arxiv-missing-1", title="Missing arXiv Record One", year=2024, pdf_url="https://arxiv.org/pdf/9999.99991.pdf", access_type=AccessType.OPEN_ACCESS),
+        PaperMetadata(paper_id="arxiv-missing-2", title="Missing arXiv Record Two", year=2024, pdf_url="https://arxiv.org/pdf/9999.99992.pdf", access_type=AccessType.OPEN_ACCESS),
+    ])
 
     _configure_minio_env()
     _ensure_bucket(config)
 
     session = create_chat_session(config)
     workspace = LiteratureWorkspace()
-    workspace.papers[paper.paper_id] = paper
-    workspace.context.active_papers = [paper.paper_id]
+    workspace.papers = {paper.paper_id: paper for paper in papers}
+    workspace.context.active_papers = [paper.paper_id for paper in papers]
 
     download_result = await execute_downloads(
         config,
-        [paper],
+        papers,
         DownloadExecutionRequest(
-            paper_ids=[paper.paper_id],
-            user_id=config.storage.default_user_id,
+            paper_ids=[paper.paper_id for paper in papers],
             session_id=session.session_id,
             dry_run=False,
         ),
     )
-    assert download_result.downloaded_count == 1
-    assert download_result.items[0].storage_ref is not None
+    assert download_result.downloaded_count == 3
+    assert download_result.requires_login_count == 0
+    assert sum(item.status == "failed" for item in download_result.items) == 2
 
-    workspace, parse_report = await parse_workspace_skill(workspace, config)
-    assert parse_report["parsed_count"] >= 1
-    workspace.context.filters.topic = "Attention Is All You Need"
+    # Parsing has its own integration coverage.  The durable queue needs parsed
+    # content to verify the artifact can be embedded after outbox dispatch.
+    for paper in papers[:3]:
+        workspace.parsed_papers[paper.paper_id] = ParsedPaper(
+            title=paper.title,
+            parsed=True,
+            sections=[{"name": "abstract", "text": f"Verified text for {paper.paper_id}."}],
+        )
+    workspace.context.filters.topic = "mixed acquisition batch"
     save_workspace(session, workspace, config=config)
 
     state_store = config_state_store(config)
-    pending_before = state_store.list_pending_embedding_jobs(limit=20)
-    assert pending_before
+    lifecycle_events = state_store.list_paper_lifecycle_events(
+        session.session_id,
+    )
+    assert {event.event_type for event in lifecycle_events} >= {
+        "discovered_relevant",
+        "artifact_stored",
+        "acquisition_verified",
+    }
 
     processed = 0
     for _ in range(4):
@@ -148,17 +134,31 @@ async def test_download_to_object_storage_and_refresh_rag_embeddings(
     else:
         assert pending_after == []
     assert processed >= 1
+    session_jobs = state_store.list_embedding_jobs(
+        session_id=session.session_id,
+        limit=20,
+    )
+    assert session_jobs
+    assert all(job.status == "completed" for job in session_jobs)
 
     loaded_profile = load_session_rag_profile(session)
     assert loaded_profile is not None
     store = PgvectorRagStore(config, loaded_profile)
-    hits = store.query_chunks([0.1, 0.2, 0.3], top_k=5)
+    query_embedding = (await embedding_client_from_config(config, loaded_profile).embed_texts(["attention mechanisms"]))[0]
+    hits = store.query_chunks(query_embedding, top_k=5)
     assert hits
+
+    metrics = build_session_knowledge_metrics(config, session.session_id)
+    assert metrics.discovery.value == 5
+    assert metrics.acquisition.value == 0.6
+    assert metrics.acquisition.numerator == 3
+    assert metrics.acquisition.denominator == 5
+    assert metrics.rag.value == 1.0
+    assert metrics.consistency.value == 1.0
 
     registry = artifact_registry_from_config(config)
     record = registry.get(
         "paper_pdf:arxiv1706",
-        user_id=config.storage.default_user_id,
         session_id=session.session_id,
     )
     assert record is not None

@@ -239,6 +239,62 @@ async def chat_completion(
     return LLMReply(text=content, used_llm=True)
 
 
+async def vision_completion(
+    config: LitTraceConfig,
+    *,
+    image_data_url: str,
+    prompt: str,
+    json_mode: bool = True,
+) -> LLMReply:
+    """Call the configured vision-capable OpenAI-compatible endpoint."""
+    vision = config.figure_enrichment
+    base_url = vision.base_url or config.llm.base_url
+    api_key = vision.api_key or config.llm.api_key
+    model = vision.model or config.llm.model
+    if not config.llm.enabled:
+        return LLMReply(text="", used_llm=False, error="llm_disabled")
+    if not api_key:
+        return LLMReply(text="", used_llm=False, error="missing_vision_api_key")
+    if not base_url or not model:
+        return LLMReply(text="", used_llm=False, error="missing_vision_endpoint")
+
+    _ensure_cost_tracker_persistence(config)
+    _ensure_retry_tracker_persistence(config)
+    _ensure_rate_limiter(config)
+    budget_error = _check_budget(config)
+    if budget_error is not None:
+        return LLMReply(text="", used_llm=False, error=budget_error)
+
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "You are a careful scientific figure analyst."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
+            ],
+        },
+    ]
+    endpoint = LLMEndpoint(api_key=api_key, base_url=base_url, model=model, label="vision")
+    try:
+        with timed("vision_request", model=model, endpoint=endpoint.label):
+            async with RateLimitSlot(rate_limiter):
+                response = await _post_chat_completion(
+                    config,
+                    messages,
+                    endpoint,
+                    _build_retry_config(config),
+                    json_mode=json_mode,
+                )
+    except Exception as exc:
+        return LLMReply(text="", used_llm=False, error=f"{exc.__class__.__name__}: {exc}")
+    payload = response.json()
+    content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if not isinstance(content, str) or not content.strip():
+        return LLMReply(text="", used_llm=False, error="empty_vision_response")
+    return LLMReply(text=content.strip(), used_llm=True)
+
+
 def _llm_endpoints(config: LitTraceConfig) -> list[LLMEndpoint]:
     endpoints = [
         LLMEndpoint(
@@ -273,7 +329,7 @@ def _llm_endpoints(config: LitTraceConfig) -> list[LLMEndpoint]:
 def _build_request_body(
     config: LitTraceConfig,
     endpoint: LLMEndpoint,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, object]],
     *,
     json_mode: bool = False,
 ) -> dict[str, object]:
@@ -297,7 +353,7 @@ def _build_request_body(
 
 async def _post_chat_completion(
     config: LitTraceConfig,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, object]],
     endpoint: LLMEndpoint,
     retry_config: RetryConfig | None = None,
     *,

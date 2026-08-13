@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from hashlib import sha256
+import asyncio
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin
@@ -21,7 +21,7 @@ from littrace.download_tasks import (
     DownloadTaskStatus,
     download_task_store_from_config,
 )
-from littrace.state_db import EmbeddingJobRecord, SessionPermissionGrant, state_store_from_config
+from littrace.lifecycle import enqueue_embedding_outbox, record_lifecycle_event
 from littrace.retrieval.full_text import resolve_full_text_for_paper
 from littrace.models import (
     AccessType,
@@ -47,23 +47,32 @@ async def execute_downloads(
     timeout = httpx.Timeout(config.api.request_timeout_seconds)
     headers = {"User-Agent": config.api.user_agent}
     task_store = download_task_store_from_config(config)
-    user_id = request.user_id or config.storage.default_user_id
     session_id = request.session_id or "adhoc"
     async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
-        for plan_item in plan.items:
+        async def run_plan_item(plan_item):
             paper = next(paper for paper in target_papers if paper.paper_id == plan_item.paper_id)
             task = DownloadTask.from_paper(
                 config,
                 paper,
                 session_id=session_id,
-                user_id=user_id,
             )
+            _record_discovered_relevant(config, task, paper)
+            _record_task_lifecycle(config, task, "acquisition_queued")
             if not request.dry_run and config.download_retry.enabled:
                 task_store.upsert(task)
             item, task = await _execute_one(client, config, paper, request.dry_run, task)
+            _record_terminal_acquisition_event(config, task)
             if not request.dry_run and config.download_retry.enabled:
                 task_store.upsert(task)
-            items.append(item)
+            return item
+
+        semaphore = asyncio.Semaphore(config.paper_download.max_concurrent_downloads)
+
+        async def run_bounded(plan_item):
+            async with semaphore:
+                return await run_plan_item(plan_item)
+
+        items = list(await asyncio.gather(*(run_bounded(item) for item in plan.items)))
 
     return DownloadExecutionResult(
         items=items,
@@ -83,8 +92,9 @@ async def _execute_one(
     dry_run: bool,
     task: DownloadTask,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
+    _record_task_lifecycle(config, task, "acquisition_started")
     if paper.access_type == AccessType.REQUIRES_LOGIN and paper.doi:
-        return _execute_cdp_download(config, paper, dry_run, task)
+        return await _execute_cdp_download_async(config, paper, dry_run, task)
     pdf_url = paper.pdf_url
     if paper.access_type == AccessType.OPEN_ACCESS and not pdf_url:
         report = await resolve_full_text_for_paper(client, paper, config)
@@ -124,7 +134,7 @@ async def _execute_one(
                         candidate_response.raise_for_status()
                     except httpx.HTTPStatusError as exc:
                         if paper.doi and exc.response.status_code in {401, 403, 429}:
-                            return _execute_cdp_download(
+                            return await _execute_cdp_download_async(
                                 config,
                                 paper,
                                 dry_run,
@@ -171,7 +181,7 @@ async def _execute_one(
                     ), task
             error = f"Response does not look like a PDF: {content_type}"
             if paper.doi and _should_try_cdp_fallback(response):
-                return _execute_cdp_download(
+                return await _execute_cdp_download_async(
                     config,
                     paper,
                     dry_run,
@@ -240,7 +250,7 @@ async def _execute_one(
     except httpx.HTTPStatusError as exc:
         error = f"{exc.__class__.__name__}: {exc}"
         if paper.doi and exc.response.status_code in {401, 403, 429}:
-            return _execute_cdp_download(
+            return await _execute_cdp_download_async(
                 config,
                 paper,
                 dry_run,
@@ -332,6 +342,25 @@ def _execute_cdp_download(
         login_instructions=[result.user_action] if result.user_action else [],
         error=error,
     ), task
+
+
+async def _execute_cdp_download_async(
+    config: LitTraceConfig,
+    paper: PaperMetadata,
+    dry_run: bool,
+    task: DownloadTask,
+    *,
+    prior_error: str | None = None,
+) -> tuple[DownloadExecutionItem, DownloadTask]:
+    """Run the blocking CDP client without blocking other download workers."""
+    return await asyncio.to_thread(
+        _execute_cdp_download,
+        config,
+        paper,
+        dry_run,
+        task,
+        prior_error=prior_error,
+    )
 
 
 def _target_pdf_path(config: LitTraceConfig, paper: PaperMetadata) -> Path:
@@ -436,6 +465,7 @@ def make_download_retry_handler(config: LitTraceConfig):
             follow_redirects=True,
         ) as client:
             _, updated = await _execute_one(client, config, paper, False, task)
+        _record_terminal_acquisition_event(config, updated)
         return updated
 
     return handler
@@ -455,7 +485,6 @@ def _store_pdf_artifact(
     object_key = build_artifact_object_key(
         config,
         ArtifactKeyContext(
-            user_id=task.user_id,
             session_id=task.session_id,
             kind="paper_pdf",
             artifact_id=artifact_id,
@@ -468,7 +497,6 @@ def _store_pdf_artifact(
         data,
         content_type=content_type or "application/pdf",
         metadata={
-            "user_id": task.user_id,
             "session_id": task.session_id,
             "paper_id": paper.paper_id,
             "kind": "paper_pdf",
@@ -479,7 +507,6 @@ def _store_pdf_artifact(
         ArtifactRecord.from_blob_ref(
             ref,
             artifact_id=artifact_id,
-            user_id=task.user_id,
             session_id=task.session_id,
             kind="paper_pdf",
             paper_id=paper.paper_id,
@@ -490,7 +517,16 @@ def _store_pdf_artifact(
             },
         )
     )
-    _register_download_state(config, task, record)
+    record_lifecycle_event(
+        config, session_id=task.session_id, paper_id=paper.paper_id,
+        event_type="artifact_stored", task_id=task.task_id, artifact_id=artifact_id,
+        payload={"artifact_id": artifact_id, "sha256": ref.sha256, "source_revision": record.revision},
+    )
+    if config.rag.enabled:
+        enqueue_embedding_outbox(
+            config, session_id=task.session_id, artifact_id=artifact_id,
+            content_sha256=ref.sha256, payload={"source_revision": record.revision},
+        )
     task.artifact_id = artifact_id
     task.target_bucket = ref.bucket
     task.target_object_key = ref.object_key
@@ -500,62 +536,41 @@ def _store_pdf_artifact(
     return ref.model_dump(mode="json")
 
 
-def _register_download_state(
+def _record_task_lifecycle(config: LitTraceConfig, task: DownloadTask, event_type: str) -> None:
+    record_lifecycle_event(
+        config, session_id=task.session_id, paper_id=task.paper_id,
+        event_type=event_type, task_id=task.task_id, artifact_id=task.artifact_id,
+        payload={"attempt_count": task.attempt_count, "status": task.status.value},
+    )
+
+
+def _record_discovered_relevant(
     config: LitTraceConfig,
     task: DownloadTask,
-    record: ArtifactRecord,
+    paper: PaperMetadata,
 ) -> None:
-    state_store = state_store_from_config(config)
-    if state_store is None:
-        return
-    state_store.grant_permission(
-        SessionPermissionGrant(
-            scope="artifact",
-            resource_key=f"{task.session_id}:{record.artifact_id}",
-            owner_user_id=task.user_id,
-            grantee_user_id=task.user_id,
-            role="owner",
-            granted_by=task.user_id,
-            metadata={"kind": record.kind, "paper_id": record.paper_id},
-        )
-    )
-    if not config.rag.enabled:
-        return
-    state_store.enqueue_embedding_job(
-        EmbeddingJobRecord(
-            job_id=_embedding_job_id(
-                task.user_id,
-                task.session_id,
-                record.artifact_id,
-                record.sha256,
-                record.revision,
-            ),
-            profile_id=f"pending:{task.user_id}:{task.session_id}",
-            user_id=task.user_id,
-            session_id=task.session_id,
-            artifact_id=record.artifact_id,
-            source_revision=record.revision,
-            content_sha256=record.sha256,
-        )
+    """Selected download candidates have passed the session relevance gate."""
+    record_lifecycle_event(
+        config,
+        session_id=task.session_id,
+        paper_id=paper.paper_id,
+        event_type="discovered_relevant",
+        task_id=task.task_id,
+        payload={
+            "relevance_score": paper.relevance_score,
+            "access_type": paper.access_type.value,
+            "source_name": task.source_name,
+        },
     )
 
 
-def _embedding_job_id(
-    user_id: str,
-    session_id: str,
-    artifact_id: str,
-    content_sha256: str | None,
-    source_revision: str | None,
-) -> str:
-    digest = sha256(
-        "\0".join(
-            [
-                user_id,
-                session_id,
-                artifact_id,
-                content_sha256 or "",
-                source_revision or "",
-            ]
-        ).encode("utf-8")
-    ).hexdigest()[:24]
-    return f"emb:{digest}"
+def _record_terminal_acquisition_event(config: LitTraceConfig, task: DownloadTask) -> None:
+    if task.status == DownloadTaskStatus.VERIFIED:
+        event_type = "acquisition_verified"
+    elif task.status == DownloadTaskStatus.AUTH_REQUIRED:
+        event_type = "acquisition_auth_required"
+    elif task.status == DownloadTaskStatus.FAILED:
+        event_type = "acquisition_failed_terminal" if task.attempt_count >= task.max_attempts else "acquisition_failed_retryable"
+    else:
+        return
+    _record_task_lifecycle(config, task, event_type)

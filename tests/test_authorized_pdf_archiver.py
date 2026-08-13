@@ -1,6 +1,6 @@
 import base64
 
-from littrace.authorized_pdf_archiver import archive_authorized_pdf_response
+from littrace.access_layer.authorized_pdf_archiver import archive_authorized_pdf_response
 from littrace.config import LitTraceConfig, StorageConfig
 from littrace.models import PaperMetadata
 
@@ -41,7 +41,7 @@ def test_archive_authorized_pdf_response_writes_base64_pdf(monkeypatch, tmp_path
             "response_body=JVBERi0xLjQK"
         )
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
 
     result = archive_authorized_pdf_response(
         config,
@@ -89,7 +89,7 @@ def test_archive_authorized_pdf_response_reports_viewer_shell(monkeypatch, tmp_p
             "response_body=<!doctype html><embed type='application/pdf'>"
         )
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
 
     result = archive_authorized_pdf_response(
         config,
@@ -147,7 +147,7 @@ def test_archive_authorized_pdf_response_falls_back_to_browser_context_fetch(
             "}"
         )
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
 
     result = archive_authorized_pdf_response(
         config,
@@ -194,7 +194,7 @@ def test_archive_authorized_pdf_response_fetches_without_network_pdf_record(
             "}"
         )
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
 
     result = archive_authorized_pdf_response(
         config,
@@ -259,8 +259,8 @@ def test_archive_authorized_pdf_response_cookie_http_after_missing_network_and_f
         def get(self, _url):
             return FakeResponse()
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.httpx.Client", FakeClient)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.httpx.Client", FakeClient)
 
     result = archive_authorized_pdf_response(
         config,
@@ -331,8 +331,8 @@ def test_archive_authorized_pdf_response_click_download_after_http_fallbacks_fai
         def get(self, _url):
             return FakeResponse()
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.httpx.Client", FakeClient)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.httpx.Client", FakeClient)
 
     result = archive_authorized_pdf_response(
         config,
@@ -380,7 +380,7 @@ def test_archive_authorized_pdf_response_prefers_browser_download_before_http_fa
             )
         raise AssertionError(f"Unexpected fallback before browser click: {args}")
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
 
     result = archive_authorized_pdf_response(
         config,
@@ -470,8 +470,8 @@ def test_archive_authorized_pdf_response_falls_back_to_cookie_http(
             assert url.endswith("article_openPDF")
             return FakeResponse()
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.httpx.Client", FakeClient)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.httpx.Client", FakeClient)
 
     result = archive_authorized_pdf_response(
         config,
@@ -551,8 +551,8 @@ def test_archive_authorized_pdf_response_cookie_http_falls_back_to_document_cook
         def get(self, _url):
             return FakeResponse()
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.httpx.Client", FakeClient)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.httpx.Client", FakeClient)
 
     result = archive_authorized_pdf_response(
         config,
@@ -653,8 +653,8 @@ def test_archive_authorized_pdf_response_follows_wiley_pdfdirect(
                 "text/html;charset=UTF-8",
             )
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.httpx.Client", FakeClient)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.httpx.Client", FakeClient)
 
     result = archive_authorized_pdf_response(
         config,
@@ -708,7 +708,7 @@ def test_archive_authorized_pdf_response_prefers_pdf_over_viewer_html(monkeypatc
             "response_body=JVBERi0xLjQK"
         )
 
-    monkeypatch.setattr("littrace.authorized_pdf_archiver.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.authorized_pdf_archiver.run_browser_act", fake_run)
 
     result = archive_authorized_pdf_response(
         config,

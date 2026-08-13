@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
@@ -14,6 +14,7 @@ from littrace.evidence.claims import (
     register_evidence,
     verify_structured_claim,
 )
+from littrace.evidence.tables import extract_performance_cells
 from littrace.models import Claim, ClaimKind, EvidenceSpan, LiteratureWorkspace, coerce_parsed
 from littrace.evidence.storyline import build_storyline_from_workspace
 from littrace.publication import evaluate_publication
@@ -79,6 +80,14 @@ class AnswerClaimSchema(BaseModel):
     requires_corroboration: bool = False
     requires_freshness: bool = False
 
+    @field_validator("claim_kind", mode="before")
+    @classmethod
+    def _normalize_claim_kind(cls, value: object) -> object:
+        # OpenAI-compatible models commonly emit this natural-language alias.
+        if isinstance(value, str) and value.strip().lower() == "quantitative":
+            return ClaimKind.NUMERIC
+        return value
+
 
 _WRITER_SYSTEM_PROMPT = (
     "You are LitTrace Research Writer. Answer in Chinese. "
@@ -140,10 +149,7 @@ async def write_evidence_grounded_answer(
             used_llm=False,
             error="missing_full_text",
         )
-    release_block = _release_blocked_reply(config, workspace)
-    if release_block is not None:
-        return release_block
-
+    await _ensure_numeric_evidence(config, question, workspace)
     user_message, evidence_registry = _writer_payload(
         question,
         workspace,
@@ -222,7 +228,11 @@ def _writer_payload(
             f"journal={paper.journal}; publisher={paper.publisher}; doi={paper.doi}"
         )
 
-    if workspace.parsed_papers:
+    # When retrieval found question-specific source spans, do not dilute them
+    # with a second copy of the leading sections from every paper. It both
+    # harms evidence selection and can push the structured answer past the LLM
+    # request timeout.
+    if workspace.parsed_papers and not rag_evidence:
         lines.append("")
         lines.append("Parsed evidence:")
         for paper_id, parsed in workspace.parsed_papers.items():
@@ -242,6 +252,10 @@ def _writer_payload(
                     page=provenance.get("page"),
                     snippet=text or name,
                     parser=provenance.get("parser"),
+                    parser_version=provenance.get("parser_version"),
+                    source_record_id=provenance.get("source_record_id"),
+                    content_hash=provenance.get("content_hash"),
+                    captured_at=provenance.get("captured_at"),
                 )
                 lines.append(
                     f"- evidence_id={evidence_id}; paper={paper_id}; section={name}; text={text}"
@@ -257,6 +271,7 @@ def _writer_payload(
             evidence_registry[evidence_id] = cell.evidence.model_copy(
                 update={
                     "evidence_id": evidence_id,
+                    "column_label": cell.metric,
                     "observed_value": cell.value,
                     "observed_unit": cell.unit,
                     "observed_value_min": cell.value_min,
@@ -272,23 +287,48 @@ def _writer_payload(
     if rag_evidence:
         lines.append("")
         lines.append("RAG evidence:")
-        for span in rag_evidence:
+        for index, span in enumerate(rag_evidence, start=1):
             if not span.evidence_id:
                 continue
-            evidence_registry[span.evidence_id] = span
+            # RAG IDs include both a profile and chunk digest. They are durable
+            # internally but unnecessarily error-prone for an LLM to copy.
+            # Use a compact, content-addressed alias in the writer contract and
+            # retain the original identifier in source_record_id for audit.
+            alias = f"rag-{(span.content_hash or str(index))[:16]}"
+            registered_span = span.model_copy(update={"evidence_id": alias})
+            evidence_registry[alias] = registered_span
             location = []
-            if span.section:
-                location.append(f"section={span.section}")
-            if span.page is not None:
-                location.append(f"page={span.page}")
-            if span.table_id:
-                location.append(f"table_id={span.table_id}")
+            if registered_span.section:
+                location.append(f"section={registered_span.section}")
+            if registered_span.page is not None:
+                location.append(f"page={registered_span.page}")
+            if registered_span.table_id:
+                location.append(f"table_id={registered_span.table_id}")
             loc_text = "; ".join(location)
             location_part = f"; {loc_text}" if loc_text else ""
             lines.append(
-                f"- evidence_id={span.evidence_id}; paper={span.paper_id}{location_part}; text={span.snippet or ''}"
+                f"- evidence_id={alias}; paper={registered_span.paper_id}{location_part}; "
+                f"text={registered_span.snippet or ''}"
             )
 
+    lines.append("")
+    lines.append(
+    "Claim requirements: each claim must be atomic. Every evidence_id must have a "
+        "support_quotes entry copied verbatim from that evidence text. A Chinese translation "
+        "is allowed only when the quote is verbatim. Do not use causal or comparative wording "
+        "unless the cited quote explicitly states it."
+    )
+    lines.append(
+        "Coverage requirements: when the question asks for multiple samples or conditions, "
+        "cover every requested sample/condition that has supplied evidence. Do not infer a "
+        "ranking for a sample whose corresponding metric is absent or marked not given."
+    )
+    if workspace.performance_cells:
+        lines.append(
+            "For every numeric claim, cite a Performance cells evidence_id (not a generic RAG "
+            "evidence_id), set claim_kind to numeric, and provide metric, expected_value, and "
+            "expected_unit exactly as registered."
+        )
     lines.append("")
     lines.append("Citation records:")
     for record in citations:
@@ -319,6 +359,37 @@ def _workspace_is_mock(workspace: LiteratureWorkspace) -> bool:
 
 def _has_parsed_full_text(workspace: LiteratureWorkspace) -> bool:
     return any(bool(coerce_parsed(parsed).parsed) for parsed in workspace.parsed_papers.values())
+
+
+async def _ensure_numeric_evidence(
+    config: LitTraceConfig,
+    question: str,
+    workspace: LiteratureWorkspace,
+) -> None:
+    """Populate traceable metric cells before an answer that can require numbers."""
+
+    if workspace.performance_cells or not config.llm.enabled:
+        return
+    normalized = question.lower()
+    numeric_terms = (
+        "性能", "参数", "数值", "指标", "模量", "刚性", "弹性", "强度", "灵敏度",
+        "performance", "metric", "modulus", "stiff", "elastic", "sensitivity", "strength",
+    )
+    if not any(term in normalized for term in numeric_terms):
+        return
+    try:
+        _, report = await extract_performance_cells(workspace, config)
+        logger.info(
+            "writer_numeric_evidence_ready",
+            extra={"cell_count": len(workspace.performance_cells), "score": report.score},
+        )
+    except Exception as exc:
+        # The writer can still return quote-bound qualitative claims. Numeric
+        # claims remain draft-only unless a later extraction supplies values.
+        logger.warning(
+            "writer_numeric_evidence_unavailable",
+            extra={"error": f"{exc.__class__.__name__}: {exc}"[:200]},
+        )
 
 
 def _release_blocked_reply(
@@ -547,7 +618,7 @@ def _render_verified_claims(
             text=claim.text,
             claim_kind=claim.claim_kind,
             evidence_ids=claim.evidence_ids,
-            support_quotes=claim.support_quotes,
+            support_quotes=_canonical_support_quotes(claim, evidence_registry),
             metric=claim.metric,
             expected_value=claim.expected_value,
             expected_unit=claim.expected_unit,
@@ -557,6 +628,7 @@ def _render_verified_claims(
             requires_corroboration=claim.requires_corroboration,
             requires_freshness=claim.requires_freshness,
             retrieval_cutoff_at=getattr(workspace.context.filters, "search_completed_at", None),
+            claim_origin="llm_quote_bound",
         )
         verification = verify_structured_claim(structured_claim, evidence_registry)
         if not verification.publishable:
@@ -588,6 +660,29 @@ def _render_verified_claims(
     lines.extend(["", "引用与访问链接："])
     lines.extend(f"- {record.citation_text} {record.access_url}" for record in records)
     return "\n".join(lines)
+
+
+def _canonical_support_quotes(
+    claim: AnswerClaimSchema,
+    evidence_registry: dict[str, EvidenceSpan],
+) -> dict[str, str]:
+    """Anchor numeric claims to the immutable metric evidence text.
+
+    Numeric evidence is already value-, unit-, and metric-validated below.
+    Models frequently return a shortened table fragment as their quote even
+    when they selected the correct metric-cell ID; retaining that fragment
+    would fail a purely textual substring check. Persist the registered source
+    snippet instead, while leaving every non-numeric quote model-supplied.
+    """
+
+    quotes = dict(claim.support_quotes)
+    if claim.claim_kind != ClaimKind.NUMERIC:
+        return quotes
+    for evidence_id in claim.evidence_ids:
+        span = evidence_registry[evidence_id]
+        if isinstance(span.observed_value, int | float) and span.snippet:
+            quotes[evidence_id] = span.snippet
+    return quotes
 
 
 def _section_evidence_id(paper_id: str, section: str, text: str) -> str:

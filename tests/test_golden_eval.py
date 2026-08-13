@@ -1,6 +1,6 @@
 from littrace.config import EvalConfig, LitTraceConfig
 from littrace.context import add_papers
-from littrace.golden_eval import run_golden_eval
+from littrace.evaluation.golden_eval import run_golden_eval
 from littrace.models import EvidenceSpan, LiteratureWorkspace, PaperMetadata, PerformanceCell
 
 

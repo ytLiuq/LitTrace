@@ -21,7 +21,6 @@ class StorageConfig(BaseModel):
     cache_dir: Path = Path("./data/cache")
     sessions_dir: Path = Path("./sessions")
     workspace_snapshot_limit: int = 30
-    default_user_id: str = "local-user"
 
 
 class ArtifactStorageConfig(BaseModel):
@@ -37,8 +36,8 @@ ObjectStoreConfig = ArtifactStorageConfig
 
 
 class MetadataStoreConfig(BaseModel):
-    backend: str = "local_json"
-    postgres_dsn: str | None = None
+    backend: str = "postgres"
+    postgres_dsn: str | None = "postgresql://littrace:littrace@localhost:5433/littrace"
     schema_name: str = "littrace"
 
 
@@ -62,6 +61,25 @@ class RagConfig(BaseModel):
     login_required_policy: str = "queue_only"
 
 
+class FigureEnrichmentConfig(BaseModel):
+    """Optional asynchronous multimodal enrichment for extracted figures."""
+
+    enabled: bool = False
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    prompt: str = (
+        "Analyze this scientific figure conservatively. Return JSON only with "
+        "exactly these fields: figure_type (string), visual_summary (string), "
+        "observations (array of strings), ocr_text (array of strings), "
+        "confidence (number from 0 to 1). "
+        "Only report details visible in the image or stated in the caption. "
+        "Do not infer unshown experimental results."
+    )
+    max_figures_per_job: int = Field(default=20, ge=1, le=100)
+    min_confidence: float = Field(default=0.65, ge=0.0, le=1.0)
+
+
 class DownloadRetryConfig(BaseModel):
     enabled: bool = True
     background_worker_enabled: bool = False
@@ -81,18 +99,25 @@ class PublicationPolicyConfig(BaseModel):
     require_publishable_claim: bool = True
 
 
+class SentinelConfig(BaseModel):
+    # Keep daily discovery/download responsive; full OCR can run as a follow-up.
+    parse_on_daily: bool = True
+
+
 class PaperDownloadConfig(BaseModel):
     mode: DownloadMode = DownloadMode.ASK_EACH_TIME
     organize_by: str = "year_doi"
     filename_template: str = "{year}_{first_author}_{short_title}_{doi_hash}.pdf"
     save_metadata_even_if_pdf_skipped: bool = False
     allow_requires_login_download: bool = True
+    max_concurrent_downloads: int = Field(default=3, ge=1, le=8)
 
 
 class DoclingParserConfig(BaseModel):
     export_markdown: bool = True
     extract_tables: bool = True
     extract_figures: bool = True
+    describe_figures: bool = False
 
 
 class PaddleOCRParserConfig(BaseModel):
@@ -109,6 +134,7 @@ class PaddleOCRParserConfig(BaseModel):
 class ParsingConfig(BaseModel):
     default_parser: str = "docling"
     parse_strategy: str = "auto"
+    docling_workers: int = Field(default=2, ge=1, le=4)
     preferred_engines: list[str] = Field(
         default_factory=lambda: ["docling", "paddleocr", "marker", "grobid"]
     )
@@ -121,6 +147,8 @@ class APIConfig(BaseModel):
     openalex_api_key: str | None = None
     unpaywall_email: str | None = None
     crossref_mailto: str | None = None
+    core_api_key: str | None = None
+    enable_europe_pmc: bool = True
     request_timeout_seconds: float = 20.0
     enable_live_search: bool = False
 
@@ -148,6 +176,7 @@ class CDPDownloaderConfig(BaseModel):
     cloudflare_wait_seconds: float = 60.0
     user_action_wait_seconds: float = 30.0
     command_timeout_seconds: float = 60.0
+    repository_download_timeout_seconds: float = 120.0
     websocket_reconnect_attempts: int = 3
 
 
@@ -160,7 +189,8 @@ class LLMConfig(BaseModel):
     fallback_api_key: str | None = None
     fallback_base_url: str | None = None
     fallback_model: str | None = None
-    request_timeout_seconds: float = 30.0
+    request_timeout_seconds: float = 60.0
+    metric_extraction_timeout_seconds: float = 150.0
     temperature: float = 0.2
     enabled: bool = True
     intent_parser_enabled: bool = True
@@ -272,6 +302,7 @@ class LitTraceConfig(BaseModel):
     artifact_storage: ArtifactStorageConfig = Field(default_factory=ArtifactStorageConfig)
     metadata_store: MetadataStoreConfig = Field(default_factory=MetadataStoreConfig)
     rag: RagConfig = Field(default_factory=RagConfig)
+    figure_enrichment: FigureEnrichmentConfig = Field(default_factory=FigureEnrichmentConfig)
     download_retry: DownloadRetryConfig = Field(default_factory=DownloadRetryConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     browser: BrowserAutomationConfig = Field(default_factory=BrowserAutomationConfig)
@@ -289,6 +320,7 @@ class LitTraceConfig(BaseModel):
     citation_guard: CitationGuardConfig = Field(default_factory=CitationGuardConfig)
     cache_policy: CachePolicyConfig = Field(default_factory=CachePolicyConfig)
     publication_policy: PublicationPolicyConfig = Field(default_factory=PublicationPolicyConfig)
+    sentinel: SentinelConfig = Field(default_factory=SentinelConfig)
 
     @property
     def object_store(self) -> ArtifactStorageConfig:
@@ -331,6 +363,12 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     config.browser.browser_act_path = (
         os.environ.get("LITTRACE_BROWSER_ACT_PATH") or config.browser.browser_act_path
     )
+    api_timeout = os.environ.get("LITTRACE_API_REQUEST_TIMEOUT_SECONDS")
+    if api_timeout:
+        try:
+            config.api.request_timeout_seconds = float(api_timeout)
+        except ValueError:
+            pass
     config.browser.default_browser_id = (
         os.environ.get("LITTRACE_BROWSER_ID") or config.browser.default_browser_id
     )
@@ -370,8 +408,17 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     config.llm.fallback_model = (
         os.environ.get("LITTRACE_FALLBACK_LLM_MODEL") or config.llm.fallback_model
     )
-    config.storage.default_user_id = (
-        os.environ.get("LITTRACE_USER_ID") or config.storage.default_user_id
+    config.figure_enrichment.base_url = (
+        os.environ.get("LITTRACE_FIGURE_ENRICHMENT_BASE_URL")
+        or config.figure_enrichment.base_url
+    )
+    config.figure_enrichment.api_key = (
+        os.environ.get("LITTRACE_FIGURE_ENRICHMENT_API_KEY")
+        or config.figure_enrichment.api_key
+    )
+    config.figure_enrichment.model = (
+        os.environ.get("LITTRACE_FIGURE_ENRICHMENT_MODEL")
+        or config.figure_enrichment.model
     )
     config.artifact_storage.backend = (
         os.environ.get("LITTRACE_ARTIFACT_STORAGE_BACKEND") or config.artifact_storage.backend

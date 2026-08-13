@@ -59,7 +59,6 @@ async def search_workspace_rag(
         return None
     session = SimpleNamespace(
         session_id=profile.session_id,
-        user_id=profile.user_id,
         workspace_dir=session_root / "workspace",
     )
     return await search_session_rag(config, session, question, top_k=top_k or profile.top_k)

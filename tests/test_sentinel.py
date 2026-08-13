@@ -12,8 +12,8 @@ from littrace.models import (
     ParsedPaper,
     PerformanceCell,
 )
-from littrace.quality_report import QualityReport
-from littrace.sentinel.agent import LiteratureSentinelAgent
+from littrace.evaluation.quality_report import QualityReport
+from littrace.sentinel.agent import LiteratureSentinel
 from littrace.sentinel.state import AccessTask, Watchlist
 from littrace.sentinel.storage import (
     load_access_queue,
@@ -22,7 +22,7 @@ from littrace.sentinel.storage import (
 )
 from littrace.skill_runner import SearchSkillResult
 from littrace.tool_contracts import ToolResult
-from littrace.harnesses import HarnessResult
+from littrace.evaluation.harnesses import HarnessResult
 
 
 def test_sentinel_run_builds_digest_and_access_queue(monkeypatch, tmp_path):
@@ -34,13 +34,13 @@ def test_sentinel_run_builds_digest_and_access_queue(monkeypatch, tmp_path):
         api=LitTraceConfig().api.model_copy(update={"enable_live_search": False}),
     )
     watchlist = Watchlist(
-        watchlist_id="mxene_sensor",
+        watchlist_id=f"mxene_sensor_{tmp_path.name}",
         topic="MXene flexible piezoresistive sensors",
         objective="monitor mxene sensors",
         query_variants=["MXene sensor"],
         year_min=2024,
     )
-    agent = LiteratureSentinelAgent(config, watchlist)
+    agent = LiteratureSentinel(config, watchlist)
 
     papers = [
         PaperMetadata(
@@ -139,19 +139,19 @@ def test_sentinel_run_builds_digest_and_access_queue(monkeypatch, tmp_path):
     assert result.run_dir is not None
     assert result.resource_pack.missing_evidence == []
     assert result.state.access_queue[0].paper_id == "p2"
-    assert (tmp_path / "sessions" / "sentinel" / "mxene_sensor" / "digests").exists()
-    assert (tmp_path / "sessions" / "sentinel" / "mxene_sensor" / "access_queue.json").exists()
+    assert (tmp_path / "sessions" / "sentinel" / watchlist.watchlist_id / "digests").exists()
+    assert [task.paper_id for task in load_access_queue(result.store)] == ["p2"]
     assert (
         tmp_path
         / "sessions"
         / "sentinel"
-        / "mxene_sensor"
+        / watchlist.watchlist_id
         / "evidence_base"
         / "runs"
         / result.summary.run_id
         / "papers.jsonl"
     ).exists()
-    workspace_dir = tmp_path / "sessions" / "sentinel" / "mxene_sensor" / "workspace"
+    workspace_dir = tmp_path / "sessions" / "sentinel" / watchlist.watchlist_id / "workspace"
     assert (workspace_dir / "evidence" / "spans.json").exists()
     assert (workspace_dir / "releases").exists()
 
@@ -168,7 +168,7 @@ def test_sentinel_resume_after_login_uses_access_queue(monkeypatch, tmp_path):
         topic="MXene flexible piezoresistive sensors",
         objective="monitor mxene sensors",
     )
-    agent = LiteratureSentinelAgent(config, watchlist)
+    agent = LiteratureSentinel(config, watchlist)
     workspace = LiteratureWorkspace()
     workspace.papers["p2"] = PaperMetadata(
         paper_id="p2",

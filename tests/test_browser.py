@@ -1,7 +1,7 @@
 from pathlib import Path
 import subprocess
 
-from littrace.browser import (
+from littrace.access_layer.browser import (
     browser_act_command,
     browser_open_args,
     publisher_window_session_name,

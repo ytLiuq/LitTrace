@@ -54,17 +54,17 @@ async def test_execute_one_stores_downloaded_pdf_as_object_ref(tmp_path):
         pdf_url="https://example.org/paper.pdf",
         access_type=AccessType.OPEN_ACCESS,
     )
-    task = DownloadTask.from_paper(config, paper, session_id="s1", user_id="u1")
+    task = DownloadTask.from_paper(config, paper, session_id="s1")
 
     item, updated = await _execute_one(FakeClient(), config, paper, False, task)
 
     assert item.status == "downloaded"
     assert item.storage_ref
-    assert item.storage_ref["object_key"] == "users/u1/sessions/s1/papers/p1/paper.pdf"
+    assert item.storage_ref["object_key"] == "sessions/s1/papers/p1/paper.pdf"
     assert updated.status == DownloadTaskStatus.VERIFIED
     assert updated.target_object_key == item.storage_ref["object_key"]
     assert (tmp_path / "objects" / item.storage_ref["object_key"]).exists()
-    record = artifact_registry_from_config(config).get("paper_pdf:p1", user_id="u1", session_id="s1")
+    record = artifact_registry_from_config(config).get("paper_pdf:p1", session_id="s1")
     assert record is not None
     assert record.object_key == item.storage_ref["object_key"]
 
@@ -99,7 +99,7 @@ async def test_execute_one_marks_recaptcha_html_pdf_url_as_auth_required(tmp_pat
         pdf_url="https://pmc.ncbi.nlm.nih.gov/articles/PMC13367112/pdf/ADVS-9999-e76572.pdf",
         access_type=AccessType.OPEN_ACCESS,
     )
-    task = DownloadTask.from_paper(config, paper, session_id="s1", user_id="u1")
+    task = DownloadTask.from_paper(config, paper, session_id="s1")
 
     item, updated = await _execute_one(FakeClient(), config, paper, False, task)
 
@@ -109,7 +109,7 @@ async def test_execute_one_marks_recaptcha_html_pdf_url_as_auth_required(tmp_pat
     assert updated.status == DownloadTaskStatus.AUTH_REQUIRED
     assert updated.requires_login
     assert not (tmp_path / "papers" / "p1.pdf").exists()
-    assert artifact_registry_from_config(config).get("paper_pdf:p1", user_id="u1", session_id="s1") is None
+    assert artifact_registry_from_config(config).get("paper_pdf:p1", session_id="s1") is None
 
 
 @pytest.mark.anyio
@@ -145,14 +145,14 @@ async def test_execute_one_downloads_pdf_link_from_open_access_landing_page(tmp_
         pdf_url="https://example.org/article",
         access_type=AccessType.OPEN_ACCESS,
     )
-    task = DownloadTask.from_paper(config, paper, session_id="s1", user_id="u1")
+    task = DownloadTask.from_paper(config, paper, session_id="s1")
 
     item, updated = await _execute_one(FakeClient(), config, paper, False, task)
 
     assert item.status == "downloaded"
     assert item.storage_ref
     assert updated.status == DownloadTaskStatus.VERIFIED
-    assert artifact_registry_from_config(config).get("paper_pdf:p1", user_id="u1", session_id="s1") is not None
+    assert artifact_registry_from_config(config).get("paper_pdf:p1", session_id="s1") is not None
 
 
 @pytest.mark.anyio
@@ -194,7 +194,7 @@ async def test_execute_one_falls_back_to_cdp_for_open_access_403(monkeypatch, tm
         pdf_url="https://example.org/paper.pdf",
         access_type=AccessType.OPEN_ACCESS,
     )
-    task = DownloadTask.from_paper(config, paper, session_id="s1", user_id="u1")
+    task = DownloadTask.from_paper(config, paper, session_id="s1")
 
     item, updated = await _execute_one(FakeClient(), config, paper, False, task)
 
@@ -239,7 +239,7 @@ async def test_execute_one_falls_back_to_cdp_for_open_access_timeout(monkeypatch
         pdf_url="https://example.org/paper.pdf",
         access_type=AccessType.OPEN_ACCESS,
     )
-    task = DownloadTask.from_paper(config, paper, session_id="s1", user_id="u1")
+    task = DownloadTask.from_paper(config, paper, session_id="s1")
 
     item, updated = await _execute_one(FakeClient(), config, paper, False, task)
 
@@ -273,7 +273,7 @@ async def test_execute_one_does_not_cdp_fallback_unknown_publisher_timeout(monke
         pdf_url="https://example.org/paper.pdf",
         access_type=AccessType.OPEN_ACCESS,
     )
-    task = DownloadTask.from_paper(config, paper, session_id="s1", user_id="u1")
+    task = DownloadTask.from_paper(config, paper, session_id="s1")
 
     item, updated = await _execute_one(FakeClient(), config, paper, False, task)
 
@@ -322,7 +322,7 @@ async def test_execute_downloads_uses_request_user_and_session_for_storage_refs(
                 access_type=AccessType.OPEN_ACCESS,
             )
         ],
-        DownloadExecutionRequest(user_id="u1", session_id="s1"),
+        DownloadExecutionRequest(session_id="s1"),
     )
 
-    assert result.items[0].storage_ref["object_key"] == "users/u1/sessions/s1/papers/p1/paper.pdf"
+    assert result.items[0].storage_ref["object_key"] == "sessions/s1/papers/p1/paper.pdf"

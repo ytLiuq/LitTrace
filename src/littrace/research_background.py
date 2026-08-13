@@ -7,13 +7,14 @@ from pydantic import BaseModel, Field
 
 from littrace.config import LitTraceConfig
 from littrace.llm import chat_completion
-from littrace.models import LiteratureWorkspace
+from littrace.models import LiteratureWorkspace, TopicRetrievalPolicy
 
 
 class ResearchBackgroundAssessment(BaseModel):
     accepted: bool
     background: str | None = None
     topic: str | None = None
+    retrieval_policy: TopicRetrievalPolicy | None = None
     reason: str | None = None
     suggestions: list[str] = Field(default_factory=list)
     review_source: str = "classifier"
@@ -26,12 +27,15 @@ class ResearchBackgroundReviewSchema(BaseModel):
     reason: str | None = None
     suggestions: list[str] = Field(default_factory=list)
     topic: str | None = None
+    retrieval_policy: TopicRetrievalPolicy | None = None
     confidence: float | None = None
 
 
 async def assess_research_background(
     text: str | None,
     config: LitTraceConfig | None = None,
+    *,
+    _repair_attempted: bool = False,
 ) -> ResearchBackgroundAssessment:
     assessment = _classify_research_background(text)
     if not assessment.accepted:
@@ -45,6 +49,15 @@ async def assess_research_background(
     if llm_review is None:
         return assessment
     if not llm_review.accepted:
+        if (
+            llm_review.reason == "weak_research_signal"
+            and not _repair_attempted
+        ):
+            repaired = await _repair_weak_research_background(config, assessment.background or "")
+            if repaired:
+                return await assess_research_background(
+                    repaired, config, _repair_attempted=True
+                )
         return _reject(
             llm_review.reason or "llm_review_rejected",
             llm_review.suggestions
@@ -59,10 +72,29 @@ async def assess_research_background(
         accepted=True,
         background=assessment.background,
         topic=llm_review.topic or assessment.topic,
+        retrieval_policy=llm_review.retrieval_policy,
+        suggestions=llm_review.suggestions,
         review_source="llm",
         reviewer_model=config.llm.model,
         confidence=llm_review.confidence,
     )
+
+
+async def _repair_weak_research_background(
+    config: LitTraceConfig,
+    background: str,
+) -> str | None:
+    reply = await chat_completion(
+        config,
+        "你负责把科研主题补全为可检索的研究背景。不得改变原研究方向或虚构材料、机制、应用；"
+        "仅补足研究对象、问题、指标和时间范围。只返回补全后的中文研究背景，不要解释。",
+        background,
+        workspace=None,
+    )
+    if not reply.used_llm:
+        return None
+    repaired = " ".join(reply.text.split())
+    return repaired if len(repaired) >= 18 else None
 
 
 def _classify_research_background(text: str | None) -> ResearchBackgroundAssessment:
@@ -151,6 +183,7 @@ def set_workspace_research_background(
     background: str,
     *,
     topic: str | None = None,
+    retrieval_policy: TopicRetrievalPolicy | None = None,
 ) -> LiteratureWorkspace:
     filters = workspace.context.filters
     filters.research_background = background
@@ -158,6 +191,7 @@ def set_workspace_research_background(
     filters.research_background_rejection_reason = None
     filters.research_background_set_at = datetime.now(UTC).isoformat()
     filters.topic = topic or _topic_from_background(background)
+    filters.research_retrieval_policy = retrieval_policy
     if not filters.discipline:
         filters.discipline = "materials chemistry"
     return workspace
@@ -201,13 +235,21 @@ async def _review_research_background_with_llm(
     prompt = (
         "你是研究主题质量门禁审核器。请判断用户给出的内容是否适合作为一个可持续追踪的科研主题。"
         "标准：必须有明确研究对象、研究问题或目标、最好有应用场景或指标；纯问候、下载命令、闲聊、过泛主题都应拒绝。"
-        "请只返回 JSON，字段为 accepted, reason, suggestions, topic, confidence。"
+        "请只返回 JSON，字段为 accepted, reason, suggestions, topic, retrieval_policy, confidence。"
     )
     user_message = (
         "研究背景：\n"
         f"{background}\n\n"
         "如果适合长期科研跟踪，请 accepted=true；"
-        "如果不适合，请 accepted=false 并给出简洁修改建议。"
+        "如果不适合，请 accepted=false 并给出简洁修改建议。\n\n"
+        "accepted=true 时必须同时给出 retrieval_policy："
+        "canonical_topic 是简洁、可检索的英文主题；query_variants 是 3-6 条英文检索式；"
+        "required_concept_groups 只包含定义研究对象或核心机制的 2-4 个必须满足的同义词组，"
+        "例如 [[\"flexible\"], [\"pressure\"], [\"piezoresistive\", \"resistive\"]]；"
+        "excluded_concepts 仅列出该主题明确排除的机制或对象；boost_concepts 列出用于排序的可选术语。"
+        "材料路线、微结构、性能指标、可靠性和应用场景通常属于 boost_concepts，除非用户明确要求它们不可缺少。"
+        "用户已明确限定机制时，应在 excluded_concepts 中列出会导致方向偏移的竞争机制。"
+        "不得凭空添加用户没有限定的材料、机制或应用；若机制未限定，不得将任何机制放入 required 或 excluded。"
     )
     reply = await chat_completion(
         config,
@@ -222,6 +264,8 @@ async def _review_research_background_with_llm(
         payload = json.loads(_extract_json(reply.text))
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
+    if isinstance(payload.get("suggestions"), str):
+        payload["suggestions"] = [payload["suggestions"]]
     try:
         return ResearchBackgroundReviewSchema.model_validate(payload)
     except Exception:

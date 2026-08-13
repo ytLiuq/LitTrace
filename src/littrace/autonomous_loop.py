@@ -11,9 +11,9 @@ from littrace.evaluation.harnesses import check_performance_cells, check_storyli
 from littrace.llm import chat_completion
 from littrace.log import get_logger
 from littrace.models import (
-    AgentCritique,
-    AgentDebateRound,
-    AutonomousResearchLoopReport,
+    ReviewFinding,
+    ReviewLoopReport,
+    ReviewRound,
     EvidenceSpan,
     LiteratureWorkspace,
     coerce_parsed,
@@ -32,12 +32,12 @@ logger = get_logger("autonomous_loop")
 
 
 # ---------------------------------------------------------------------------
-# Schema for LLM debate critique output (Dimension 3: Schema validation)
+# Schema for optional Reviewer output (Dimension 3: schema validation)
 # ---------------------------------------------------------------------------
 
 
-class DebateCritiqueItem(BaseModel):
-    """A single critique from one LLM debate persona."""
+class ReviewerFindingItem(BaseModel):
+    """A single finding from the bounded Reviewer."""
 
     reviewer: str = Field(description="Persona name, e.g. Method Reviewer")
     severity: str = Field(default="warning", description="error | warning | info")
@@ -45,31 +45,31 @@ class DebateCritiqueItem(BaseModel):
     suggested_fix: str | None = None
 
 
-class DebateCritiqueSchema(BaseModel):
-    """Validated schema for _smart_debate_critiques LLM output."""
+class ReviewerFindingSchema(BaseModel):
+    """Validated schema for the optional reviewer's structured output."""
 
-    critiques: list[DebateCritiqueItem] = Field(default_factory=list)
+    critiques: list[ReviewerFindingItem] = Field(default_factory=list)
 
 
-# Keywords that indicate error-level severity (kept for backward compat)
+# Keywords that promote a reviewer finding to error severity.
 _ERROR_KEYWORDS = ("unsupported", "缺少证据", "无证据", "错误", "严重", "阻断", "cannot", "invalid")
 
 
-async def run_autonomous_research_loop(
+async def run_review_loop(
     config: LitTraceConfig,
     objective: str,
     workspace: LiteratureWorkspace,
     max_rounds: int = 2,
-    enable_smart_debate: bool = True,
+    enable_optional_reviewer: bool = True,
     auto_replan: bool = False,
     rag_evidence: list[EvidenceSpan] | None = None,
-) -> AutonomousResearchLoopReport:
-    """Run a bounded writer/reviewer/reviser/replanner loop over current evidence."""
+) -> ReviewLoopReport:
+    """Run mandatory quality gates plus an optional bounded, read-only reviewer."""
 
     if not workspace.context.active_papers:
-        return AutonomousResearchLoopReport(
+        return ReviewLoopReport(
             objective=objective,
-            final_answer="当前还没有文献上下文，无法启动多 agent 修订循环。请先检索论文。",
+            final_answer="当前还没有文献上下文，无法启动审查流程。请先检索论文。",
             passed=False,
             score=0.0,
             replan_actions=["search_papers"],
@@ -79,7 +79,7 @@ async def run_autonomous_research_loop(
     if rag_evidence is None:
         rag_evidence = await _rag_evidence_for_workspace(config, objective, workspace)
     draft = await _initial_draft(config, objective, workspace, rag_evidence=rag_evidence)
-    rounds: list[AgentDebateRound] = []
+    rounds: list[ReviewRound] = []
     final_answer = draft
     final_score = 0.0
     passed = False
@@ -88,10 +88,10 @@ async def run_autonomous_research_loop(
     aggregate_warnings: list[str] = []
 
     for round_index in range(1, max_rounds + 1):
-        critiques = _review_draft(final_answer, workspace, config)
-        if enable_smart_debate:
+        critiques = _run_quality_gates(final_answer, workspace, config)
+        if enable_optional_reviewer:
             critiques.extend(
-                await _smart_debate_critiques(config, objective, final_answer, workspace)
+                await _run_optional_reviewer(config, objective, final_answer, workspace)
             )
         revised = _revise_draft(final_answer, critiques, workspace)
         score = _round_score(critiques, workspace, config)
@@ -104,10 +104,10 @@ async def run_autonomous_research_loop(
                 replan_actions,
             )
             if executed_actions:
-                followup_critiques = _review_draft(revised, workspace, config)
+                followup_critiques = _run_quality_gates(revised, workspace, config)
                 critiques.extend(
-                    AgentCritique(
-                        reviewer="Replanning Agent",
+                    ReviewFinding(
+                        reviewer="Readiness Gate",
                         severity="info",
                         finding=f"已执行自动重规划动作：{action}",
                         suggested_fix="基于更新后的 workspace 继续下一轮复核。",
@@ -119,7 +119,7 @@ async def run_autonomous_research_loop(
                 score = _round_score(critiques, workspace, config)
         passed = not any(item.severity == "error" for item in critiques)
         rounds.append(
-            AgentDebateRound(
+            ReviewRound(
                 round_index=round_index,
                 writer_draft=final_answer,
                 critiques=critiques,
@@ -152,12 +152,12 @@ async def run_autonomous_research_loop(
     release_ready = not release_blockers
     if not release_ready:
         final_answer = (
-            "当前多 agent 修订结果未通过最终发布检查，不能作为研究结论输出。"
+            "当前审查结果未通过最终发布检查，不能作为研究结论输出。"
             "请根据以下阻断项补充或核对证据：\n"
             + "\n".join(f"- {blocker}" for blocker in release_blockers[:5])
         )
 
-    return AutonomousResearchLoopReport(
+    return ReviewLoopReport(
         objective=objective,
         final_answer=final_answer,
         rounds=rounds,
@@ -220,17 +220,17 @@ async def _rag_evidence_for_workspace(
     return evidence
 
 
-def _review_draft(
+def _run_quality_gates(
     draft: str,
     workspace: LiteratureWorkspace,
     config: LitTraceConfig,
-) -> list[AgentCritique]:
-    critiques: list[AgentCritique] = []
+) -> list[ReviewFinding]:
+    critiques: list[ReviewFinding] = []
     citation_report = guard_citations(draft, workspace)
     for sentence in citation_report.unsupported_sentences:
         critiques.append(
-            AgentCritique(
-                reviewer="Citation Auditor",
+            ReviewFinding(
+                reviewer="Citation Gate",
                 severity="error",
                 finding=f"句子缺少论文级锚点或访问链接：{sentence}",
                 suggested_fix="删除该句，或补充 paper id、DOI、标题锚点、访问链接之一。",
@@ -241,8 +241,8 @@ def _review_draft(
     storyline_harness = check_storyline_claims(storyline_claims)
     for finding in storyline_harness.errors:
         critiques.append(
-            AgentCritique(
-                reviewer="Storyline Skeptic",
+            ReviewFinding(
+                reviewer="Storyline Gate",
                 severity="error",
                 finding=f"发展脉络证据不足：{finding}",
                 suggested_fix="先解析全文，或把因果叙事降级为元数据趋势。",
@@ -250,8 +250,8 @@ def _review_draft(
         )
     for warning in storyline_harness.warnings:
         critiques.append(
-            AgentCritique(
-                reviewer="Storyline Skeptic",
+            ReviewFinding(
+                reviewer="Storyline Gate",
                 severity="warning",
                 finding=warning,
                 suggested_fix="增加跨论文证据，避免宽泛历史叙述。",
@@ -262,8 +262,8 @@ def _review_draft(
     if "性能" in draft or "对比" in draft or "performance" in draft.lower():
         if not workspace.performance_cells:
             critiques.append(
-                AgentCritique(
-                    reviewer="Table Auditor",
+                ReviewFinding(
+                    reviewer="Table Gate",
                     severity="warning",
                     finding="草稿涉及性能/对比，但当前没有 performance cells。",
                     suggested_fix="运行 PDF/OCR 解析和表格抽取，或明确说明缺少可比数据。",
@@ -271,8 +271,8 @@ def _review_draft(
             )
         for finding in table_harness.errors:
             critiques.append(
-                AgentCritique(
-                    reviewer="Table Auditor",
+                ReviewFinding(
+                    reviewer="Table Gate",
                     severity="error",
                     finding=f"性能指标缺少可追溯证据：{finding}",
                     suggested_fix="补充页码、表格编号或原文片段。",
@@ -280,8 +280,8 @@ def _review_draft(
             )
         for warning in table_harness.warnings[:5]:
             critiques.append(
-                AgentCritique(
-                    reviewer="Table Auditor",
+                ReviewFinding(
+                    reviewer="Table Gate",
                     severity="warning",
                     finding=warning,
                     suggested_fix="补齐单位、方向或可比性说明。",
@@ -291,8 +291,8 @@ def _review_draft(
     quality = build_quality_report_skill(config, workspace)
     if quality.metrics.get("parsed_rate", 0.0) == 0 and workspace.context.active_papers:
         critiques.append(
-            AgentCritique(
-                reviewer="Replanning Agent",
+            ReviewFinding(
+                reviewer="Readiness Gate",
                 severity="warning",
                 finding="当前 active papers 尚未形成 parsed full text。",
                 suggested_fix="优先执行 full-text resolve/download/parse，再生成最终学术叙述。",
@@ -300,8 +300,8 @@ def _review_draft(
         )
     if not any(item.severity == "error" for item in critiques):
         critiques.append(
-            AgentCritique(
-                reviewer="Lead Reviewer",
+            ReviewFinding(
+                reviewer="Quality Gates",
                 severity="info",
                 finding="未发现阻断性证据问题；可作为当前上下文下的审慎草稿。",
                 suggested_fix="继续补充全文和结构化表格可提高结论密度。",
@@ -310,22 +310,22 @@ def _review_draft(
     return critiques
 
 
-async def _smart_debate_critiques(
+async def _run_optional_reviewer(
     config: LitTraceConfig,
     objective: str,
     draft: str,
     workspace: LiteratureWorkspace,
-) -> list[AgentCritique]:
+) -> list[ReviewFinding]:
     if not config.llm.enabled or not config.llm.api_key:
         return []
-    payload = _smart_debate_payload(objective, draft, workspace)
+    payload = _reviewer_payload(objective, draft, workspace)
     system_prompt = (
-        "You are a skeptical academic multi-agent review council. "
+        "You are one temporary, read-only academic reviewer. "
         "Return a JSON object with a 'critiques' array. "
         "Each critique must have: reviewer (string), severity (error|warning|info), "
         "finding (Chinese text), suggested_fix (Chinese text or null). "
-        "Use the personas: Method Reviewer, Evidence Reviewer, Synthesis Reviewer. "
-        "Do not introduce new papers or facts. If evidence is insufficient, ask for replan actions."
+        "Review method, evidence, and synthesis quality. Do not introduce new papers or facts. "
+        "Do not request tools or mutate state. If evidence is insufficient, suggest a bounded replan action."
     )
     reply = await chat_completion(
         config,
@@ -341,27 +341,27 @@ async def _smart_debate_critiques(
     try:
         raw = json.loads(reply.text)
     except json.JSONDecodeError:
-        logger.warning("debate_json_parse_failed", extra={"text_len": len(reply.text)})
-        return _parse_debate_as_text(reply.text)
+        logger.warning("reviewer_json_parse_failed", extra={"text_len": len(reply.text)})
+        return []
 
     try:
-        validated = DebateCritiqueSchema.model_validate(raw)
+        validated = ReviewerFindingSchema.model_validate(raw)
     except ValidationError as exc:
         logger.warning(
-            "debate_schema_validation_failed",
+            "reviewer_schema_validation_failed",
             extra={"errors": exc.errors()[:3]},
         )
-        return _parse_debate_as_text(reply.text)
+        return []
 
-    critiques: list[AgentCritique] = []
+    critiques: list[ReviewFinding] = []
     for item in validated.critiques:
         severity = item.severity if item.severity in ("error", "warning", "info") else "warning"
         lowered = item.finding.lower()
         if any(kw in lowered for kw in _ERROR_KEYWORDS):
             severity = "error"
         critiques.append(
-            AgentCritique(
-                reviewer=item.reviewer or "LLM Debate Reviewer",
+            ReviewFinding(
+                reviewer=item.reviewer or "Optional Reviewer",
                 severity=severity,
                 finding=item.finding,
                 suggested_fix=item.suggested_fix
@@ -371,29 +371,7 @@ async def _smart_debate_critiques(
     return critiques[:8]
 
 
-def _parse_debate_as_text(text: str) -> list[AgentCritique]:
-    """Fallback parser for non-JSON LLM output — preserves backward compat."""
-    critiques: list[AgentCritique] = []
-    for line in text.splitlines():
-        text_line = line.strip(" -\t")
-        if not text_line:
-            continue
-        severity = "warning"
-        lowered = text_line.lower()
-        if any(kw in lowered for kw in _ERROR_KEYWORDS):
-            severity = "error"
-        critiques.append(
-            AgentCritique(
-                reviewer="LLM Debate Reviewer",
-                severity=severity,
-                finding=text_line,
-                suggested_fix="用当前 workspace 证据补足，或将相关结论降级为待验证假设。",
-            )
-        )
-    return critiques[:8]
-
-
-def _smart_debate_payload(
+def _reviewer_payload(
     objective: str,
     draft: str,
     workspace: LiteratureWorkspace,
@@ -422,13 +400,13 @@ def _smart_debate_payload(
 
 def _revise_draft(
     draft: str,
-    critiques: list[AgentCritique],
+    critiques: list[ReviewFinding],
     workspace: LiteratureWorkspace,
 ) -> str:
     citation_errors = [
         item
         for item in critiques
-        if item.reviewer == "Citation Auditor" and item.severity == "error"
+        if item.reviewer == "Citation Gate" and item.severity == "error"
     ]
     revised = draft
     if citation_errors:
@@ -437,14 +415,14 @@ def _revise_draft(
     warnings = [item for item in critiques if item.severity in {"warning", "error"}]
     if warnings:
         revised = revised.rstrip()
-        revised += "\n\n多 agent 复核后的限制说明："
+        revised += "\n\n质量门与可选审稿后的限制说明："
         for item in warnings[:6]:
             revised += f"\n- {item.reviewer}: {item.finding}"
     return revised
 
 
 def _round_score(
-    critiques: list[AgentCritique],
+    critiques: list[ReviewFinding],
     workspace: LiteratureWorkspace,
     config: LitTraceConfig,
 ) -> float:
@@ -460,7 +438,7 @@ def _round_score(
 
 
 def _replan_actions(
-    critiques: list[AgentCritique],
+    critiques: list[ReviewFinding],
     workspace: LiteratureWorkspace,
 ) -> list[str]:
     actions: list[str] = []
@@ -468,11 +446,11 @@ def _replan_actions(
         actions.append("resolve_full_text")
     if not workspace.parsed_papers and workspace.context.active_papers:
         actions.append("parse_full_text_with_paddleocr")
-    if any(item.reviewer == "Table Auditor" for item in critiques):
+    if any(item.reviewer == "Table Gate" for item in critiques):
         actions.append("extract_tables_and_structured_artifacts")
-    if any(item.reviewer == "Citation Auditor" for item in critiques):
+    if any(item.reviewer == "Citation Gate" for item in critiques):
         actions.append("rerun_citation_guard_after_revision")
-    if any(item.reviewer == "Storyline Skeptic" for item in critiques):
+    if any(item.reviewer == "Storyline Gate" for item in critiques):
         actions.append("rebuild_storyline_from_parsed_evidence")
     return actions
 

@@ -2,7 +2,7 @@ import pytest
 
 from littrace.config import LitTraceConfig
 from littrace.rerank_learning import learn_rerank_policy_from_golden
-from littrace.retrieval_eval import RetrievalEvalReport
+from littrace.evaluation.retrieval_eval import RetrievalEvalReport
 
 
 @pytest.mark.anyio

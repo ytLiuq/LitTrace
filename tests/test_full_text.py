@@ -3,7 +3,7 @@ import pytest
 
 from littrace.config import APIConfig, LitTraceConfig
 from littrace.context import add_papers
-from littrace.full_text import (
+from littrace.retrieval.full_text import (
     fetch_crossref_paper_by_doi,
     full_text_config_warnings,
     resolve_full_text_for_paper,

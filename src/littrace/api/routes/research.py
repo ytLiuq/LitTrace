@@ -75,7 +75,11 @@ async def chat(request: ChatRequest) -> ChatResponse:
     config = api_app.load_config()
     session = load_or_create_session(config, request.session_id)
     session_workspace = load_workspace(session)
-    background_response = await _research_background_gate(request, session_workspace, config)
+    background_response = await _route_research_background_fast_gate(
+        request,
+        session_workspace,
+        config,
+    )
     if background_response is not None:
         api_app._set_workspace(session_workspace)
         background_response.session_id = session.session_id
@@ -89,6 +93,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             {"action": background_response.action, "session_id": session.session_id},
         )
         return background_response
+    request = request.model_copy(update={"session_id": session.session_id})
     session_memory = load_memory(session)
     response, session_workspace = await handle_chat(
         request,
@@ -117,22 +122,25 @@ async def export_session(session_id: str) -> dict[str, str]:
     return await export_session_bundle_skill(session, workspace, config)
 
 
-async def _research_background_gate(
+async def _route_research_background_fast_gate(
     request: ChatRequest,
     workspace: LiteratureWorkspace,
     config,
 ) -> ChatResponse | None:
-    explicit_background = request.research_background
-    if workspace_has_research_background(workspace) and not explicit_background:
+    candidate = request.research_background
+    should_check = bool(candidate)
+    if not should_check and not workspace_has_research_background(workspace):
+        should_check = _looks_like_obvious_non_topic(request.message)
+        candidate = request.message if should_check else None
+    if not should_check:
         return None
-    candidate = explicit_background or (
-        request.message if not workspace_has_research_background(workspace) else None
-    )
+
     assessment = await assess_research_background(candidate, config)
     if not assessment.accepted:
         if not workspace_has_research_background(workspace):
             mark_workspace_research_background_rejected(
-                workspace, assessment.reason or "invalid"
+                workspace,
+                assessment.reason or "invalid",
             )
         return ChatResponse(
             reply=(
@@ -147,6 +155,7 @@ async def _research_background_gate(
         workspace,
         assessment.background or str(candidate or ""),
         topic=assessment.topic,
+        retrieval_policy=assessment.retrieval_policy,
     )
     return ChatResponse(
         reply=(
@@ -157,3 +166,8 @@ async def _research_background_gate(
         action="research_background_set",
         workspace=workspace,
     )
+
+
+def _looks_like_obvious_non_topic(message: str) -> bool:
+    cleaned = " ".join(message.split()).lower()
+    return cleaned in {"你好", "hello", "hi", "测试", "随便"} or len(cleaned) < 6

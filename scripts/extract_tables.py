@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from littrace.config import load_config
 from littrace.models import LiteratureWorkspace
-from littrace.tables import extract_performance_cells, build_comparison_matrices
+from littrace.evidence.tables import build_comparison_matrices, extract_performance_cells
 
 
 async def main():

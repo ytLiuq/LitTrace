@@ -10,14 +10,13 @@ from littrace.session import create_chat_session
 def _profile() -> RagProfile:
     return RagProfile(
         profile_id="rag:123",
-        user_id="u1",
         session_id="s1",
-        namespace="u1.s1",
+        namespace="s1",
         topic="MXene pressure sensor",
         query_variants=["MXene pressure sensor"],
         backend="pgvector",
         postgres_schema="littrace_rag",
-        collection_name="littrace_u1_s1",
+        collection_name="littrace_s1",
         embedding_provider="openai-compatible",
         embedding_model="text-embedding-3-small",
         embedding_dimension=16,
@@ -53,12 +52,11 @@ def test_build_rag_chunk_drafts_preserves_session_payload():
     assert chunks[0].paper_id == "p1"
     assert chunks[0].section == "Results"
     assert chunks[0].page == 4
-    assert chunks[0].metadata["user_id"] == "u1"
     assert chunks[0].metadata["session_id"] == "s1"
 
 
 def test_refresh_skips_cleanly_when_rag_disabled(tmp_path):
-    config = LitTraceConfig(storage=StorageConfig(sessions_dir=tmp_path, default_user_id="u1"))
+    config = LitTraceConfig(storage=StorageConfig(sessions_dir=tmp_path))
     config.rag.enabled = False
     session = create_chat_session(config)
     workspace = LiteratureWorkspace(
@@ -79,7 +77,7 @@ def test_refresh_skips_cleanly_when_rag_disabled(tmp_path):
 
 
 def test_refresh_uses_real_embedding_boundary_and_pgvector_store(monkeypatch, tmp_path):
-    config = LitTraceConfig(storage=StorageConfig(sessions_dir=tmp_path, default_user_id="u1"))
+    config = LitTraceConfig(storage=StorageConfig(sessions_dir=tmp_path))
     config.rag.enabled = True
     config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5433/littrace"
     config.rag.embedding_base_url = "https://embeddings.example.com/v1"

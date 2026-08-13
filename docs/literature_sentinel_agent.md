@@ -35,7 +35,7 @@
 
 ```text
 Scheduler / CLI / API
-  -> LiteratureSentinelAgent
+  -> LiteratureSentinel
      -> LangGraph State Machine
         -> load_state
         -> search_recent
@@ -73,7 +73,7 @@ LangGraph = 条件流程与重试
 src/littrace/
   sentinel/
     __init__.py
-    agent.py                 # LiteratureSentinelAgent 入口
+    agent.py                 # LiteratureSentinel workflow 入口
     graph.py                 # LangGraph state machine
     state.py                 # SentinelState / Watchlist / RetryQueue
     resource_pack.py         # ResourcePack / EvidencePack

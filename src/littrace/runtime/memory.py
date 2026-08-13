@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-import json
-import os
 from datetime import datetime
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
 from littrace.models import LiteratureWorkspace, coerce_parsed
-from littrace.runtime.messages import AgentRunResult, ReActTrace
 from littrace.state_db import state_store_from_config
 
 if TYPE_CHECKING:
@@ -20,6 +16,46 @@ if TYPE_CHECKING:
 
 MemoryKind = Literal["working", "episodic", "document", "preference"]
 MemoryScope = Literal["turn", "session", "workspace"]
+
+
+class ExecutionArtifact(BaseModel):
+    artifact_id: str = Field(default_factory=lambda: uuid4().hex)
+    kind: str
+    producer: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReActStep(BaseModel):
+    step_index: int
+    thought: str
+    decision: str = "act"
+    action: str
+    observation: str
+    tool: str | None = None
+    next_action: str | None = None
+    ok: bool = True
+
+
+class ReActTrace(BaseModel):
+    strategy: str = "bounded_react"
+    max_steps: int = 4
+    allowed_tools: list[str] = Field(default_factory=list)
+    planned_actions: list[str] = Field(default_factory=list)
+    steps: list[ReActStep] = Field(default_factory=list)
+    final_observation: str | None = None
+    stop_reason: str | None = None
+
+    @property
+    def completed(self) -> bool:
+        return bool(self.final_observation)
+
+
+class ExecutionResult(BaseModel):
+    component: str
+    status: str = "completed"
+    artifacts: list[ExecutionArtifact] = Field(default_factory=list)
+    react_trace: ReActTrace | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class MemoryRecord(BaseModel):
@@ -83,7 +119,7 @@ def build_session_memory(
     *,
     session_id: str | None = None,
     artifact_index: dict[str, Any] | None = None,
-    agent_results: list[AgentRunResult] | None = None,
+    execution_results: list[ExecutionResult] | None = None,
 ) -> SessionMemory:
     memory = SessionMemory(
         session_id=session_id,
@@ -96,7 +132,7 @@ def build_session_memory(
         episodic=EpisodicMemory(
             records=[
                 *_episode_records_from_artifact_index(artifact_index or {}),
-                *_episode_records_from_agent_results(agent_results or []),
+                *_episode_records_from_execution_results(execution_results or []),
             ]
         ),
     )
@@ -135,47 +171,33 @@ def memory_path_for_session(session: "ChatSession") -> Path:
 
 def save_session_memory(session: "ChatSession", memory: SessionMemory) -> Path:
     path = memory_path_for_session(session)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        handle.write(memory.model_dump_json(indent=2))
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary_path = Path(handle.name)
-    os.replace(temporary_path, path)
     store = _session_state_store(session)
-    if store is not None:
-        store.upsert_memory(
-            session.session_id,
-            user_id=session.user_id,
-            memory_json=memory.model_dump(mode="json"),
-        )
+    store.upsert_memory(
+        session.session_id,
+        memory_json=memory.model_dump(mode="json"),
+    )
     return path
 
 
 def load_session_memory(session: "ChatSession") -> SessionMemory:
     store = _session_state_store(session)
-    if store is not None:
-        loaded = store.load_memory(session.session_id, user_id=session.user_id)
-        if isinstance(loaded, dict):
-            try:
-                return SessionMemory.model_validate(loaded)
-            except Exception:
-                pass
-    path = memory_path_for_session(session)
-    if not path.exists():
+    loaded = store.load_memory(session.session_id)
+    if not isinstance(loaded, dict):
         return SessionMemory(session_id=session.session_id)
     try:
-        return SessionMemory.model_validate_json(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+        return SessionMemory.model_validate(loaded)
+    except (ValueError, TypeError):
         return SessionMemory(session_id=session.session_id)
 
 
 def _session_state_store(session: "ChatSession"):
-    backend = getattr(session, "metadata_store_backend", "local_json")
+    backend = getattr(session, "metadata_store_backend", "postgres")
     dsn = getattr(session, "metadata_postgres_dsn", None)
     schema_name = getattr(session, "metadata_schema_name", "littrace")
-    if backend != "postgres" or not dsn:
-        return None
+    if backend != "postgres":
+        raise ValueError("metadata_store.backend must be 'postgres' for session memory.")
+    if not dsn:
+        raise ValueError("metadata_store.postgres_dsn is required for session memory.")
     config = {
         "metadata_store": {
             "backend": backend,
@@ -188,11 +210,11 @@ def _session_state_store(session: "ChatSession"):
     return state_store_from_config(LitTraceConfig.model_validate(config))
 
 
-def append_episode_from_agent_result(
+def append_episode_from_execution_result(
     memory: SessionMemory,
-    result: AgentRunResult,
+    result: ExecutionResult,
 ) -> SessionMemory:
-    memory.episodic.records.extend(_episode_records_from_agent_results([result]))
+    memory.episodic.records.extend(_episode_records_from_execution_results([result]))
     memory.generated_at = datetime.now().isoformat(timespec="seconds")
     return memory
 
@@ -301,18 +323,18 @@ def _episode_records_from_artifact_index(index: dict[str, Any]) -> list[MemoryRe
     return records
 
 
-def _episode_records_from_agent_results(results: list[AgentRunResult]) -> list[MemoryRecord]:
+def _episode_records_from_execution_results(results: list[ExecutionResult]) -> list[MemoryRecord]:
     records: list[MemoryRecord] = []
     for result in results:
         if result.react_trace:
-            records.extend(_episode_records_from_react_trace(result.agent, result.react_trace))
+            records.extend(_episode_records_from_react_trace(result.component, result.react_trace))
         for artifact in result.artifacts:
             records.append(
                 MemoryRecord(
                     kind="episodic",
                     scope="turn",
-                    source=f"agent:{result.agent}",
-                    tags=["agent_artifact", artifact.kind],
+                    source=f"component:{result.component}",
+                    tags=["execution_artifact", artifact.kind],
                     confidence=1.0 if result.status == "completed" else 0.5,
                     content={
                         "artifact_id": artifact.artifact_id,

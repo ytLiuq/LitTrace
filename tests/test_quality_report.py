@@ -1,7 +1,7 @@
 from littrace.config import LitTraceConfig
 from littrace.context import add_papers
 from littrace.models import LiteratureWorkspace, PaperMetadata
-from littrace.quality_report import build_quality_report
+from littrace.evaluation.quality_report import build_quality_report
 
 
 def test_quality_report_summarizes_workspace():

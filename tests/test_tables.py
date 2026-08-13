@@ -2,7 +2,7 @@ import asyncio
 import json
 
 from littrace.models import EvidenceSpan, LiteratureWorkspace, PaperMetadata, PerformanceCell
-from littrace.tables import (
+from littrace.evidence.tables import (
     build_comparison_matrices,
     decide_artifact_extraction_need,
     extract_performance_cells,
@@ -18,7 +18,7 @@ def _mock_llm(monkeypatch, llm_response):
 
         return LLMReply(text=json.dumps(llm_response), used_llm=True)
 
-    monkeypatch.setattr("littrace.tables.chat_completion", _fake_chat_completion)
+    monkeypatch.setattr("littrace.evidence.tables.chat_completion", _fake_chat_completion)
 
 
 def _run(coro):
@@ -129,6 +129,44 @@ def test_extract_performance_cells_from_parsed_tables(monkeypatch):
     assert workspace.performance_cells[0].metric == "gauge factor"
 
 
+def test_extraction_uses_its_own_timeout_and_reports_schema_failures(monkeypatch):
+    from littrace.config import LLMConfig, LitTraceConfig
+    from littrace.llm import LLMReply
+
+    workspace = LiteratureWorkspace(
+        parsed_papers={
+            "p1": {
+                "parsed": True,
+                "sections": [{"name": "Results", "text": "Sensitivity 2.3 kPa-1."}],
+            }
+        }
+    )
+    observed_timeouts: list[float] = []
+
+    async def fake_completion(config, *args, **kwargs):
+        observed_timeouts.append(config.llm.request_timeout_seconds)
+        return LLMReply(
+            text=json.dumps(
+                [
+                    {"metric": "sensitivity", "value": 2.3, "unit": "kPa-1", "snippet": "Sensitivity 2.3 kPa-1."},
+                    {"metric": "young's modulus", "value": "not given", "unit": "kPa"},
+                ]
+            ),
+            used_llm=True,
+        )
+
+    monkeypatch.setattr("littrace.evidence.tables.chat_completion", fake_completion)
+    config = LitTraceConfig(
+        llm=LLMConfig(request_timeout_seconds=3, metric_extraction_timeout_seconds=90)
+    )
+    _, harness = _run(extract_performance_cells(workspace, config))
+
+    assert observed_timeouts == [90]
+    assert not harness.passed
+    assert harness.score < 1
+    assert any("Schema violation" in error for error in harness.errors)
+
+
 def test_build_comparison_matrices_groups_metrics_and_preserves_evidence(monkeypatch):
     workspace = LiteratureWorkspace(
         papers={
@@ -206,7 +244,7 @@ def test_build_comparison_matrices_groups_metrics_and_preserves_evidence(monkeyp
                 used_llm=True,
             )
 
-    monkeypatch.setattr("littrace.tables.chat_completion", _fake_chat)
+    monkeypatch.setattr("littrace.evidence.tables.chat_completion", _fake_chat)
 
     workspace, _ = _run(extract_performance_cells(workspace))
 

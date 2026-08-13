@@ -1,7 +1,7 @@
 """Public boundary for browser, publisher access, and local PDF retrieval.
 
-Exports are loaded lazily so low-level compatibility modules can import a
-specific implementation without pulling in the whole browser/login stack.
+Exports are loaded lazily so lightweight callers do not pull in the whole
+browser/login stack.
 """
 
 from importlib import import_module

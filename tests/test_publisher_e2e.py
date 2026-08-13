@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from littrace.cdp_downloader import CDPDownloadResult
+from littrace.access_layer.cdp_downloader import CDPDownloadResult
 from littrace.config import LitTraceConfig, StorageConfig
 from littrace.models import PaperMetadata
 from littrace.publisher_e2e import (

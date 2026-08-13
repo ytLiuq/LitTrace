@@ -148,7 +148,7 @@ def parse_chat_intent(message: str) -> ChatIntent:
     if any(
         token in lowered for token in ["agent状态", "agent 进度", "agents status", "agent status"]
     ):
-        intent.actions.append("agent_status")
+        intent.actions.append("component_status")
     if any(token in lowered for token in ["隐藏上下文", "隐藏文献", "hide context"]):
         intent.show_context = False
         intent.actions.append("hide_context")

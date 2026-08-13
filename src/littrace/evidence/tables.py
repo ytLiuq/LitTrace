@@ -182,6 +182,8 @@ Return STRICT JSON: a list of objects, each with keys:
 
 Rules:
 - Extract ONLY from the provided text; do NOT invent values.
+- Extract only observations with a numeric value. Skip "not given", "N/A", qualitative
+  descriptions, and multi-value prose that cannot be represented by one value plus an optional range.
 - snippet must be the exact surrounding text (max 200 chars) where the value was found.
 - If a value appears as a range (e.g. "0.1-0.5 S/cm"), set value_min and value_max.
 - Common metrics: sensitivity, gauge factor, response time, recovery time, limit of detection,
@@ -321,9 +323,14 @@ async def extract_performance_cells(
         if not payload.strip():
             continue
 
+        extraction_config = config.model_copy(deep=True)
+        extraction_config.llm.request_timeout_seconds = max(
+            config.llm.request_timeout_seconds,
+            config.llm.metric_extraction_timeout_seconds,
+        )
         with timed("llm_metric_extract", paper_id=paper_id):
             reply = await chat_completion(
-                config,
+                extraction_config,
                 _EXTRACTION_SYSTEM_PROMPT,
                 payload,
                 workspace=None,
@@ -375,6 +382,7 @@ async def extract_performance_cells(
     _store_structured_artifacts(workspace, artifacts)
 
     # Dimension 3: Run schema compliance harness if there were any LLM items
+    schema_result = HarnessResult(passed=True, score=1.0)
     if total_raw_items > 0:
         schema_report = check_schema_compliance(
             [
@@ -395,10 +403,12 @@ async def extract_performance_cells(
                     "errors": schema_report.errors[:5],
                 },
             )
+        schema_result = schema_report.to_result()
 
     harness = _combine_harnesses(
         performance=check_performance_cells(cells),
         artifacts=check_structured_artifacts(artifacts),
+        schema=schema_result,
         artifact_count=len(artifacts),
     )
     logger.info(
@@ -752,19 +762,21 @@ def _store_structured_artifacts(
 def _combine_harnesses(
     performance: HarnessResult,
     artifacts: HarnessResult,
+    schema: HarnessResult,
     artifact_count: int,
 ) -> HarnessResult:
-    score = (performance.score + artifacts.score) / 2
+    score = (performance.score + artifacts.score + schema.score) / 3
     warnings = [
         *performance.warnings,
         *artifacts.warnings,
+        *schema.warnings,
     ]
     if artifact_count == 0:
         warnings.append("No table, figure, formula, or equation artifacts were extracted.")
     return HarnessResult(
-        passed=performance.passed and artifacts.passed,
+        passed=performance.passed and artifacts.passed and schema.passed,
         score=score,
-        errors=[*performance.errors, *artifacts.errors],
+        errors=[*performance.errors, *artifacts.errors, *schema.errors],
         warnings=warnings,
     )
 

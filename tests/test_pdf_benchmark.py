@@ -1,8 +1,8 @@
 from littrace.config import LitTraceConfig
 from littrace.context import add_papers
 from littrace.models import LiteratureWorkspace, PaperMetadata
-from littrace.ocr.tool import ParsedPaper
-from littrace.pdf_benchmark import benchmark_pdf_parsing, benchmark_single_pdf
+from littrace.models import ParsedPaper
+from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing, benchmark_single_pdf
 
 
 def test_pdf_benchmark_reports_missing_local_pdfs_and_confidence():
@@ -53,7 +53,10 @@ def test_benchmark_single_pdf_reports_elapsed_and_chars(monkeypatch, tmp_path):
                 parser_reports=[{"parser": "fake"}],
             )
 
-    monkeypatch.setattr("littrace.pdf_benchmark.build_ocr_tool", lambda config, paper_lookup: FakeTool())
+    monkeypatch.setattr(
+        "littrace.evaluation.pdf_benchmark.build_ocr_tool",
+        lambda config, paper_lookup: FakeTool(),
+    )
 
     report = benchmark_single_pdf(pdf, LitTraceConfig())
 

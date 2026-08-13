@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from littrace.access import target_pdf_path
+from littrace.access_layer.paths import target_pdf_path
 from littrace.config import LitTraceConfig
 from littrace.models import LiteratureWorkspace
 

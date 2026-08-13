@@ -4,48 +4,45 @@ from pydantic import BaseModel, Field
 
 from littrace.config import LitTraceConfig
 from littrace.evaluation.harnesses import check_performance_cells, check_storyline_claims
-from littrace.models import LiteratureWorkspace
 from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
+from littrace.models import LiteratureWorkspace
 from littrace.skill_runner import build_comparison_matrix_skill, build_storyline_skill
 
 
-class AgentAuditReport(BaseModel):
-    agent: str
+class QualityAuditReport(BaseModel):
+    component: str
     passed: bool
     score: float
     findings: list[str] = Field(default_factory=list)
 
 
-def audit_parser_agent(config: LitTraceConfig, workspace: LiteratureWorkspace) -> AgentAuditReport:
+def audit_parser(config: LitTraceConfig, workspace: LiteratureWorkspace) -> QualityAuditReport:
     report = benchmark_pdf_parsing(workspace, config)
-    findings = list(report.warnings)
     score = 0.5 * report.local_pdf_rate + 0.5 * report.parsed_rate
-    return AgentAuditReport(
-        agent="PDF/OCR Parser",
+    return QualityAuditReport(
+        component="PDF/OCR parsing",
         passed=score >= 0.6,
         score=round(score, 3),
-        findings=findings,
+        findings=list(report.warnings),
     )
 
 
-def audit_table_agent(workspace: LiteratureWorkspace) -> AgentAuditReport:
+def audit_tables(workspace: LiteratureWorkspace) -> QualityAuditReport:
     harness = check_performance_cells(workspace.performance_cells)
     matrix = build_comparison_matrix_skill(workspace)
-    findings = [*harness.errors, *harness.warnings, *matrix.warnings]
-    score = harness.score if workspace.performance_cells else 0.0
-    return AgentAuditReport(
-        agent="Table Extractor",
+    return QualityAuditReport(
+        component="table extraction",
         passed=harness.passed and bool(workspace.performance_cells),
-        score=round(score, 3),
-        findings=findings,
+        score=round(harness.score if workspace.performance_cells else 0.0, 3),
+        findings=[*harness.errors, *harness.warnings, *matrix.warnings],
     )
 
 
-def audit_storyline_agent(workspace: LiteratureWorkspace) -> AgentAuditReport:
+def audit_storyline(workspace: LiteratureWorkspace) -> QualityAuditReport:
     claims = build_storyline_skill(workspace)
     harness = check_storyline_claims(claims)
-    return AgentAuditReport(
-        agent="Storyline Verifier",
+    return QualityAuditReport(
+        component="storyline evidence",
         passed=harness.passed and bool(claims),
         score=round(harness.score if claims else 0.0, 3),
         findings=[*harness.errors, *harness.warnings],

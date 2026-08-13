@@ -3,14 +3,13 @@
 import pytest
 
 from littrace.config import HarnessThresholdConfig, LitTraceConfig
-from littrace.harnesses import (
+from littrace.evaluation.harnesses import (
     HarnessCheck,
     HarnessConfig,
     HarnessEngine,
     HarnessFinding,
     HarnessRegistry,
     HarnessReport,
-    HarnessResult,
     Severity,
     check_citations,
     check_performance_cells,
@@ -99,50 +98,6 @@ def _make_claim(
 
 
 # ---------------------------------------------------------------------------
-# HarnessResult backward compatibility
-# ---------------------------------------------------------------------------
-
-
-class TestHarnessResultCompat:
-    """Verify that HarnessReport is backward-compatible with HarnessResult."""
-
-    def test_report_properties_match_result_fields(self):
-        report = HarnessReport(
-            check_name="test",
-            passed=True,
-            score=1.0,
-            findings=[
-                HarnessFinding(severity=Severity.ERROR, message="err1"),
-                HarnessFinding(severity=Severity.WARNING, message="warn1"),
-            ],
-        )
-        assert report.errors == ["err1"]
-        assert report.warnings == ["warn1"]
-
-    def test_to_result_converts_correctly(self):
-        report = HarnessReport(
-            check_name="test",
-            passed=False,
-            score=0.5,
-            findings=[
-                HarnessFinding(severity=Severity.ERROR, message="err"),
-                HarnessFinding(severity=Severity.WARNING, message="warn"),
-            ],
-        )
-        result = report.to_result()
-        assert isinstance(result, HarnessResult)
-        assert result.passed is False
-        assert result.score == 0.5
-        assert result.errors == ["err"]
-        assert result.warnings == ["warn"]
-
-    def test_empty_report_has_empty_lists(self):
-        report = HarnessReport(check_name="test", passed=True, score=1.0)
-        assert report.errors == []
-        assert report.warnings == []
-
-
-# ---------------------------------------------------------------------------
 # check_citations
 # ---------------------------------------------------------------------------
 
@@ -182,14 +137,6 @@ class TestCheckCitations:
         records = [_make_citation(link_status=LinkStatus.FAILED)]
         report = check_citations(records)
         assert report.findings[0].remediation_hint is not None
-
-    def test_backward_compat_via_to_result(self):
-        records = [_make_citation(link_status=LinkStatus.FAILED)]
-        report = check_citations(records)
-        result = report.to_result()
-        assert not result.passed
-        assert len(result.errors) == 1
-
 
 # ---------------------------------------------------------------------------
 # check_performance_cells
@@ -548,51 +495,3 @@ class TestHarnessConfig:
         assert isinstance(config.allowed_artifact_types, set)
         assert isinstance(config.allowed_storyline_types, set)
         assert isinstance(config.storyline_multi_paper_types, set)
-
-
-# ---------------------------------------------------------------------------
-# Integration: verify backward compat with existing call patterns
-# ---------------------------------------------------------------------------
-
-
-class TestBackwardCompat:
-    """Verify that existing call patterns (accessing .passed, .score, .errors,
-    .warnings on the return value of check_* functions) still work."""
-
-    def test_citations_compat(self):
-        result = check_citations([_make_citation(link_status=LinkStatus.FAILED)])
-        assert hasattr(result, "passed")
-        assert hasattr(result, "score")
-        assert hasattr(result, "errors")
-        assert hasattr(result, "warnings")
-        assert not result.passed
-        assert len(result.errors) == 1
-
-    def test_performance_cells_compat(self):
-        result = check_performance_cells([_make_cell(confidence=0.3)])
-        assert hasattr(result, "passed")
-        assert hasattr(result, "warnings")
-        assert len(result.warnings) >= 1
-
-    def test_combine_harnesses_pattern(self):
-        """Simulate the _combine_harnesses pattern from tables.py."""
-        perf = check_performance_cells([_make_cell()])
-        art = check_structured_artifacts([_make_artifact()])
-        combined = HarnessResult(
-            passed=perf.passed and art.passed,
-            score=(perf.score + art.score) / 2,
-            errors=[*perf.errors, *art.errors],
-            warnings=[*perf.warnings, *art.warnings],
-        )
-        assert combined.passed
-        assert combined.score == 1.0
-
-    def test_report_to_result_roundtrip(self):
-        """Verify to_result() produces a valid HarnessResult."""
-        report = check_storyline_claims([_make_claim()])
-        result = report.to_result()
-        assert isinstance(result, HarnessResult)
-        assert result.passed == report.passed
-        assert result.score == report.score
-        assert result.errors == report.errors
-        assert result.warnings == report.warnings

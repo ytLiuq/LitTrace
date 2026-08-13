@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from littrace.config import load_config
 from littrace.models import PaperSearchRequest
-from littrace.search import build_query_variants
+from littrace.retrieval.search import build_query_variants
 from littrace.workflow import run_research_graph
 
 

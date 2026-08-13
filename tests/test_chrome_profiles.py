@@ -6,7 +6,7 @@ from littrace.chrome_profiles import (
     discover_chrome_profiles,
     launch_chrome_for_cdp,
 )
-from littrace.cdp_downloader import CDPStatus
+from littrace.access_layer.cdp_downloader import CDPStatus
 from littrace.config import CDPDownloaderConfig, LitTraceConfig
 
 
@@ -58,6 +58,7 @@ def test_build_chrome_launch_plan_uses_cdp_url_port(monkeypatch, tmp_path):
 
     assert plan is not None
     assert "--remote-debugging-port=9333" in plan.command
+    assert "--remote-allow-origins=http://127.0.0.1:9333" in plan.command
     assert f"--user-data-dir={user_data}" in plan.command
     assert "--profile-directory=Profile 1" in plan.command
 

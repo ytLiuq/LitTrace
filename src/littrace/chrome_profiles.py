@@ -109,6 +109,9 @@ def build_chrome_launch_plan(
     command = [
         discovery.executable,
         f"--remote-debugging-port={port}",
+        # Chrome rejects WebSocket clients from the CDP origin unless this is
+        # explicitly allowed. Keep the origin scoped to LitTrace's local port.
+        f"--remote-allow-origins=http://127.0.0.1:{port}",
         f"--user-data-dir={discovery.user_data_dir}",
         f"--profile-directory={selected}",
     ]

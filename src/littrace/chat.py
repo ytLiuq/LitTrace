@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from littrace.autonomous_loop import run_autonomous_research_loop
+from littrace.autonomous_loop import run_review_loop
 from littrace.citation_guard import guard_citations, remove_unsupported_sentences
 from littrace.citations import citation_records_for_papers
 from littrace.config import LitTraceConfig
@@ -13,7 +13,7 @@ from littrace.evaluation.harnesses import (
 from littrace.intent import ChatIntent
 from littrace.log import get_logger, timed
 from littrace.chat_parts.formatting import (
-    format_agent_status,
+    format_component_status,
     format_current_papers,
     format_search_result_reply,
 )
@@ -37,6 +37,12 @@ from littrace.models import (
 from littrace.research_writer import (
     write_evidence_grounded_answer,
     write_storyline_narrative,
+)
+from littrace.research_background import (
+    assess_research_background,
+    mark_workspace_research_background_rejected,
+    set_workspace_research_background,
+    workspace_has_research_background,
 )
 from littrace.retrieval.rag_search import (
     rag_hits_to_evidence_spans,
@@ -100,6 +106,10 @@ async def handle_chat(
         },
     )
 
+    background_response = await _research_background_gate(request, workspace, config, intent)
+    if background_response is not None:
+        return _with_intent(background_response, intent), workspace
+
     if "show_context" in intent.actions:
         workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=True))
         return _with_intent(
@@ -127,12 +137,12 @@ async def handle_chat(
             workspace,
         )
 
-    if intent.actions == ["agent_status"]:
+    if intent.actions == ["component_status"]:
         return (
             _with_intent(
                 ChatResponse(
-                    reply=_format_agent_status(),
-                    action="agent_status",
+                    reply=_format_component_status(),
+                    action="component_status",
                     workspace=workspace,
                 ),
                 intent,
@@ -596,7 +606,7 @@ async def _run_composite_intent(
             request,
             workspace,
         )
-        loop_report = await run_autonomous_research_loop(
+        loop_report = await run_review_loop(
             config,
             intent.topic or request.message,
             workspace,
@@ -606,7 +616,7 @@ async def _run_composite_intent(
         workspace.context.filters.autonomous_loop_report = loop_report.model_dump(mode="json")
         warnings.extend(rag_warnings)
         replies.append(
-            f"已完成多 agent 审稿/反驳/修订循环：{len(loop_report.rounds)} 轮，"
+            f"已完成质量门与可选 Reviewer 审查：{len(loop_report.rounds)} 轮，"
             f"score={loop_report.score:.3f}，passed={loop_report.passed}。"
         )
         if loop_report.release_ready:
@@ -725,8 +735,8 @@ def _insufficient_real_evidence_reply(workspace: LiteratureWorkspace) -> str:
     return insufficient_real_evidence_reply(workspace)
 
 
-def _format_agent_status() -> str:
-    return format_agent_status()
+def _format_component_status() -> str:
+    return format_component_status()
 
 
 def _apply_download_selection(
@@ -943,6 +953,56 @@ def _paper_id_for_index(active_ids: list[str], index: int) -> str | None:
     if position < 0 or position >= len(active_ids):
         return None
     return active_ids[position]
+
+
+async def _research_background_gate(
+    request: ChatRequest,
+    workspace: LiteratureWorkspace,
+    config: LitTraceConfig,
+    intent: ChatIntent,
+) -> ChatResponse | None:
+    if not request.session_id and not request.research_background:
+        return None
+    if workspace_has_research_background(workspace):
+        return None
+
+    allowed_actions = {"list_context", "show_context", "hide_context", "component_status"}
+    if any(action in allowed_actions for action in intent.actions):
+        return None
+
+    explicit_background = request.research_background
+    candidate = explicit_background or request.message
+    assessment = await assess_research_background(candidate, config)
+    if not assessment.accepted:
+        mark_workspace_research_background_rejected(
+            workspace,
+            assessment.reason or "invalid",
+        )
+        return ChatResponse(
+            reply=(
+                "这个 session 需要先设置一个明确的研究背景，我暂时不会把当前内容作为长期科研主题。\n\n"
+                + "\n".join(f"- {item}" for item in assessment.suggestions)
+            ),
+            action="research_background_required",
+            workspace=workspace,
+            warnings=[assessment.reason or "invalid_research_background"],
+        )
+
+    set_workspace_research_background(
+        workspace,
+        assessment.background or str(candidate or ""),
+        topic=assessment.topic,
+        retrieval_policy=assessment.retrieval_policy,
+    )
+    return ChatResponse(
+        reply=(
+            "已记录这个 session 的研究背景，并会把它作为长期记忆用于每日文献检索、PDF 下载和 RAG 更新。\n\n"
+            f"研究主题：{workspace.context.filters.topic}\n\n"
+            "接下来你可以告诉我具体要检索、下载、比较或分析什么。"
+        ),
+        action="research_background_set",
+        workspace=workspace,
+    )
 
 
 async def _rag_evidence_for_workspace(

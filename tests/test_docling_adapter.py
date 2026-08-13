@@ -1,4 +1,5 @@
 import builtins
+import os
 from pathlib import Path
 import sys
 import types
@@ -20,7 +21,7 @@ def test_markdown_to_sections_preserves_heading_evidence():
     assert "Fabrication" in sections[1]["text"]
 
 
-def test_docling_pdf_parser_disables_internal_ocr(monkeypatch, tmp_path):
+def test_docling_pdf_parser_uses_text_table_and_figure_pipeline(monkeypatch, tmp_path):
     captured = {}
 
     class FakePdfPipelineOptions:
@@ -78,10 +79,18 @@ def test_docling_pdf_parser_disables_internal_ocr(monkeypatch, tmp_path):
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
 
-    parsed = DoclingOCRTool().parse_pdf(pdf_path)
+    config = types.SimpleNamespace(
+        parsing=types.SimpleNamespace(
+            docling=types.SimpleNamespace(
+                describe_figures=False,
+            )
+        )
+    )
+    parsed = DoclingOCRTool(config).parse_pdf(pdf_path)
 
     assert parsed.parsed
-    assert captured["pipeline_kwargs"] == {"do_ocr": False}
+    assert captured["pipeline_kwargs"]["do_ocr"] is False
+    assert captured["pipeline_kwargs"]["generate_picture_images"] is True
     assert parsed.structured_document["schema"] == "littrace.docling.structured_document.v1"
     assert parsed.structured_document["markdown"] == "# Title\n\nBody"
 

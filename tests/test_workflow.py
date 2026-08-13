@@ -85,10 +85,10 @@ async def test_run_research_graph_can_run_autonomous_review(monkeypatch):
     from littrace.llm import LLMReply
 
     async def _fake_chat(config, system_prompt, user_message, workspace=None, **kwargs):
-        return LLMReply(text="多 agent 审稿后的研究结论。", used_llm=True)
+        return LLMReply(text="可选 Reviewer 审稿后的研究结论。", used_llm=True)
 
     async def _fake_write(config, question, workspace):
-        return LLMReply(text="多 agent 审稿后的研究结论。", used_llm=True)
+        return LLMReply(text="可选 Reviewer 审稿后的研究结论。", used_llm=True)
 
     monkeypatch.setattr("littrace.research_writer.chat_completion", _fake_chat)
     monkeypatch.setattr("littrace.autonomous_loop.chat_completion", _fake_chat)

@@ -1,13 +1,16 @@
 from littrace.context import add_papers
 from littrace.models import LiteratureWorkspace, PaperMetadata, ParsedPaper
 from littrace.runtime.memory import (
-    append_episode_from_agent_result,
+    ExecutionArtifact,
+    ExecutionResult,
+    ReActStep,
+    ReActTrace,
+    append_episode_from_execution_result,
     build_memory_view,
     build_session_memory,
     load_session_memory,
     save_session_memory,
 )
-from littrace.runtime.messages import AgentArtifact, AgentRunResult, ReActStep, ReActTrace
 from littrace.config import LitTraceConfig, StorageConfig
 from littrace.session import create_chat_session
 
@@ -56,10 +59,10 @@ def test_build_memory_view_limits_records_and_surfaces_warnings():
     assert "no_document_memory" in view.warnings
 
 
-def test_memory_records_agent_react_trace_and_artifacts():
-    result = AgentRunResult(
-        agent="retrieval",
-        artifacts=[AgentArtifact(kind="paper_search_result", producer="retrieval")],
+def test_memory_records_execution_trace_and_artifacts():
+    result = ExecutionResult(
+        component="search_papers",
+        artifacts=[ExecutionArtifact(kind="paper_search_result", producer="search_papers")],
         react_trace=ReActTrace(
             stop_reason="completed",
             steps=[
@@ -75,10 +78,10 @@ def test_memory_records_agent_react_trace_and_artifacts():
         ),
     )
 
-    memory = append_episode_from_agent_result(build_session_memory(LiteratureWorkspace()), result)
+    memory = append_episode_from_execution_result(build_session_memory(LiteratureWorkspace()), result)
 
-    assert any(record.source == "react:retrieval" for record in memory.episodic.records)
-    assert any("agent_artifact" in record.tags for record in memory.episodic.records)
+    assert any(record.source == "react:search_papers" for record in memory.episodic.records)
+    assert any("execution_artifact" in record.tags for record in memory.episodic.records)
 
 
 def test_session_memory_can_roundtrip(tmp_path):

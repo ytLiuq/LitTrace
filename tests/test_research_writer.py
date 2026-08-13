@@ -6,9 +6,32 @@ from littrace.llm import LLMReply
 from littrace.models import EvidenceSpan, LiteratureWorkspace, PaperMetadata, PerformanceCell
 from littrace.research_writer import (
     _performance_evidence_id,
+    _writer_payload,
     fallback_evidence_answer,
     write_evidence_grounded_answer,
 )
+
+
+def test_writer_uses_compact_rag_evidence_aliases():
+    workspace = add_papers(
+        LiteratureWorkspace(),
+        [PaperMetadata(paper_id="p1", title="Traceable Paper", doi="10.1000/example")],
+    )
+    rag = EvidenceSpan(
+        paper_id="p1",
+        evidence_id="rag:rag:long-profile-id:rag:long-chunk-id",
+        source_record_id="rag:rag:long-profile-id:rag:long-chunk-id",
+        section="Results",
+        snippet="The measured Young's modulus was 4.66 kPa.",
+        content_hash="a" * 64,
+        parser="rag",
+    )
+
+    payload, registry = _writer_payload("报告模量", workspace, rag_evidence=[rag])
+
+    assert "evidence_id=rag-aaaaaaaaaaaaaaaa" in payload
+    assert "rag-aaaaaaaaaaaaaaaa" in registry
+    assert registry["rag-aaaaaaaaaaaaaaaa"].source_record_id == rag.source_record_id
 
 
 def test_fallback_evidence_answer_refuses_without_full_text():
@@ -196,15 +219,110 @@ def _metric_evidence_id(workspace: LiteratureWorkspace) -> str:
 
 
 @pytest.mark.anyio
-async def test_writer_blocks_final_answer_without_publishable_claim():
+async def test_writer_does_not_preblock_new_answer_for_old_unreleased_claims():
     reply = await write_evidence_grounded_answer(
-        LitTraceConfig(llm=LLMConfig(enabled=True, api_key="test-key")),
+        LitTraceConfig(llm=LLMConfig(enabled=False)),
         "总结性能",
         _parsed_workspace().model_copy(update={"performance_cells": []}),
     )
 
     assert not reply.used_llm
-    assert reply.error == "claim_release_blocked"
+    assert reply.error == "llm_disabled"
+
+
+@pytest.mark.anyio
+async def test_writer_publishes_quote_bound_translation(monkeypatch):
+    from littrace import research_writer
+
+    workspace = add_papers(
+        LiteratureWorkspace(
+            parsed_papers={
+                "p1": {
+                    "parsed": True,
+                    "sections": [
+                        {
+                            "name": "Results",
+                            "text": "The gelatin hydrogel was lyophilized to form a rigid aerogel.",
+                            "evidence": {
+                                "page": 2,
+                                "parser": "docling",
+                                "parser_version": "docling:v1",
+                                "source_record_id": "paper:p1",
+                                "content_hash": "a" * 64,
+                                "captured_at": "2026-08-10T00:00:00+00:00",
+                            },
+                        }
+                    ],
+                }
+            }
+        ),
+        [PaperMetadata(paper_id="p1", title="Real Paper", doi="10.1000/real")],
+    )
+
+    async def fake_completion(*args, **kwargs):
+        payload = args[2]
+        evidence_id = payload.split("evidence_id=", 1)[1].split(";", 1)[0]
+        return LLMReply(
+            text=(
+                '{"claims": [{"text": "纯明胶水凝胶冻干后形成刚性气凝胶。", '
+                f'"evidence_ids": ["{evidence_id}"], '
+                f'"support_quotes": {{"{evidence_id}": '
+                '"The gelatin hydrogel was lyophilized to form a rigid aerogel."}}]}'
+            ),
+            used_llm=True,
+        )
+
+    monkeypatch.setattr(research_writer, "chat_completion", fake_completion)
+    reply = await write_evidence_grounded_answer(
+        LitTraceConfig(llm=LLMConfig(enabled=True, api_key="test-key")),
+        "说明明胶气凝胶的刚性。",
+        workspace,
+    )
+
+    assert reply.used_llm
+    assert "纯明胶水凝胶冻干后形成刚性气凝胶" in reply.text
+    assert "草稿，未发布" not in reply.text
+    assert workspace.claim_verification_reports[-1].publishable
+
+
+@pytest.mark.anyio
+async def test_writer_publishes_numeric_claim_against_performance_cell(monkeypatch):
+    from littrace import research_writer
+
+    workspace = _parsed_workspace()
+    workspace.performance_cells[0] = workspace.performance_cells[0].model_copy(
+        update={
+            "evidence": EvidenceSpan(
+                paper_id="p1",
+                page=4,
+                snippet="12.5 kPa-1.",
+            )
+        }
+    )
+    evidence_id = _metric_evidence_id(workspace)
+
+    async def fake_completion(*args, **kwargs):
+        return LLMReply(
+            text=(
+                '{"claims": [{"text": "该器件的灵敏度为12.5 kPa-1。", '
+                f'"evidence_ids": ["{evidence_id}"], '
+                f'"support_quotes": {{"{evidence_id}": "model-truncated table quote"}}, '
+                '"claim_kind": "numeric", "metric": "sensitivity", '
+                '"expected_value": 12.5, "expected_unit": "kPa-1"}]}'
+            ),
+            used_llm=True,
+        )
+
+    monkeypatch.setattr(research_writer, "chat_completion", fake_completion)
+    reply = await write_evidence_grounded_answer(
+        LitTraceConfig(llm=LLMConfig(enabled=True, api_key="test-key")),
+        "给出器件的灵敏度性能参数。",
+        workspace,
+    )
+
+    assert reply.used_llm
+    assert "草稿，未发布" not in reply.text
+    assert workspace.claim_verification_reports[-1].publishable
 
 
 @pytest.mark.anyio
@@ -243,11 +361,11 @@ async def test_writer_retries_malformed_json_once(monkeypatch):
 
     assert calls == 2
     assert reply.used_llm
-    assert "草稿性断言" in reply.text
-    assert "草稿，未发布" in reply.text
+    assert "以下结论已逐条绑定" in reply.text
+    assert "草稿，未发布" not in reply.text
     assert "引用与访问链接" in reply.text
     assert any(claim.text == "该材料在全文中表现出稳定的压力传感。" for claim in workspace.claims)
-    assert not workspace.claim_verification_reports[-1].publishable
+    assert workspace.claim_verification_reports[-1].publishable
 
 
 @pytest.mark.anyio

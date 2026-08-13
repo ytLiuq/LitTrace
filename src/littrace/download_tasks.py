@@ -5,11 +5,10 @@ import json
 import threading
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from pathlib import Path
 from typing import Awaitable, Callable, Protocol
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from littrace.config import LitTraceConfig
 from littrace.models import AccessType, PaperMetadata
@@ -31,7 +30,6 @@ class DownloadTaskStatus(StrEnum):
 
 class DownloadTask(BaseModel):
     task_id: str = Field(default_factory=lambda: uuid4().hex)
-    user_id: str
     session_id: str
     paper_id: str
     source_name: str | None = None
@@ -60,10 +58,8 @@ class DownloadTask(BaseModel):
         paper: PaperMetadata,
         *,
         session_id: str,
-        user_id: str | None = None,
     ) -> "DownloadTask":
         return cls(
-            user_id=user_id or config.storage.default_user_id,
             session_id=session_id,
             paper_id=paper.paper_id,
             source_name=_source_name_for_paper(paper),
@@ -115,54 +111,8 @@ class DownloadTaskStore(Protocol):
     def list_retryable(self, *, limit: int = 20) -> list[DownloadTask]:
         ...
 
-
-class LocalDownloadTaskStore:
-    """JSON-backed compatibility store with the same semantics as a task table."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._lock = threading.Lock()
-
-    def upsert(self, task: DownloadTask) -> DownloadTask:
-        with self._lock:
-            tasks = self._read_all()
-            tasks[task.task_id] = task
-            self._write_all(tasks)
-        return task
-
-    def get(self, task_id: str) -> DownloadTask | None:
-        return self._read_all().get(task_id)
-
-    def list_retryable(self, *, limit: int = 20) -> list[DownloadTask]:
-        tasks = [task for task in self._read_all().values() if task.retryable]
-        tasks.sort(key=lambda task: task.updated_at)
-        return tasks[:limit]
-
-    def _read_all(self) -> dict[str, DownloadTask]:
-        if not self.path.exists():
-            return {}
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        if not isinstance(raw, list):
-            return {}
-        tasks: dict[str, DownloadTask] = {}
-        for item in raw:
-            try:
-                task = DownloadTask.model_validate(item)
-            except (ValidationError, ValueError, TypeError):
-                continue
-            tasks[task.task_id] = task
-        return tasks
-
-    def _write_all(self, tasks: dict[str, DownloadTask]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        ordered = sorted(tasks.values(), key=lambda task: task.created_at)
-        self.path.write_text(
-            json.dumps([task.model_dump(mode="json") for task in ordered], indent=2),
-            encoding="utf-8",
-        )
+    def list_for_session(self, session_id: str) -> list[DownloadTask]:
+        ...
 
 
 class PostgresDownloadTaskStore:
@@ -177,13 +127,13 @@ class PostgresDownloadTaskStore:
             conn.execute(
                 f"""
                 INSERT INTO {self.schema_name}.download_tasks (
-                    task_id, user_id, session_id, paper_id, source_name, source_url, doi,
+                    task_id, session_id, paper_id, source_name, source_url, doi,
                     access_type, requires_login, status, attempt_count, max_attempts,
                     retry_after, last_error, target_bucket, target_object_key, artifact_id,
                     sha256, size_bytes, created_at, updated_at, completed_at, payload
                 )
                 VALUES (
-                    %(task_id)s, %(user_id)s, %(session_id)s, %(paper_id)s,
+                    %(task_id)s, %(session_id)s, %(paper_id)s,
                     %(source_name)s, %(source_url)s, %(doi)s, %(access_type)s,
                     %(requires_login)s, %(status)s, %(attempt_count)s, %(max_attempts)s,
                     %(retry_after)s, %(last_error)s, %(target_bucket)s,
@@ -191,7 +141,6 @@ class PostgresDownloadTaskStore:
                     %(created_at)s, %(updated_at)s, %(completed_at)s, %(payload)s
                 )
                 ON CONFLICT (task_id) DO UPDATE SET
-                    user_id = EXCLUDED.user_id,
                     session_id = EXCLUDED.session_id,
                     paper_id = EXCLUDED.paper_id,
                     source_name = EXCLUDED.source_name,
@@ -250,6 +199,19 @@ class PostgresDownloadTaskStore:
             ).fetchall()
         return [_task_from_payload(row[0]) for row in rows]
 
+    def list_for_session(self, session_id: str) -> list[DownloadTask]:
+        self._ensure_schema()
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT payload FROM {self.schema_name}.download_tasks
+                WHERE session_id = %(session_id)s
+                ORDER BY updated_at DESC
+                """,
+                {"session_id": session_id},
+            ).fetchall()
+        return [_task_from_payload(row[0]) for row in rows]
+
     def _ensure_schema(self) -> None:
         if self._initialized:
             return
@@ -259,7 +221,6 @@ class PostgresDownloadTaskStore:
                 f"""
                 CREATE TABLE IF NOT EXISTS {self.schema_name}.download_tasks (
                     task_id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
                     session_id TEXT NOT NULL,
                     paper_id TEXT NOT NULL,
                     source_name TEXT,
@@ -292,10 +253,7 @@ class PostgresDownloadTaskStore:
                 """
             )
             conn.execute(
-                f"""
-                CREATE INDEX IF NOT EXISTS download_tasks_user_session_idx
-                ON {self.schema_name}.download_tasks (user_id, session_id, updated_at)
-                """
+                f"ALTER TABLE {self.schema_name}.download_tasks DROP COLUMN IF EXISTS user_id CASCADE"
             )
             conn.commit()
         self._initialized = True
@@ -355,19 +313,13 @@ class DownloadRetryWorker:
             self._stop_event.wait(self.interval_seconds)
 
 
-def local_download_task_store_from_config(config: LitTraceConfig) -> LocalDownloadTaskStore:
-    return LocalDownloadTaskStore(config.storage.metadata_dir / "download_tasks.json")
-
-
 def download_task_store_from_config(config: LitTraceConfig) -> DownloadTaskStore:
-    if config.metadata_store.backend == "local_json":
-        return local_download_task_store_from_config(config)
-    if config.metadata_store.backend == "postgres":
-        dsn = config.metadata_store.postgres_dsn
-        if not dsn:
-            raise ValueError("metadata_store.postgres_dsn is required for Postgres task storage.")
-        return PostgresDownloadTaskStore(dsn, schema_name=config.metadata_store.schema_name)
-    raise ValueError(f"Unsupported metadata_store.backend: {config.metadata_store.backend}")
+    if config.metadata_store.backend != "postgres":
+        raise ValueError("metadata_store.backend must be 'postgres' for download tasks.")
+    dsn = config.metadata_store.postgres_dsn
+    if not dsn:
+        raise ValueError("metadata_store.postgres_dsn is required for Postgres task storage.")
+    return PostgresDownloadTaskStore(dsn, schema_name=config.metadata_store.schema_name)
 
 
 def _source_name_for_paper(paper: PaperMetadata) -> str | None:

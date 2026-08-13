@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Annotated
 
+from fastapi import APIRouter, Header
+
+from littrace.api.auth import resolve_request_session
 from littrace.artifact_registry import artifact_registry_from_config
 from littrace.artifact_store import BlobRef, artifact_store_from_config
-from littrace.state_db import state_store_from_config
 from littrace.models import (
     ComparisonMatrixReport,
     LiteratureWorkspace,
@@ -67,28 +69,20 @@ def artifacts_need() -> ArtifactNeedReport:
 @router.get("/artifacts/{artifact_id}/download-link", response_model=object)
 def artifact_download_link(
     artifact_id: str,
-    user_id: str,
     session_id: str,
     expires_seconds: int = 3600,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
 ) -> dict[str, object]:
     config = api_app.load_config()
-    registry = artifact_registry_from_config(config)
-    record = registry.get(
-        artifact_id,
-        user_id=user_id,
-        session_id=session_id,
+    auth = resolve_request_session(
+        config,
+        route_session_id=session_id,
+        header_session_id=x_littrace_session_id,
     )
+    registry = artifact_registry_from_config(config)
+    record = registry.find_in_session(artifact_id, session_id=auth.session_id)
     if record is None:
-        candidate = registry.find_in_session(artifact_id, session_id=session_id)
-        if candidate is None or not _has_artifact_access(
-            config,
-            user_id=user_id,
-            session_id=session_id,
-            artifact_id=artifact_id,
-            owner_user_id=candidate.user_id,
-        ):
-            return {"found": False, "authorized": False, "artifact_id": artifact_id}
-        record = candidate
+        return {"found": False, "authorized": False, "artifact_id": artifact_id}
     ref = BlobRef(
         backend=record.backend,
         bucket=record.bucket,
@@ -97,7 +91,6 @@ def artifact_download_link(
         size_bytes=record.size_bytes,
         content_type=record.content_type,
         metadata={
-            "user_id": record.user_id,
             "session_id": record.session_id,
             "kind": record.kind,
         },
@@ -115,30 +108,6 @@ def artifact_download_link(
         "size_bytes": record.size_bytes,
         "sha256": record.sha256,
     }
-
-
-def _has_artifact_access(
-    config,
-    *,
-    user_id: str,
-    session_id: str,
-    artifact_id: str,
-    owner_user_id: str,
-) -> bool:
-    if user_id == owner_user_id:
-        return True
-    state_store = state_store_from_config(config)
-    if state_store is None:
-        return False
-    return state_store.has_access(
-        scope="artifact",
-        resource_key=f"{session_id}:{artifact_id}",
-        user_id=user_id,
-    ) or state_store.has_access(
-        scope="session",
-        resource_key=session_id,
-        user_id=user_id,
-    )
 
 
 @router.get("/storyline/report")

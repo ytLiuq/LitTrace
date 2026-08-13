@@ -1,6 +1,6 @@
 from littrace.config import LitTraceConfig, StorageConfig
 from littrace.context import add_papers
-from littrace.login_flow import AuthorizedPdfFetchResult
+from littrace.access_layer.login_flow import AuthorizedPdfFetchResult
 from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata
 from littrace.publisher_session import build_publisher_session_e2e_report
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Annotated
 
+from fastapi import APIRouter, Header
+
+from littrace.api.auth import resolve_request_session
 from littrace.attachments import (
     AttachmentResult,
     DownloadPresenceReport,
@@ -23,7 +26,8 @@ from littrace.access_layer import (
     launch_login_for_paper,
     publisher_window_session_name_for_chat,
 )
-from littrace.models import DownloadExecutionRequest, DownloadExecutionResult
+from littrace.download_tasks import DownloadTaskStatus, download_task_store_from_config
+from littrace.models import DownloadExecutionRequest, DownloadExecutionResult, PublisherDownloadProgress
 from littrace.publisher_session import PublisherSessionE2EReport, build_publisher_session_e2e_report
 from littrace.skill_runner import build_download_plan_skill, execute_downloads_skill
 from littrace.session import load_or_create_session, save_workspace
@@ -41,14 +45,61 @@ api_app = _AppProxy()
 router = APIRouter()
 
 
+@router.get("/downloads/progress", response_model=list[PublisherDownloadProgress])
+def downloads_progress(session_id: str | None = None) -> list[PublisherDownloadProgress]:
+    """Return publisher-level progress for the UI to poll during downloads."""
+    config = api_app.load_config()
+    session_key = session_id or getattr(api_app.WORKSPACE.context, "session_id", None)
+    if not session_key:
+        return []
+    tasks = download_task_store_from_config(config).list_for_session(session_key)
+    grouped: dict[str, list] = {}
+    for task in tasks:
+        grouped.setdefault(task.source_name or "unknown", []).append(task)
+    result: list[PublisherDownloadProgress] = []
+    active_statuses = {
+        DownloadTaskStatus.FETCHING_SOURCE,
+        DownloadTaskStatus.SOURCE_RESOLVED,
+        DownloadTaskStatus.DOWNLOADING,
+        DownloadTaskStatus.UPLOADING_TO_OBJECT_STORAGE,
+    }
+    for publisher, publisher_tasks in sorted(grouped.items()):
+        total = len(publisher_tasks)
+        completed = sum(task.status in {DownloadTaskStatus.STORED, DownloadTaskStatus.VERIFIED} for task in publisher_tasks)
+        requires_login = sum(task.status == DownloadTaskStatus.AUTH_REQUIRED for task in publisher_tasks)
+        failed = sum(task.status == DownloadTaskStatus.FAILED for task in publisher_tasks)
+        active = sum(task.status in active_statuses for task in publisher_tasks)
+        queued = sum(task.status in {DownloadTaskStatus.PLANNED, DownloadTaskStatus.QUEUED} for task in publisher_tasks)
+        result.append(PublisherDownloadProgress(
+            publisher=publisher, total=total, queued=queued, active=active,
+            completed=completed, requires_login=requires_login, failed=failed,
+            percent=round(100 * completed / total, 1) if total else 0.0,
+        ))
+    return result
+
+
 @router.post("/downloads/plan", response_model=object)
 async def download_plan():
     return await build_download_plan_skill(api_app.load_config(), api_app.WORKSPACE)
 
 
 @router.post("/downloads/execute", response_model=DownloadExecutionResult)
-async def downloads_execute(request: DownloadExecutionRequest) -> DownloadExecutionResult:
-    return await execute_downloads_skill(api_app.load_config(), api_app.WORKSPACE, request)
+async def downloads_execute(
+    request: DownloadExecutionRequest,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> DownloadExecutionResult:
+    config = api_app.load_config()
+    auth = resolve_request_session(
+        config,
+        route_session_id=request.session_id,
+        header_session_id=x_littrace_session_id,
+    )
+    request = request.model_copy(
+        update={
+            "session_id": auth.session_id,
+        }
+    )
+    return await execute_downloads_skill(config, api_app.WORKSPACE, request)
 
 
 @router.post("/downloads/login/{paper_id}", response_model=LoginLaunchResult)
@@ -120,11 +171,24 @@ def attach_pdf(paper_id: str, source_path: str) -> AttachmentResult:
 
 
 @router.post("/papers/{paper_id}/attach-si", response_model=object)
-def attach_si(paper_id: str, source_path: str, session_id: str | None = None):
+def attach_si(
+    paper_id: str,
+    source_path: str,
+    session_id: str | None = None,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+):
     from littrace.supplementary import attach_supplementary_file
 
     config = api_app.load_config()
-    session = load_or_create_session(config, session_id)
+    auth = resolve_request_session(
+        config,
+        route_session_id=session_id,
+        header_session_id=x_littrace_session_id,
+    )
+    session = load_or_create_session(
+        config,
+        auth.session_id,
+    )
     result = attach_supplementary_file(api_app.WORKSPACE, session, paper_id, source_path)
     save_workspace(session, api_app.WORKSPACE, config=config)
     return result

@@ -1,8 +1,8 @@
 from littrace.context import add_papers
-from littrace.harnesses import check_storyline_claims
+from littrace.evaluation.harnesses import check_storyline_claims
 from littrace.models import PaperMetadata
 from littrace.models import LiteratureWorkspace
-from littrace.storyline import (
+from littrace.evidence.storyline import (
     build_storyline_from_workspace,
     build_storyline_preview,
     render_structured_storyline_report,

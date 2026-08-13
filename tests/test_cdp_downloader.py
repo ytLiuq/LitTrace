@@ -1,11 +1,13 @@
 
-from littrace.cdp_core import CDPBrowser, STEALTH_JS, discover_elsevier_pdf_candidates
-from littrace.cdp_downloader import (
-    _same_origin_relative_url,
-    check_cdp_status,
+from littrace.access_layer.cdp_core import (
+    CDPBrowser,
+    STEALTH_JS,
+    discover_elsevier_pdf_candidates,
     identify_publisher,
     publisher_urls,
+    same_origin_relative_url,
 )
+from littrace.access_layer.cdp_downloader import check_cdp_status
 from littrace.config import CDPDownloaderConfig, LitTraceConfig
 
 
@@ -37,11 +39,11 @@ def test_springer_1007_uses_link_springer_pdf_url():
 
 
 def test_same_origin_relative_url_avoids_cors():
-    assert _same_origin_relative_url(
+    assert same_origin_relative_url(
         "https://pubs.acs.org/doi/10.1021/example",
         "https://pubs.acs.org/doi/pdf/10.1021/example",
     ) == "/doi/pdf/10.1021/example"
-    assert _same_origin_relative_url(
+    assert same_origin_relative_url(
         "https://pubs.acs.org/doi/10.1021/example",
         "https://example.org/paper.pdf",
     ) == "https://example.org/paper.pdf"
@@ -52,7 +54,7 @@ def test_check_cdp_status_reports_unavailable(monkeypatch):
         def raise_for_status(self):
             raise RuntimeError("no chrome")
 
-    monkeypatch.setattr("littrace.cdp_downloader.httpx.get", lambda *_args, **_kwargs: Boom())
+    monkeypatch.setattr("littrace.access_layer.cdp_downloader.httpx.get", lambda *_args, **_kwargs: Boom())
     config = LitTraceConfig(cdp_downloader=CDPDownloaderConfig(cdp_url="http://127.0.0.1:65535"))
 
     status = check_cdp_status(config)

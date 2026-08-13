@@ -72,7 +72,7 @@ def test_paddleocr_pdf_parser_marks_page_evidence(monkeypatch, tmp_path):
         return [(1, image_path)]
 
     def fake_parse_image(self, image_path, mode=None, preferred_engines=None):
-        from littrace.ocr.tool import ParsedPaper
+        from littrace.models import ParsedPaper
 
         return ParsedPaper(
             pdf_path=image_path,
@@ -174,7 +174,7 @@ def test_paddleocr_parallel_page_workers(monkeypatch, tmp_path):
     image2.write_bytes(b"png")
 
     def fake_parse_image(self, image_path, mode=None, preferred_engines=None):
-        from littrace.ocr.tool import ParsedPaper
+        from littrace.models import ParsedPaper
 
         return ParsedPaper(
             pdf_path=image_path,

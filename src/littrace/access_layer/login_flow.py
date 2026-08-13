@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, HttpUrl
 
-from littrace.authorized_pdf_archiver import (
+from littrace.access_layer.authorized_pdf_archiver import (
     AuthorizedPdfArchiveResult,
     archive_authorized_pdf_response,
 )

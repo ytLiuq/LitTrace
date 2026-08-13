@@ -3,7 +3,11 @@ import pytest
 
 from littrace.config import APIConfig, LitTraceConfig
 from littrace.models import PaperMetadata, PaperSearchRequest
-from littrace.search import LiveSearchClient, _has_enough_relevant_results, build_query_variants
+from littrace.retrieval.search import (
+    LiveSearchClient,
+    _has_enough_relevant_results,
+    build_query_variants,
+)
 
 
 @pytest.mark.anyio
@@ -48,15 +52,10 @@ async def test_openalex_retries_transient_503():
     assert any("openalex_retry_1: HTTP 503" in error for error in client.diagnostics.errors)
 
 
-def test_carbon_pdms_chinese_topic_builds_english_query_variants():
+def test_bare_topic_does_not_inject_material_or_mechanism_variants():
     variants = build_query_variants("碳基PDMS柔性薄膜传感器长时间受压漂移")
 
-    joined = " ".join(variants).lower()
-    assert variants[0] == "碳基PDMS柔性薄膜传感器长时间受压漂移"
-    assert "carbon" in joined
-    assert "pdms" in joined
-    assert "drift" in joined
-    assert "stability" in joined
+    assert variants == ["碳基PDMS柔性薄膜传感器长时间受压漂移"]
 
 
 def test_live_search_continues_past_minimum_to_return_extra_results():

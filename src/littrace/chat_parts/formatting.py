@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from littrace.agents import agent_runtime_statuses
+from littrace.runtime_components import component_statuses
 from littrace.models import LiteratureWorkspace
 
 MIN_ANALYSIS_PAPERS = 5
 
 
-def format_agent_status() -> str:
-    lines = ["当前 Agent 开发状态："]
-    for status in agent_runtime_statuses():
+def format_component_status() -> str:
+    lines = ["当前运行组件状态（1 个主 Coordinator；Reviewer 按需启动）："]
+    for status in component_statuses():
         flag = "可执行" if status.implemented else "待开发"
         node = f"，节点：{status.workflow_node}" if status.workflow_node else ""
         remaining = "；剩余：" + " / ".join(status.remaining_work) if status.remaining_work else ""

@@ -23,7 +23,6 @@ class BlobRef(BaseModel):
 
 @dataclass(frozen=True)
 class ArtifactKeyContext:
-    user_id: str
     session_id: str
     kind: str
     artifact_id: str
@@ -266,8 +265,6 @@ def build_artifact_object_key(config: LitTraceConfig, context: ArtifactKeyContex
     prefix = config.artifact_storage.path_prefix.strip("/")
     pieces = [
         *([prefix] if prefix else []),
-        "users",
-        _safe_segment(context.user_id),
         "sessions",
         _safe_segment(context.session_id),
     ]

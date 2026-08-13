@@ -18,7 +18,7 @@ def build_ocr_tool(
     elif strategy in {"ocr", "paddleocr", "paddlerocr"}:
         backend = "paddleocr"
     if backend in {"docling", "text_only", "text-only", "text"}:
-        return DoclingOCRTool()
+        return DoclingOCRTool(config)
     if backend in {"paddleocr", "paddlerocr"}:
         return PaddleOCRTool(config.parsing.paddleocr)
     raise ValueError(

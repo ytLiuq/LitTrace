@@ -816,9 +816,10 @@ def check_schema_compliance(
                 )
             )
 
-    total = max(len(items), 1)
+    total = max(sum(max(item.total_items, 0) for item in items), 1)
+    valid = sum(max(0, min(item.valid_items, item.total_items)) for item in items)
     errors = [f for f in findings if f.severity == Severity.ERROR]
-    score = (total - len(errors)) / total
+    score = valid / total
     return HarnessReport(
         check_name="check_schema_compliance",
         passed=not errors,

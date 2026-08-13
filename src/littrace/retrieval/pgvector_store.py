@@ -95,12 +95,12 @@ class PgvectorRagStore:
                 cursor.executemany(
                     f"""
                     INSERT INTO {table} (
-                        profile_id, user_id, session_id, chunk_id, paper_id,
+                        profile_id, session_id, chunk_id, paper_id,
                         source_record_id, section, page, table_id, chunk_hash,
                         text, embedding, metadata, updated_at
                     )
                     VALUES (
-                        %(profile_id)s, %(user_id)s, %(session_id)s, %(chunk_id)s, %(paper_id)s,
+                        %(profile_id)s, %(session_id)s, %(chunk_id)s, %(paper_id)s,
                         %(source_record_id)s, %(section)s, %(page)s, %(table_id)s, %(chunk_hash)s,
                         %(text)s, %(embedding)s, %(metadata)s::jsonb, %(updated_at)s
                     )
@@ -119,7 +119,6 @@ class PgvectorRagStore:
                     [
                         {
                             "profile_id": self.profile.profile_id,
-                            "user_id": self.profile.user_id,
                             "session_id": self.profile.session_id,
                             "chunk_id": chunk.chunk_id,
                             "paper_id": chunk.paper_id,
@@ -153,15 +152,42 @@ class PgvectorRagStore:
                     f"""
                     DELETE FROM {table}
                     WHERE profile_id = %(profile_id)s
-                      AND user_id = %(user_id)s
                       AND session_id = %(session_id)s
                       AND NOT (chunk_id = ANY(%(chunk_ids)s))
                     """,
                     {
                         "profile_id": self.profile.profile_id,
-                        "user_id": self.profile.user_id,
                         "session_id": self.profile.session_id,
                         "chunk_ids": ids,
+                    },
+                )
+                deleted = cursor.rowcount if cursor.rowcount >= 0 else 0
+            connection.commit()
+        return deleted
+
+    def delete_paper_chunks(self, paper_ids: Iterable[str]) -> int:
+        import psycopg
+        from pgvector.psycopg import register_vector
+
+        ids = list(paper_ids)
+        if not ids:
+            return 0
+        self.ensure_schema()
+        table = self.collection.qualified_table
+        with psycopg.connect(self.config.rag.postgres_dsn) as connection:
+            register_vector(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    DELETE FROM {table}
+                    WHERE profile_id = %(profile_id)s
+                      AND session_id = %(session_id)s
+                      AND paper_id = ANY(%(paper_ids)s)
+                    """,
+                    {
+                        "profile_id": self.profile.profile_id,
+                        "session_id": self.profile.session_id,
+                        "paper_ids": ids,
                     },
                 )
                 deleted = cursor.rowcount if cursor.rowcount >= 0 else 0
@@ -181,12 +207,10 @@ class PgvectorRagStore:
                     f"""
                     DELETE FROM {table}
                     WHERE profile_id = %(profile_id)s
-                      AND user_id = %(user_id)s
                       AND session_id = %(session_id)s
                     """,
                     {
                         "profile_id": self.profile.profile_id,
-                        "user_id": self.profile.user_id,
                         "session_id": self.profile.session_id,
                     },
                 )
@@ -216,14 +240,12 @@ class PgvectorRagStore:
                         chunk_hash, text, metadata, 1 - (embedding <=> %(embedding)s::vector) AS score
                     FROM {table}
                     WHERE profile_id = %(profile_id)s
-                      AND user_id = %(user_id)s
                       AND session_id = %(session_id)s
                     ORDER BY embedding <=> %(embedding)s::vector
                     LIMIT %(limit)s
                     """,
                     {
                         "profile_id": self.profile.profile_id,
-                        "user_id": self.profile.user_id,
                         "session_id": self.profile.session_id,
                         "embedding": embedding,
                         "limit": limit,
@@ -261,7 +283,6 @@ def pgvector_setup_sql(profile: RagProfile) -> list[str]:
         f"""
         CREATE TABLE IF NOT EXISTS {table} (
             profile_id text NOT NULL,
-            user_id text NOT NULL,
             session_id text NOT NULL,
             chunk_id text PRIMARY KEY,
             paper_id text NOT NULL,
@@ -274,10 +295,10 @@ def pgvector_setup_sql(profile: RagProfile) -> list[str]:
             embedding vector({dimension}) NOT NULL,
             metadata jsonb NOT NULL DEFAULT '{{}}'::jsonb,
             updated_at timestamptz NOT NULL DEFAULT now(),
-            CHECK (user_id = {sql_literal(profile.user_id)}),
             CHECK (session_id = {sql_literal(profile.session_id)})
         )
         """,
+        f"ALTER TABLE {table} DROP COLUMN IF EXISTS user_id CASCADE",
         f"CREATE INDEX IF NOT EXISTS {quote_ident(profile.collection_name + '_profile_idx')} "
         f"ON {table} (profile_id)",
         f"CREATE INDEX IF NOT EXISTS {quote_ident(profile.collection_name + '_paper_idx')} "

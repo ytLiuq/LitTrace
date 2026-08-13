@@ -9,10 +9,10 @@ This module is the **single source of truth** for:
 - ``publisher_urls`` — publisher-specific landing/PDF URL templates
 - ``CLOUDFLARE_MARKERS`` — strings indicating a Cloudflare challenge page
 - ``INSTITUTIONAL_LOGIN_MARKERS`` — strings indicating CARSI/Shibboleth auth
-- Helper functions: ``_is_pdf_file``, ``_same_origin_relative_url``,
-  ``_normalize_doi``, ``_find_recent_pdf``, ``_move_pdf``
+- Helper functions for PDF validation, DOI normalization, download discovery,
+  same-origin URL handling, and file moves.
 
-Both ``littrace.cdp_downloader`` (the project-integrated version) and the
+Both ``littrace.access_layer.cdp_downloader`` (the project-integrated version) and the
 standalone ``universal_paper_downloader.py`` SKILL script import from this
 module, eliminating the previous code duplication.
 

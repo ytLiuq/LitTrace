@@ -1,7 +1,7 @@
 import json
 
 from littrace.config import LitTraceConfig, StorageConfig
-from littrace.document_composer import build_research_document_report
+from littrace.evidence.document_composer import build_research_document_report
 from littrace.models import (
     ChatRequest,
     EvidenceSpan,
@@ -14,6 +14,7 @@ from littrace.evidence.claims import register_evidence
 from littrace.session import (
     append_message,
     create_chat_session,
+    delete_chat_session,
     list_chat_sessions,
     load_workspace,
     load_or_create_session,
@@ -51,9 +52,7 @@ def test_session_folder_persists_workspace_and_messages(tmp_path):
 
 
 def test_session_persists_user_scoped_rag_profile(tmp_path):
-    config = LitTraceConfig(
-        storage=StorageConfig(sessions_dir=tmp_path, default_user_id="u1")
-    )
+    config = LitTraceConfig(storage=StorageConfig(sessions_dir=tmp_path))
     config.rag.enabled = True
     config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5432/littrace"
     session = create_chat_session(config)
@@ -67,19 +66,18 @@ def test_session_persists_user_scoped_rag_profile(tmp_path):
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    assert profile["user_id"] == "u1"
     assert profile["session_id"] == session.session_id
     assert profile["backend"] == "pgvector"
     assert profile["topic"] == "MXene pressure sensor"
-    assert profile["collection_name"].startswith("littrace_u1_")
+    assert profile["collection_name"].startswith("littrace_")
     assert manifest["rag_enabled"] is True
     assert manifest["rag"]["profile_id"] == profile["profile_id"]
     assert workspace.context.filters.rag_profile["profile_id"] == profile["profile_id"]
 
 
-def test_load_or_create_session_recovers_user_id_from_manifest(tmp_path):
+def test_load_or_create_session_recovers_session_id_from_manifest(tmp_path):
     config = LitTraceConfig(
-        storage=StorageConfig(sessions_dir=tmp_path, default_user_id="fallback-user")
+        storage=StorageConfig(sessions_dir=tmp_path)
     )
     session = create_chat_session(config)
     workspace = LiteratureWorkspace()
@@ -87,12 +85,10 @@ def test_load_or_create_session_recovers_user_id_from_manifest(tmp_path):
 
     manifest_path = session.workspace_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["user_id"] = "u2"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     loaded = load_or_create_session(config, session.session_id)
 
-    assert loaded.user_id == "u2"
     assert loaded.session_id == session.session_id
 
 
@@ -167,6 +163,57 @@ def test_session_persists_evidence_and_release_snapshots(tmp_path):
     assert (session.evidence_dir / "claims.json").exists()
     assert (session.evidence_dir / "verification.json").exists()
     assert list(session.releases_dir.glob("release_*.json"))
+
+
+def test_delete_session_reports_object_storage_failures(monkeypatch, tmp_path):
+    from littrace.artifact_registry import ArtifactRecord
+    from littrace.artifact_store import BlobRef
+
+    config = LitTraceConfig(
+        storage=StorageConfig(
+            sessions_dir=tmp_path / "sessions",
+            metadata_dir=tmp_path / "metadata",
+        )
+    )
+    session = create_chat_session(config)
+    save_workspace(session, LiteratureWorkspace(), config=config)
+    record = ArtifactRecord.from_blob_ref(
+            BlobRef(
+                backend="local",
+                object_key="sessions/s1/papers/p1/paper.pdf",
+                content_type="application/pdf",
+            ),
+            artifact_id="paper_pdf:p1",
+            session_id=session.session_id,
+            kind="paper_pdf",
+            paper_id="p1",
+    )
+
+    class FakeRegistry:
+        def list_for_session(self, *, session_id):
+            return [record] if session_id == record.session_id else []
+
+        def delete_for_session(self, *, session_id):
+            return int(session_id == record.session_id)
+
+    registry = FakeRegistry()
+
+    class FailingArtifactStore:
+        def delete(self, ref):
+            raise OSError(f"cannot delete {ref.object_key}")
+
+    monkeypatch.setattr("littrace.session.artifact_registry_from_config", lambda _config: registry)
+    monkeypatch.setattr("littrace.session.artifact_store_from_config", lambda _config: FailingArtifactStore())
+
+    report = delete_chat_session(config, session.session_id)
+
+    assert report.deleted is True
+    assert report.object_deleted_count == 0
+    assert any(
+        failure["artifact_id"] == "paper_pdf:p1"
+        for failure in report.object_delete_failures
+    )
+    assert report.warnings == [f"object_delete_failed:{len(report.object_delete_failures)}"]
 
 
 def test_session_retains_bounded_snapshots_and_recovers_from_corrupt_workspace(tmp_path):

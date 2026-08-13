@@ -1,6 +1,6 @@
 from littrace.config import BrowserAutomationConfig, LitTraceConfig
-from littrace.authorized_pdf_archiver import AuthorizedPdfArchiveResult
-from littrace.login_flow import (
+from littrace.access_layer.authorized_pdf_archiver import AuthorizedPdfArchiveResult
+from littrace.access_layer.login_flow import (
     authorized_pdf_url_for_paper,
     browser_login_session_for_paper,
     BrowserAuthorizationWaitResult,
@@ -156,8 +156,8 @@ def test_open_browser_login_session_blocks_confirm_fallback_by_default(monkeypat
             return FakeRunResult(1, 'Error: Session "littrace-acs-auth" not found', True)
         return FakeRunResult(1, "Error 230404: Unknown error", True)
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.login_flow.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.time.sleep", lambda *_args, **_kwargs: None)
 
     config = LitTraceConfig(
         browser=BrowserAutomationConfig(
@@ -207,8 +207,8 @@ def test_open_browser_login_session_does_not_invent_fixed_browser_fallback_witho
             return FakeRunResult(1, 'Error: Session "littrace-acs-auth" not found', True)
         return FakeRunResult(1, "Error 230404: Unknown error", True)
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.login_flow.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.time.sleep", lambda *_args, **_kwargs: None)
 
     config = LitTraceConfig(
         browser=BrowserAutomationConfig(
@@ -252,8 +252,8 @@ def test_open_browser_login_session_can_fallback_when_explicitly_allowed(monkeyp
             return FakeRunResult(1, "Error 230404: Unknown error", True)
         return FakeRunResult(0)
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.login_flow.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.time.sleep", lambda *_args, **_kwargs: None)
     config = LitTraceConfig(
         browser=BrowserAutomationConfig(
             default_browser_id="direct_local_105121787802550357",
@@ -298,8 +298,8 @@ def test_open_browser_login_session_falls_back_after_nonrecoverable_direct_failu
             return FakeRunResult(1, "Error 210101: Connection health check failed.")
         return FakeRunResult(0)
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.login_flow.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.time.sleep", lambda *_args, **_kwargs: None)
     config = LitTraceConfig(
         browser=BrowserAutomationConfig(
             default_browser_id="direct_local_105121787802550357",
@@ -349,8 +349,8 @@ def test_open_browser_login_session_retries_same_browser_after_recoverable_open_
             return FakeRunResult(1, "Browser window not found", True)
         return FakeRunResult(0)
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.login_flow.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.time.sleep", lambda *_args, **_kwargs: None)
 
     config = LitTraceConfig(
         browser=BrowserAutomationConfig(chrome_direct_open_retries=1)
@@ -392,8 +392,8 @@ def test_open_browser_login_session_uses_configured_multi_retry(monkeypatch):
             return FakeRunResult(1, "Error 230404: Unknown error", True)
         return FakeRunResult(0)
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.login_flow.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.time.sleep", lambda *_args, **_kwargs: None)
     config = LitTraceConfig(
         browser=BrowserAutomationConfig(chrome_direct_open_retries=3)
     )
@@ -440,8 +440,8 @@ def test_open_browser_login_session_prewarms_chrome_direct_before_open(monkeypat
         events.append("prewarm")
         return FakePrewarm()
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.login_flow.prewarm_chrome_direct", fake_prewarm)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.prewarm_chrome_direct", fake_prewarm)
     config = LitTraceConfig(
         browser=BrowserAutomationConfig(
             default_browser_id="direct_local_105121787802550357",
@@ -478,7 +478,7 @@ def test_open_browser_login_session_reuses_existing_chat_window_with_navigate(mo
         calls.append(args)
         return FakeRunResult()
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
 
     result = open_browser_login_session(
         LitTraceConfig(),
@@ -527,7 +527,7 @@ def test_open_browser_login_session_stops_when_browser_act_api_key_required(monk
             api_key_required=True,
         )
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
 
     result = open_browser_login_session(LitTraceConfig(), paper)
 
@@ -622,7 +622,7 @@ def test_resume_browser_auth_after_user_close_reports_recoverable_window_loss(mo
         stderr = "Error: Browser window not found"
         recoverable_window_closed = True
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
 
     result = resume_browser_auth_after_user_close(LitTraceConfig(), paper)
 
@@ -653,9 +653,9 @@ def test_fetch_authorized_pdf_after_user_auth_uses_background_pdf_command(monkey
         calls.append(args)
         return FakeRunResult()
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
     monkeypatch.setattr(
-        "littrace.login_flow.archive_authorized_pdf_response",
+        "littrace.access_layer.login_flow.archive_authorized_pdf_response",
         lambda *_args, **_kwargs: AuthorizedPdfArchiveResult(
             paper_id="acs",
             pdf_url="https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548",
@@ -678,7 +678,7 @@ def test_discover_pdf_url_from_browser_session_extracts_frontend_pdf_link(monkey
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
 
     result = discover_pdf_url_from_browser_session(LitTraceConfig(), "littrace-acs-auth")
 
@@ -692,7 +692,7 @@ def test_discover_pdf_url_marks_cloudflare_confirmation_required(monkeypatch):
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
 
     result = discover_pdf_url_from_browser_session(LitTraceConfig(), "littrace-acs-auth")
 
@@ -707,7 +707,7 @@ def test_discover_pdf_url_accepts_current_pdf_viewer_url(monkeypatch):
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
 
     result = discover_pdf_url_from_browser_session(LitTraceConfig(), "littrace-nature-auth")
 
@@ -722,7 +722,7 @@ def test_discover_pdf_url_marks_cloudflare_query_confirmation_required(monkeypat
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
 
     result = discover_pdf_url_from_browser_session(LitTraceConfig(), "littrace-science-auth")
 
@@ -748,7 +748,7 @@ def test_discover_pdf_url_uses_state_fallback_for_cloudflare(monkeypatch):
         calls.append(args)
         return FakeStateResult() if args[-1] == "state" else FakeRunResult()
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
 
     result = discover_pdf_url_from_browser_session(LitTraceConfig(), "littrace-wiley-auth")
 
@@ -764,7 +764,7 @@ def test_discover_pdf_url_extracts_sciencedirect_pdfft_link(monkeypatch):
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
 
     result = discover_pdf_url_from_browser_session(LitTraceConfig(), "littrace-elsevier-auth")
 
@@ -778,7 +778,7 @@ def test_discover_pdf_url_extracts_rsc_articlepdf_link(monkeypatch):
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
 
     result = discover_pdf_url_from_browser_session(LitTraceConfig(), "littrace-rsc-auth")
 
@@ -792,7 +792,7 @@ def test_detect_user_confirmation_required_reads_page_text(monkeypatch):
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: FakeRunResult())
 
     result = detect_user_confirmation_required(LitTraceConfig(), "littrace-acs-auth")
 
@@ -831,10 +831,10 @@ def test_fetch_authorized_pdf_prefers_frontend_pdf_link_over_fallback(monkeypatc
         calls.append(args)
         return FakeRunResult()
 
-    monkeypatch.setattr("littrace.login_flow.discover_pdf_url_from_browser_session", fake_discover)
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.discover_pdf_url_from_browser_session", fake_discover)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
     monkeypatch.setattr(
-        "littrace.login_flow.archive_authorized_pdf_response",
+        "littrace.access_layer.login_flow.archive_authorized_pdf_response",
         lambda *_args, **_kwargs: AuthorizedPdfArchiveResult(
             paper_id="acs",
             pdf_url="https://pubs.acs.org/doi/pdf/10.1021/acsomega.2c06548?download=true",
@@ -881,8 +881,8 @@ def test_fetch_authorized_pdf_opens_pdf_session_after_auth_archive_failure(monke
             error=None if len(archive_calls) == 2 else "auth session network logs not ready",
         )
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
-    monkeypatch.setattr("littrace.login_flow.archive_authorized_pdf_response", fake_archive)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.archive_authorized_pdf_response", fake_archive)
 
     result = fetch_authorized_pdf_after_user_auth(
         LitTraceConfig(),
@@ -920,9 +920,9 @@ def test_fetch_authorized_pdf_keeps_landing_first_publishers_in_auth_session(mon
         calls.append(args)
         raise AssertionError("landing-first publishers should not open a second PDF session")
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
     monkeypatch.setattr(
-        "littrace.login_flow.archive_authorized_pdf_response",
+        "littrace.access_layer.login_flow.archive_authorized_pdf_response",
         lambda *_args, **_kwargs: AuthorizedPdfArchiveResult(
             paper_id="mdpi",
             pdf_url="https://www.mdpi.com/1424-8220/24/1/1/pdf?version=1",
@@ -965,9 +965,9 @@ def test_fetch_authorized_pdf_stops_when_auth_session_is_not_authorized(monkeypa
         calls.append(args)
         raise AssertionError("should not open PDF browser session without authorization")
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
     monkeypatch.setattr(
-        "littrace.login_flow.wait_for_browser_authorization",
+        "littrace.access_layer.login_flow.wait_for_browser_authorization",
         lambda *_args, **_kwargs: BrowserAuthorizationWaitResult(
             session_name="littrace-acs-auth",
             authorized=False,
@@ -1001,7 +1001,7 @@ def test_wait_for_browser_authorization_polls_until_pdf_link(monkeypatch):
 
         return Result()
 
-    monkeypatch.setattr("littrace.login_flow.discover_pdf_url_from_browser_session", fake_discover)
+    monkeypatch.setattr("littrace.access_layer.login_flow.discover_pdf_url_from_browser_session", fake_discover)
 
     result = wait_for_browser_authorization(
         LitTraceConfig(),
@@ -1032,7 +1032,7 @@ def test_wait_for_browser_authorization_tolerates_stale_session_before_ready(mon
 
         return Result()
 
-    monkeypatch.setattr("littrace.login_flow.discover_pdf_url_from_browser_session", fake_discover)
+    monkeypatch.setattr("littrace.access_layer.login_flow.discover_pdf_url_from_browser_session", fake_discover)
 
     result = wait_for_browser_authorization(
         LitTraceConfig(),
@@ -1056,7 +1056,7 @@ def test_wait_for_browser_authorization_times_out(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(
-        "littrace.login_flow.discover_pdf_url_from_browser_session",
+        "littrace.access_layer.login_flow.discover_pdf_url_from_browser_session",
         lambda *_args, **_kwargs: Result(),
     )
 
@@ -1085,7 +1085,7 @@ def test_wait_for_browser_authorization_does_not_treat_wiley_login_page_as_autho
         stderr = ""
 
     monkeypatch.setattr(
-        "littrace.login_flow.discover_pdf_url_from_browser_session",
+        "littrace.access_layer.login_flow.discover_pdf_url_from_browser_session",
         lambda *_args, **_kwargs: Result(),
     )
 
@@ -1116,7 +1116,7 @@ def test_discover_pdf_url_treats_wiley_full_access_as_authorized(monkeypatch):
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: Result())
 
     result = discover_pdf_url_from_browser_session(
         LitTraceConfig(),
@@ -1139,7 +1139,7 @@ def test_discover_institutional_login_url_prefers_wiley_ssostart(monkeypatch):
         stderr = ""
         recoverable_window_closed = False
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", lambda *_args, **_kwargs: Result())
 
     result = discover_institutional_login_url_from_browser_session(
         LitTraceConfig(),
@@ -1171,11 +1171,11 @@ def test_open_institutional_login_if_available_navigates_when_login_required(mon
         recoverable_window_closed = False
 
     monkeypatch.setattr(
-        "littrace.login_flow.discover_pdf_url_from_browser_session",
+        "littrace.access_layer.login_flow.discover_pdf_url_from_browser_session",
         lambda *_args, **_kwargs: Discovery(),
     )
     monkeypatch.setattr(
-        "littrace.login_flow.discover_institutional_login_url_from_browser_session",
+        "littrace.access_layer.login_flow.discover_institutional_login_url_from_browser_session",
         lambda *_args, **_kwargs: Link(),
     )
 
@@ -1183,7 +1183,7 @@ def test_open_institutional_login_if_available_navigates_when_login_required(mon
         calls.append(args)
         return RunResult()
 
-    monkeypatch.setattr("littrace.login_flow.run_browser_act", fake_run)
+    monkeypatch.setattr("littrace.access_layer.login_flow.run_browser_act", fake_run)
 
     result = open_institutional_login_if_available(
         LitTraceConfig(),

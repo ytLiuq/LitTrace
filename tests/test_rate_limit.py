@@ -13,7 +13,7 @@ from littrace.rate_limit import (
     RateLimitSlot,
     rate_limiter,
 )
-from littrace.harnesses import (
+from littrace.evaluation.harnesses import (
     HarnessConfig,
     RateLimitHealthItem,
     check_rate_limit,
@@ -357,7 +357,7 @@ class TestCheckRateLimit:
                 assert len(f.remediation_hint) > 10
 
     def test_registered_in_registry(self):
-        from littrace.harnesses import registry
+        from littrace.evaluation.harnesses import registry
 
         names = list(registry.all_checks().keys())
         assert "check_rate_limit" in names

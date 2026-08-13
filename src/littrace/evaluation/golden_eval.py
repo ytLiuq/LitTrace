@@ -5,7 +5,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from littrace.agent_interactions import build_agent_interaction_report
+from littrace.workflow_status import build_workflow_status
 from littrace.config import LitTraceConfig
 from littrace.citations import citation_records_for_papers
 from littrace.models import LiteratureWorkspace
@@ -64,7 +64,7 @@ def evaluate_workspace_against_golden(
     metrics_available = {_norm(cell.metric) for cell in workspace.performance_cells}
     storyline_text = _storyline_search_text(workspace)
     citation_records = citation_records_for_papers(active_papers)
-    interaction_report = build_agent_interaction_report(workspace)
+    workflow_status = build_workflow_status(workspace)
     failures: list[dict[str, object]] = []
 
     expected_dois = _expected_values(cases, "expected_dois")
@@ -104,8 +104,8 @@ def evaluate_workspace_against_golden(
         "golden_table_metric_recall": _safe_div(len(found_metrics), len(expected_metrics)),
         "golden_storyline_keyword_coverage": _safe_div(len(found_story), len(expected_story)),
         "golden_citation_coverage": _safe_div(citation_coverage, len(citation_records)),
-        "golden_agent_flow_blocked_count": float(interaction_report.blocked_count),
-        "golden_agent_flow_complete_count": float(interaction_report.complete_count),
+        "golden_workflow_blocked_count": float(workflow_status.blocked_count),
+        "golden_workflow_complete_count": float(workflow_status.complete_count),
     }
     return metrics, failures
 

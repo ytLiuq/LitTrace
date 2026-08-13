@@ -5,8 +5,8 @@ from datetime import UTC, datetime
 from typing import TypedDict
 from uuid import uuid4
 
-from littrace.agent_interactions import build_agent_interaction_report
-from littrace.autonomous_loop import run_autonomous_research_loop
+from littrace.workflow_status import build_workflow_status
+from littrace.autonomous_loop import run_review_loop
 from littrace.context import add_ranked_candidate_papers, _merge_filters
 from littrace.config import LitTraceConfig, load_config
 from littrace.retrieval.full_text_context import build_full_text_context
@@ -65,7 +65,7 @@ class ResearchWorkflowState(TypedDict, total=False):
     storyline_harness: object
     document_report: object
     autonomous_loop_report: object
-    agent_interactions: object
+    workflow_status: object
     workflow_trace: WorkflowTrace
 
 
@@ -421,7 +421,7 @@ def build_littrace_graph():
     async def autonomous_review(state: ResearchWorkflowState) -> ResearchWorkflowState:
         config = state.get("config") or load_config()
         objective = state["request"].topic
-        report = await run_autonomous_research_loop(
+        report = await run_review_loop(
             config,
             objective,
             state["workspace"],
@@ -433,7 +433,7 @@ def build_littrace_graph():
             state,
             "autonomous_review",
             "completed",
-            "autonomous_review_enabled=True，需要多 Agent 复核、反驳和修订。",
+            "autonomous_review_enabled=True，需要执行质量门和可选 Reviewer 审查。",
             inputs={"objective": objective, "auto_replan": state.get("auto_replan_enabled", False)},
             outputs={
                 "round_count": len(report.rounds),
@@ -643,7 +643,7 @@ async def run_research_graph(
         citation_audit=state.get("citation_audit"),
         download_plan=state.get("download_plan"),
         publisher_routes=state.get("publisher_routes"),
-        agent_interactions=build_agent_interaction_report(state["workspace"]),
+        workflow_status=build_workflow_status(state["workspace"]),
         parse_report=state.get("parse_report"),
         table_harness=state.get("table_harness"),
         comparison_matrix=state.get("comparison_matrix"),

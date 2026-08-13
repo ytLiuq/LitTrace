@@ -176,6 +176,16 @@ def _semantic_error(claim: Claim, evidence: list[EvidenceSpan]) -> str | None:
 
     if claim.claim_kind == ClaimKind.NUMERIC:
         return None
+    if (
+        claim.claim_origin == "llm_quote_bound"
+        and claim.claim_kind == ClaimKind.QUALITATIVE
+        and not claim.requires_corroboration
+    ):
+        # _quote_error has already established that every quote is a verbatim
+        # substring of durable source evidence. This admits faithful
+        # translation while keeping derived, causal, comparative, and
+        # freshness claims on the strict path below.
+        return None
     normalized_claim = _normalize(claim.text)
     if any(normalized_claim in _normalize(span.snippet or "") for span in evidence):
         return None
@@ -197,7 +207,11 @@ def _metric_is_grounded(metric: str, claim: Claim, evidence: list[EvidenceSpan])
     normalized_metric = _normalize(metric)
     if normalized_metric in _normalize(claim.text):
         return True
-    return any(normalized_metric in _normalize(span.snippet or "") for span in evidence)
+    return any(
+        normalized_metric in _normalize(span.snippet or "")
+        or normalized_metric == _normalize(span.column_label or "")
+        for span in evidence
+    )
 
 
 def _units_are_compatible(claim: Claim, evidence: list[EvidenceSpan]) -> bool:

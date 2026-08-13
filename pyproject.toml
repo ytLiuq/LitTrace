@@ -21,7 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 parsers = [
   "docling>=2.70",
-  "paddleocr>=2.8",
+  "paddleocr[doc-parser]>=3.7",
   "paddlepaddle>=3.3",
   "pypdfium2>=4.30",
 ]
@@ -52,3 +52,8 @@ littrace-mcp = "littrace.mcp_server:main"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.pytest.ini_options]
+markers = [
+  "live: opt-in tests that access real publishers and local browser/CDP services",
+]

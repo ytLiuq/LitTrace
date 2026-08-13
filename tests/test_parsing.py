@@ -7,7 +7,7 @@ from littrace.models import (
     ParsedPaper,
     ParsedTable,
 )
-from littrace.parsing import parse_workspace_papers
+from littrace.evidence.parsing import parse_workspace_papers
 from littrace.runtime.memory import build_session_memory
 from littrace.session import create_chat_session, save_workspace
 
@@ -72,7 +72,7 @@ def test_parse_workspace_papers_records_docling_quality_report(tmp_path):
     config = LitTraceConfig(storage=StorageConfig(paper_library_dir=tmp_path / "papers"))
     paper = PaperMetadata(paper_id="p1", title="Paper")
     workspace = add_papers(LiteratureWorkspace(papers={"p1": paper}), [paper])
-    from littrace.parsing import local_pdf_path
+    from littrace.evidence.parsing import local_pdf_path
 
     pdf_path = local_pdf_path(config, paper)
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,7 +119,7 @@ def test_real_pdf_structured_document_persists_to_session_memory(tmp_path):
     )
     paper = PaperMetadata(paper_id="p1", title="Real PDF Paper")
     workspace = add_papers(LiteratureWorkspace(papers={"p1": paper}), [paper])
-    from littrace.parsing import local_pdf_path
+    from littrace.evidence.parsing import local_pdf_path
 
     pdf_path = local_pdf_path(config, paper)
     pdf_path.parent.mkdir(parents=True, exist_ok=True)

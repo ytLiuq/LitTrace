@@ -1,6 +1,6 @@
 import pytest
 
-from littrace.autonomous_loop import run_autonomous_research_loop
+from littrace.autonomous_loop import run_review_loop
 from littrace.config import LLMConfig, LitTraceConfig
 from littrace.context import add_papers
 from littrace.llm import LLMReply
@@ -12,7 +12,7 @@ from littrace.retrieval.rag_search import RagSearchResult
 
 @pytest.mark.anyio
 async def test_autonomous_loop_reports_empty_workspace():
-    report = await run_autonomous_research_loop(
+    report = await run_review_loop(
         LitTraceConfig(llm=LLMConfig(enabled=False)),
         "总结当前文献",
         LiteratureWorkspace(),
@@ -38,7 +38,7 @@ async def test_autonomous_loop_raises_when_llm_disabled_with_papers():
     )
 
     with pytest.raises(RuntimeError, match="LLM unavailable"):
-        await run_autonomous_research_loop(
+        await run_review_loop(
             LitTraceConfig(llm=LLMConfig(enabled=False)),
             "请比较性能并讲发展脉络",
             workspace,
@@ -69,7 +69,7 @@ async def test_autonomous_loop_raises_when_llm_disabled_even_with_parsed(monkeyp
     monkeypatch.setattr("littrace.autonomous_loop.parse_workspace_skill", fake_parse)
 
     with pytest.raises(RuntimeError, match="LLM unavailable"):
-        await run_autonomous_research_loop(
+        await run_review_loop(
             LitTraceConfig(llm=LLMConfig(enabled=False)),
             "请自动重规划并比较性能",
             workspace,
@@ -100,11 +100,11 @@ async def test_autonomous_loop_rechecks_publication_gate_before_final_answer(mon
     config.rag.backend = "pgvector"
     config.rag.postgres_dsn = "postgresql://littrace:littrace@localhost:5433/littrace"
 
-    report = await run_autonomous_research_loop(
+    report = await run_review_loop(
         config,
         "总结当前文献",
         workspace,
-        enable_smart_debate=False,
+        enable_optional_reviewer=False,
     )
 
     assert not report.release_ready
@@ -132,15 +132,14 @@ async def test_autonomous_loop_passes_rag_evidence_into_writer(monkeypatch):
     workspace.context.filters.downloaded_full_text_count = 1
     profile = RagProfile(
         profile_id="rag:123",
-        user_id="u1",
         session_id="s1",
-        namespace="u1.s1",
+        namespace="s1",
         topic="Traceable Paper",
         query_variants=["Traceable Paper"],
         source_routes=["crossref"],
         backend="pgvector",
         postgres_schema="littrace_rag",
-        collection_name="littrace_u1_s1",
+        collection_name="littrace_s1",
         embedding_provider="openai-compatible",
         embedding_model="text-embedding-v3",
         embedding_dimension=1024,
@@ -182,11 +181,11 @@ async def test_autonomous_loop_passes_rag_evidence_into_writer(monkeypatch):
     monkeypatch.setattr("littrace.autonomous_loop.search_workspace_rag", fake_search_workspace_rag)
     monkeypatch.setattr("littrace.autonomous_loop.write_evidence_grounded_answer", fake_writer)
 
-    await run_autonomous_research_loop(
+    await run_review_loop(
         config,
         "总结当前文献",
         workspace,
-        enable_smart_debate=False,
+        enable_optional_reviewer=False,
     )
 
     assert captured["objective"] == "总结当前文献"

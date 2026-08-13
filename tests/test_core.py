@@ -1,8 +1,8 @@
-from littrace.access import plan_download
+from littrace.access_layer.paths import plan_download
 from littrace.config import DownloadMode, LitTraceConfig, PaperDownloadConfig
 from littrace.context import add_papers, apply_context_update
 from littrace.citations import best_access_url, citation_for_paper, format_apa_like_citation
-from littrace.harnesses import check_storyline_claims
+from littrace.evaluation.harnesses import check_storyline_claims
 from littrace.models import (
     AccessType,
     ContextUpdate,
@@ -11,8 +11,8 @@ from littrace.models import (
     PaperMetadata,
     StorylineClaim,
 )
-from littrace.source_router import route_sources
-from littrace.search import (
+from littrace.retrieval.source_router import route_sources
+from littrace.retrieval.search import (
     SearchDiagnostics,
     _crossref_attempt_params,
     filter_search_results,

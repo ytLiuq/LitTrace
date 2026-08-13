@@ -1,6 +1,6 @@
 from littrace.context import add_papers
 from littrace.models import LiteratureWorkspace, PaperMetadata
-from littrace.storyline_review import review_storyline
+from littrace.evidence.storyline_review import review_storyline
 
 
 def test_storyline_review_reports_missing_claims():

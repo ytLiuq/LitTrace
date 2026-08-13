@@ -33,10 +33,6 @@ DEFAULT_CLAIM_HINTS: list[str] = [
     "challenge",
 ]
 
-# Backwards-compatible module-level alias (tests and legacy code may import this).
-CLAIM_HINTS = DEFAULT_CLAIM_HINTS
-
-
 def guard_citations(
     text: str,
     workspace: LiteratureWorkspace,

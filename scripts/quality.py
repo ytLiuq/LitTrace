@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from littrace.config import load_config
 from littrace.models import LiteratureWorkspace
-from littrace.quality_report import build_quality_report
+from littrace.evaluation.quality_report import build_quality_report
 
 
 def main():

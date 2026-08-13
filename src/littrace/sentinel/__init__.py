@@ -1,4 +1,4 @@
-from littrace.sentinel.agent import LiteratureSentinelAgent, SentinelRunResult, SentinelStore
+from littrace.sentinel.agent import LiteratureSentinel, SentinelRunResult, SentinelStore
 from littrace.sentinel.resource_pack import ResourcePack, build_resource_pack
 from littrace.sentinel.state import (
     AccessTask,
@@ -11,7 +11,7 @@ from littrace.sentinel.state import (
 __all__ = [
     "AccessTask",
     "DigestRecord",
-    "LiteratureSentinelAgent",
+    "LiteratureSentinel",
     "ResourcePack",
     "RetryTask",
     "SentinelRunResult",

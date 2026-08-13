@@ -1,6 +1,6 @@
 # LitTrace RAG Automation
 
-LitTrace keeps RAG state isolated by `user_id + session_id`. Each session owns a
+LitTrace keeps RAG state isolated by `session_id`. Each session owns a
 `workspace/rag/profile.json`, and pgvector tables are derived from that profile.
 
 ## One-Off Daily Job
@@ -21,6 +21,84 @@ The job order is:
    documents.
 
 Use this command from cron, launchd, or another scheduler.
+
+## Queue Operations
+
+Inspect the embedding queue:
+
+```bash
+littrace rag jobs status
+littrace rag jobs status --session SESSION_ID
+littrace rag jobs status --status dead --limit 50
+```
+
+Run pending embedding jobs once:
+
+```bash
+littrace rag jobs run --limit 20
+```
+
+Requeue dead-letter embedding jobs after fixing the underlying cause:
+
+```bash
+littrace rag jobs requeue-dead --session SESSION_ID --limit 20
+```
+
+Jobs are claimed with a worker lease and `FOR UPDATE SKIP LOCKED`, so multiple
+workers can run concurrently. Expired `running` leases become reclaimable.
+Failures below the retry limit remain `failed` with `next_attempt_at`; failures
+at or above the retry limit move to `dead` and require explicit requeue.
+
+## Dependency Doctor
+
+Check whether the configured metadata DB, pgvector DB, artifact store, and
+embedding endpoint settings are ready:
+
+```bash
+littrace rag doctor
+```
+
+The doctor does not download papers. It is safe to run before real external E2E
+tests or from deployment checks.
+
+## Session Health Metrics
+
+LitTrace tracks four session-level metrics that map directly to the product
+goal: turning a research background into a fresh, searchable research memory.
+
+Inspect them from the CLI:
+
+```bash
+littrace metrics session --session SESSION_ID
+```
+
+Or from the API:
+
+```http
+GET /sessions/{session_id}/metrics
+X-LitTrace-Session-Id: {session_id}
+```
+
+The report includes:
+
+```text
+Discovery: 今日相关新增 N 篇
+Acquisition: PDF 获取率 X%
+RAG: freshness X%，stale N
+Consistency: pass X%，missing N
+```
+
+`readiness` is the user-facing status:
+
+```text
+not_ready -> search_ready -> pdf_ready -> rag_ready -> analysis_ready
+```
+
+Discovery is calculated from the session's source-retrieval ledger: a paper is
+counted once on the UTC day on which it was first recorded. A missing ledger is
+reported as `not_measured`, never as a misleading zero. RAG freshness matches
+the current artifact checksum against completed embedding jobs; `stale` is the
+number of available embeddable artifacts without a current completed job.
 
 ## Long-Running Worker
 

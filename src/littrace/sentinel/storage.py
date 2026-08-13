@@ -6,8 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from littrace.config import LitTraceConfig
 from littrace.models import LiteratureWorkspace
 from littrace.sentinel.state import AccessTask, SentinelState, Watchlist
@@ -15,6 +13,7 @@ from littrace.sentinel.state import AccessTask, SentinelState, Watchlist
 
 @dataclass
 class SentinelStore:
+    config: LitTraceConfig
     watchlist_id: str
     root: Path
     workspace_dir: Path
@@ -30,11 +29,10 @@ class SentinelStore:
     access_queue_path: Path
     digest_dir: Path
     evidence_base_dir: Path
-    user_id: str = "local-user"
 
     @property
     def session_id(self) -> str:
-        return self.watchlist_id
+        return f"sentinel:{self.watchlist_id}"
 
 
 def sentinel_root(config: LitTraceConfig, watchlist_id: str) -> Path:
@@ -51,6 +49,7 @@ def get_sentinel_store(config: LitTraceConfig, watchlist_id: str) -> SentinelSto
     releases_dir = workspace_dir / "releases"
     evidence_base_dir = root / "evidence_base"
     store = SentinelStore(
+        config=config,
         watchlist_id=watchlist_id,
         root=root,
         workspace_dir=workspace_dir,
@@ -66,7 +65,6 @@ def get_sentinel_store(config: LitTraceConfig, watchlist_id: str) -> SentinelSto
         access_queue_path=root / "access_queue.json",
         digest_dir=root / "digests",
         evidence_base_dir=evidence_base_dir,
-        user_id=config.storage.default_user_id,
     )
     return store
 
@@ -82,81 +80,56 @@ def ensure_sentinel_store(config: LitTraceConfig, watchlist: Watchlist) -> Senti
     store.releases_dir.mkdir(parents=True, exist_ok=True)
     store.digest_dir.mkdir(parents=True, exist_ok=True)
     store.evidence_base_dir.mkdir(parents=True, exist_ok=True)
+    from littrace.session import ChatSession, save_workspace
+    from littrace.state_db import state_store_from_config
+
+    if state_store_from_config(config).get_session(store.session_id) is None:
+        save_workspace(
+            ChatSession.from_root(store.root, store.session_id, config=config),
+            LiteratureWorkspace(),
+            config=config,
+        )
     return store
 
 
 def load_watchlist(store: SentinelStore) -> Watchlist:
-    path = store.root / "watchlist.yaml"
-    if not path.exists():
-        return Watchlist(watchlist_id=store.watchlist_id, topic=store.watchlist_id)
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
-    raw.setdefault("watchlist_id", store.watchlist_id)
-    raw.setdefault("topic", store.watchlist_id)
-    return Watchlist.model_validate(raw)
+    record = _sentinel_record(store)
+    raw = record.manifest_json.get("watchlist") if record else None
+    return Watchlist.model_validate(raw or {"watchlist_id": store.watchlist_id, "topic": store.watchlist_id})
 
 
 def save_watchlist(store: SentinelStore, watchlist: Watchlist) -> Path:
-    store.root.mkdir(parents=True, exist_ok=True)
-    path = store.root / "watchlist.yaml"
-    path.write_text(
-        yaml.safe_dump(watchlist.model_dump(mode="json"), sort_keys=False), encoding="utf-8"
-    )
-    return path
+    state = load_sentinel_state(store).model_copy(update={"watchlist": watchlist})
+    save_sentinel_state(store, state)
+    return store.root
 
 
 def load_sentinel_state(store: SentinelStore) -> SentinelState:
-    if not store.state_path.exists():
-        state = SentinelState(watchlist=load_watchlist(store))
-        state.access_queue = load_access_queue(store)
-        return state
-    try:
-        state = SentinelState.model_validate_json(store.state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        state = SentinelState(watchlist=load_watchlist(store))
-    persisted_queue = load_access_queue(store)
-    if persisted_queue:
-        state.access_queue = persisted_queue
-    return state
+    record = _sentinel_record(store)
+    raw = record.manifest_json.get("sentinel_state") if record else None
+    return SentinelState.model_validate(raw or {"watchlist": {"watchlist_id": store.watchlist_id, "topic": store.watchlist_id}})
 
 
 def save_sentinel_state(store: SentinelStore, state: SentinelState) -> Path:
-    store.root.mkdir(parents=True, exist_ok=True)
-    state_path = store.state_path
-    state_path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
-    save_access_queue(store, state.access_queue)
-    return state_path
+    record = _sentinel_record(store)
+    if record is None:
+        raise ValueError(f"Sentinel session is missing: {store.watchlist_id}")
+    manifest = dict(record.manifest_json)
+    manifest["watchlist"] = state.watchlist.model_dump(mode="json")
+    manifest["sentinel_state"] = state.model_dump(mode="json")
+    record.manifest_json = manifest
+    _state_store(store).upsert_session(record)
+    return store.root
 
 
 def load_access_queue(store: SentinelStore) -> list[AccessTask]:
-    if not store.access_queue_path.exists():
-        return []
-    try:
-        raw = json.loads(store.access_queue_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(raw, list):
-        return []
-    tasks: list[AccessTask] = []
-    for item in raw:
-        try:
-            tasks.append(AccessTask.model_validate(item))
-        except ValueError:
-            continue
-    return tasks
+    return load_sentinel_state(store).access_queue
 
 
 def save_access_queue(store: SentinelStore, tasks: list[AccessTask]) -> Path:
-    store.root.mkdir(parents=True, exist_ok=True)
-    store.access_queue_path.write_text(
-        json.dumps([task.model_dump(mode="json") for task in tasks], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return store.access_queue_path
+    state = load_sentinel_state(store)
+    save_sentinel_state(store, state.model_copy(update={"access_queue": tasks}))
+    return store.root
 
 
 def save_sentinel_workspace(
@@ -168,8 +141,7 @@ def save_sentinel_workspace(
         "SentinelWorkspaceSession",
         (),
         {
-            "session_id": store.watchlist_id,
-            "user_id": store.user_id,
+            "session_id": store.session_id,
             "root": store.root,
             "workspace_dir": store.workspace_dir,
             "workspace_path": store.workspace_path,
@@ -181,6 +153,9 @@ def save_sentinel_workspace(
             "evidence_dir": store.evidence_dir,
             "releases_dir": store.releases_dir,
             "rag_dir": store.workspace_dir / "rag",
+            "metadata_store_backend": store.config.metadata_store.backend,
+            "metadata_postgres_dsn": store.config.metadata_store.postgres_dsn,
+            "metadata_schema_name": store.config.metadata_store.schema_name,
         },
     )()
     from littrace.session import save_workspace
@@ -193,8 +168,7 @@ def load_sentinel_workspace(store: SentinelStore) -> LiteratureWorkspace:
         "SentinelWorkspaceSession",
         (),
         {
-            "session_id": store.watchlist_id,
-            "user_id": store.user_id,
+            "session_id": store.session_id,
             "root": store.root,
             "workspace_dir": store.workspace_dir,
             "workspace_path": store.workspace_path,
@@ -206,11 +180,24 @@ def load_sentinel_workspace(store: SentinelStore) -> LiteratureWorkspace:
             "evidence_dir": store.evidence_dir,
             "releases_dir": store.releases_dir,
             "rag_dir": store.workspace_dir / "rag",
+            "metadata_store_backend": store.config.metadata_store.backend,
+            "metadata_postgres_dsn": store.config.metadata_store.postgres_dsn,
+            "metadata_schema_name": store.config.metadata_store.schema_name,
         },
     )()
     from littrace.session import load_workspace
 
     return load_workspace(session_like)
+
+
+def _state_store(store: SentinelStore):
+    from littrace.state_db import state_store_from_config
+
+    return state_store_from_config(store.config)
+
+
+def _sentinel_record(store: SentinelStore):
+    return _state_store(store).get_session(store.session_id)
 
 
 def touch_run_dir(store: SentinelStore, run_id: str) -> Path:

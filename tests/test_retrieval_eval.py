@@ -1,7 +1,7 @@
 import pytest
 
 from littrace.config import EvalConfig, LitTraceConfig
-from littrace.retrieval_eval import run_retrieval_golden_eval
+from littrace.evaluation.retrieval_eval import run_retrieval_golden_eval
 
 
 @pytest.mark.anyio
@@ -42,7 +42,7 @@ async def test_retrieval_golden_eval_scores_live_pipeline(monkeypatch, tmp_path)
             active_limit=15,
         )
 
-    monkeypatch.setattr("littrace.retrieval_eval.run_search_preview", fake_preview)
+    monkeypatch.setattr("littrace.evaluation.retrieval_eval.run_search_preview", fake_preview)
 
     report = await run_retrieval_golden_eval(
         LitTraceConfig(eval=EvalConfig(golden_set_dir=golden)),

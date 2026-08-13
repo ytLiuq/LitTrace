@@ -3,12 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from littrace.models import EvidenceSpan
-from littrace.ocr.tool import OCRMode, ParsedPaper, ParsedTable
+from littrace.models import EvidenceSpan, ParsedPaper, ParsedTable
+from littrace.ocr.tool import OCRMode
 
 
 class DoclingOCRTool:
     name = "docling"
+
+    def __init__(self, config=None):
+        self.config = config
 
     def parse_pdf(
         self,
@@ -52,17 +55,25 @@ class DoclingOCRTool:
             )
 
         try:
-            pipeline_options = PdfPipelineOptions(do_ocr=False)
+            docling_config = getattr(getattr(self.config, "parsing", None), "docling", None)
+            pipeline_options = PdfPipelineOptions(
+                do_ocr=False,
+                generate_picture_images=True,
+                do_picture_description=bool(
+                    getattr(docling_config, "describe_figures", False)
+                ),
+            )
             converter = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
             )
             result = converter.convert(str(pdf_path))
             document = result.document
-            markdown = document.export_to_markdown()
             raw_dict = _safe_export_dict(document)
+            figures, figure_assets = _extract_figures(document, pdf_path)
+            markdown = document.export_to_markdown()
+            markdown = _replace_image_placeholders(markdown, figures)
             sections = markdown_to_sections(markdown, pdf_path.stem)
             tables = _tables_from_docling_dict(raw_dict, pdf_path.stem)
-            figures = _figures_from_docling_dict(raw_dict, pdf_path.stem)
             return ParsedPaper(
                 pdf_path=pdf_path,
                 title=_title_from_markdown(markdown),
@@ -72,6 +83,7 @@ class DoclingOCRTool:
                     sections=sections,
                     tables=tables,
                     figures=figures,
+                    figure_assets=figure_assets,
                 ),
                 sections=sections,
                 tables=tables,
@@ -84,6 +96,7 @@ class DoclingOCRTool:
                         "markdown_chars": len(markdown),
                         "raw_keys": sorted(raw_dict.keys()) if raw_dict else [],
                         "structured_document": _document_summary(raw_dict),
+                        "figure_asset_count": len(figure_assets),
                     }
                 ],
                 parsed=True,
@@ -246,6 +259,74 @@ def _figures_from_docling_dict(raw: dict[str, Any], paper_id: str) -> list[dict[
     return parsed
 
 
+def _extract_figures(document: Any, pdf_path: Path) -> tuple[list[dict[str, object]], list[str]]:
+    figures: list[dict[str, object]] = []
+    assets: list[str] = []
+    items = getattr(document, "iterate_items", lambda **_: [])(with_groups=False)
+    for item, _ in items:
+        label = str(getattr(getattr(item, "label", None), "value", getattr(item, "label", ""))).lower()
+        if "picture" not in label and "chart" not in label:
+            continue
+        index = len(figures) + 1
+        caption = _item_caption(item, document)
+        visual_summary = _item_visual_summary(item)
+        asset_path = pdf_path.parent / "docling_assets" / f"figure-{index}.png"
+        try:
+            image = item.get_image(document)
+            if image is not None:
+                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                image.save(asset_path, format="PNG")
+                assets.append(str(asset_path))
+        except Exception:
+            pass
+        figures.append(
+            {
+                "figure_id": f"F{index}",
+                "caption": caption,
+                "asset_path": str(asset_path) if asset_path.exists() else None,
+                "asset_ref": f"artifact://figure_image/{pdf_path.stem}/F{index}",
+                "summary": visual_summary or caption or f"Extracted figure F{index}; visual summary unavailable.",
+                "visual_summary_available": bool(visual_summary),
+                "evidence": EvidenceSpan(
+                    paper_id=pdf_path.stem,
+                    section="figures",
+                    snippet=caption,
+                    parser="docling",
+                    confidence=0.6 if caption else 0.35,
+                ).model_dump(),
+            }
+        )
+    return figures, assets
+
+
+def _item_caption(item: Any, document: Any) -> str | None:
+    for name in ("caption_text", "get_caption_text"):
+        method = getattr(item, name, None)
+        if callable(method):
+            try:
+                value = method(document)
+                if value:
+                    return str(value).strip()
+            except Exception:
+                pass
+    return str(getattr(item, "text", "") or "").strip() or None
+
+
+def _item_visual_summary(item: Any) -> str | None:
+    meta = getattr(item, "meta", None)
+    description = getattr(meta, "description", None)
+    text = getattr(description, "text", None)
+    return str(text).strip() if text else None
+
+
+def _replace_image_placeholders(markdown: str, figures: list[dict[str, object]]) -> str:
+    for figure in figures:
+        ref = str(figure.get("asset_ref") or "")
+        label = str(figure.get("figure_id") or "figure")
+        markdown = markdown.replace("<!-- image -->", f"![{label}]({ref})", 1)
+    return markdown
+
+
 def _document_summary(raw: dict[str, Any]) -> dict[str, object]:
     if not raw:
         return {}
@@ -264,6 +345,7 @@ def _structured_document(
     sections: list[dict[str, object]],
     tables: list[ParsedTable],
     figures: list[dict[str, object]],
+    figure_assets: list[str],
 ) -> dict[str, object]:
     return {
         "schema": "littrace.docling.structured_document.v1",
@@ -287,6 +369,7 @@ def _structured_document(
             for table in tables
         ],
         "figures": figures,
+        "figure_assets": figure_assets,
         "summary": _document_summary(raw),
         "docling_raw_keys": sorted(raw.keys()) if raw else [],
     }

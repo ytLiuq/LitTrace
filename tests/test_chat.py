@@ -9,7 +9,7 @@ from littrace.context import add_papers
 from littrace.llm import LLMReply
 from littrace.models import (
     ChatRequest,
-    AutonomousResearchLoopReport,
+    ReviewLoopReport,
     EvidenceSpan,
     LiteratureWorkspace,
     PaperMetadata,
@@ -356,7 +356,7 @@ async def test_chat_search_trace_includes_evidence_quality_gate():
 @pytest.mark.anyio
 async def test_chat_passes_rag_hits_into_writer(monkeypatch, tmp_path):
     config = LitTraceConfig(
-        storage={"sessions_dir": tmp_path, "default_user_id": "u1"},
+        storage={"sessions_dir": tmp_path},
         llm=LLMConfig(enabled=True, api_key="fake-key", intent_parser_enabled=False),
     )
     config.rag.enabled = True
@@ -367,6 +367,8 @@ async def test_chat_passes_rag_hits_into_writer(monkeypatch, tmp_path):
         [PaperMetadata(paper_id=f"p{i}", title=f"Paper {i}") for i in range(5)],
     )
     workspace.context.filters.search_mode = "live"
+    workspace.context.filters.research_background = "MXene pressure sensor literature analysis"
+    workspace.context.filters.research_background_status = "accepted"
     workspace.context.filters.parsed_full_text_count = 5
     workspace.context.filters.downloaded_full_text_count = 5
     for paper_id in workspace.context.active_papers:
@@ -378,15 +380,14 @@ async def test_chat_passes_rag_hits_into_writer(monkeypatch, tmp_path):
 
     profile = RagProfile(
         profile_id="rag:123",
-        user_id="u1",
         session_id=session.session_id,
-        namespace=f"u1.{session.session_id}",
+        namespace=session.session_id,
         topic="MXene pressure sensor",
         query_variants=["MXene pressure sensor"],
         source_routes=["crossref", "openalex"],
         backend="pgvector",
         postgres_schema="littrace_rag",
-        collection_name="littrace_u1_s1",
+        collection_name="littrace_s1",
         embedding_provider="openai-compatible",
         embedding_model="text-embedding-v3",
         embedding_dimension=1024,
@@ -483,15 +484,17 @@ async def test_chat_can_select_downloads_by_index():
 
 
 @pytest.mark.anyio
-async def test_chat_reports_agent_status():
+async def test_chat_reports_component_status():
     response, _ = await handle_chat(
         ChatRequest(message="agent状态"),
         LiteratureWorkspace(),
         LitTraceConfig(llm=LLMConfig(enabled=False, intent_parser_enabled=False)),
     )
 
-    assert response.action == "agent_status"
-    assert "Publisher Connector" in response.reply
+    assert response.action == "component_status"
+    assert "LitTrace Coordinator" in response.reply
+    assert "Citation and Evidence Gates" in response.reply
+    assert "Optional Reviewer" in response.reply
 
 
 @pytest.mark.anyio
@@ -519,7 +522,7 @@ async def test_chat_runs_autonomous_review_loop(monkeypatch):
         )
     )
 
-    _mock_llm_reply(monkeypatch, text="多 agent 审稿后的研究结论。")
+    _mock_llm_reply(monkeypatch, text="可选 Reviewer 审稿后的研究结论。")
 
     response, workspace = await handle_chat(
         ChatRequest(message="请多轮反驳并修订当前结论"),
@@ -530,17 +533,16 @@ async def test_chat_runs_autonomous_review_loop(monkeypatch):
     )
 
     assert response.action == "autonomous_review"
-    assert "多 agent 审稿" in response.reply
+    assert "质量门与可选 Reviewer 审查" in response.reply
     assert workspace.context.filters.autonomous_loop_report is not None
-    assert "未输出修订后的研究结论" in response.reply
-    assert "多 agent 审稿后的研究结论。" not in response.reply
-    assert workspace.context.filters.autonomous_loop_report["release_ready"] is False
+    assert "可选 Reviewer 审稿后的研究结论" in response.reply
+    assert workspace.context.filters.autonomous_loop_report["release_ready"] is True
 
 
 @pytest.mark.anyio
 async def test_chat_hides_unreleased_autonomous_answer(monkeypatch):
     async def fake_autonomous_loop(*args, **kwargs):
-        return AutonomousResearchLoopReport(
+        return ReviewLoopReport(
             objective="复核",
             final_answer="不应直接展示的未发布结论。",
             passed=False,
@@ -549,7 +551,7 @@ async def test_chat_hides_unreleased_autonomous_answer(monkeypatch):
             release_blockers=["Claim verification blocks release."],
         )
 
-    monkeypatch.setattr("littrace.chat.run_autonomous_research_loop", fake_autonomous_loop)
+    monkeypatch.setattr("littrace.chat.run_review_loop", fake_autonomous_loop)
     response, workspace = await handle_chat(
         ChatRequest(message="请多轮反驳并修订当前结论"),
         LiteratureWorkspace(),

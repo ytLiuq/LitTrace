@@ -424,8 +424,8 @@ def _autonomous_review_summary(workspace: LiteratureWorkspace) -> ResearchDocume
     raw = getattr(workspace.context.filters, "autonomous_loop_report", None)
     if not isinstance(raw, dict):
         return ResearchDocumentSection(
-            title="多 Agent 复核与修订",
-            body="当前会话尚未运行 Autonomous Review Council；建议在最终报告前运行自动审稿/反驳/修订循环。",
+            title="质量门与可选审稿",
+            body="当前会话尚未运行可选 Reviewer；重要报告可在最终发布前执行一次限轮、只读审稿。",
         )
     rounds = raw.get("rounds") or []
     lines = [
@@ -461,7 +461,7 @@ def _autonomous_review_summary(workspace: LiteratureWorkspace) -> ResearchDocume
         lines.append("### Revised answer excerpt")
         lines.append(final_answer[:1000])
     return ResearchDocumentSection(
-        title="多 Agent 复核与修订",
+        title="质量门与可选审稿",
         body="\n".join(lines),
     )
 

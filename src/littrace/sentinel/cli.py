@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from littrace.config import LitTraceConfig
-from littrace.sentinel.agent import LiteratureSentinelAgent
+from littrace.sentinel.agent import LiteratureSentinel
 from littrace.sentinel.state import Watchlist
 from littrace.sentinel.storage import (
     ensure_sentinel_store,
@@ -25,8 +25,8 @@ async def run_sentinel(config: LitTraceConfig, watchlist_id: str, topic: str | N
     watchlist = load_watchlist(store)
     if topic:
         watchlist = watchlist.model_copy(update={"topic": topic, "objective": topic})
-    agent = LiteratureSentinelAgent(config, watchlist)
-    return await agent.run()
+    sentinel = LiteratureSentinel(config, watchlist)
+    return await sentinel.run()
 
 
 def access_review(config: LitTraceConfig, watchlist_id: str, topic: str | None = None):
@@ -34,8 +34,8 @@ def access_review(config: LitTraceConfig, watchlist_id: str, topic: str | None =
     watchlist = load_watchlist(store)
     if topic:
         watchlist = watchlist.model_copy(update={"topic": topic, "objective": topic})
-    agent = LiteratureSentinelAgent(config, watchlist)
-    return agent.access_review()
+    sentinel = LiteratureSentinel(config, watchlist)
+    return sentinel.access_review()
 
 
 async def resume_after_login(config: LitTraceConfig, watchlist_id: str, topic: str | None = None):
@@ -43,5 +43,5 @@ async def resume_after_login(config: LitTraceConfig, watchlist_id: str, topic: s
     watchlist = load_watchlist(store)
     if topic:
         watchlist = watchlist.model_copy(update={"topic": topic, "objective": topic})
-    agent = LiteratureSentinelAgent(config, watchlist)
-    return await agent.resume_after_login()
+    sentinel = LiteratureSentinel(config, watchlist)
+    return await sentinel.resume_after_login()

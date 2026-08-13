@@ -1,6 +1,6 @@
 from littrace.config import LitTraceConfig, PublicationPolicyConfig
 from littrace.context import add_papers
-from littrace.document_composer import build_research_document_report
+from littrace.evidence.document_composer import build_research_document_report
 from littrace.models import (
     ClaimStatus,
     EvidenceSpan,
@@ -67,7 +67,7 @@ def test_document_report_is_citation_and_evidence_backed():
     assert "LitTrace Research Report" in report.markdown
     assert "## 摘要" in report.markdown
     assert "## 方法与证据来源" in report.markdown
-    assert "## 多 Agent 复核与修订" in report.markdown
+    assert "## 质量门与可选审稿" in report.markdown
     assert "Evidence Reviewer" in report.markdown
     assert "修订后的保守结论。" not in report.markdown
     assert "## 局限性与下一步" in report.markdown

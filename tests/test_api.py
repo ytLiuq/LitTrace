@@ -57,21 +57,13 @@ def test_search_context_and_download_plan_api(monkeypatch):
     assert citations[0]["citation_text"]
     assert citations[0]["access_url"]
 
-    response = client.get("/agents/crew")
-    assert response.status_code == 200
-    roles = response.json()
-    assert any(role["name"] == "Citation Verifier" for role in roles)
-
-    response = client.get("/agents/status")
+    response = client.get("/agents/components")
     assert response.status_code == 200
     statuses = response.json()
-    assert any(status["workflow_node"] == "route_publishers" for status in statuses)
+    assert any(status["name"] == "LitTrace Coordinator" for status in statuses)
+    assert any(status["role_layer"] == "deterministic quality gates" for status in statuses)
 
-    response = client.get("/agents/strength")
-    assert response.status_code == 200
-    assert response.json()["agents"]
-
-    response = client.get("/agents/audits")
+    response = client.get("/agents/quality-audits")
     assert response.status_code == 200
     assert response.json()
 
@@ -79,9 +71,9 @@ def test_search_context_and_download_plan_api(monkeypatch):
     assert response.status_code == 200
     assert response.json()["steps"]
 
-    response = client.get("/agents/interactions")
+    response = client.get("/agents/workflow")
     assert response.status_code == 200
-    assert response.json()["handoffs"]
+    assert response.json()["transitions"]
 
     response = client.get("/quality")
     assert response.status_code == 200
@@ -154,7 +146,7 @@ def test_search_context_and_download_plan_api(monkeypatch):
     assert workflow["citation_audit"] is None
     assert workflow["download_plan"] is None
     assert workflow["publisher_routes"] is not None
-    assert workflow["agent_interactions"] is not None
+    assert workflow["workflow_status"] is not None
     assert workflow["parse_report"] is not None
     assert workflow["table_harness"] is not None
     assert workflow["comparison_matrix"] is not None
@@ -198,7 +190,7 @@ def test_search_context_and_download_plan_api(monkeypatch):
 
     response = client.post("/chat", json={"message": "agent状态"})
     assert response.status_code == 200
-    assert response.json()["action"] == "agent_status"
+    assert response.json()["action"] == "component_status"
 
     response = client.post(f"/sessions/{session_id}/export")
     assert response.status_code == 200

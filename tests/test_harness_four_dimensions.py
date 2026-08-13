@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import pytest
 
-from littrace.harnesses import (
+from littrace.evaluation.harnesses import (
     HarnessConfig,
     Severity,
     registry,
@@ -423,6 +423,7 @@ class TestCheckSchemaCompliance:
         ]
         report = check_schema_compliance(items)
         assert not report.passed  # strict mode -> ERROR
+        assert report.score == 0.7
         assert any("Schema violation" in e for e in report.errors)
 
     def test_some_invalid_non_strict(self):
@@ -676,7 +677,7 @@ class TestRegistryCompleteness:
 
 class TestTablesSchemaValidation:
     def test_parse_llm_cells_valid(self):
-        from littrace.tables import _parse_llm_cells
+        from littrace.evidence.tables import _parse_llm_cells
 
         raw_cells = [
             {
@@ -699,7 +700,7 @@ class TestTablesSchemaValidation:
         assert len(errors) == 0
 
     def test_parse_llm_cells_invalid_value(self):
-        from littrace.tables import _parse_llm_cells
+        from littrace.evidence.tables import _parse_llm_cells
 
         raw_cells = [
             {"metric": "sensitivity", "value": "not_a_number", "unit": "%", "section": "results"},
@@ -710,7 +711,7 @@ class TestTablesSchemaValidation:
         assert "value" in errors[0].lower()
 
     def test_parse_llm_cells_missing_metric(self):
-        from littrace.tables import _parse_llm_cells
+        from littrace.evidence.tables import _parse_llm_cells
 
         raw_cells = [
             {"value": 0.9, "unit": "%"},  # no metric
@@ -720,7 +721,7 @@ class TestTablesSchemaValidation:
         assert len(errors) == 1
 
     def test_parse_llm_cells_mixed_valid_invalid(self):
-        from littrace.tables import _parse_llm_cells
+        from littrace.evidence.tables import _parse_llm_cells
 
         raw_cells = [
             {
@@ -744,7 +745,7 @@ class TestTablesSchemaValidation:
         assert len(errors) == 1
 
     def test_parse_llm_cells_non_dict_item(self):
-        from littrace.tables import _parse_llm_cells
+        from littrace.evidence.tables import _parse_llm_cells
 
         raw_cells = [
             "not a dict",

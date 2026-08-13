@@ -4,7 +4,6 @@ storage:
   cache_dir: "./data/cache"
   sessions_dir: "./sessions"
   workspace_snapshot_limit: 30
-  default_user_id: "local-user"
 
 artifact_storage:
   backend: "local"  # local | s3 (MinIO-compatible)
@@ -13,6 +12,11 @@ artifact_storage:
   endpoint_url: null
   region: null
   path_prefix: ""
+
+metadata_store:
+  backend: "postgres"
+  postgres_dsn: "postgresql://littrace:littrace@localhost:5433/littrace"
+  schema_name: "littrace"
 
 rag:
   enabled: false
@@ -32,6 +36,15 @@ rag:
   auto_refresh_enabled: false
   auto_download_open_access: true
   login_required_policy: "queue_only"
+
+figure_enrichment:
+  enabled: false
+  # Use a vision-capable OpenAI-compatible endpoint/model.
+  base_url: null
+  api_key: null
+  model: null
+  max_figures_per_job: 20
+  min_confidence: 0.65
 
 cache_policy:
   default_ttl_seconds: 86400
@@ -59,6 +72,7 @@ cdp_downloader:
   cloudflare_wait_seconds: 60
   user_action_wait_seconds: 30
   command_timeout_seconds: 60
+  repository_download_timeout_seconds: 120
   websocket_reconnect_attempts: 3
 
 browser:
@@ -70,10 +84,12 @@ paper_download:
   organize_by: "year_doi"
   filename_template: "{year}_{first_author}_{short_title}_{doi_hash}.pdf"
   save_metadata_even_if_pdf_skipped: false
+  max_concurrent_downloads: 3
   allow_requires_login_download: true
 
 parsing:
   default_parser: "paddleocr"
+  docling_workers: 2
   preferred_engines:
     - "docling"
     - "paddleocr"
@@ -83,6 +99,7 @@ parsing:
     export_markdown: true
     extract_tables: true
     extract_figures: true
+    describe_figures: false
   paddleocr:
     lang: "en"
     use_angle_cls: true

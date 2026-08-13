@@ -299,7 +299,7 @@ Harness 不应该拥有主执行流程。它应该像质量门一样读取 works
 - `src/littrace/autonomous_loop.py`
 - `src/littrace/runtime/agents.py`
 - `src/littrace/runtime/orchestrator.py`
-- `src/littrace/agent_interactions.py`
+- `src/littrace/workflow_status.py`
 - `src/littrace/storyline_review.py`
 
 推荐定位：
@@ -586,7 +586,7 @@ PDF / Docling 测试组：
   tests/test_workflow.py \
   tests/test_api_routes.py \
   tests/test_autonomous_loop.py \
-  tests/test_runtime_agents.py
+  tests/test_runtime_memory.py
 ```
 
 代码质量：

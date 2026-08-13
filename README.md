@@ -17,8 +17,8 @@ Workspace** architecture:
   documents, artifacts, snapshots, and runtime memory.
 - **LangGraph** is kept for bounded research workflows and traceable state
   transitions, not as the whole product architecture.
-- Optional runtime agents and the Autonomous Review Council are quality/review
-  layers; they do not own the main execution path.
+- Deterministic quality gates run on the main path. A temporary, read-only,
+  bounded Reviewer Agent is optional for high-value reports.
 
 ## Product Principles
 
@@ -120,8 +120,8 @@ Shell commands:
 /dashboard
 /quality
 /agents
-/agent-flow
-/agent-audits
+/workflow
+/quality-audits
 /plan MXene sensor
 /init-config
 /login N
@@ -146,7 +146,7 @@ Shell commands:
 `/golden-eval` reads real materials/chemistry tasks from `eval/golden`.
 When the current chat has literature context, it also scores DOI recall,
 recent-paper ratio, publisher coverage, table-metric recall, storyline evidence
-coverage, citation coverage, and agent handoff progress.
+coverage, citation coverage, and workflow progress.
 
 RAG maintenance commands run outside the interactive shell:
 
@@ -158,6 +158,19 @@ littrace rag daemon --interval-hours 24
 ```
 
 See `docs/rag_automation.md` for cron and macOS launchd examples.
+
+### 验证真实 daily 更新
+
+普通 `pytest` 只验证本地逻辑，不访问出版社，也不会启动 Chrome。要验证完整的
+检索 -> 全文入口探测 -> CDP 下载 -> digest 落盘链路，显式运行 live smoke test：
+
+```bash
+LITTRACE_LIVE_DAILY_TESTS=1 .venv/bin/pytest -q -m live tests/test_live_daily_update.py
+```
+
+该测试需要网络和可启动的 Chrome，耗时通常数分钟；`cdp_downloader.auto_launch_chrome: true`
+时 LitTrace 会自动启动自己的 CDP Chrome。登录、MFA 或 Cloudflare 阻断的论文不会被伪造
+成成功，而是进入 Sentinel access queue。
 
 Conversation examples:
 
@@ -184,14 +197,9 @@ Unpaywall OA locations when configured, publisher landing pages, and existing
 PDF URLs before download or login handoff. `/backfill-dois` adds exact DOI
 metadata to the current context when keyword search misses a known target paper.
 
-Each shell run creates a folder under `storage.sessions_dir` (default:
-`./sessions/<timestamp-id>/`) containing:
-
-```text
-workspace.json
-messages.jsonl
-artifacts/
-```
+Sessions, messages, task state, and research memory are persisted in Postgres.
+PDFs and derived artifacts use the configured object-storage backend. Local
+working directories are disposable staging space only.
 
 Copy `config.example.yaml` to `config.yaml` and set `storage.paper_library_dir`
 before running workflows that may download PDFs.
@@ -224,31 +232,21 @@ PaddleOCR handles raster images directly. For PDFs, LitTrace uses optional
 `pypdfium2` to render pages to temporary PNG files, then runs PaddleOCR page by
 page and stores page-aware evidence spans.
 
-## Agent Status
+## Runtime Components
 
-- `Source Router` routes materials/chemistry queries toward OpenAlex, Crossref,
-  Unpaywall, and preferred publisher families.
-- `Citation Verifier` builds citation records and audits access links.
-- `Access Manager` plans compliant downloads and uses the CDP publisher
-  downloader for login-gated papers. It asks the user to complete required
-  Cloudflare or institutional authentication in local Chrome, then downloads
-  via publisher-specific PDF routes.
-- `Publisher Connector` maps papers to publisher families such as ACS, Wiley,
-  Nature, MDPI, RSC, and Elsevier, then emits DOI/publisher access routes.
-- `PDF/OCR Parser` requires a local PDF and uses Docling or PaddleOCR; metadata/abstract
-  fallback is disabled for research answers.
-- `Table Agent` extracts performance cells into evidence-preserving matrices.
-- `Research Planner` turns a question into a retrieval/parse/table/storyline
-  plan using the current context.
-- `Research Writer` produces evidence-grounded answers behind citation guard.
-- `Eval Auditor` reports agent strength, quality metrics, and golden-set status.
+- `LitTrace Coordinator` is the only default agent. It owns the user turn and
+  invokes retrieval, access, parsing, extraction, synthesis, and export skills
+  through typed ToolContracts.
+- Citation, evidence, table, storyline, publication, and evaluation checks are
+  deterministic quality gates, not agents.
+- `Optional Reviewer` runs only when explicitly requested for a
+  high-value report. It receives a bounded evidence bundle, is read-only, has
+  no search/download tools, cannot publish, and uses bounded rounds.
 - `Publisher E2E` can run real golden-set DOI checks with
   `LITTRACE_RUN_PUBLISHER_E2E=1 pytest tests/test_publisher_e2e.py`; each case must
   download and parse a PDF, otherwise it fails.
-- `Research Storyline Agent` builds conservative solution-limit-response chains
-  from parsed evidence and refuses unsupported broad narratives.
-- `Dialogue Agent` is the primary product surface: a local shell with a
-  hideable literature context panel.
+- Storyline construction and the local dialogue surface are Coordinator-owned
+  skills and product interfaces, not separate agents.
 
 ## API Preview
 
@@ -281,11 +279,9 @@ curl -X POST http://127.0.0.1:8000/workflow/research \
 curl -X POST http://127.0.0.1:8000/parse/context
 curl -X POST http://127.0.0.1:8000/tables/extract
 curl http://127.0.0.1:8000/tables/matrix
-curl http://127.0.0.1:8000/agents/crew
-curl http://127.0.0.1:8000/agents/status
-curl http://127.0.0.1:8000/agents/strength
-curl http://127.0.0.1:8000/agents/audits
-curl http://127.0.0.1:8000/agents/interactions
+curl http://127.0.0.1:8000/agents/components
+curl http://127.0.0.1:8000/agents/quality-audits
+curl http://127.0.0.1:8000/agents/workflow
 curl "http://127.0.0.1:8000/agents/plan?topic=MXene%20sensor"
 curl http://127.0.0.1:8000/eval/golden
 curl http://127.0.0.1:8000/publishers/routes

@@ -24,6 +24,7 @@ class OpenAICompatibleEmbeddingClient:
     api_key: str | None
     model: str
     timeout_seconds: float = 30.0
+    batch_size: int = 4
 
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
         if not texts:
@@ -32,24 +33,33 @@ class OpenAICompatibleEmbeddingClient:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            response = await client.post(
-                endpoint,
-                headers=headers,
-                json={"model": self.model, "input": texts},
-            )
-            response.raise_for_status()
-        payload = response.json()
-        data = payload.get("data")
-        if not isinstance(data, list):
-            raise ValueError("Embedding response is missing a data list.")
-        ordered = sorted(data, key=lambda item: int(item.get("index", 0)))
         embeddings: list[list[float]] = []
-        for item in ordered:
-            embedding = item.get("embedding") if isinstance(item, dict) else None
-            if not isinstance(embedding, list):
-                raise ValueError("Embedding response item is missing an embedding list.")
-            embeddings.append([float(value) for value in embedding])
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            for start in range(0, len(texts), max(self.batch_size, 1)):
+                batch = texts[start : start + max(self.batch_size, 1)]
+                response = await client.post(
+                    endpoint,
+                    headers=headers,
+                    json={"model": self.model, "input": batch},
+                )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    detail = response.text[:500].replace("\n", " ")
+                    raise httpx.HTTPStatusError(
+                        f"{exc}; response={detail}",
+                        request=exc.request,
+                        response=exc.response,
+                    ) from exc
+                payload = response.json()
+                data = payload.get("data")
+                if not isinstance(data, list):
+                    raise ValueError("Embedding response is missing a data list.")
+                for item in sorted(data, key=lambda item: int(item.get("index", 0))):
+                    embedding = item.get("embedding") if isinstance(item, dict) else None
+                    if not isinstance(embedding, list):
+                        raise ValueError("Embedding response item is missing an embedding list.")
+                    embeddings.append([float(value) for value in embedding])
         if len(embeddings) != len(texts):
             raise ValueError(
                 f"Embedding response count mismatch: expected {len(texts)}, got {len(embeddings)}."

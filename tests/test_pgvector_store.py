@@ -6,14 +6,13 @@ from littrace.retrieval.rag_search import rag_hits_to_evidence_spans
 def test_pgvector_setup_sql_binds_profile_and_session():
     profile = RagProfile(
         profile_id="rag:123",
-        user_id="u1",
         session_id="s1",
-        namespace="u1.s1",
+        namespace="s1",
         topic="MXene pressure sensor",
         query_variants=["MXene pressure sensor"],
         backend="pgvector",
         postgres_schema="littrace_rag",
-        collection_name="littrace_u1_s1",
+        collection_name="littrace_s1",
         embedding_provider="openai-compatible",
         embedding_model="text-embedding-3-small",
         embedding_dimension=1536,
@@ -31,7 +30,6 @@ def test_pgvector_setup_sql_binds_profile_and_session():
     assert any("CREATE EXTENSION IF NOT EXISTS vector" in stmt for stmt in statements)
     assert any("CREATE SCHEMA IF NOT EXISTS \"littrace_rag\"" in stmt for stmt in statements)
     assert any("vector(1536)" in stmt for stmt in statements)
-    assert any("CHECK (user_id = 'u1')" in stmt for stmt in statements)
     assert any("CHECK (session_id = 's1')" in stmt for stmt in statements)
     assert any("USING hnsw (embedding vector_cosine_ops)" in stmt for stmt in statements)
 
@@ -57,14 +55,13 @@ def test_rag_chunk_record_keeps_chunk_payload():
 def test_pgvector_query_chunks_returns_ranked_hits(monkeypatch):
     profile = RagProfile(
         profile_id="rag:123",
-        user_id="u1",
         session_id="s1",
-        namespace="u1.s1",
+        namespace="s1",
         topic="MXene pressure sensor",
         query_variants=["MXene pressure sensor"],
         backend="pgvector",
         postgres_schema="littrace_rag",
-        collection_name="littrace_u1_s1",
+        collection_name="littrace_s1",
         embedding_provider="openai-compatible",
         embedding_model="text-embedding-3-small",
         embedding_dimension=1536,
@@ -132,14 +129,13 @@ def test_pgvector_query_chunks_returns_ranked_hits(monkeypatch):
 def test_pgvector_delete_missing_chunks_scopes_to_profile(monkeypatch):
     profile = RagProfile(
         profile_id="rag:123",
-        user_id="u1",
         session_id="s1",
-        namespace="u1.s1",
+        namespace="s1",
         topic="MXene pressure sensor",
         query_variants=["MXene pressure sensor"],
         backend="pgvector",
         postgres_schema="littrace_rag",
-        collection_name="littrace_u1_s1",
+        collection_name="littrace_s1",
         embedding_provider="openai-compatible",
         embedding_model="text-embedding-3-small",
         embedding_dimension=1536,
@@ -197,10 +193,9 @@ def test_pgvector_delete_missing_chunks_scopes_to_profile(monkeypatch):
 def test_rag_hits_convert_to_evidence_spans():
     profile = RagProfile(
         profile_id="rag:123",
-        user_id="u1",
         session_id="s1",
-        namespace="u1.s1",
-        collection_name="littrace_u1_s1",
+        namespace="s1",
+        collection_name="littrace_s1",
         topic="MXene pressure sensor",
         query_variants=["MXene pressure sensor"],
         source_routes=["crossref", "openalex"],

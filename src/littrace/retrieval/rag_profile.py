@@ -16,7 +16,6 @@ from littrace.retrieval.source_router import route_sources
 class RagProfile(BaseModel):
     schema_version: str = "littrace.rag_profile.v1"
     profile_id: str
-    user_id: str
     session_id: str
     namespace: str
     topic: str | None = None
@@ -56,24 +55,21 @@ def build_session_rag_profile(
     session: object,
     workspace: LiteratureWorkspace,
 ) -> RagProfile:
-    user_id = str(getattr(session, "user_id", config.storage.default_user_id))
     session_id = str(getattr(session, "session_id"))
     topic = workspace.context.filters.research_background or workspace.context.filters.topic
     query_variants = _query_variants(workspace, topic)
     source_routes = _source_routes(workspace, topic)
-    namespace = f"{_safe_segment(user_id)}.{_safe_segment(session_id)}"
-    fingerprint = "\0".join([user_id, session_id])
+    namespace = _safe_segment(session_id)
+    fingerprint = session_id
     profile_id = f"rag:{sha256(fingerprint.encode()).hexdigest()[:16]}"
     collection_name = "_".join(
         [
             _safe_segment(config.rag.collection_prefix),
-            _safe_segment(user_id),
             _safe_segment(session_id),
         ]
     )
     return RagProfile(
         profile_id=profile_id,
-        user_id=user_id,
         session_id=session_id,
         namespace=namespace,
         topic=topic,

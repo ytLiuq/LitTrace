@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Callable, Protocol
 
 import httpx
 
 from littrace.config import LitTraceConfig
-from littrace.models import AccessType, PaperMetadata, PaperSearchRequest, PaperSearchResult
+from littrace.models import (
+    AccessType,
+    PaperMetadata,
+    PaperSearchRequest,
+    PaperSearchResult,
+    TopicRetrievalPolicy,
+)
 from littrace.retrieval.adapters import SourceHealth, classify_source_exception
 from littrace.retry import retry_async, RetryConfig, BackoffStrategy
 
@@ -18,6 +25,9 @@ class PaperSearchClient(Protocol):
     name: str
 
     async def search(self, request: PaperSearchRequest) -> PaperSearchResult:
+        return await asyncio.wait_for(self._search_impl(request), timeout=180.0)
+
+    async def _search_impl(self, request: PaperSearchRequest) -> PaperSearchResult:
         """Search one source and return normalized metadata."""
 
 
@@ -124,35 +134,66 @@ class MockMaterialsSearchClient:
 class LiveSearchClient:
     name = "live_search"
 
-    def __init__(self, config: LitTraceConfig):
+    def __init__(
+        self,
+        config: LitTraceConfig,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+    ):
         self.config = config
         self.diagnostics = SearchDiagnostics(live_attempted=True)
+        self.progress_callback = progress_callback
+
+    def _progress(self, **event: object) -> None:
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback(event)
+        except Exception as exc:
+            self.diagnostics.errors.append(
+                f"progress_callback:{exc.__class__.__name__}: {exc}"
+            )
 
     async def search(self, request: PaperSearchRequest) -> PaperSearchResult:
         timeout = httpx.Timeout(self.config.api.request_timeout_seconds)
         headers = {"User-Agent": self.config.api.user_agent}
         requests = _variant_requests(request)
         self.diagnostics.query_variants = [variant.topic for variant in requests]
+        self._progress(stage="search_started", status="running", variant_count=len(requests))
         openalex_results: list[PaperMetadata] = []
         crossref_results: list[PaperMetadata] = []
         async with httpx.AsyncClient(
             timeout=timeout, headers=headers, follow_redirects=True
         ) as client:
             for index, variant_request in enumerate(requests, start=1):
-                openalex, crossref = await _gather_named(
-                    {
-                        f"openalex_variant_{index}": self._search_openalex(client, variant_request),
-                        f"crossref_variant_{index}": self._search_crossref(client, variant_request),
-                    },
-                    self.diagnostics,
+                self._progress(
+                    stage="search_variant_started", status="running",
+                    variant=index, query=variant_request.topic,
                 )
-                self.diagnostics.source_counts[f"openalex_variant_{index}"] = len(openalex)
-                self.diagnostics.source_counts[f"crossref_variant_{index}"] = len(crossref)
-                openalex_results.extend(openalex)
-                crossref_results.extend(crossref)
+                sources = {
+                    f"openalex_variant_{index}": self._search_openalex(client, variant_request),
+                    f"crossref_variant_{index}": self._search_crossref(client, variant_request),
+                }
+                if self.config.api.enable_europe_pmc:
+                    sources[f"europe_pmc_variant_{index}"] = self._search_europe_pmc(client, variant_request)
+                if self.config.api.core_api_key:
+                    sources[f"core_variant_{index}"] = self._search_core(client, variant_request)
+                source_results = await asyncio.wait_for(
+                    _gather_named(sources, self.diagnostics), timeout=60.0
+                )
+                openalex_results.extend(source_results[0])
+                crossref_results.extend(source_results[1])
+                extra_results = [paper for source in source_results[2:] for paper in source]
+                openalex_results.extend(extra_results)
+                for source_name, source_papers in zip(sources, source_results):
+                    self.diagnostics.source_counts[source_name] = len(source_papers)
+                    self._progress(
+                        stage="search_source_finished", status="finished",
+                        variant=index, source=source_name, count=len(source_papers),
+                    )
+                all_results = [*openalex_results, *crossref_results]
                 relevant_so_far = rank_papers(
                     filter_search_results(
-                        merge_papers([*openalex_results, *crossref_results]),
+                        merge_papers(all_results),
                         request,
                     ),
                     request,
@@ -165,14 +206,20 @@ class LiveSearchClient:
                 self.diagnostics.ranking_counts[f"context_ready_after_variant_{index}"] = len(
                     context_ready_so_far
                 )
-                self.diagnostics.filtered_counts[f"after_variant_{index}"] = (
-                    len(openalex_results) + len(crossref_results) - len(relevant_so_far)
-                )
+                self.diagnostics.filtered_counts[f"after_variant_{index}"] = len(all_results) - len(relevant_so_far)
                 self.diagnostics.source_counts[f"relevant_after_variant_{index}"] = len(
                     relevant_so_far
                 )
                 if _has_enough_relevant_results(context_ready_so_far, request):
+                    self._progress(
+                        stage="search_variant_finished", status="finished",
+                        variant=index, count=len(context_ready_so_far), early_stop=True,
+                    )
                     break
+                self._progress(
+                    stage="search_variant_finished", status="finished",
+                    variant=index, count=len(context_ready_so_far), early_stop=False,
+                )
 
             self.diagnostics.source_counts["openalex"] = len(openalex_results)
             self.diagnostics.source_counts["crossref"] = len(crossref_results)
@@ -182,16 +229,106 @@ class LiveSearchClient:
             self.diagnostics.filtered_counts["merged"] = len(merged_raw) - len(merged)
             self.diagnostics.filtered_counts["basic_candidate_pool"] = len(merged)
             if self.config.api.unpaywall_email:
-                merged = await self._enrich_unpaywall(client, merged)
-                self.diagnostics.source_counts["unpaywall_enriched"] = len(
-                    [paper for paper in merged if paper.access_type == AccessType.OPEN_ACCESS]
-                )
+                try:
+                    merged = await asyncio.wait_for(
+                        self._enrich_unpaywall(client, merged), timeout=45.0
+                    )
+                except asyncio.TimeoutError:
+                    self.diagnostics.errors.append("unpaywall: timeout")
+                    self.diagnostics.source_counts["unpaywall_enriched"] = len(
+                        [paper for paper in merged if paper.access_type == AccessType.OPEN_ACCESS]
+                    )
+                    self._progress(
+                        stage="search_unpaywall_finished", status="finished",
+                        count=self.diagnostics.source_counts["unpaywall_enriched"],
+                    )
             merged = rank_papers(merged, request)
             self.diagnostics.ranking_counts["ranked_candidate_pool"] = len(merged)
             self.diagnostics.ranking_counts["context_ready"] = len(
                 [paper for paper in merged if _context_relevance_score(request, paper) >= 0.45]
             )
-            return PaperSearchResult(request=request, papers=merged[: request.limit])
+            result = PaperSearchResult(request=request, papers=merged[: request.limit])
+            self._progress(
+                stage="search_finished", status="finished", count=len(result.papers),
+                source_counts=self.diagnostics.source_counts,
+            )
+            return result
+
+    async def _search_europe_pmc(
+        self, client: httpx.AsyncClient, request: PaperSearchRequest
+    ) -> list[PaperMetadata]:
+        target = min(max(request.limit, 25), 200)
+        papers: list[PaperMetadata] = []
+        cursor: str | None = "*"
+        while cursor and len(papers) < target:
+            response = await _get_with_retries(
+                client,
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                params={
+                    "query": request.topic,
+                    "format": "json",
+                    "pageSize": min(100, target),
+                    "cursorMark": cursor,
+                    "resultType": "core",
+                },
+                source="europe_pmc",
+                diagnostics=self.diagnostics,
+            )
+            payload = response.json()
+            results = payload.get("resultList", {}).get("result", [])
+            if not results:
+                break
+            for item in results:
+                title = item.get("title")
+                if not title:
+                    continue
+                doi = _normalize_doi(item.get("doi"))
+                full_text = item.get("fullTextUrlList", {}).get("fullTextUrl", [])
+                pdf_url = next(
+                    (entry.get("url") for entry in full_text if entry.get("documentStyle") == "pdf"),
+                    None,
+                )
+                papers.append(PaperMetadata(
+                    paper_id=_paper_id(doi, title), title=title,
+                    authors=[item.get("authorString")] if item.get("authorString") else [],
+                    year=_safe_year(item.get("pubYear")), journal=item.get("journalTitle"),
+                    publisher="Europe PMC", doi=doi, abstract=item.get("abstractText"),
+                    source_urls=[item.get("id")] if item.get("id") else [], pdf_url=pdf_url,
+                    access_type=AccessType.OPEN_ACCESS if pdf_url else AccessType.UNAVAILABLE,
+                ))
+            self._progress(
+                stage="search_source_page", status="finished", source="europe_pmc",
+                page=max(1, (len(papers) + min(100, target) - 1) // min(100, target)),
+                count=len(results), total=len(papers),
+            )
+            cursor = payload.get("nextCursorMark")
+        return papers[:target]
+
+    async def _search_core(
+        self, client: httpx.AsyncClient, request: PaperSearchRequest
+    ) -> list[PaperMetadata]:
+        target = min(max(request.limit, 25), 200)
+        response = await client.get(
+            "https://api.core.ac.uk/v3/search/works",
+            params={"q": request.topic, "limit": target, "offset": 0},
+            headers={"Authorization": f"Bearer {self.config.api.core_api_key}"},
+        )
+        response.raise_for_status()
+        papers: list[PaperMetadata] = []
+        for item in response.json().get("results", []):
+            title = item.get("title")
+            if not title:
+                continue
+            doi = _normalize_doi(item.get("doi"))
+            pdf_url = item.get("downloadUrl")
+            papers.append(PaperMetadata(
+                paper_id=_paper_id(doi, title), title=title,
+                authors=[author.get("name") for author in item.get("authors", []) if author.get("name")],
+                year=_safe_year(item.get("yearPublished")), publisher="CORE", doi=doi,
+                abstract=item.get("abstract"), source_urls=[item.get("sourceFulltextUrls", [None])[0]] if item.get("sourceFulltextUrls") else [],
+                pdf_url=pdf_url, access_type=AccessType.OPEN_ACCESS if pdf_url else AccessType.UNAVAILABLE,
+            ))
+        return papers
 
     async def fetch(self, request: PaperSearchRequest) -> PaperSearchResult:
         return await self.search(request)
@@ -201,9 +338,11 @@ class LiveSearchClient:
         client: httpx.AsyncClient,
         request: PaperSearchRequest,
     ) -> list[PaperMetadata]:
+        per_page = 50
+        target = min(max(request.limit, 50), 200)
         params: dict[str, str | int] = {
             "search": request.topic,
-            "per-page": min(max(request.limit, 10), 50),
+            "per-page": per_page,
             "sort": "publication_date:desc" if request.wants_recent else "relevance_score:desc",
         }
         filters = []
@@ -214,17 +353,28 @@ class LiveSearchClient:
         if self.config.api.openalex_api_key:
             params["api_key"] = self.config.api.openalex_api_key
 
-        response = await _get_with_retries(
-            client,
-            "https://api.openalex.org/works",
-            params=params,
-            source="openalex",
-            diagnostics=self.diagnostics,
-        )
-        response.raise_for_status()
-        data = response.json()
         papers = []
-        for item in data.get("results", []):
+        for page in range(1, (target + per_page - 1) // per_page + 1):
+            page_params = {**params, "page": page}
+            response = await _get_with_retries(
+                client, "https://api.openalex.org/works", params=page_params,
+                source="openalex", diagnostics=self.diagnostics,
+            )
+            items = response.json().get("results", [])
+            if not items:
+                break
+            papers.extend(self._openalex_papers(items))
+            self._progress(
+                stage="search_source_page", status="finished", source="openalex",
+                page=page, count=len(items), total=len(papers),
+            )
+            if len(items) < per_page:
+                break
+        return papers[:target]
+
+    def _openalex_papers(self, items: list[dict]) -> list[PaperMetadata]:
+        papers: list[PaperMetadata] = []
+        for item in items:
             title = item.get("title")
             if not title:
                 continue
@@ -269,7 +419,9 @@ class LiveSearchClient:
         items: list[dict] = []
         for index, params in enumerate(attempts, start=1):
             try:
-                items = await _crossref_items(client, params)
+                items = await _crossref_items_paginated(
+                    client, params, request.limit, progress_callback=self._progress
+                )
             except httpx.HTTPError as exc:
                 self.diagnostics.errors.append(
                     f"crossref_attempt_{index}: {exc.__class__.__name__}: {exc}"
@@ -311,42 +463,51 @@ class LiveSearchClient:
         client: httpx.AsyncClient,
         papers: list[PaperMetadata],
     ) -> list[PaperMetadata]:
-        for paper in papers:
-            if not paper.doi:
-                continue
-            response = await client.get(
-                f"https://api.unpaywall.org/v2/{paper.doi}",
-                params={"email": self.config.api.unpaywall_email},
-            )
-            if response.status_code == 404:
-                continue
-            response.raise_for_status()
-            data = response.json()
-            best = data.get("best_oa_location") or {}
-            pdf_url = best.get("url_for_pdf")
-            landing_url = best.get("url")
-            if data.get("is_oa") and (pdf_url or landing_url):
-                paper.pdf_url = pdf_url or landing_url
-                paper.access_type = AccessType.OPEN_ACCESS
-                if landing_url and landing_url not in [str(url) for url in paper.source_urls]:
-                    paper.source_urls.append(landing_url)
-            elif paper.access_type == AccessType.UNAVAILABLE and _publisher_requires_login(paper):
-                paper.access_type = AccessType.REQUIRES_LOGIN
+        semaphore = asyncio.Semaphore(10)
+
+        async def enrich_one(paper: PaperMetadata) -> None:
+            async with semaphore:
+                await self._enrich_unpaywall_paper(client, paper)
+
+        await asyncio.gather(*(enrich_one(paper) for paper in papers if paper.doi))
         return papers
+
+    async def _enrich_unpaywall_paper(
+        self, client: httpx.AsyncClient, paper: PaperMetadata
+    ) -> None:
+        if not paper.doi:
+            return
+        response = await client.get(
+            f"https://api.unpaywall.org/v2/{paper.doi}",
+            params={"email": self.config.api.unpaywall_email},
+        )
+        if response.status_code == 404:
+            return
+        response.raise_for_status()
+        data = response.json()
+        best = data.get("best_oa_location") or {}
+        pdf_url = best.get("url_for_pdf")
+        landing_url = best.get("url")
+        if data.get("is_oa") and (pdf_url or landing_url):
+            paper.pdf_url = pdf_url or landing_url
+            paper.access_type = AccessType.OPEN_ACCESS
+            if landing_url and landing_url not in [str(url) for url in paper.source_urls]:
+                paper.source_urls.append(landing_url)
+        elif paper.access_type == AccessType.UNAVAILABLE and _publisher_requires_login(paper):
+            paper.access_type = AccessType.REQUIRES_LOGIN
 
 
 async def _gather_named(
     coroutines: dict[str, object],
     diagnostics: SearchDiagnostics,
 ) -> list[list[PaperMetadata]]:
-    results: list[list[PaperMetadata]] = []
-    for name, coroutine in coroutines.items():
+    async def run_one(name: str, coroutine: object) -> list[PaperMetadata]:
         try:
-            response = await coroutine
-            results.append(response)
+            response = await asyncio.wait_for(coroutine, timeout=30.0)
             diagnostics.source_health[name] = SourceHealth(
                 source_name=name, healthy=True, request_count=1
             )
+            return response
         except Exception as exc:
             diagnostics.errors.append(f"{name}: {exc.__class__.__name__}: {exc}")
             diagnostics.source_health[name] = SourceHealth(
@@ -356,8 +517,11 @@ async def _gather_named(
                 failure_count=1,
                 last_failure_class=classify_source_exception(exc),
             )
-            results.append([])
-    return results
+            return []
+
+    return list(await asyncio.gather(*(
+        run_one(name, coroutine) for name, coroutine in coroutines.items()
+    )))
 
 
 def _crossref_attempt_params(request: PaperSearchRequest) -> list[dict[str, str | int]]:
@@ -373,41 +537,45 @@ def _crossref_attempt_params(request: PaperSearchRequest) -> list[dict[str, str 
 
 def build_query_variants(topic: str) -> list[str]:
     normalized = re.sub(r"\s+", " ", topic).strip()
-    variants = [normalized] if normalized else []
-    lowered = normalized.lower()
-    expanded: list[str] = []
+    # Session research backgrounds supply LLM-derived variants. A bare topic must
+    # never acquire material or mechanism assumptions from a global heuristic.
+    return [normalized] if normalized else []
 
-    if any(token in normalized for token in ["碳基", "碳", "炭"]) or "carbon" in lowered:
-        expanded.extend(["carbon-based", "carbon black", "graphene", "carbon nanotube", "CNT"])
-    if "pdms" in lowered or "聚二甲基硅氧烷" in normalized:
-        expanded.extend(["PDMS", "polydimethylsiloxane"])
-    if any(token in normalized for token in ["柔性", "薄膜", "压敏", "压力", "传感"]):
-        expanded.extend(["flexible thin-film pressure sensor", "flexible pressure sensor"])
-    if any(token in normalized for token in ["长时间", "长期", "受压", "漂移", "稳定"]):
-        expanded.extend(
-            [
-                "long-term pressure drift",
-                "compression drift",
-                "signal drift",
-                "hysteresis",
-                "stability",
-            ]
-        )
-    if any(token in normalized for token in ["材料", "化学"]) or expanded:
-        expanded.extend(["materials chemistry", "wearable sensor"])
 
-    if expanded:
-        variants.append(" ".join(dict.fromkeys(expanded)))
-        variants.append("carbon PDMS flexible pressure sensor long-term stability drift hysteresis")
-        variants.append("carbon black PDMS pressure sensor stability drift compression")
-        variants.append("graphene PDMS flexible pressure sensor long-term stability")
-        variants.append("CNT PDMS flexible pressure sensor drift hysteresis")
-        variants.append("PDMS flexible pressure sensor long-term stability")
-        variants.append("flexible piezoresistive pressure sensor drift stability")
-        variants.append("conductive polymer composite flexible pressure sensor hysteresis")
-        variants.append("carbon composite flexible pressure sensor durability")
+def filter_papers_by_retrieval_policy(
+    papers: list[PaperMetadata],
+    policy: TopicRetrievalPolicy | None,
+) -> tuple[list[PaperMetadata], dict[str, str]]:
+    """Apply session-specific hard constraints before any automated download."""
+    if policy is None:
+        return papers, {}
+    accepted: list[PaperMetadata] = []
+    rejected: dict[str, str] = {}
+    required_groups = [
+        [term.strip().lower() for term in group if term.strip()]
+        for group in policy.required_concept_groups
+    ]
+    excluded = [term.strip().lower() for term in policy.excluded_concepts if term.strip()]
+    for paper in papers:
+        text = _paper_search_text(paper)
+        missing = [
+            group for group in required_groups if group and not any(_contains_concept(text, term) for term in group)
+        ]
+        matched_excluded = [term for term in excluded if _contains_concept(text, term)]
+        if missing:
+            rejected[paper.paper_id] = "missing_required:" + "|".join(missing[0])
+        elif matched_excluded:
+            rejected[paper.paper_id] = "excluded_concept:" + matched_excluded[0]
+        else:
+            accepted.append(paper)
+    return accepted, rejected
 
-    return list(dict.fromkeys(variant for variant in variants if variant))[:10]
+
+def _contains_concept(text: str, term: str) -> bool:
+    normalized_text = re.sub(r"[-_/]+", " ", text.lower())
+    normalized_text = re.sub(r"\s+", " ", normalized_text)
+    normalized_term = re.sub(r"[-_/]+", " ", term.lower()).strip()
+    return normalized_term in normalized_text
 
 
 def _variant_requests(request: PaperSearchRequest) -> list[PaperSearchRequest]:
@@ -468,10 +636,40 @@ def _compact_crossref_topic(topic: str) -> str:
     return " ".join(tokens[:7]) or topic
 
 
+def _safe_year(value: object) -> int | None:
+    try:
+        year = int(str(value)[:4])
+    except (TypeError, ValueError):
+        return None
+    return year if 1000 <= year <= 3000 else None
+
+
 async def _crossref_items(client: httpx.AsyncClient, params: dict[str, str | int]) -> list[dict]:
     response = await client.get("https://api.crossref.org/works", params=params)
     response.raise_for_status()
     return response.json().get("message", {}).get("items", [])
+
+
+async def _crossref_items_paginated(
+    client: httpx.AsyncClient,
+    params: dict[str, str | int],
+    limit: int,
+    progress_callback: Callable[..., None] | None = None,
+) -> list[dict]:
+    target = min(max(limit, 25), 200)
+    rows = min(int(params.get("rows", 25)), 50)
+    items: list[dict] = []
+    for offset in range(0, target, rows):
+        page = await _crossref_items(client, {**params, "rows": rows, "offset": offset})
+        items.extend(page)
+        if progress_callback is not None:
+            progress_callback(
+                stage="search_source_page", status="finished", source="crossref",
+                page=offset // rows + 1, count=len(page), total=len(items),
+            )
+        if len(page) < rows:
+            break
+    return items[:target]
 
 
 async def _get_with_retries(
@@ -496,7 +694,6 @@ async def _get_with_retries(
     )
 
     def _on_retry(attempt: int, exc: Exception, delay: float) -> None:
-        # Preserve backward-compatible diagnostics format: "openalex_retry_1: HTTP 503"
         status = ""
         if isinstance(exc, httpx.HTTPStatusError):
             status = f" HTTP {exc.response.status_code}"
@@ -563,25 +760,19 @@ def rank_papers(papers: list[PaperMetadata], request: PaperSearchRequest) -> lis
         lexical_score = _lexical_relevance_score(request.topic, paper)
         title_score = _title_relevance_score(request.topic, paper)
         phrase_score = _key_phrase_score(request.topic, paper)
-        topical_score = _topical_specificity_score(request.topic, paper)
-        concept_score = _concept_group_score(request.topic, paper)
         venue_score = _materials_venue_score(paper)
-        mandatory = 1.0 if _matches_mandatory_concepts(request.topic, paper) else 0.35
         relevance = paper.relevance_score or lexical_score
         access = 1.0 if paper.access_type == AccessType.OPEN_ACCESS else 0.4
         paper.relevance_score = min(
             1.0,
-            0.10 * relevance
-            + 0.19 * lexical_score
-            + 0.24 * title_score
-            + 0.18 * concept_score
-            + 0.10 * phrase_score
-            + 0.07 * topical_score
-            + 0.07 * paper.recency_score
-            + 0.05 * venue_score
-            + 0.025 * citation_score
-            + 0.01 * access
-            + 0.005 * mandatory,
+            0.08 * relevance
+            + 0.25 * lexical_score
+            + 0.33 * title_score
+            + 0.14 * phrase_score
+            + 0.10 * paper.recency_score
+            + 0.06 * venue_score
+            + 0.02 * citation_score
+            + 0.02 * access,
         )
     return sorted(
         papers,
@@ -616,8 +807,7 @@ def filter_search_results(
                 continue
         lexical = _lexical_relevance_score(request.topic, paper)
         venue = _materials_venue_score(paper)
-        concept_score = _concept_group_score(request.topic, paper)
-        if lexical < 0.08 and concept_score < 0.25 and venue < 0.4:
+        if lexical < 0.08 and venue < 0.4:
             continue
         filtered.append(paper)
     return filtered
@@ -638,18 +828,14 @@ def select_context_papers(
 def _context_relevance_score(request: PaperSearchRequest, paper: PaperMetadata) -> float:
     lexical = _lexical_relevance_score(request.topic, paper)
     title = _title_relevance_score(request.topic, paper)
-    concept = _concept_group_score(request.topic, paper)
     phrase = _key_phrase_score(request.topic, paper)
-    mandatory = 1.0 if _matches_mandatory_concepts(request.topic, paper) else 0.0
     ranked = paper.relevance_score or 0.0
     return min(
         1.0,
-        0.24 * ranked
-        + 0.24 * lexical
-        + 0.22 * title
-        + 0.18 * concept
-        + 0.08 * phrase
-        + 0.04 * mandatory,
+        0.42 * ranked
+        + 0.27 * lexical
+        + 0.23 * title
+        + 0.08 * phrase,
     )
 
 
@@ -934,33 +1120,6 @@ def _key_phrase_score(topic: str, paper: PaperMetadata) -> float:
     return matched / len(phrases)
 
 
-def _topical_specificity_score(topic: str, paper: PaperMetadata) -> float:
-    topic_lowered = topic.lower()
-    text = _paper_search_text(paper)
-    score = 0.0
-    if "hydrogel" in topic_lowered and "hydrogel" in text:
-        score += 0.25
-    if "conductive" in topic_lowered and any(
-        marker in text for marker in ["conductive", "conductivity"]
-    ):
-        score += 0.2
-    if "strain" in topic_lowered and "strain" in text:
-        score += 0.2
-    if (
-        "temperature" in text
-        and "strain" in text
-        and ("hydrogel" in topic_lowered or "strain" in topic_lowered)
-    ):
-        score += 0.16
-    if "wearable" in topic_lowered and any(
-        marker in text for marker in ["wearable", "human motion", "motion monitoring", "flexible"]
-    ):
-        score += 0.12
-    if any(marker in text for marker in ["meeting abstracts", "conference", "figshare"]):
-        score -= 0.18
-    return max(0.0, min(1.0, score))
-
-
 def _paper_search_text(paper: PaperMetadata) -> str:
     return " ".join(
         value
@@ -972,56 +1131,6 @@ def _paper_search_text(paper: PaperMetadata) -> str:
         ]
         if value
     ).lower()
-
-
-def _concept_group_score(topic: str, paper: PaperMetadata) -> float:
-    groups = _required_concept_groups(topic)
-    if not groups:
-        return 1.0
-    text = _paper_search_text(paper)
-    matched = sum(any(marker in text for marker in markers) for markers in groups)
-    return matched / len(groups)
-
-
-def _matches_mandatory_concepts(topic: str, paper: PaperMetadata) -> bool:
-    lowered = topic.lower()
-    text = _paper_search_text(paper)
-    if ("pdms" in lowered or "聚二甲基硅氧烷" in topic) and not any(
-        marker in text for marker in ["pdms", "polydimethylsiloxane"]
-    ):
-        return False
-    if "mxene" in lowered and "mxene" not in text:
-        return False
-    if "hydrogel" in lowered and "hydrogel" not in text:
-        return False
-    return True
-
-
-def _required_concept_score(topic: str) -> float:
-    groups = _required_concept_groups(topic)
-    if not groups:
-        return 0.0
-    if len(groups) <= 2:
-        return 1.0
-    return 0.75
-
-
-def _required_concept_groups(topic: str) -> list[set[str]]:
-    lowered = topic.lower()
-    groups: list[set[str]] = []
-    if "pdms" in lowered or "聚二甲基硅氧烷" in topic:
-        groups.append({"pdms", "polydimethylsiloxane"})
-    if any(token in topic for token in ["碳基", "碳", "炭"]) or "carbon" in lowered:
-        groups.append({"carbon", "graphene", "nanotube", "cnt", "carbon black"})
-    if any(token in topic for token in ["压力", "压敏", "受压"]) or "pressure" in lowered:
-        groups.append({"pressure", "piezoresistive", "tactile"})
-    if any(token in topic for token in ["传感", "传感器"]) or "sensor" in lowered:
-        groups.append({"sensor", "sensing"})
-    if "mxene" in lowered:
-        groups.append({"mxene"})
-    if "hydrogel" in lowered:
-        groups.append({"hydrogel"})
-    return groups
 
 
 def _materials_venue_score(paper: PaperMetadata) -> float:
