@@ -38,6 +38,7 @@ storage = [
 dev = [
   "pytest>=8.2",
   "ruff>=0.6",
+  "fpdf2>=2.7",
 ]
 
 [tool.setuptools.packages.find]
@@ -55,5 +56,11 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 markers = [
+  "unit: pure-logic unit tests, no I/O",
+  "domain: domain integration tests (real components, light fixtures)",
+  "api: HTTP/CLI/TUI surface tests",
+  "adapters: external adapter integration (docling, paddleocr, browser, downloads)",
   "live: opt-in tests that access real publishers and local browser/CDP services",
+  "eval: evaluation harness tests",
 ]
+testpaths = ["tests"]

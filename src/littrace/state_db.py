@@ -35,6 +35,7 @@ class SessionSummaryRecord(BaseModel):
     revision: int = 0
     structured_document_count: int = 0
     workspace_snapshot_count: int = 0
+    workspace_json: dict[str, object] = Field(default_factory=dict)
 
 
 class SessionMessageRecord(BaseModel):
@@ -303,6 +304,7 @@ class PostgresStateStore:
                 revision=record.revision,
                 structured_document_count=record.structured_document_count,
                 workspace_snapshot_count=record.workspace_snapshot_count,
+                workspace_json=dict(record.workspace_json or {}),
             )
             for row in rows
             if (record := _record_from_payload(row[0], SessionStateRecord)) is not None

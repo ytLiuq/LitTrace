@@ -264,7 +264,15 @@ def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSess
                 for message in state_store.list_messages(record.session_id):
                     if message.role != "user":
                         continue
-                    content = message.content_text or message.content_json.get("message")
+                    # Prefer the inner ChatRequest.message field when present;
+                    # content_text may be the JSON dump of a dict payload, which
+                    # would otherwise become the entire topic string.
+                    inner = message.content_json.get("message")
+                    content = (
+                        inner
+                        if isinstance(inner, str) and inner.strip()
+                        else message.content_text
+                    )
                     if isinstance(content, str) and content.strip():
                         topic = _summarize_topic(content)
                         break
@@ -275,7 +283,12 @@ def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSess
                     updated_at=record.updated_at,
                     topic=topic,
                     message_count=len(state_store.list_messages(record.session_id)),
-                    paper_count=len(workspace.get("papers", {})) if isinstance(workspace, dict) else 0,
+                    # paper_count reflects the active literature context — papers
+                    # sitting in the workspace's `papers` map but not promoted to
+                    # the active set are not "in the session" yet.
+                    paper_count=len(workspace.get("context", {}).get("active_papers", []))
+                    if isinstance(workspace, dict)
+                    else 0,
                 )
             )
         summaries.sort(key=lambda item: item.updated_at, reverse=True)
