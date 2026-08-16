@@ -295,6 +295,106 @@ def _route_quick_action(
     return None
 
 
+async def _compose_storyline_narrative(
+    config: LitTraceConfig,
+    workspace: LiteratureWorkspace,
+    storyline,
+    replies: list[str],
+    warnings: list[str],
+) -> tuple[list[str], list[str], None]:
+    """Generate a storyline narrative with citation guard + hallucination
+    harness. Returns the (possibly appended) ``replies`` and
+    ``warnings`` lists.
+    """
+    narrative = await write_storyline_narrative(config, workspace)
+    if not narrative.used_llm:
+        replies.append("已基于当前证据生成发展脉络草案；低证据部分会保持保守。")
+        if narrative.error:
+            warnings.append(narrative.error)
+        return replies, warnings, None
+    claim_hints = config.citation_guard.claim_hints or None
+    guard = guard_citations(narrative.text, workspace, claim_hints=claim_hints)
+    cleaned_narrative = remove_unsupported_sentences(narrative.text, guard)
+    workspace.guard_reports.append(guard.model_dump())
+    replies.append(cleaned_narrative)
+    warnings.extend(guard.warnings)
+    warnings.extend(guard.unsupported_sentences[:3])
+    halu_report = check_hallucination_grounding(
+        [
+            HallucinationCheckItem(
+                text=cleaned_narrative,
+                checked_sentence_count=guard.checked_sentence_count,
+                unsupported_sentence_count=len(guard.unsupported_sentences),
+                unsupported_sentences=guard.unsupported_sentences,
+                source="chat:storyline",
+            )
+        ]
+    )
+    warnings.extend(halu_report.errors[:2])
+    warnings.extend(halu_report.warnings[:2])
+    return replies, warnings, None
+
+
+async def _execute_parse_action(
+    workspace: LiteratureWorkspace,
+    intent: ChatIntent,
+    request: ChatRequest,
+    config: LitTraceConfig,
+    action: str,
+) -> tuple[LiteratureWorkspace, str | None, str | None, str]:
+    """Run the ``parse`` action: parse downloaded PDFs in the workspace.
+
+    Returns ``(workspace, reply, warning, action)``. ``reply`` and
+    ``warning`` are None when nothing happened. ``action`` is updated
+    to ``"parse_full_text"`` when parse runs as a standalone action.
+    """
+    parse_config = config
+    if intent.parse_strategy:
+        parse_config = config.model_copy(deep=True)
+        parse_config.parsing.parse_strategy = intent.parse_strategy
+    try:
+        workspace, report = await parse_workspace_skill(
+            workspace,
+            parse_config,
+            context=_tool_context("chat.composite", intent, request),
+        )
+        reply = (
+            f"已尝试解析全文：成功解析 {report['parsed_count']} 篇，"
+            f"失败 {report['failed_count']} 篇。"
+        )
+        warning = str(report)
+        new_action = "parse_full_text" if action == "composite" else action
+        return workspace, reply, warning, new_action
+    except RuntimeError as exc:
+        return workspace, None, str(exc), action
+
+
+async def _execute_table_action(
+    workspace: LiteratureWorkspace,
+    intent: ChatIntent,
+    request: ChatRequest,
+    config: LitTraceConfig,
+    action: str,
+) -> tuple[LiteratureWorkspace, str | None, str, list[str]]:
+    """Run the ``table`` action: extract performance metrics into a matrix."""
+    try:
+        workspace, harness = await extract_tables_skill(
+            workspace,
+            config,
+            context=_tool_context("chat.composite", intent, request),
+        )
+        matrix = build_comparison_matrix_skill(workspace)
+        reply = (
+            f"已生成性能对比表：抽取 {len(workspace.performance_cells)} 个指标单元，"
+            f"形成 {len(matrix.matrices)} 个指标矩阵。"
+        )
+        warnings = [*harness.errors, *harness.warnings, *matrix.warnings]
+        new_action = "build_table" if action == "composite" else action
+        return workspace, reply, new_action, warnings
+    except RuntimeError as exc:
+        return workspace, None, action, [str(exc)]
+
+
 async def _execute_search_action(
     intent: ChatIntent,
     request: ChatRequest,
@@ -510,40 +610,22 @@ async def _run_composite_intent(
         action = "search"
 
     if "parse" in intent.actions:
-        parse_config = config
-        if intent.parse_strategy:
-            parse_config = config.model_copy(deep=True)
-            parse_config.parsing.parse_strategy = intent.parse_strategy
-        try:
-            workspace, report = await parse_workspace_skill(
-                workspace,
-                parse_config,
-                context=_tool_context("chat.composite", intent, request),
-            )
-            replies.append(
-                f"已尝试解析全文：成功解析 {report['parsed_count']} 篇，失败 {report['failed_count']} 篇。"
-            )
-            warnings.append(str(report))
-            action = "parse_full_text" if action == "composite" else action
-        except RuntimeError as exc:
-            warnings.append(str(exc))
+        workspace, parse_reply, parse_warning, action = await _execute_parse_action(
+            workspace, intent, request, config, action
+        )
+        if parse_reply:
+            replies.append(parse_reply)
+        if parse_warning:
+            warnings.append(parse_warning)
 
     evidence_quality = _workspace_evidence_quality(workspace)
     if "table" in intent.actions and has_minimum_evidence:
-        try:
-            workspace, harness = await extract_tables_skill(
-                workspace,
-                config,
-                context=_tool_context("chat.composite", intent, request),
-            )
-            matrix = build_comparison_matrix_skill(workspace)
-            replies.append(
-                f"已生成性能对比表：抽取 {len(workspace.performance_cells)} 个指标单元，形成 {len(matrix.matrices)} 个指标矩阵。"
-            )
-            warnings.extend([*harness.errors, *harness.warnings, *matrix.warnings])
-            action = "build_table" if action == "composite" else action
-        except RuntimeError as exc:
-            warnings.append(str(exc))
+        workspace, table_reply, action, table_warnings = _execute_table_action(
+            workspace, intent, request, config, action
+        )
+        if table_reply:
+            replies.append(table_reply)
+        warnings.extend(table_warnings)
     elif "table" in intent.actions and not has_minimum_evidence:
         warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过性能对比表。")
 
@@ -559,34 +641,9 @@ async def _run_composite_intent(
         if not storyline:
             replies.append("当前证据不足以生成真实的发展脉络。建议先检索并解析全文。")
         else:
-            narrative = await write_storyline_narrative(config, workspace)
-            if narrative.used_llm:
-                claim_hints = config.citation_guard.claim_hints or None
-                guard = guard_citations(narrative.text, workspace, claim_hints=claim_hints)
-                cleaned_narrative = remove_unsupported_sentences(narrative.text, guard)
-                workspace.guard_reports.append(guard.model_dump())
-                replies.append(cleaned_narrative)
-                warnings.extend(guard.warnings)
-                warnings.extend(guard.unsupported_sentences[:3])
-
-                # Dimension 2: Hallucination harness for storyline
-                halu_report = check_hallucination_grounding(
-                    [
-                        HallucinationCheckItem(
-                            text=cleaned_narrative,
-                            checked_sentence_count=guard.checked_sentence_count,
-                            unsupported_sentence_count=len(guard.unsupported_sentences),
-                            unsupported_sentences=guard.unsupported_sentences,
-                            source="chat:storyline",
-                        )
-                    ]
-                )
-                warnings.extend(halu_report.errors[:2])
-                warnings.extend(halu_report.warnings[:2])
-            else:
-                replies.append("已基于当前证据生成发展脉络草案；低证据部分会保持保守。")
-                if narrative.error:
-                    warnings.append(narrative.error)
+            replies, warnings, _ = await _compose_storyline_narrative(
+                config, workspace, storyline, replies, warnings
+            )
         result = await run_research_graph(
             PaperSearchRequest(topic=intent.topic or request.message, live=False),
             config,
