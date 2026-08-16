@@ -28,6 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import secrets
+import sys
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -51,6 +54,37 @@ app = Server("littrace")
 # Module-level state (MCP servers are single-session by design)
 _config: LitTraceConfig = load_config()
 _workspace = None  # LiteratureWorkspace, lazily imported
+
+
+def _get_or_create_mcp_token() -> str:
+    """Return the auth token for this MCP server.
+
+    If ``LITTRACE_MCP_TOKEN`` is set, use it (so the operator can pin a
+    stable token in the host MCP config). Otherwise generate a fresh
+    token at startup and print it once to stderr — the operator has to
+    paste it into the MCP client config. This avoids a no-auth default
+    while still allowing zero-config first-run.
+    """
+    explicit = os.environ.get("LITTRACE_MCP_TOKEN", "").strip()
+    if explicit:
+        return explicit
+    generated = "mcp-" + secrets.token_urlsafe(24)
+    print(
+        f"[mcp] LITTRACE_MCP_TOKEN not set. Generated one-shot token:\n"
+        f"      {generated}\n"
+        f"      Paste it into the MCP client config or set LITTRACE_MCP_TOKEN={generated}",
+        file=sys.stderr,
+    )
+    return generated
+
+
+MCP_TOKEN = _get_or_create_mcp_token()
+"""The token every call_tool() invocation must include.
+
+Clients send it as the ``token`` argument; a missing or mismatched
+value is rejected with an explicit error so a misconfigured client
+fails loud rather than silently polluting the workspace.
+"""
 
 
 def _get_workspace():
@@ -203,6 +237,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Execute a LitTrace tool and return the result as text."""
     global _workspace
     workspace = _get_workspace()
+
+    token = (arguments or {}).get("token", "")
+    if not token or token != MCP_TOKEN:
+        logger.warning("mcp_auth_failed", extra={"tool": name, "got_token": bool(token)})
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "Authentication failed. Pass the configured LITTRACE_MCP_TOKEN "
+                    "as the 'token' argument to every call_tool invocation. "
+                    "If you have not configured a token, set LITTRACE_MCP_TOKEN "
+                    "in the server process environment or paste the one printed "
+                    "to stderr at startup."
+                ),
+            )
+        ]
 
     try:
         if name == "search_papers":
