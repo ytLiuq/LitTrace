@@ -369,6 +369,85 @@ async def _execute_parse_action(
         return workspace, None, str(exc), action
 
 
+async def _execute_document_action(
+    workspace: LiteratureWorkspace,
+    intent: ChatIntent,
+    request: ChatRequest,
+    config: LitTraceConfig,
+    replies: list[str],
+    warnings: list[str],
+    action: str,
+    evidence_quality: dict[str, int],
+) -> tuple[list[str], list[str], str]:
+    """Run the ``document`` action: build a research report from the
+    workspace's parsed evidence. Returns updated ``(replies, warnings,
+    action)``. ``action`` is updated to ``"compose_document"`` when
+    document runs as a standalone action.
+    """
+    if evidence_quality["parsed_count"] == 0:
+        warnings.append("当前缺少全文解析证据，已禁止基于题录/摘要生成报告。")
+        return replies, warnings, action
+    try:
+        report = await build_research_report_skill(
+            workspace,
+            config,
+            context=_tool_context("chat.composite", intent, request),
+        )
+        workspace.context.filters.document_report = report.model_dump(mode="json")
+        if report.release_ready:
+            replies.append(
+                f"已生成可发布的研究报告：{len(report.sections)} 个章节，"
+                f"{report.evidence_count} 条证据锚点，{len(report.citation_records)} 条引用。"
+            )
+        else:
+            replies.append("已生成研究报告草稿，但发布门禁未通过；仅可作为待补证草稿。")
+        if report.warnings:
+            warnings.extend(report.warnings[:5])
+        new_action = "compose_document" if action == "composite" else action
+        return replies, warnings, new_action
+    except RuntimeError as exc:
+        warnings.append(str(exc))
+        return replies, warnings, action
+
+
+async def _execute_autonomous_review_action(
+    workspace: LiteratureWorkspace,
+    intent: ChatIntent,
+    request: ChatRequest,
+    config: LitTraceConfig,
+    replies: list[str],
+    warnings: list[str],
+    action: str,
+) -> tuple[list[str], list[str], str]:
+    """Run the ``autonomous_review`` action: quality gates + reviewer
+    loop. Returns updated ``(replies, warnings, action)``.
+    """
+    rag_evidence, rag_warnings = await _rag_evidence_for_workspace(
+        config, request, workspace
+    )
+    loop_report = await run_review_loop(
+        config,
+        intent.topic or request.message,
+        workspace,
+        auto_replan=intent.auto_replan,
+        rag_evidence=rag_evidence,
+    )
+    workspace.context.filters.autonomous_loop_report = loop_report.model_dump(mode="json")
+    warnings.extend(rag_warnings)
+    replies.append(
+        f"已完成质量门与可选 Reviewer 审查：{len(loop_report.rounds)} 轮，"
+        f"score={loop_report.score:.3f}，passed={loop_report.passed}。"
+    )
+    if loop_report.release_ready:
+        replies.append(loop_report.final_answer)
+    else:
+        replies.append("自主审查结果未通过最终发布门禁，未输出修订后的研究结论。")
+        warnings.extend(loop_report.release_blockers[:3])
+    warnings.extend(loop_report.warnings[:5])
+    new_action = "autonomous_review" if action == "composite" else action
+    return replies, warnings, new_action
+
+
 async def _execute_table_action(
     workspace: LiteratureWorkspace,
     intent: ChatIntent,
@@ -659,56 +738,16 @@ async def _run_composite_intent(
         warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过发展脉络分析。")
 
     if "document" in intent.actions and has_minimum_evidence:
-        if evidence_quality["parsed_count"] == 0:
-            warnings.append("当前缺少全文解析证据，已禁止基于题录/摘要生成报告。")
-        try:
-            report = await build_research_report_skill(
-                workspace,
-                config,
-                context=_tool_context("chat.composite", intent, request),
-            )
-            workspace.context.filters.document_report = report.model_dump(mode="json")
-            if report.release_ready:
-                replies.append(
-                    f"已生成可发布的研究报告：{len(report.sections)} 个章节，"
-                    f"{report.evidence_count} 条证据锚点，{len(report.citation_records)} 条引用。"
-                )
-            else:
-                replies.append("已生成研究报告草稿，但发布门禁未通过；仅可作为待补证草稿。")
-            if report.warnings:
-                warnings.extend(report.warnings[:5])
-            action = "compose_document" if action == "composite" else action
-        except RuntimeError as exc:
-            warnings.append(str(exc))
+        replies, warnings, action = await _execute_document_action(
+            workspace, intent, request, config, replies, warnings, action, evidence_quality
+        )
     elif "document" in intent.actions and not has_minimum_evidence:
         warnings.append(f"相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已跳过报告生成。")
 
     if "autonomous_review" in intent.actions:
-        rag_evidence, rag_warnings = await _rag_evidence_for_workspace(
-            config,
-            request,
-            workspace,
+        replies, warnings, action = await _execute_autonomous_review_action(
+            workspace, intent, request, config, replies, warnings, action
         )
-        loop_report = await run_review_loop(
-            config,
-            intent.topic or request.message,
-            workspace,
-            auto_replan=intent.auto_replan,
-            rag_evidence=rag_evidence,
-        )
-        workspace.context.filters.autonomous_loop_report = loop_report.model_dump(mode="json")
-        warnings.extend(rag_warnings)
-        replies.append(
-            f"已完成质量门与可选 Reviewer 审查：{len(loop_report.rounds)} 轮，"
-            f"score={loop_report.score:.3f}，passed={loop_report.passed}。"
-        )
-        if loop_report.release_ready:
-            replies.append(loop_report.final_answer)
-        else:
-            replies.append("自主审查结果未通过最终发布门禁，未输出修订后的研究结论。")
-            warnings.extend(loop_report.release_blockers[:3])
-        warnings.extend(loop_report.warnings[:5])
-        action = "autonomous_review" if action == "composite" else action
 
     if "download" in intent.actions and not intent.skip_download:
         try:
