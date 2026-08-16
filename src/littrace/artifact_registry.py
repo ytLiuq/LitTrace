@@ -240,12 +240,10 @@ class PostgresArtifactRegistry:
 
 
 def artifact_registry_from_config(config: LitTraceConfig) -> ArtifactRegistry:
-    if config.metadata_store.backend != "postgres":
-        raise ValueError("metadata_store.backend must be 'postgres' for artifact registry.")
-    dsn = config.metadata_store.postgres_dsn
-    if not dsn:
-        raise ValueError("metadata_store.postgres_dsn is required for Postgres artifacts.")
-    return PostgresArtifactRegistry(dsn, schema_name=config.metadata_store.schema_name)
+    from littrace.state_db import require_postgres_metadata
+
+    dsn, schema_name = require_postgres_metadata(config.metadata_store)
+    return PostgresArtifactRegistry(dsn, schema_name=schema_name)
 
 
 def _artifact_row(record: ArtifactRecord) -> dict[str, object]:
@@ -262,7 +260,5 @@ def _artifact_row(record: ArtifactRecord) -> dict[str, object]:
 
 
 def _safe_identifier(value: str) -> str:
-    cleaned = "".join(char if char.isalnum() or char == "_" else "_" for char in value)
-    if not cleaned or cleaned[0].isdigit():
-        cleaned = f"littrace_{cleaned}"
-    return cleaned[:63]
+    from littrace.state_db import _safe_identifier as _si
+    return _si(value)

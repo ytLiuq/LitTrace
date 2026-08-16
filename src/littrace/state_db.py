@@ -25,6 +25,38 @@ from pydantic import BaseModel, Field
 from littrace.config import LitTraceConfig
 
 
+def _safe_identifier(value: str) -> str:
+    """Coerce ``value`` into a Postgres-safe schema/table identifier.
+
+    Postgres caps unquoted identifiers at 63 bytes; the only legal
+    characters are ``[A-Za-z0-9_]`` (with a leading digit rule). We
+    rewrite anything else to ``_`` and prefix a ``littrace_`` tag if
+    the result is empty or starts with a digit.
+    """
+    cleaned = "".join(char if char.isalnum() or char == "_" else "_" for char in value)
+    if not cleaned or cleaned[0].isdigit():
+        cleaned = f"littrace_{cleaned}"
+    return cleaned[:63]
+
+
+def require_postgres_metadata(metadata_store) -> tuple[str, str]:
+    """Validate that ``metadata_store`` is a Postgres config and return
+    ``(dsn, schema_name)``.
+
+    Centralises the ``backend must be 'postgres'`` + ``postgres_dsn is
+    required`` checks previously duplicated across 5 ``*_from_config``
+    factories. Raises :class:`ValueError` with a caller-specific suffix
+    so the message still tells the operator which subsystem failed.
+    """
+    if getattr(metadata_store, "backend", None) != "postgres":
+        raise ValueError("metadata_store.backend must be 'postgres'.")
+    dsn = getattr(metadata_store, "postgres_dsn", None)
+    schema_name = getattr(metadata_store, "schema_name", "littrace")
+    if not dsn:
+        raise ValueError("metadata_store.postgres_dsn is required.")
+    return dsn, schema_name
+
+
 # ---------------------------------------------------------------------------
 # Pydantic records
 # ---------------------------------------------------------------------------
@@ -973,10 +1005,9 @@ def _from_jsonb(value) -> object:
 
 
 def state_store_from_config(config: LitTraceConfig) -> PostgresStateStore:
-    if config.metadata_store.backend != "postgres":
-        raise ValueError("metadata_store.backend must be 'postgres' for state storage.")
+    dsn, schema_name = require_postgres_metadata(config.metadata_store)
     return PostgresStateStore(
-        dsn=config.metadata_store.postgres_dsn,
-        schema_name=config.metadata_store.schema_name,
+        dsn=dsn,
+        schema_name=schema_name,
         allow_schema_reset=config.metadata_store.allow_schema_reset,
     )
