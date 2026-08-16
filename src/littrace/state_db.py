@@ -18,8 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, Protocol
-from uuid import uuid4
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -42,8 +41,6 @@ class SessionStateRecord(BaseModel):
     memory_view_json: dict[str, object] = Field(default_factory=dict)
     rag_profile_json: dict[str, object] = Field(default_factory=dict)
     revision: int = 0
-    structured_document_count: int = 0
-    workspace_snapshot_count: int = 0
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -55,8 +52,6 @@ class SessionSummaryRecord(BaseModel):
     updated_at: str
     workspace_sha256: str | None = None
     revision: int = 0
-    structured_document_count: int = 0
-    workspace_snapshot_count: int = 0
 
 
 class AsyncTaskRecord(BaseModel):
@@ -185,21 +180,6 @@ class PostgresStateStore:
             ) from exc
         return psycopg.connect(self.dsn)
 
-    def _exec(self, sql: str, params: tuple = ()) -> None:
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(sql, params)
-            conn.commit()
-
-    def _fetchone(self, sql: str, params: tuple = ()):
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchone()
-
-    def _fetchall(self, sql: str, params: tuple = ()):
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(sql, params)
-            return cur.fetchall()
-
     # --- schema bootstrap ---------------------------------------------------
 
     def _ensure_schema(self) -> None:
@@ -235,8 +215,6 @@ class PostgresStateStore:
                     memory_view_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                     rag_profile_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                     revision INTEGER NOT NULL DEFAULT 0,
-                    structured_document_count INTEGER NOT NULL DEFAULT 0,
-                    workspace_snapshot_count INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMPTZ NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL
                 )
@@ -337,8 +315,6 @@ class PostgresStateStore:
                         memory_view_json = %s,
                         rag_profile_json = %s,
                         revision = %s,
-                        structured_document_count = %s,
-                        workspace_snapshot_count = %s,
                         updated_at = now()
                     WHERE session_id = %s AND revision = %s
                     RETURNING created_at, updated_at
@@ -351,8 +327,6 @@ class PostgresStateStore:
                         _jsonb(state.memory_view_json),
                         _jsonb(state.rag_profile_json),
                         state.revision,
-                        state.structured_document_count,
-                        state.workspace_snapshot_count,
                         state.session_id,
                         expected_revision,
                     ),
@@ -380,10 +354,9 @@ class PostgresStateStore:
                 INSERT INTO {s}.session_state (
                     session_id, workspace_sha256, workspace_json, manifest_json,
                     artifact_index_json, memory_view_json, rag_profile_json,
-                    revision, structured_document_count, workspace_snapshot_count,
-                    created_at, updated_at
+                    revision, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()), now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()), now())
                 ON CONFLICT (session_id) DO UPDATE SET
                     workspace_sha256 = EXCLUDED.workspace_sha256,
                     workspace_json = EXCLUDED.workspace_json,
@@ -392,8 +365,6 @@ class PostgresStateStore:
                     memory_view_json = EXCLUDED.memory_view_json,
                     rag_profile_json = EXCLUDED.rag_profile_json,
                     revision = EXCLUDED.revision,
-                    structured_document_count = EXCLUDED.structured_document_count,
-                    workspace_snapshot_count = EXCLUDED.workspace_snapshot_count,
                     updated_at = now()
                 RETURNING created_at, updated_at
                 """,
@@ -406,8 +377,6 @@ class PostgresStateStore:
                     _jsonb(state.memory_view_json),
                     _jsonb(state.rag_profile_json),
                     state.revision,
-                    state.structured_document_count,
-                    state.workspace_snapshot_count,
                     state.created_at,
                 ),
             )

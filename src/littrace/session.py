@@ -807,8 +807,6 @@ def _sync_session_state(
         memory_view_json=memory.model_dump(mode="json") if hasattr(memory, "model_dump") else {},
         rag_profile_json=rag_profile.model_dump(mode="json") if rag_profile is not None else {},
         revision=new_revision,
-        structured_document_count=workspace.context.filters.structured_document_count,
-        workspace_snapshot_count=workspace.context.filters.workspace_snapshot_count,
         )
     # CAS optimistic concurrency: read the prior revision and only update
     # if it hasn't moved. Prevents lost updates when save_workspace fires

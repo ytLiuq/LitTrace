@@ -369,7 +369,6 @@ class WorkspaceFilters(BaseModel):
     valid_candidate_count: int = 0
     ranking_policy: str | None = None
     publisher_search_plan: dict[str, object] = Field(default_factory=dict)
-    search_completed_at: str | None = None
     requires_login_candidate_ids: list[str] = Field(default_factory=list)
     search_diagnostics: dict[str, object] | None = None
     source_health: dict[str, dict[str, object]] = Field(default_factory=dict)
@@ -381,9 +380,6 @@ class WorkspaceFilters(BaseModel):
 
     # Full-text context
     full_text_context_warnings: list[str] = Field(default_factory=list)
-    full_text_context_policy: str | None = None
-    full_text_resolved_count: int = 0
-    pre_full_text_active_papers: list[str] = Field(default_factory=list)
     pending_intent: dict[str, object] | None = None
 
     # Storyline / structured artifacts
