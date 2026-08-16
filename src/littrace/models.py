@@ -430,14 +430,10 @@ class WorkspaceFilters(BaseModel):
     year_min: int | None = None
     journals: list[str] = Field(default_factory=list)
     active_context_limit: int | None = None
-    active_context_count: int = 0
-    active_context_source: str | None = None
     candidate_pool_count: int = 0
     candidate_pool_ids: list[str] = Field(default_factory=list)
     valid_candidate_count: int = 0
     ranking_policy: str | None = None
-    publisher_search_plan: dict[str, object] = Field(default_factory=dict)
-    requires_login_candidate_ids: list[str] = Field(default_factory=list)
     search_diagnostics: dict[str, object] | None = None
     source_health: dict[str, dict[str, object]] = Field(default_factory=dict)
     workspace_revision: int = 0

@@ -59,7 +59,6 @@ def add_ranked_candidate_papers(
             "candidate_pool_ids": ranked_ids,
             "candidate_pool_count": len(ranked_ids),
             "active_context_limit": active_limit,
-            "active_context_count": len(active),
             "ranking_policy": "wide_recall_rank_then_top_context",
         },
     )

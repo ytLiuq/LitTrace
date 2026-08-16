@@ -131,12 +131,6 @@ async def build_full_text_context(
             "full_text_resolved_count": sum(1 for report in reports if report.best_pdf_url),
             "downloaded_full_text_count": len(downloaded_ids),
             "parsed_full_text_count": int(parse_report.get("parsed_count") or 0),
-            "active_context_count": len(workspace.context.active_papers),
-            "active_context_source": "downloaded_full_text_pdfs",
-            "pre_full_text_active_papers": original_active,
-            "requires_login_candidate_ids": [
-                paper.paper_id for paper in valid if paper.access_type == AccessType.REQUIRES_LOGIN
-            ],
         },
     )
     if not workspace.context.active_papers:
