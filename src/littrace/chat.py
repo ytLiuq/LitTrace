@@ -111,60 +111,9 @@ async def handle_chat(
     if background_response is not None:
         return _with_intent(background_response, intent), workspace
 
-    if "show_context" in intent.actions:
-        workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=True))
-        return _with_intent(
-            _response("已显示当前文献上下文。", "show_context", workspace), intent
-        ), workspace
-
-    if "hide_context" in intent.actions:
-        workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=False))
-        return _with_intent(
-            _response("已隐藏当前文献上下文，后续对话会保持简洁。", "hide_context", workspace),
-            intent,
-        ), workspace
-
-    if intent.actions == ["list_context"]:
-        return (
-            _with_intent(
-                ChatResponse(
-                    reply=_format_current_papers(workspace),
-                    action="list_context",
-                    workspace=workspace,
-                    citations=_active_citations(workspace),
-                ),
-                intent,
-            ),
-            workspace,
-        )
-
-    if intent.actions == ["component_status"]:
-        return (
-            _with_intent(
-                ChatResponse(
-                    reply=_format_component_status(),
-                    action="component_status",
-                    workspace=workspace,
-                ),
-                intent,
-            ),
-            workspace,
-        )
-
-    if any(action in intent.actions for action in ["select_downloads", "deselect_downloads"]):
-        workspace, reply = _apply_download_selection(workspace, intent)
-        return (
-            _with_intent(
-                ChatResponse(
-                    reply=reply,
-                    action="select_downloads",
-                    workspace=WorkspaceSummary.from_workspace(workspace),
-                    citations=_active_citations(workspace),
-                ),
-                intent,
-            ),
-            workspace,
-        )
+    quick_response = _route_quick_action(intent, workspace)
+    if quick_response is not None:
+        return quick_response, workspace
 
     if _should_run_composite(intent):
         logger.info("composite_intent", extra={"actions": intent.actions})
@@ -292,6 +241,58 @@ async def handle_chat(
         ),
         workspace,
     )
+
+
+def _route_quick_action(
+    intent: ChatIntent,
+    workspace: LiteratureWorkspace,
+) -> ChatResponse | None:
+    """Handle show/hide-context, list-context, component-status, and
+    select/deselect-downloads actions in one place. Returns the response
+    to short-circuit the rest of handle_chat, or None when the intent
+    should fall through to the composite / analysis branches."""
+    if "show_context" in intent.actions:
+        workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=True))
+        return _with_intent(
+            _response("已显示当前文献上下文。", "show_context", workspace), intent
+        )
+    if "hide_context" in intent.actions:
+        workspace = apply_context_update(workspace, ContextUpdate(visible_to_user=False))
+        return _with_intent(
+            _response("已隐藏当前文献上下文，后续对话会保持简洁。", "hide_context", workspace),
+            intent,
+        )
+    if intent.actions == ["list_context"]:
+        return _with_intent(
+            ChatResponse(
+                reply=_format_current_papers(workspace),
+                action="list_context",
+                workspace=workspace,
+                citations=_active_citations(workspace),
+            ),
+            intent,
+        )
+    if intent.actions == ["component_status"]:
+        return _with_intent(
+            ChatResponse(
+                reply=_format_component_status(),
+                action="component_status",
+                workspace=workspace,
+            ),
+            intent,
+        )
+    if any(action in intent.actions for action in ["select_downloads", "deselect_downloads"]):
+        workspace, reply = _apply_download_selection(workspace, intent)
+        return _with_intent(
+            ChatResponse(
+                reply=reply,
+                action="select_downloads",
+                workspace=WorkspaceSummary.from_workspace(workspace),
+                citations=_active_citations(workspace),
+            ),
+            intent,
+        )
+    return None
 
 
 async def _run_composite_intent(
