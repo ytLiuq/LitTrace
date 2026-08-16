@@ -295,6 +295,110 @@ def _route_quick_action(
     return None
 
 
+async def _execute_search_action(
+    intent: ChatIntent,
+    request: ChatRequest,
+    workspace: LiteratureWorkspace,
+    config: LitTraceConfig,
+) -> tuple[ResearchRunResult, LiteratureWorkspace, str, list[str], int, bool]:
+    """Run the ``search`` action: build a research graph, optionally retry
+    with an expanded year range when too few papers came back, and
+    return the result + a few side-effect fields the caller still needs
+    for the composite reply.
+    """
+    search_year_min = intent.year_min or config.literature_context.default_year_min
+    topic = intent.topic or request.message
+    query_variants = build_query_variants(topic)
+    research_result = await run_research_graph(
+        PaperSearchRequest(
+            topic=topic,
+            year_min=search_year_min,
+            limit=40,
+            live=request.live,
+            min_relevant_results=MIN_ANALYSIS_PAPERS,
+            query_variants=query_variants,
+        ),
+        config,
+        audit_citations_enabled=False,
+        plan_downloads_enabled=False,
+        route_publishers_enabled=True,
+        parse_full_text_enabled=False,
+        extract_tables_enabled=False,
+        build_storyline_enabled=False,
+        compose_document_enabled=False,
+        autonomous_review_enabled=False,
+    )
+    workspace = research_result.workspace
+    workspace = _apply_literature_filters(workspace, intent)
+    expanded_year_range = False
+    if (
+        len(workspace.context.active_papers) < MIN_ANALYSIS_PAPERS
+        and search_year_min is not None
+    ):
+        before_expand_count = len(workspace.context.active_papers)
+        expanded_year_range = True
+        _append_chat_trace_step(
+            research_result,
+            node="evidence_gate",
+            status="expanded",
+            reason=(
+                f"最近年份范围内只找到 {before_expand_count} 篇，少于最低分析门槛 "
+                f"{MIN_ANALYSIS_PAPERS} 篇，因此扩大检索年限。"
+            ),
+            inputs={"year_min": search_year_min, "paper_count": before_expand_count},
+            outputs={"retry_year_min": None},
+        )
+        pre_retry_steps = (
+            list(research_result.workflow_trace.steps)
+            if research_result.workflow_trace is not None
+            else []
+        )
+        research_result = await run_research_graph(
+            PaperSearchRequest(
+                topic=topic,
+                year_min=None,
+                limit=40,
+                live=request.live,
+                min_relevant_results=MIN_ANALYSIS_PAPERS,
+                query_variants=query_variants,
+            ),
+            config,
+            audit_citations_enabled=False,
+            plan_downloads_enabled=False,
+            route_publishers_enabled=True,
+            parse_full_text_enabled=False,
+            extract_tables_enabled=False,
+            build_storyline_enabled=False,
+            compose_document_enabled=False,
+            autonomous_review_enabled=False,
+        )
+        if research_result.workflow_trace is not None and pre_retry_steps:
+            research_result.workflow_trace.steps = [
+                *pre_retry_steps,
+                *research_result.workflow_trace.steps,
+            ]
+        workspace = research_result.workspace
+        if intent.journals:
+            expanded_intent = ChatIntent(journals=intent.journals)
+            workspace = _apply_literature_filters(workspace, expanded_intent)
+        workspace.context.filters.expanded_year_range_from = search_year_min
+    _prepend_intent_trace_step(
+        research_result,
+        topic=topic,
+        intent=intent,
+        live=request.live if request.live is not None else config.api.enable_live_search,
+        query_variant_count=len(query_variants),
+    )
+    return (
+        research_result,
+        workspace,
+        topic,
+        query_variants,
+        search_year_min,
+        expanded_year_range,
+    )
+
+
 async def _run_composite_intent(
     intent: ChatIntent,
     request: ChatRequest,
@@ -311,88 +415,8 @@ async def _run_composite_intent(
     has_minimum_evidence = True
 
     if "search" in intent.actions:
-        search_year_min = intent.year_min or config.literature_context.default_year_min
-        topic = intent.topic or request.message
-        query_variants = build_query_variants(topic)
-        research_result = await run_research_graph(
-            PaperSearchRequest(
-                topic=topic,
-                year_min=search_year_min,
-                limit=40,
-                live=request.live,
-                min_relevant_results=MIN_ANALYSIS_PAPERS,
-                query_variants=query_variants,
-            ),
-            config,
-            audit_citations_enabled=False,
-            plan_downloads_enabled=False,
-            route_publishers_enabled=True,
-            parse_full_text_enabled=False,
-            extract_tables_enabled=False,
-            build_storyline_enabled=False,
-            compose_document_enabled=False,
-            autonomous_review_enabled=False,
-        )
-        workspace = research_result.workspace
-        workspace = _apply_literature_filters(workspace, intent)
-        expanded_year_range = False
-        if (
-            len(workspace.context.active_papers) < MIN_ANALYSIS_PAPERS
-            and search_year_min is not None
-        ):
-            before_expand_count = len(workspace.context.active_papers)
-            expanded_year_range = True
-            _append_chat_trace_step(
-                research_result,
-                node="evidence_gate",
-                status="expanded",
-                reason=(
-                    f"最近年份范围内只找到 {before_expand_count} 篇，少于最低分析门槛 "
-                    f"{MIN_ANALYSIS_PAPERS} 篇，因此扩大检索年限。"
-                ),
-                inputs={"year_min": search_year_min, "paper_count": before_expand_count},
-                outputs={"retry_year_min": None},
-            )
-            pre_retry_steps = (
-                list(research_result.workflow_trace.steps)
-                if research_result.workflow_trace is not None
-                else []
-            )
-            research_result = await run_research_graph(
-                PaperSearchRequest(
-                    topic=topic,
-                    year_min=None,
-                    limit=40,
-                    live=request.live,
-                    min_relevant_results=MIN_ANALYSIS_PAPERS,
-                    query_variants=query_variants,
-                ),
-                config,
-                audit_citations_enabled=False,
-                plan_downloads_enabled=False,
-                route_publishers_enabled=True,
-                parse_full_text_enabled=False,
-                extract_tables_enabled=False,
-                build_storyline_enabled=False,
-                compose_document_enabled=False,
-                autonomous_review_enabled=False,
-            )
-            if research_result.workflow_trace is not None and pre_retry_steps:
-                research_result.workflow_trace.steps = [
-                    *pre_retry_steps,
-                    *research_result.workflow_trace.steps,
-                ]
-            workspace = research_result.workspace
-            if intent.journals:
-                expanded_intent = ChatIntent(journals=intent.journals)
-                workspace = _apply_literature_filters(workspace, expanded_intent)
-            workspace.context.filters.expanded_year_range_from = search_year_min
-        _prepend_intent_trace_step(
-            research_result,
-            topic=topic,
-            intent=intent,
-            live=request.live if request.live is not None else config.api.enable_live_search,
-            query_variant_count=len(query_variants),
+        (research_result, workspace, topic, query_variants, search_year_min, expanded_year_range) = (
+            await _execute_search_action(intent, request, workspace, config)
         )
         search_mode = getattr(workspace.context.filters, "search_mode", None)
         is_real_search = search_mode == "live"
