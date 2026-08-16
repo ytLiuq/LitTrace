@@ -10,7 +10,13 @@ from littrace.intent import (
     merge_pending_intent,
 )
 from littrace.intent_llm import IntentParseError, parse_chat_intent_semantic
-from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace, ResearchTask
+from littrace.models import (
+    ChatRequest,
+    ChatResponse,
+    LiteratureWorkspace,
+    ResearchTask,
+    WorkspaceSummary,
+)
 from littrace.runtime.memory import MemoryView, SessionMemory, build_memory_view
 
 
@@ -24,7 +30,7 @@ class CoordinatorTurn(BaseModel):
 
     intent: ChatIntent | None = None
     task: ResearchTask | None = None
-    workspace: LiteratureWorkspace
+    workspace: WorkspaceSummary
     memory_view: MemoryView
     early_response: ChatResponse | None = None
 
@@ -44,7 +50,7 @@ class LitTraceCoordinator:
             intent = await parse_chat_intent_semantic(message, config)
         except IntentParseError as exc:
             return CoordinatorTurn(
-                workspace=workspace,
+                workspace=WorkspaceSummary.from_workspace(workspace),
                 memory_view=build_memory_view(
                     workspace,
                     purpose="planning",
@@ -57,7 +63,7 @@ class LitTraceCoordinator:
                         "里的 LLM 配置，或显式关闭 llm.intent_parser_enabled。"
                     ),
                     action="intent_parse_error",
-                    workspace=workspace,
+                    workspace=WorkspaceSummary.from_workspace(workspace),
                     warnings=[str(exc)],
                 ),
             )
@@ -69,7 +75,7 @@ class LitTraceCoordinator:
                 workspace.context.filters.pending_intent = None
                 return CoordinatorTurn(
                     intent=intent,
-                    workspace=workspace,
+                    workspace=WorkspaceSummary.from_workspace(workspace),
                     memory_view=build_memory_view(
                         workspace,
                         purpose="planning",
@@ -79,7 +85,7 @@ class LitTraceCoordinator:
                         ChatResponse(
                             reply="已取消上一条待澄清指令。",
                             action="cancel_pending_intent",
-                            workspace=workspace,
+                            workspace=WorkspaceSummary.from_workspace(workspace),
                         ),
                         intent,
                     ),
@@ -93,7 +99,7 @@ class LitTraceCoordinator:
             questions = intent.clarification_questions or ["你希望我下一步具体执行什么？"]
             return CoordinatorTurn(
                 intent=intent,
-                workspace=workspace,
+                workspace=WorkspaceSummary.from_workspace(workspace),
                 memory_view=build_memory_view(
                     workspace,
                     purpose="planning",
@@ -103,7 +109,7 @@ class LitTraceCoordinator:
                     reply="我先确认一下，避免跑偏：\n"
                     + "\n".join(f"- {question}" for question in questions),
                     action="clarify_intent",
-                    workspace=workspace,
+                    workspace=WorkspaceSummary.from_workspace(workspace),
                     intent_confidence=intent.confidence,
                     ambiguous_intent=True,
                     ambiguity_reasons=intent.ambiguity_reasons,
@@ -115,7 +121,7 @@ class LitTraceCoordinator:
         return CoordinatorTurn(
             intent=intent,
             task=_research_task(intent),
-            workspace=workspace,
+            workspace=WorkspaceSummary.from_workspace(workspace),
             memory_view=build_memory_view(
                 workspace,
                 purpose=_memory_purpose_for_intent(intent),

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Annotated
 
+from fastapi import APIRouter, Header
+
+from littrace.api.auth import resolve_request_session
 from littrace.chat import handle_chat
 from littrace.models import (
     ChatRequest,
@@ -10,6 +13,7 @@ from littrace.models import (
     PaperSearchRequest,
     ResearchRunRequest,
     ResearchRunResult,
+    WorkspaceSummary,
 )
 from littrace.research_background import (
     assess_research_background,
@@ -28,6 +32,16 @@ from littrace.skill_runner import export_session_bundle_skill
 from littrace.workflow import run_research_graph, run_search_preview
 
 
+def _workspace_summary(workspace: LiteratureWorkspace) -> WorkspaceSummary:
+    """Project a full workspace down to a small, response-friendly summary.
+
+    The full workspace carries every parsed paper, structured document,
+    and evidence span — multi-MB for a real session. The API surface
+    exposes only metadata + active-paper list, never full text.
+    """
+    return WorkspaceSummary.from_workspace(workspace)
+
+
 class _AppProxy:
     def __getattr__(self, name: str):
         from littrace.api import app as api_app
@@ -39,23 +53,39 @@ api_app = _AppProxy()
 router = APIRouter()
 
 
-@router.post("/search/preview", response_model=LiteratureWorkspace)
-async def search_preview(request: PaperSearchRequest) -> LiteratureWorkspace:
+@router.post("/search/preview", response_model=WorkspaceSummary)
+async def search_preview(
+    request: PaperSearchRequest,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> WorkspaceSummary:
     config = api_app.load_config()
-    api_app._set_workspace(await run_search_preview(request, config))
+    auth = resolve_request_session(
+        config,
+        header_session_id=x_littrace_session_id,
+    )
+    workspace = await run_search_preview(request, config)
+    api_app._set_workspace(workspace)
     api_app.append_trace(
         config,
         "search_preview",
-        {"topic": request.topic, "papers": len(api_app.WORKSPACE.papers)},
+        {"topic": request.topic, "session_id": auth.session_id, "papers": len(workspace.papers)},
     )
-    return api_app.WORKSPACE
+    return _workspace_summary(workspace)
 
 
 @router.post("/workflow/research", response_model=ResearchRunResult)
-async def workflow_research(request: ResearchRunRequest) -> ResearchRunResult:
+async def workflow_research(
+    request: ResearchRunRequest,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> ResearchRunResult:
+    config = api_app.load_config()
+    auth = resolve_request_session(
+        config,
+        header_session_id=x_littrace_session_id,
+    )
     result = await run_research_graph(
         request.search,
-        api_app.load_config(),
+        config,
         audit_citations_enabled=request.audit_citations,
         plan_downloads_enabled=request.plan_downloads,
         route_publishers_enabled=request.route_publishers,
@@ -67,13 +97,22 @@ async def workflow_research(request: ResearchRunRequest) -> ResearchRunResult:
         auto_replan_enabled=request.auto_replan,
     )
     api_app._set_workspace(result.workspace)
+    result.workspace = result.workspace  # keep full workspace for the LLM path
     return result
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(
+    request: ChatRequest,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> ChatResponse:
     config = api_app.load_config()
-    session = load_or_create_session(config, request.session_id)
+    auth = resolve_request_session(
+        config,
+        route_session_id=request.session_id,
+        header_session_id=x_littrace_session_id,
+    )
+    session = load_or_create_session(config, auth.session_id)
     session_workspace = load_workspace(session)
     background_response = await _route_research_background_fast_gate(
         request,
@@ -84,6 +123,11 @@ async def chat(request: ChatRequest) -> ChatResponse:
         api_app._set_workspace(session_workspace)
         background_response.session_id = session.session_id
         background_response.session_root = str(session.root)
+        # Project the full workspace down to a summary before returning —
+        # the route response stays under 100 KB even for a 200-paper
+        # session. The full workspace is still in the session_state row +
+        # workspace_dir on disk.
+        background_response.workspace = _workspace_summary(session_workspace)  # type: ignore[assignment]
         save_workspace(session, session_workspace, config=config)
         append_message(session, "user", request)
         append_message(session, "assistant", background_response)
@@ -104,6 +148,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
     api_app._set_workspace(session_workspace)
     response.session_id = session.session_id
     response.session_root = str(session.root)
+    # Project the full workspace down to a summary before returning.
+    response.workspace = _workspace_summary(session_workspace)  # type: ignore[assignment]
     try:
         save_workspace(session, api_app.WORKSPACE, config=config)
     except TypeError:
@@ -115,9 +161,17 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 
 @router.post("/sessions/{session_id}/export")
-async def export_session(session_id: str) -> dict[str, str]:
+async def export_session(
+    session_id: str,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> dict[str, str]:
     config = api_app.load_config()
-    session = load_or_create_session(config, session_id)
+    auth = resolve_request_session(
+        config,
+        route_session_id=session_id,
+        header_session_id=x_littrace_session_id,
+    )
+    session = load_or_create_session(config, auth.session_id)
     workspace = load_workspace(session)
     return await export_session_bundle_skill(session, workspace, config)
 

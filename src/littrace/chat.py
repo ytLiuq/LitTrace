@@ -30,6 +30,7 @@ from littrace.models import (
     ChatResponse,
     ContextUpdate,
     EvidenceSpan,
+    WorkspaceSummary,
     LiteratureWorkspace,
     PaperSearchRequest,
     WorkflowTraceStep,
@@ -157,7 +158,7 @@ async def handle_chat(
                 ChatResponse(
                     reply=reply,
                     action="select_downloads",
-                    workspace=workspace,
+                    workspace=WorkspaceSummary.from_workspace(workspace),
                     citations=_active_citations(workspace),
                 ),
                 intent,
@@ -244,7 +245,7 @@ async def handle_chat(
                 ChatResponse(
                     reply=reply_text,
                     action="llm_chat",
-                    workspace=workspace,
+                    workspace=WorkspaceSummary.from_workspace(workspace),
                     citations=_active_citations(workspace),
                     warnings=(
                         rag_warnings
@@ -651,7 +652,7 @@ async def _run_composite_intent(
             ChatResponse(
                 reply="\n".join(replies),
                 action=action,
-                workspace=workspace,
+                workspace=WorkspaceSummary.from_workspace(workspace),
                 research_result=research_result,
                 citations=_active_citations(workspace),
                 download_plan=download_plan,
@@ -666,7 +667,7 @@ async def _run_composite_intent(
 
 
 def _response(reply: str, action: str, workspace: LiteratureWorkspace) -> ChatResponse:
-    return ChatResponse(reply=reply, action=action, workspace=workspace)
+    return ChatResponse(reply=reply, action=action, workspace=WorkspaceSummary.from_workspace(workspace))
 
 
 def _with_intent(response: ChatResponse, intent: ChatIntent) -> ChatResponse:

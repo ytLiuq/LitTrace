@@ -585,6 +585,53 @@ class ChatRequest(BaseModel):
     research_background: str | None = None
 
 
+class WorkspaceSummary(BaseModel):
+    """API-friendly projection of a full ``LiteratureWorkspace``.
+
+    Strips every large payload (parsed text, structured documents, evidence
+    spans, comparison matrices) so the API response stays under 100 KB
+    even for a 200-paper session. Callers needing the full payload can
+    hit ``/sessions/{id}/export``.
+    """
+
+    session_id: str
+    paper_count: int = 0
+    active_paper_count: int = 0
+    parsed_paper_count: int = 0
+    excluded_paper_count: int = 0
+    papers: list["PaperMetadata"] = Field(default_factory=list)
+    active_papers: list[str] = Field(default_factory=list)
+    excluded_papers: list[str] = Field(default_factory=list)
+    # ``context`` is a slim mirror of ``workspace.context`` so callers that
+    # previously read ``workspace.context.active_papers`` keep working
+    # without a full ``LiteratureWorkspace`` payload.
+    context: dict[str, object] = Field(default_factory=dict)
+    filters: dict[str, object] = Field(default_factory=dict)
+    topic: str | None = None
+    research_background: str | None = None
+    research_background_status: str | None = None
+
+    @classmethod
+    def from_workspace(
+        cls, workspace: "LiteratureWorkspace"
+    ) -> "WorkspaceSummary":
+        return cls(
+            session_id=str(getattr(workspace, "session_id", "") or ""),
+            paper_count=len(workspace.papers),
+            active_paper_count=len(workspace.context.active_papers),
+            parsed_paper_count=len(workspace.parsed_papers),
+            excluded_paper_count=len(workspace.context.excluded_papers),
+            papers=list(workspace.papers.values()),
+            active_papers=list(workspace.context.active_papers),
+            excluded_papers=list(workspace.context.excluded_papers),
+            context=workspace.context.model_dump(mode="json"),
+            filters=workspace.context.filters.model_dump(mode="json"),
+            topic=workspace.context.filters.topic,
+            research_background=workspace.context.filters.research_background,
+            research_background_status=workspace.context.filters.research_background_status,
+        )
+
+
 class ChatResponse(BaseModel):
     reply: str
     action: str
@@ -602,6 +649,11 @@ class ChatResponse(BaseModel):
     comparison_matrix: "ComparisonMatrixReport | None" = None
     workflow_trace: WorkflowTrace | None = None
     warnings: list[str] = Field(default_factory=list)
+    # ``workspace`` is now a small summary, not the full
+    # ``LiteratureWorkspace``. Stays under 100 KB even for a 200-paper
+    # session. The full payload is in the session_state row + workspace_dir
+    # on disk; callers needing it can hit ``/sessions/{id}/export``.
+    workspace: "WorkspaceSummary | None" = None
 
 
 class EvidenceSpan(BaseModel):
