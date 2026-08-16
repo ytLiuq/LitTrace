@@ -30,11 +30,11 @@ from littrace.state_db import state_store_from_config
 from littrace.evidence.tables import decide_artifact_extraction_need
 from littrace.tui import render_context_lines
 
-# 后台同步 / RAG daily 集成
+# 后台同步 / RAG embedding 集成
 try:
-    from littrace.rag_jobs import run_daily_rag_maintenance  # noqa: F401
+    from littrace.rag_jobs import run_pending_embedding_jobs  # noqa: F401
 except ImportError:  # pragma: no cover - defensive
-    run_daily_rag_maintenance = None  # type: ignore[assignment]
+    run_pending_embedding_jobs = None  # type: ignore[assignment]
 try:
     from littrace.retrieval.rag_refresh import refresh_session_rag_index  # noqa: F401
 except ImportError:  # pragma: no cover - defensive
@@ -68,6 +68,44 @@ DESIGN = {
 }
 
 
+# Slash-command catalog used by the input-box autocomplete popup.
+# Each entry is (name, description, context_only). `context_only` is
+# recorded for a future workspace-aware filter pass; v1 shows all commands.
+COMMAND_CATALOG: list[tuple[str, str, bool]] = [
+    ("context", "显示 / 隐藏当前文献上下文", True),
+    ("papers", "列出当前上下文文献", True),
+    ("parse", "按当前解析模式处理 PDF", False),
+    ("parse --ocr", "强制使用 OCR 解析", False),
+    ("parse --text", "强制使用文本层解析", False),
+    ("table", "抽取性能指标并生成对比表", True),
+    ("storyline", "梳理论文回应关系", True),
+    ("storyline-report", "导出 storyline 报告", True),
+    ("storyline-review", "Reviewer 审阅 storyline", True),
+    ("dashboard", "打开 RAG / Daily 仪表盘", True),
+    ("quality", "运行质量门", True),
+    ("agents", "列出可用 agents", False),
+    ("workflow", "显示当前 workflow trace", True),
+    ("quality-audits", "运行质量审计", True),
+    ("plan", "显示当前执行计划", False),
+    ("init-config", "运行 config wizard", False),
+    ("login", "打开授权登录弹窗", True),
+    ("attach", "手动附加本地 PDF", False),
+    ("attach-si", "附加 SI / 补充材料", False),
+    ("full-text", "构建 full-text context", True),
+    ("backfill-dois", "回填 DOI", False),
+    ("publisher-retrieve", "按 publisher 抓取", False),
+    ("check-downloads", "检查当前下载计划", True),
+    ("resume-downloads", "恢复下载（等待用户授权）", True),
+    ("benchmark", "运行评测基准", False),
+    ("golden-eval", "运行 golden set 评估", False),
+    ("export", "导出当前 session", False),
+    ("quit", "关闭窗口", False),
+    ("全部下载", "选择当前上下文中全部待下载文献", True),
+    ("选择第 N 篇下载", "选择第 N 篇进入下载计划", True),
+    ("取消选择第 N 篇", "从下载计划中移除第 N 篇", True),
+]
+
+
 class LitTraceWindow:
     def __init__(self) -> None:
         self.tk, self.ttk = _load_tk()
@@ -83,8 +121,13 @@ class LitTraceWindow:
         self.login_popup = None
         self.rag_busy = False
         self.sync_session_btn: object | None = None
-        self.full_daily_btn: object | None = None
+        self.embedding_refresh_btn: object | None = None
         self.rag_text: object | None = None
+        # Slash-command autocomplete popup state.
+        self.command_popup: object | None = None
+        self.command_popup_list: object | None = None
+        self.command_popup_index: int = 0
+        self.command_popup_query: str = ""
 
         self.root = self.tk.Tk()
         self.root.title("LitTrace")
@@ -115,6 +158,11 @@ class LitTraceWindow:
         self.style.configure("Subnav.TFrame", background=DESIGN["parchment"])
         self.style.configure("Tile.TFrame", background=DESIGN["surface_1"])
         self.style.configure("Pearl.TFrame", background=DESIGN["pearl"])
+        # Chat input area: outer host provides parchment border; inner pearl
+        # uses a slightly tinted surface_2 to differentiate from the chat
+        # output's white canvas above.
+        self.style.configure("InputHost.TFrame", background=DESIGN["parchment"])
+        self.style.configure("InputPearl.TFrame", background=DESIGN["surface_2"])
         self.style.configure(
             "DarkTile.TFrame",
             background=DESIGN["dark_tile"],
@@ -344,13 +392,16 @@ class LitTraceWindow:
             pady=0,
             bd=0,
             relief=self.tk.FLAT,
-            highlightthickness=0,
+            highlightthickness=1,
+            highlightbackground=DESIGN["hairline"],
+            highlightcolor=DESIGN["hairline"],
             bg=DESIGN["canvas"],
             fg=DESIGN["ink"],
             insertbackground=DESIGN["primary"],
             font=_font("body"),
             spacing1=2,
             spacing3=12,
+            state="disabled",
         )
         self.chat_text.tag_configure("role", foreground=DESIGN["ink"], font=_font("body_strong"))
         self.chat_text.tag_configure(
@@ -399,8 +450,13 @@ class LitTraceWindow:
         chat_scroll.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.chat_text.configure(yscrollcommand=chat_scroll.set)
 
-        input_frame = self.ttk.Frame(chat_frame, style="Pearl.TFrame", padding=(14, 10))
-        input_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        # Wrap input in an outer host frame so the input area visually separates
+        # from the chat output above (different background, hairline border).
+        input_host = self.ttk.Frame(chat_frame, style="InputHost.TFrame")
+        input_host.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        input_host.columnconfigure(0, weight=1)
+        input_frame = self.ttk.Frame(input_host, style="InputPearl.TFrame", padding=(14, 10))
+        input_frame.grid(row=0, column=0, sticky="ew", padx=1, pady=(1, 1))
         input_frame.columnconfigure(0, weight=1)
         self.input_entry = self.tk.Text(
             input_frame,
@@ -408,8 +464,10 @@ class LitTraceWindow:
             height=3,
             bd=0,
             relief=self.tk.FLAT,
-            highlightthickness=0,
-            bg=DESIGN["pearl"],
+            highlightthickness=1,
+            highlightbackground=DESIGN["hairline"],
+            highlightcolor=DESIGN["primary"],
+            bg=DESIGN["surface_2"],
             fg=DESIGN["ink"],
             insertbackground=DESIGN["primary"],
             font=_font("body"),
@@ -417,6 +475,8 @@ class LitTraceWindow:
         self.input_entry.grid(row=0, column=0, sticky="ew", ipady=4)
         self.input_entry.bind("<Return>", self._send_from_event)
         self.input_entry.bind("<Shift-Return>", lambda _event: None)
+        self.input_entry.bind("<Key>", self._handle_input_keypress)
+        self.input_entry.bind("<KeyRelease>", self._handle_input_keyrelease)
         self.ttk.Button(input_frame, text="发送", style="Primary.TButton", command=self._send).grid(
             row=0, column=1, padx=(12, 0)
         )
@@ -481,13 +541,13 @@ class LitTraceWindow:
             command=self._trigger_session_sync,
         )
         self.sync_session_btn.grid(row=0, column=0, padx=(0, 4), sticky="ew")
-        self.full_daily_btn = self.ttk.Button(
+        self.embedding_refresh_btn = self.ttk.Button(
             rag_btn_frame,
-            text="立即全量 Daily",
-            style="Primary.TButton",
-            command=self._trigger_full_daily,
+            text="立即 Embedding 刷新",
+            style="Secondary.TButton",
+            command=self._trigger_embedding_refresh,
         )
-        self.full_daily_btn.grid(row=0, column=1, padx=(4, 0), sticky="ew")
+        self.embedding_refresh_btn.grid(row=0, column=1, padx=(4, 0), sticky="ew")
         self.status_var = self.tk.StringVar(value=f"Session: {self.session.session_id}")
         self.ttk.Label(
             self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w"
@@ -621,9 +681,158 @@ class LitTraceWindow:
         self._send()
         return "break"
 
+    # --- Slash-command autocomplete popup -------------------------------------
+
+    def _handle_input_keypress(self, event) -> str | None:
+        """Intercept Up/Down/Tab/Escape while the popup is visible."""
+        if self.command_popup is None or not self.command_popup.winfo_exists():
+            return None
+        keysym = event.keysym
+        if keysym == "Down":
+            self._navigate_command_popup(+1)
+            return "break"
+        if keysym == "Up":
+            self._navigate_command_popup(-1)
+            return "break"
+        if keysym == "Tab":
+            self._commit_command_popup()
+            return "break"
+        if keysym == "Escape":
+            self._hide_command_popup()
+            return "break"
+        if keysym in {"space", "Return"}:
+            self._hide_command_popup()
+        return None
+
+    def _handle_input_keyrelease(self, event) -> None:
+        """Re-evaluate popup visibility after each keystroke."""
+        if event.keysym in {"Up", "Down", "Tab", "Escape"}:
+            return
+        self._refresh_command_popup()
+
+    def _refresh_command_popup(self) -> None:
+        text = self.input_entry.get("1.0", self.tk.END).rstrip("\n")
+        slash_pos = self._find_active_slash(text)
+        if slash_pos < 0:
+            self._hide_command_popup()
+            return
+        query = text[slash_pos + 1 :]
+        if not query or any(ch.isspace() for ch in query):
+            # Multi-word or trailing space: no popup; let the user finish typing.
+            self._hide_command_popup()
+            return
+        self._show_command_popup(query)
+
+    def _find_active_slash(self, text: str) -> int:
+        """Return the index of the most-recent `/` preceded by start-of-buffer /
+        whitespace / newline, or -1 if none."""
+        pos = -1
+        for index, ch in enumerate(text):
+            if ch != "/":
+                continue
+            if index == 0 or text[index - 1] in " \n\t":
+                pos = index
+        return pos
+
+    def _show_command_popup(self, query: str) -> None:
+        q = query.lower()
+        matches = [
+            (name, desc)
+            for name, desc, _ctx in COMMAND_CATALOG
+            if name.lower().startswith(q)
+        ]
+        if not matches:
+            self._hide_command_popup()
+            return
+        if self.command_popup is None or not self.command_popup.winfo_exists():
+            self._build_command_popup()
+        listbox = self.command_popup_list
+        listbox.delete(0, self.tk.END)
+        for name, desc in matches:
+            listbox.insert(self.tk.END, f"/{name}    {desc}")
+        self.command_popup_index = 0
+        self.command_popup_query = query
+        listbox.selection_clear(0, self.tk.END)
+        listbox.selection_set(0)
+        listbox.activate(0)
+        listbox.see(0)
+        self._position_command_popup()
+        self.command_popup.deiconify()
+        self.command_popup.lift()
+
+    def _build_command_popup(self) -> None:
+        popup = self.tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.configure(background=DESIGN["hairline"])
+        frame = self.ttk.Frame(popup, style="Tile.TFrame", padding=2)
+        frame.pack(fill=self.tk.BOTH, expand=True)
+        listbox = self.tk.Listbox(
+            frame,
+            activestyle="none",
+            highlightthickness=0,
+            bd=0,
+            bg=DESIGN["canvas"],
+            fg=DESIGN["ink"],
+            selectbackground=DESIGN["accent_teal_subtle"],
+            selectforeground=DESIGN["ink"],
+            font=_font("caption"),
+            height=8,
+            exportselection=False,
+        )
+        listbox.pack(fill=self.tk.BOTH, expand=True)
+        listbox.bind("<ButtonRelease-1>", lambda _e: self._commit_command_popup())
+        self.command_popup = popup
+        self.command_popup_list = listbox
+
+    def _position_command_popup(self) -> None:
+        if self.command_popup is None:
+            return
+        x = self.input_entry.winfo_rootx()
+        y = self.input_entry.winfo_rooty() - self.command_popup.winfo_reqheight() - 4
+        self.command_popup.geometry(f"+{x}+{max(y, 0)}")
+
+    def _navigate_command_popup(self, delta: int) -> None:
+        if self.command_popup_list is None:
+            return
+        size = self.command_popup_list.size()
+        if size == 0:
+            return
+        self.command_popup_index = (self.command_popup_index + delta) % size
+        self.command_popup_list.selection_clear(0, self.tk.END)
+        self.command_popup_list.selection_set(self.command_popup_index)
+        self.command_popup_list.activate(self.command_popup_index)
+        self.command_popup_list.see(self.command_popup_index)
+
+    def _commit_command_popup(self) -> None:
+        if self.command_popup_list is None:
+            return
+        sel = self.command_popup_list.curselection()
+        if not sel:
+            return
+        line = self.command_popup_list.get(sel[0])
+        command = line.split()[0]  # `/name`
+        text = self.input_entry.get("1.0", self.tk.END).rstrip("\n")
+        slash_pos = self._find_active_slash(text)
+        if slash_pos < 0:
+            self._hide_command_popup()
+            return
+        # Replace the entire `/<query>` span with the selected `/<command>`.
+        end = slash_pos + 1 + len(self.command_popup_query)
+        self.input_entry.delete(f"1.0 +{slash_pos} chars", f"1.0 +{end} chars")
+        self.input_entry.insert(f"1.0 +{slash_pos} chars", command)
+        self._hide_command_popup()
+
+    def _hide_command_popup(self) -> None:
+        if self.command_popup is not None and self.command_popup.winfo_exists():
+            self.command_popup.withdraw()
+
     def _append_message(self, role: str, text: str) -> None:
         tag = _chat_bubble_tag(role)
+        # chat_text is created in `state="disabled"` (read-only).) Flip to
+        # normal to insert the new bubble, then back to disabled.
+        self.chat_text.configure(state="normal")
         self.chat_text.insert(self.tk.END, f"{text}\n\n", (tag,))
+        self.chat_text.configure(state="disabled")
         self.chat_text.see(self.tk.END)
 
     def _show_execution_path(self, message: str) -> None:
@@ -705,8 +914,8 @@ class LitTraceWindow:
             state = "disabled" if busy else "normal"
             if self.sync_session_btn is not None:
                 self.sync_session_btn.configure(state=state)
-            if self.full_daily_btn is not None:
-                self.full_daily_btn.configure(state=state)
+            if self.embedding_refresh_btn is not None:
+                self.embedding_refresh_btn.configure(state=state)
             if label:
                 self.status_var.set(label)
 
@@ -747,33 +956,32 @@ class LitTraceWindow:
 
         self.root.after(0, done)
 
-    def _trigger_full_daily(self) -> None:
+    def _trigger_embedding_refresh(self) -> None:
         if self.rag_busy:
             return
-        if run_daily_rag_maintenance is None:
-            self.status_var.set("RAG 不可用: run_daily_rag_maintenance 未导入")
+        if run_pending_embedding_jobs is None:
+            self.status_var.set("RAG 不可用: run_pending_embedding_jobs 未导入")
             return
-        self._set_rag_busy(True, "正在执行全量 Daily…")
-        threading.Thread(target=self._full_daily_thread, daemon=True).start()
+        self._set_rag_busy(True, "正在刷新 Embedding 队列…")
+        threading.Thread(target=self._embedding_refresh_thread, daemon=True).start()
 
-    def _full_daily_thread(self) -> None:
+    def _embedding_refresh_thread(self) -> None:
         try:
-            report = asyncio.run(run_daily_rag_maintenance(self.config))
+            report = asyncio.run(run_pending_embedding_jobs(self.config))
             summary = (
-                f"Daily 完成: refreshed={report.sessions_refreshed} "
-                f"failed={report.sessions_failed} skipped={report.sessions_skipped} "
-                f"jobs={report.embedding_jobs_processed}/{report.embedding_jobs_failed}"
+                f"Embedding 完成: processed={report.processed} "
+                f"failed={report.failed} skipped={report.skipped} "
+                f"outbox={report.outbox_dispatched}/{report.outbox_failed}"
             )
             if report.warnings:
                 summary += f" warns={len(report.warnings)}"
         except Exception as exc:
-            summary = f"Daily 失败: {exc.__class__.__name__}: {exc}"
+            summary = f"Embedding 失败: {exc.__class__.__name__}: {exc}"
 
         def done() -> None:
             self.status_var.set(summary)
             self._set_rag_busy(False)
             self._refresh_rag_panel()
-            self._refresh_session_history()
 
         self.root.after(0, done)
 
