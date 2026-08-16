@@ -90,6 +90,32 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
+def quiet_call(
+    func,
+    *args,
+    logger=None,
+    level: str = "debug",
+    op: str = "",
+    default=None,
+    **kwargs,
+):
+    """Call ``func(*args, **kwargs)`` swallowing ``Exception``.
+
+    Centralises the 24 bare ``except Exception: pass`` swallows scattered
+    across the codebase. At least one log line is emitted so a silent
+    failure leaves a trail. Returns ``default`` (None) on error.
+    """
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - intentional swallow
+        if logger is not None:
+            getattr(logger, level)(
+                "quiet_call_failed",
+                extra={"op": op, "error": f"{exc.__class__.__name__}: {exc}"},
+            )
+        return default
+
+
 # ── Timed context manager ───────────────────────────────────────
 
 
