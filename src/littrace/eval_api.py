@@ -65,7 +65,7 @@ def retrieval_metrics(
     recall = 0.0
     precision = 0.0
     if config is not None:
-        cases = _load_cases(config.eval.golden_set_dir)
+        cases = _load_cases(config.eval_golden_set_dir)
         if cases:
             expected_dois: set[str] = set()
             for case in cases:

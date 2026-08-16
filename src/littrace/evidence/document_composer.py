@@ -45,8 +45,8 @@ def build_research_document_report(
     release_blockers = _release_blockers(
         verification_reports,
         has_analytic_claims=bool(verification_reports),
-        strict_all_claims=config.publication_policy.strict_all_claims,
-        require_publishable_claim=config.publication_policy.require_publishable_claim,
+        strict_all_claims=config.publication_strict_all_claims,
+        require_publishable_claim=config.publication_require_publishable_claim,
     )
     quality_metrics = _with_verification_metrics(
         quality.metrics, verification_reports, release_blockers
@@ -57,7 +57,7 @@ def build_research_document_report(
         *quality.warnings,
         *release_blockers,
     ]
-    published_only = not config.publication_policy.strict_all_claims
+    published_only = not config.publication_strict_all_claims
     visible_storyline = (
         _published_storyline(storyline, verification_reports) if published_only else storyline
     )

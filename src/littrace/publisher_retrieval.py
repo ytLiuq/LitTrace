@@ -81,7 +81,7 @@ async def fetch_publisher_search_results(
             config,
             "publisher_search",
             key,
-            allow_stale=config.cache_policy.allow_stale_on_source_failure,
+            allow_stale=config.cache_allow_stale_on_source_failure,
         )
         if stale.value is not None:
             result = parse_publisher_search_html(plan, stale.value)

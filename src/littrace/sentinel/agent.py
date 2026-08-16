@@ -132,7 +132,7 @@ class LiteratureSentinel:
             )
             downloaded_count = download_result.downloaded_count
 
-        if self.config.sentinel.parse_on_daily:
+        if self.config.sentinel_parse_on_daily:
             workspace, parse_report = await parse_workspace_skill(workspace, self.config)
             # Table metrics are an optional enrichment step. A missing, unavailable, or
             # timing-out LLM must not discard the metadata/search results of a daily run.

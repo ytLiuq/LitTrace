@@ -44,11 +44,11 @@ async def run_retrieval_golden_eval(
     live: bool = True,
     limit: int = 40,
 ) -> RetrievalEvalReport:
-    cases = _load_cases(config.eval.golden_set_dir)
+    cases = _load_cases(config.eval_golden_set_dir)
     results: list[RetrievalEvalCaseResult] = []
     warnings: list[str] = []
     if not cases:
-        warnings.append(f"No golden cases found under {config.eval.golden_set_dir}.")
+        warnings.append(f"No golden cases found under {config.eval_golden_set_dir}.")
 
     for case in cases:
         topic = str(case.get("topic") or "").strip()

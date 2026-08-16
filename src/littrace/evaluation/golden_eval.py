@@ -24,7 +24,7 @@ def run_golden_eval(
     config: LitTraceConfig,
     workspace: LiteratureWorkspace | None = None,
 ) -> GoldenEvalReport:
-    root = config.eval.golden_set_dir
+    root = config.eval_golden_set_dir
     cases = _load_cases(root)
     warnings: list[str] = []
     if not root.exists():

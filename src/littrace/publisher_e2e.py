@@ -66,11 +66,11 @@ async def run_publisher_golden_e2e(
     cases_dir: Path | None = None,
     timeout_seconds: float = 180.0,
 ) -> PublisherE2EReport:
-    cases = _load_cases(cases_dir or config.eval.golden_set_dir)
+    cases = _load_cases(cases_dir or config.eval_golden_set_dir)
     results: list[PublisherE2EPaperResult] = []
     warnings: list[str] = []
     if not cases:
-        warnings.append(f"No golden cases found under {cases_dir or config.eval.golden_set_dir}.")
+        warnings.append(f"No golden cases found under {cases_dir or config.eval_golden_set_dir}.")
 
     timeout = httpx.Timeout(config.api.request_timeout_seconds)
     headers = {"User-Agent": config.api.user_agent}

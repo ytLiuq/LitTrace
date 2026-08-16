@@ -97,21 +97,6 @@ class DownloadRetryConfig(BaseModel):
     base_delay_seconds: float = 60.0
 
 
-class CachePolicyConfig(BaseModel):
-    default_ttl_seconds: int = 86_400
-    allow_stale_on_source_failure: bool = True
-
-
-class PublicationPolicyConfig(BaseModel):
-    strict_all_claims: bool = True
-    require_publishable_claim: bool = True
-
-
-class SentinelConfig(BaseModel):
-    # Keep daily discovery/download responsive; full OCR can run as a follow-up.
-    parse_on_daily: bool = True
-
-
 class PaperDownloadConfig(BaseModel):
     mode: DownloadMode = DownloadMode.ASK_EACH_TIME
     organize_by: str = "year_doi"
@@ -216,11 +201,6 @@ class LiteratureContextDefaults(BaseModel):
     preferred_journals: list[str] = Field(default_factory=list)
 
 
-class EvalConfig(BaseModel):
-    golden_set_dir: Path = Path("./eval/golden")
-    traces_dir: Path = Path("./eval/traces")
-
-
 class HarnessThresholdConfig(BaseModel):
     """Thresholds for harness quality checks — configurable via config.yaml."""
 
@@ -321,16 +301,27 @@ class LitTraceConfig(BaseModel):
     paper_download: PaperDownloadConfig = Field(default_factory=PaperDownloadConfig)
     parsing: ParsingConfig = Field(default_factory=ParsingConfig)
     literature_context: LiteratureContextDefaults = Field(default_factory=LiteratureContextDefaults)
-    eval: EvalConfig = Field(default_factory=EvalConfig)
     harness: HarnessThresholdConfig = Field(default_factory=HarnessThresholdConfig)
     retry: RetryPolicyConfig = Field(default_factory=RetryPolicyConfig)
     cost_budget: CostBudgetConfig = Field(default_factory=CostBudgetConfig)
-    schema_validation: SchemaValidationConfig = Field(default_factory=SchemaValidationConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     citation_guard: CitationGuardConfig = Field(default_factory=CitationGuardConfig)
-    cache_policy: CachePolicyConfig = Field(default_factory=CachePolicyConfig)
-    publication_policy: PublicationPolicyConfig = Field(default_factory=PublicationPolicyConfig)
-    sentinel: SentinelConfig = Field(default_factory=SentinelConfig)
+    # --- flat fields merged from collapsed sub-configs (5 deleted) ---
+    # Cache policy (was CachePolicyConfig)
+    cache_default_ttl_seconds: int = 86_400
+    cache_allow_stale_on_source_failure: bool = True
+    # Publication policy (was PublicationPolicyConfig)
+    publication_strict_all_claims: bool = True
+    publication_require_publishable_claim: bool = True
+    # Sentinel (was SentinelConfig)
+    sentinel_parse_on_daily: bool = True
+    # Eval paths (was EvalConfig)
+    eval_golden_set_dir: Path = Path("./eval/golden")
+    eval_traces_dir: Path = Path("./eval/traces")
+    # Schema validation (was SchemaValidationConfig)
+    schema_validation_enabled: bool = True
+    schema_validation_strict: bool = True
+    schema_validation_drop_invalid: bool = False
 
     @property
     def object_store(self) -> ArtifactStorageConfig:

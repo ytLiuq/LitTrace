@@ -50,7 +50,7 @@ def read_cached_text(
         if ttl_seconds is not None
         else stored_ttl
         if stored_ttl is not None
-        else config.cache_policy.default_ttl_seconds
+        else config.cache_default_ttl_seconds
     )
     stale = False
     if effective_ttl < 0:
@@ -84,7 +84,7 @@ def write_text_cache(
                 "created_at": datetime.now(UTC).isoformat(),
                 "ttl_seconds": ttl_seconds
                 if ttl_seconds is not None
-                else config.cache_policy.default_ttl_seconds,
+                else config.cache_default_ttl_seconds,
             }
         ),
         encoding="utf-8",
