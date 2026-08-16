@@ -71,7 +71,14 @@ class DoclingOCRTool:
             raw_dict = _safe_export_dict(document)
             figures, figure_assets = _extract_figures(document, pdf_path)
             markdown = document.export_to_markdown()
+            markdown = _decode_html_entities(markdown)
             markdown = _replace_image_placeholders(markdown, figures)
+            # Docling only emits a figures[] entry when the PDF contains an
+            # actual picture item. Many real-world PDFs (and all
+            # fpdf2-generated ones) ship figure captions as plain bold
+            # text. Fall back to regex-matching the markdown so RAG never
+            # loses the figure + caption association.
+            figures = _merge_figures_from_markdown(figures, markdown, pdf_path.stem)
             sections = markdown_to_sections(markdown, pdf_path.stem)
             tables = _tables_from_docling_dict(raw_dict, pdf_path.stem)
             return ParsedPaper(
@@ -317,6 +324,112 @@ def _item_visual_summary(item: Any) -> str | None:
     description = getattr(meta, "description", None)
     text = getattr(description, "text", None)
     return str(text).strip() if text else None
+
+
+_FIGURE_CAPTION_RE = __import__("re").compile(
+    r"^(?:\s*)(?:Figure|Fig\.|图|表)\s*(\d+)[\.\:\)]\s*(.+?)\s*$",
+    __import__("re").IGNORECASE,
+)
+
+
+def _merge_figures_from_markdown(
+    figures: list[dict[str, object]],
+    markdown: str,
+    paper_id: str,
+) -> list[dict[str, object]]:
+    """Backfill figure entries that docling missed.
+
+    Docling's `_extract_figures` walks `document.iterate_items()` and only
+    emits a figure when the PDF actually carries a picture item. Many
+    real-world PDFs (and all fpdf2 / LaTeX-rendered ones) ship the
+    figure caption as a plain bold text line such as
+    ``Figure 1. Schematic of the ...`` with no inline image. Without
+    this backfill, RAG's `parsed.figures` is empty and figure chunks
+    never reach the chunker.
+
+    Strategy: regex-match ``^(Figure|Fig.|图|表) N. <caption>`` lines
+    in the markdown, and either:
+      - merge with an existing docling-detected figure whose
+        ``figure_id`` matches the same N, or
+      - append a new synthetic figure with that caption.
+
+    Returns the merged figure list (does not mutate the input).
+    """
+    detected_by_id = {str(f.get("figure_id")): f for f in figures}
+    next_index = max(
+        (len(detected_by_id) + 1),
+        _next_figure_index(markdown),
+    )
+    out: list[dict[str, object]] = list(figures)
+    seen_numbers: set[int] = set()
+    for line in markdown.splitlines():
+        match = _FIGURE_CAPTION_RE.match(line)
+        if not match:
+            continue
+        number = int(match.group(1))
+        if number in seen_numbers:
+            continue
+        seen_numbers.add(number)
+        caption = _decode_html_entities(match.group(2).strip()).rstrip(".")
+        existing = detected_by_id.get(f"F{number}")
+        if existing is not None:
+            if not existing.get("caption"):
+                existing["caption"] = caption
+                ev = existing.get("evidence") or {}
+                if isinstance(ev, dict):
+                    ev["snippet"] = caption
+            continue
+        new_figure = {
+            "figure_id": f"F{number}",
+            "caption": caption,
+            "asset_path": None,
+            "asset_ref": f"artifact://figure_image/{paper_id}/F{number}",
+            "summary": caption,
+            "visual_summary_available": False,
+            "source": "markdown_fallback",
+            "evidence": EvidenceSpan(
+                paper_id=paper_id,
+                section="figures",
+                snippet=caption[:500],
+                parser="docling+markdown",
+                confidence=0.5,
+            ).model_dump(),
+        }
+        out.append(new_figure)
+        next_index = number + 1
+    out.sort(key=lambda f: _figure_sort_key(str(f.get("figure_id"))))
+    return out
+
+
+def _next_figure_index(markdown: str) -> int:
+    max_seen = 0
+    for line in markdown.splitlines():
+        match = _FIGURE_CAPTION_RE.match(line)
+        if match:
+            max_seen = max(max_seen, int(match.group(1)))
+    return max_seen
+
+
+def _figure_sort_key(figure_id: str) -> tuple[int, str]:
+    digits = "".join(ch for ch in figure_id if ch.isdigit())
+    return (int(digits) if digits else 0, figure_id)
+
+
+_HTML_ENTITY_RE = __import__("re").compile(r"&(#?[a-z0-9]+);", __import__("re").IGNORECASE)
+
+
+def _decode_html_entities(text: str) -> str:
+    """Decode the handful of HTML entities docling emits into markdown.
+
+    Docling escapes ``>``, ``<``, ``&`` as ``&gt;`` / ``&lt;`` / ``&amp;``
+    which corrupts downstream RAG tokenization (e.g. ``&gt;5000`` no
+    longer matches ``>5000``). This is intentionally minimal — only the
+    entities docling actually emits, leaving numeric entities intact.
+    """
+    table = {"gt": ">", "lt": "<", "amp": "&", "quot": '"', "apos": "'"}
+    return _HTML_ENTITY_RE.sub(
+        lambda m: table.get(m.group(1).lower(), m.group(0)), text
+    )
 
 
 def _replace_image_placeholders(markdown: str, figures: list[dict[str, object]]) -> str:
