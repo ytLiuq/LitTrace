@@ -170,6 +170,7 @@ class PostgresStateStore:
 
     dsn: str
     schema_name: str = "littrace"
+    allow_schema_reset: bool = False
     _initialized: bool = False
 
     # --- connection helpers -------------------------------------------------
@@ -208,17 +209,20 @@ class PostgresStateStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(f"CREATE SCHEMA IF NOT EXISTS {s}")
 
-            # DROP old tables — demo stage, no data preservation.
-            for old in (
-                "artifact_outbox",
-                "embedding_jobs",
-                "paper_lifecycle_events",
-                "session_messages",
-                "session_memory",
-                "session_snapshots",
-                "sessions",
-            ):
-                cur.execute(f"DROP TABLE IF EXISTS {s}.{old} CASCADE")
+            # DROP legacy tables ONLY when the operator has explicitly
+            # enabled schema reset. Default off — protects production /
+            # shared DSNs from accidental data loss on every boot.
+            if self.allow_schema_reset:
+                for old in (
+                    "artifact_outbox",
+                    "embedding_jobs",
+                    "paper_lifecycle_events",
+                    "session_messages",
+                    "session_memory",
+                    "session_snapshots",
+                    "sessions",
+                ):
+                    cur.execute(f"DROP TABLE IF EXISTS {s}.{old} CASCADE")
 
             cur.execute(
                 f"""
@@ -247,7 +251,9 @@ class PostgresStateStore:
                     messages JSONB NOT NULL DEFAULT '[]'::jsonb,
                     snapshot_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
                     events JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    updated_at TIMESTAMPTZ NOT NULL
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    CONSTRAINT chat_trail_messages_cap CHECK (jsonb_array_length(messages) <= 5000),
+                    CONSTRAINT chat_trail_events_cap   CHECK (jsonb_array_length(events)   <= 5000)
                 )
                 """
             )
@@ -305,11 +311,70 @@ class PostgresStateStore:
 
     # --- L1: session_state --------------------------------------------------
 
-    def upsert_session_state(self, state: SessionStateRecord) -> SessionStateRecord:
+    def upsert_session_state(
+        self, state: SessionStateRecord, *, expected_revision: int | None = None
+    ) -> SessionStateRecord:
+        """Upsert a session row. If ``expected_revision`` is set, treat the
+        UPDATE as compare-and-set: only overwrite if the row is at the
+        given revision. Returns the new record on success, raises
+        ``RuntimeError`` on CAS mismatch so the caller can retry.
+
+        On CONFLICT (new session), the CAS check is bypassed and the
+        initial revision is used.
+        """
         self._ensure_schema()
         s = self.schema_name
         now = datetime.now(UTC).isoformat()
         with self._connect() as conn, conn.cursor() as cur:
+            if expected_revision is not None:
+                cur.execute(
+                    f"""
+                    UPDATE {s}.session_state
+                    SET workspace_sha256 = %s,
+                        workspace_json = %s,
+                        manifest_json = %s,
+                        artifact_index_json = %s,
+                        memory_view_json = %s,
+                        rag_profile_json = %s,
+                        revision = %s,
+                        structured_document_count = %s,
+                        workspace_snapshot_count = %s,
+                        updated_at = now()
+                    WHERE session_id = %s AND revision = %s
+                    RETURNING created_at, updated_at
+                    """,
+                    (
+                        state.workspace_sha256,
+                        _jsonb(state.workspace_json),
+                        _jsonb(state.manifest_json),
+                        _jsonb(state.artifact_index_json),
+                        _jsonb(state.memory_view_json),
+                        _jsonb(state.rag_profile_json),
+                        state.revision,
+                        state.structured_document_count,
+                        state.workspace_snapshot_count,
+                        state.session_id,
+                        expected_revision,
+                    ),
+                )
+                if cur.rowcount == 0:
+                    current = self.get_session_state(state.session_id)
+                    if current is None:
+                        # Row vanished between read and CAS; do an INSERT.
+                        self.upsert_session_state(state, expected_revision=None)
+                        return state
+                    raise RuntimeError(
+                        f"SessionState CAS mismatch for {state.session_id}: "
+                        f"expected revision {expected_revision}, got {current.revision}"
+                    )
+                row = cur.fetchone()
+                conn.commit()
+                return state.model_copy(
+                    update={
+                        "created_at": str(row[0]),
+                        "updated_at": str(row[1]),
+                    }
+                )
             cur.execute(
                 f"""
                 INSERT INTO {s}.session_state (
@@ -347,6 +412,7 @@ class PostgresStateStore:
                 ),
             )
             row = cur.fetchone()
+            conn.commit()
         return state.model_copy(
             update={
                 "created_at": str(row[0]),
@@ -414,6 +480,38 @@ class PostgresStateStore:
             for row in rows
         ]
 
+    def update_memory_view(self, session_id: str, payload: dict[str, object]) -> bool:
+        """Single-field update of ``session_state.memory_view_json``.
+
+        Use this instead of ``upsert_session_state`` for partial writes so
+        concurrent ``save_workspace`` calls don't lose their full-row
+        overwrite to a stale read-modify-write on memory.
+        """
+        s = self.schema_name
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE {s}.session_state
+                SET memory_view_json = %s,
+                    updated_at = now()
+                WHERE session_id = %s
+                """,
+                (_jsonb(payload), session_id),
+            )
+            updated = cur.rowcount
+            conn.commit()
+        if updated:
+            return True
+        # Row doesn't exist — synthesize a minimal record so a memory-only
+        # save still has a home before the first save_workspace.
+        self.upsert_session_state(
+            SessionStateRecord(
+                session_id=session_id,
+                memory_view_json=payload,
+            )
+        )
+        return True
+
     def delete_session_state(self, session_id: str) -> int:
         self._ensure_schema()
         s = self.schema_name
@@ -442,6 +540,34 @@ class PostgresStateStore:
         s = self.schema_name
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_chat_trail(conn, session_id)
+            # Roll-over: if we are within 100 entries of the SQL CHECK cap
+            # (5000), drop the oldest 20% so a long session can keep
+            # appending without tripping the constraint.
+            cur.execute(
+                f"SELECT jsonb_array_length(messages) FROM {s}.chat_trail WHERE session_id = %s",
+                (session_id,),
+            )
+            length_row = cur.fetchone()
+            current_len = int(length_row[0]) if length_row and length_row[0] is not None else 0
+            if current_len >= 5000 - 100:
+                drop_count = max(1, current_len // 5)
+                cur.execute(
+                    f"""
+                    UPDATE {s}.chat_trail
+                    SET messages = (
+                        SELECT COALESCE(jsonb_agg(elem ORDER BY ord), '[]'::jsonb)
+                        FROM (
+                            SELECT elem, ord
+                            FROM jsonb_array_elements(messages) WITH ORDINALITY AS t(elem, ord)
+                            ORDER BY ord DESC
+                            LIMIT %s
+                        ) recent
+                    ),
+                    updated_at = now()
+                    WHERE session_id = %s
+                    """,
+                    (5000 - drop_count, session_id),
+                )
             cur.execute(
                 f"""
                 UPDATE {s}.chat_trail
@@ -450,6 +576,13 @@ class PostgresStateStore:
                 WHERE session_id = %s
                 """,
                 (_jsonb([record]), session_id),
+            )
+            # Keep the session_state.updated_at column in sync so the
+            # sidebar session list (ordered by session_state.updated_at)
+            # surfaces new chat activity even when no save_workspace ran.
+            cur.execute(
+                f"UPDATE {s}.session_state SET updated_at = now() WHERE session_id = %s",
+                (session_id,),
             )
             conn.commit()
 
@@ -472,6 +605,31 @@ class PostgresStateStore:
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_chat_trail(conn, session_id)
             cur.execute(
+                f"SELECT jsonb_array_length(events) FROM {s}.chat_trail WHERE session_id = %s",
+                (session_id,),
+            )
+            length_row = cur.fetchone()
+            current_len = int(length_row[0]) if length_row and length_row[0] is not None else 0
+            if current_len >= 5000 - 100:
+                drop_count = max(1, current_len // 5)
+                cur.execute(
+                    f"""
+                    UPDATE {s}.chat_trail
+                    SET events = (
+                        SELECT COALESCE(jsonb_agg(elem ORDER BY ord), '[]'::jsonb)
+                        FROM (
+                            SELECT elem, ord
+                            FROM jsonb_array_elements(events) WITH ORDINALITY AS t(elem, ord)
+                            ORDER BY ord DESC
+                            LIMIT %s
+                        ) recent
+                    ),
+                    updated_at = now()
+                    WHERE session_id = %s
+                    """,
+                    (5000 - drop_count, session_id),
+                )
+            cur.execute(
                 f"""
                 UPDATE {s}.chat_trail
                 SET events = events || %s::jsonb,
@@ -479,6 +637,10 @@ class PostgresStateStore:
                 WHERE session_id = %s
                 """,
                 (_jsonb([event]), session_id),
+            )
+            cur.execute(
+                f"UPDATE {s}.session_state SET updated_at = now() WHERE session_id = %s",
+                (session_id,),
             )
             conn.commit()
 
@@ -525,7 +687,7 @@ class PostgresStateStore:
                     source_revision = EXCLUDED.source_revision,
                     event_type = EXCLUDED.event_type,
                     updated_at = now()
-                RETURNING created_at, updated_at
+                RETURNING task_id, created_at, updated_at
                 """,
                 (
                     task.task_id,
@@ -550,10 +712,15 @@ class PostgresStateStore:
             )
             row = cur.fetchone()
             conn.commit()
+        # RETURNING includes the actual persisted task_id, which differs from
+        # the caller's value when ON CONFLICT DO UPDATE preserved the first
+        # enqueue's row. Use the persisted id so downstream references
+        # (lifecycle events keyed by task_id) match the real row.
         return task.model_copy(
             update={
-                "created_at": str(row[0]),
-                "updated_at": str(row[1]),
+                "task_id": str(row[0]),
+                "created_at": str(row[1]),
+                "updated_at": str(row[2]),
             }
         )
 
@@ -812,10 +979,18 @@ def _row_to_async_task(row: tuple) -> AsyncTaskRecord:
 
 
 def _jsonb(value: object) -> str:
-    """psycopg requires JSON-as- text wrapped in a JSONB cast for parameterized JSONB."""
+    """Serialize for a JSONB cast. Uses ``ensure_ascii=False`` so non-ASCII
+    (Chinese, emoji, etc.) round-trips at native size and GIN-indexed
+    JSONB queries match the same string the caller searched for. Falls
+    back to ``str()`` for non-JSON-serializable values (``datetime``,
+    ``UUID``, ``Path``, ``set`` …) so a stray non-serializable in
+    ``workspace_json`` cannot crash a save_workspace."""
     import json as _json
 
-    return _json.dumps(value)
+    def _default(value):
+        return str(value)
+
+    return _json.dumps(value, ensure_ascii=False, default=_default)
 
 
 def _from_jsonb(value) -> object:
@@ -834,4 +1009,5 @@ def state_store_from_config(config: LitTraceConfig) -> PostgresStateStore:
     return PostgresStateStore(
         dsn=config.metadata_store.postgres_dsn,
         schema_name=config.metadata_store.schema_name,
+        allow_schema_reset=config.metadata_store.allow_schema_reset,
     )

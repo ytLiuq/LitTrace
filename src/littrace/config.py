@@ -39,6 +39,10 @@ class MetadataStoreConfig(BaseModel):
     backend: str = "postgres"
     postgres_dsn: str | None = "postgresql://littrace:littrace@localhost:5433/littrace"
     schema_name: str = "littrace"
+    # When True, state_store bootstrap will DROP legacy tables and recreate
+    # the 3-table layout. Default off so a typo in DSN can't nuke data.
+    # Override with LITTRACE_ALLOW_SCHEMA_RESET=1 (demo stage only).
+    allow_schema_reset: bool = False
 
 
 class RagConfig(BaseModel):
@@ -453,6 +457,9 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     )
     config.metadata_store.schema_name = (
         os.environ.get("LITTRACE_POSTGRES_SCHEMA") or config.metadata_store.schema_name
+    )
+    config.metadata_store.allow_schema_reset = _env_bool(
+        "LITTRACE_ALLOW_SCHEMA_RESET", config.metadata_store.allow_schema_reset
     )
     config.rag.enabled = _env_bool("LITTRACE_RAG_ENABLED", config.rag.enabled)
     config.rag.backend = os.environ.get("LITTRACE_RAG_BACKEND") or config.rag.backend

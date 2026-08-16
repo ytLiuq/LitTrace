@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin
@@ -9,6 +10,7 @@ import httpx
 
 from littrace.artifact_store import (
     ArtifactKeyContext,
+    BlobRef,
     artifact_store_from_config,
     build_artifact_object_key,
 )
@@ -482,6 +484,10 @@ def make_download_retry_handler(config: LitTraceConfig):
     return handler
 
 
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def _store_pdf_artifact(
     config: LitTraceConfig,
     task: DownloadTask,
@@ -492,6 +498,7 @@ def _store_pdf_artifact(
 ) -> dict[str, object]:
     task.mark(DownloadTaskStatus.UPLOADING_TO_OBJECT_STORAGE)
     store = artifact_store_from_config(config)
+    registry = artifact_registry_from_config(config)
     artifact_id = f"paper_pdf:{paper.paper_id}"
     object_key = build_artifact_object_key(
         config,
@@ -503,41 +510,58 @@ def _store_pdf_artifact(
             paper_id=paper.paper_id,
         ),
     )
-    ref = store.put_bytes(
-        object_key,
-        data,
-        content_type=content_type or "application/pdf",
-        metadata={
-            "session_id": task.session_id,
-            "paper_id": paper.paper_id,
-            "kind": "paper_pdf",
-            "doi": paper.doi or "",
-        },
-    )
-    record = artifact_registry_from_config(config).upsert(
-        ArtifactRecord.from_blob_ref(
-            ref,
-            artifact_id=artifact_id,
-            session_id=task.session_id,
-            kind="paper_pdf",
-            paper_id=paper.paper_id,
+    # Idempotency: if a registry row already exists for this
+    # (session_id, artifact_id) and the byte sha256 matches, skip the PUT
+    # and the lifecycle event. This protects against double-download from
+    # chat intent + auto_resume + a retry worker all racing.
+    prior = registry.find_in_session(artifact_id, session_id=task.session_id)
+    if prior is not None and prior.sha256 and prior.sha256 == _sha256_hex(data):
+        ref = BlobRef(
+            backend=prior.backend,
+            bucket=prior.bucket,
+            object_key=prior.object_key,
+            sha256=prior.sha256,
+            size_bytes=prior.size_bytes,
+            content_type=prior.content_type,
+            uri=prior.bucket and f"s3://{prior.bucket}/{prior.object_key}" or prior.object_key,
+        )
+        record = prior
+    else:
+        ref = store.put_bytes(
+            object_key,
+            data,
+            content_type=content_type or "application/pdf",
             metadata={
-                "doi": paper.doi,
-                "source_name": task.source_name,
-                "source_url": task.source_url,
+                "session_id": task.session_id,
+                "paper_id": paper.paper_id,
+                "kind": "paper_pdf",
+                "doi": paper.doi or "",
             },
         )
-    )
-    record_lifecycle_event(
-        config, session_id=task.session_id, paper_id=paper.paper_id,
-        event_type="artifact_stored", task_id=task.task_id, artifact_id=artifact_id,
-        payload={"artifact_id": artifact_id, "sha256": ref.sha256, "source_revision": record.revision},
-    )
-    if config.rag.enabled:
-        enqueue_embedding_outbox(
-            config, session_id=task.session_id, artifact_id=artifact_id,
-            content_sha256=ref.sha256, payload={"source_revision": record.revision},
+        record = registry.upsert(
+            ArtifactRecord.from_blob_ref(
+                ref,
+                artifact_id=artifact_id,
+                session_id=task.session_id,
+                kind="paper_pdf",
+                paper_id=paper.paper_id,
+                metadata={
+                    "doi": paper.doi,
+                    "source_name": task.source_name,
+                    "source_url": task.source_url,
+                },
+            )
         )
+        record_lifecycle_event(
+            config, session_id=task.session_id, paper_id=paper.paper_id,
+            event_type="artifact_stored", task_id=task.task_id, artifact_id=artifact_id,
+            payload={"artifact_id": artifact_id, "sha256": ref.sha256, "source_revision": record.revision},
+        )
+        if config.rag.enabled:
+            enqueue_embedding_outbox(
+                config, session_id=task.session_id, artifact_id=artifact_id,
+                content_sha256=ref.sha256, payload={"source_revision": record.revision},
+            )
     task.artifact_id = artifact_id
     task.target_bucket = ref.bucket
     task.target_object_key = ref.object_key

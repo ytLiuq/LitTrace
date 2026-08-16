@@ -33,8 +33,16 @@ def write_config_template(path: str | Path = "config.yaml", overwrite: bool = Fa
     raw["rag"]["enabled"] = False
     raw["rag"]["backend"] = "pgvector"
     raw["rag"]["postgres_dsn"] = "postgresql://littrace:littrace@localhost:5433/littrace"
+    # Demo-stage defaults: explicit opt-in for any data acquisition. The
+    # operator must set these to true to actually start pulling bytes.
+    raw["rag"]["auto_download_open_access"] = False
+    raw["rag"]["allow_requires_login_download"] = False
+    raw["metadata_store"]["allow_schema_reset"] = False
+    raw["cdp_downloader"]["auto_launch_chrome"] = False
     raw["rag"]["embedding_base_url"] = "https://api.openai.com/v1"
-    raw["rag"]["embedding_api_key"] = "your-openai-api-key"
+    # No placeholder API key — littrace enforces "real key required" on
+    # startup. Ship an empty value and let the operator set their own.
+    raw["rag"]["embedding_api_key"] = ""
     raw["parsing"]["default_parser"] = "docling"
     target.write_text(yaml.safe_dump(raw, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return ConfigWizardResult(path=str(target), created=True)

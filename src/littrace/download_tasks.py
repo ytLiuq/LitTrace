@@ -95,7 +95,13 @@ class DownloadTask(BaseModel):
         return self
 
     def schedule_retry(self, base_delay_seconds: float) -> "DownloadTask":
-        delay = min(base_delay_seconds * (2 ** max(self.attempt_count - 1, 0)), 3600)
+        import random as _random
+
+        base = min(base_delay_seconds * (2 ** max(self.attempt_count - 1, 0)), 3600)
+        # Jitter ±20% to break thundering-herd alignment between concurrent
+        # retry workers and across many failed papers.
+        jitter = base * (0.8 + 0.4 * _random.random())
+        delay = int(jitter)
         self.retry_after = (datetime.now(UTC) + timedelta(seconds=delay)).isoformat()
         self.updated_at = datetime.now(UTC).isoformat()
         return self
@@ -140,9 +146,7 @@ class PostgresDownloadTaskStore:
                     %(target_object_key)s, %(artifact_id)s, %(sha256)s, %(size_bytes)s,
                     %(created_at)s, %(updated_at)s, %(completed_at)s, %(payload)s
                 )
-                ON CONFLICT (task_id) DO UPDATE SET
-                    session_id = EXCLUDED.session_id,
-                    paper_id = EXCLUDED.paper_id,
+                ON CONFLICT (session_id, paper_id) DO UPDATE SET
                     source_name = EXCLUDED.source_name,
                     source_url = EXCLUDED.source_url,
                     doi = EXCLUDED.doi,
@@ -241,7 +245,9 @@ class PostgresDownloadTaskStore:
                     created_at TIMESTAMPTZ NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL,
                     completed_at TIMESTAMPTZ,
-                    payload JSONB NOT NULL
+                    payload JSONB NOT NULL,
+                    CONSTRAINT download_tasks_session_paper_uk
+                        UNIQUE (session_id, paper_id)
                 )
                 """
             )

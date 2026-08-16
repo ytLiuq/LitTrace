@@ -190,6 +190,10 @@ def auto_archive_login_downloads(
 ) -> tuple[int, list[str]]:
     archived = 0
     warnings: list[str] = []
+    # Cap auto-archive size: a 10 GB accidental browser download should not
+    # be silently moved into paper_library_dir. 200 MB matches the largest
+    # realistic single-paper PDF in the wild.
+    max_bytes = 200 * 1024 * 1024
     for paper_id in workspace.context.active_papers:
         paper = workspace.papers[paper_id]
         target = target_pdf_path(config, paper)
@@ -198,9 +202,39 @@ def auto_archive_login_downloads(
         candidates = _download_candidates(target.parent)
         if not candidates:
             continue
+        # Refuse to archive when the candidates are ambiguous (more than
+        # one paper maps to the same download_dir). Skip with a warning
+        # rather than silently picking the most-recent PDF.
+        if len(candidates) > 1 and len(workspace.context.active_papers) > 1:
+            sibling_dirs = {
+                path.parent for path in candidates
+            }
+            # Heuristic: if multiple papers share the same download_dir,
+            # the candidates are ambiguous — skip and warn.
+            if len(sibling_dirs) == 1 and len(workspace.context.active_papers) > 1:
+                warnings.append(
+                    f"Auto-archive skipped for {paper_id}: {len(candidates)} candidates "
+                    f"in shared download_dir; resolve manually."
+                )
+                continue
         source = candidates[0]
+        if source.stat().st_size > max_bytes:
+            warnings.append(
+                f"Auto-archive skipped for {paper_id}: {source.name} is "
+                f"{source.stat().st_size} bytes (>{max_bytes} cap)."
+            )
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
-        source.replace(target)
+        # Copy then unlink to preserve the original in case the archive
+        # step fails halfway. Atomic-replace can otherwise leave the
+        # download folder empty.
+        import shutil
+
+        shutil.copy2(source, target)
+        try:
+            source.unlink()
+        except OSError:
+            pass
         archived += 1
         warnings.append(
             f"Auto-archived browser download for {paper_id}: {source.name} -> paper.pdf"

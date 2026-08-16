@@ -241,31 +241,6 @@ def _cell_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _figures_from_docling_dict(raw: dict[str, Any], paper_id: str) -> list[dict[str, object]]:
-    figures = raw.get("figures") or raw.get("pictures") or []
-    if not isinstance(figures, list):
-        return []
-    parsed: list[dict[str, object]] = []
-    for index, figure in enumerate(figures, start=1):
-        caption = None
-        if isinstance(figure, dict):
-            caption = str(figure.get("caption") or figure.get("label") or "") or None
-        parsed.append(
-            {
-                "figure_id": f"F{index}",
-                "caption": caption,
-                "evidence": EvidenceSpan(
-                    paper_id=paper_id,
-                    section="figures",
-                    snippet=caption,
-                    parser="docling",
-                    confidence=0.6,
-                ).model_dump(),
-            }
-        )
-    return parsed
-
-
 def _extract_figures(document: Any, pdf_path: Path) -> tuple[list[dict[str, object]], list[str]]:
     figures: list[dict[str, object]] = []
     assets: list[str] = []

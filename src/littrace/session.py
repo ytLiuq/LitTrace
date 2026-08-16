@@ -797,20 +797,28 @@ def _sync_session_state(
     if state_store is None:
         return
     workspace_json = json.loads(workspace.model_dump_json())
-    state_store.upsert_session_state(
-        SessionStateRecord(
-            session_id=session.session_id,
-            workspace_sha256=manifest.get("workspace_sha256"),
-            workspace_json=workspace_json if isinstance(workspace_json, dict) else {},
-            manifest_json=manifest,
-            artifact_index_json=artifact_index,
-            memory_view_json=memory.model_dump(mode="json") if hasattr(memory, "model_dump") else {},
-            rag_profile_json=rag_profile.model_dump(mode="json") if rag_profile is not None else {},
-            revision=int(manifest.get("revision", 0) or 0),
-            structured_document_count=workspace.context.filters.structured_document_count,
-            workspace_snapshot_count=workspace.context.filters.workspace_snapshot_count,
+    new_revision = int(manifest.get("revision", 0) or 0)
+    record = SessionStateRecord(
+        session_id=session.session_id,
+        workspace_sha256=manifest.get("workspace_sha256"),
+        workspace_json=workspace_json if isinstance(workspace_json, dict) else {},
+        manifest_json=manifest,
+        artifact_index_json=artifact_index,
+        memory_view_json=memory.model_dump(mode="json") if hasattr(memory, "model_dump") else {},
+        rag_profile_json=rag_profile.model_dump(mode="json") if rag_profile is not None else {},
+        revision=new_revision,
+        structured_document_count=workspace.context.filters.structured_document_count,
+        workspace_snapshot_count=workspace.context.filters.workspace_snapshot_count,
         )
-    )
+    # CAS optimistic concurrency: read the prior revision and only update
+    # if it hasn't moved. Prevents lost updates when save_workspace fires
+    # concurrently from two threads.
+    prior = state_store.get_session_state(session.session_id)
+    expected_revision = (prior.revision if prior is not None else -1)
+    if expected_revision == new_revision:
+        # Nothing changed at the row level — skip the write entirely.
+        return
+    state_store.upsert_session_state(record, expected_revision=expected_revision)
 
 
 def _load_session_record(session: ChatSession) -> SessionStateRecord | None:

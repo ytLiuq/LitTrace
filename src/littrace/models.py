@@ -337,9 +337,14 @@ class DOIBackfillRequest(BaseModel):
 
 
 class WorkspaceFilters(BaseModel):
-    """Explicit, serializable metadata describing the current workspace state."""
+    """Explicit, serializable metadata describing the current workspace state.
 
-    model_config = ConfigDict(extra="forbid")
+    ``extra="ignore"`` (was ``"forbid"``) lets old persisted sessions load
+    cleanly when a new field is added or an old field is renamed — the
+    extra keys are silently dropped rather than crashing the load path.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     # Search-related
     search_mode: str | None = None

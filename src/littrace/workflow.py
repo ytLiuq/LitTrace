@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import TypedDict
@@ -67,6 +68,20 @@ class ResearchWorkflowState(TypedDict, total=False):
     autonomous_loop_report: object
     workflow_status: object
     workflow_trace: WorkflowTrace
+
+
+def _littrace_config_for_workflow() -> "LitTraceConfig | None":
+    """Best-effort read of the global LitTraceConfig for workflow timeouts.
+
+    Returns ``None`` if the config cannot be loaded (test environments,
+    missing optional deps). Callers must tolerate ``None`` and fall back
+    to a sane default.
+    """
+    try:
+        from littrace.config import load_config
+        return load_config()
+    except Exception:
+        return None
 
 
 def _workflow_tool_context(state: ResearchWorkflowState, node: str) -> ToolCallContext:
@@ -514,14 +529,41 @@ def build_littrace_graph():
 
         return select
 
-    def _wrap_node(name: str, fn):
-        """Wrap a LangGraph node with timed logging."""
+    def _wrap_node(name: str, fn, *, timeout_seconds: float | None = None):
+        """Wrap a LangGraph node with timed logging + per-node timeout.
+
+        The timeout defaults to ``api.request_timeout_seconds * 4`` so a
+        single stuck node cannot block the chat path indefinitely. Pass an
+        explicit ``timeout_seconds`` to override for a specific node.
+        """
         import functools
+
+        effective_timeout = timeout_seconds
+        if effective_timeout is None:
+            try:
+                effective_timeout = float(
+                    getattr(_littrace_config_for_workflow(), "api.request_timeout_seconds", 60.0)
+                ) * 4
+            except Exception:
+                effective_timeout = 240.0
 
         @functools.wraps(fn)
         async def wrapped(state, *args, **kwargs):
             with timed(f"node:{name}"):
-                result = await fn(state, *args, **kwargs)
+                try:
+                    result = await asyncio.wait_for(
+                        fn(state, *args, **kwargs),
+                        timeout=effective_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "workflow_node_timeout",
+                        extra={
+                            "node": name,
+                            "timeout_seconds": effective_timeout,
+                        },
+                    )
+                    raise
                 ws = state.get("workspace")
                 logger.info(
                     "node_completed",

@@ -97,7 +97,15 @@ class LocalArtifactStore:
         return self._path_for_ref(ref).exists()
 
     def signed_url(self, ref: BlobRef, expires_seconds: int = 3600) -> str:
-        return ref.uri or self._path_for_ref(ref).resolve().as_uri()
+        # Local backend has no real signed URL. The previous behaviour
+        # returned ``file:///...`` URIs which leak the operator's
+        # filesystem path and silently break in browsers (file:// is
+        # cross-origin blocked). Raise so the route layer can either
+        # stream the bytes via an internal proxy or return 501.
+        raise NotImplementedError(
+            "LocalArtifactStore does not support signed_url; "
+            "expose bytes via an internal streaming endpoint instead."
+        )
 
     def ref_for_path(
         self,
