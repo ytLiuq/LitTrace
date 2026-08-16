@@ -79,7 +79,12 @@ def parse_workspace_papers(
 
 
 def local_pdf_path(config: LitTraceConfig, paper: PaperMetadata) -> Path:
-    return paper_storage_dir(config, paper) / "paper.pdf"
+    """Canonical alias for ``target_pdf_path`` — kept for backward
+    compatibility; new code should import from
+    ``littrace.access_layer.paths``."""
+    from littrace.access_layer.paths import target_pdf_path
+
+    return target_pdf_path(config, paper)
 
 
 def _docling_quality_report(parsed: ParsedPaper) -> dict[str, object]:

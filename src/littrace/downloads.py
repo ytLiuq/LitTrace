@@ -122,7 +122,7 @@ async def _execute_one(
             task_id=task.task_id,
         ), task
 
-    target_path = _target_pdf_path(config, paper)
+    target_path = target_pdf_path(config, paper)
     if dry_run:
         return DownloadExecutionItem(
             paper_id=paper.paper_id,
@@ -310,7 +310,7 @@ def _execute_cdp_download(
     *,
     prior_error: str | None = None,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
-    target_path = _target_pdf_path(config, paper)
+    target_path = target_pdf_path(config, paper)
     if dry_run:
         return DownloadExecutionItem(
             paper_id=paper.paper_id,
@@ -376,8 +376,8 @@ async def _execute_cdp_download_async(
     )
 
 
-def _target_pdf_path(config: LitTraceConfig, paper: PaperMetadata) -> Path:
-    return target_pdf_path(config, paper)
+# _target_pdf_path internal alias removed; callers use
+# littrace.access_layer.paths.target_pdf_path directly.
 
 
 def _looks_like_pdf_bytes(content: bytes) -> bool:

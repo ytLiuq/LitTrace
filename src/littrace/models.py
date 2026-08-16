@@ -49,6 +49,74 @@ class EvidenceSourceKind(StrEnum):
     USER_SUPPLIED = "user_supplied"
 
 
+class ArtifactKind(StrEnum):
+    """Canonical artifact kinds used in chat_trail, async_tasks, and
+    workspace.context.filters.artifact_index.
+
+    Replaces ~40 string-literal sites across downloads.py, session.py,
+    session_metrics.py, artifact_ops.py with one enum reference.
+    """
+
+    PAPER_PDF = "paper_pdf"
+    SUPPLEMENTARY = "supplementary"
+    STRUCTURED_DOCUMENT = "structured_document"
+    WORKSPACE = "workspace"
+    WORKSPACE_SNAPSHOT = "workspace_snapshot"
+    MESSAGES = "messages"
+    MEMORY = "memory"
+    ARTIFACTS = "artifacts"
+
+    @classmethod
+    def embeddable(cls) -> set[str]:
+        """Kinds that are submitted to the embedding queue."""
+        return {cls.PAPER_PDF, cls.SUPPLEMENTARY, cls.STRUCTURED_DOCUMENT}
+
+
+class IntentAction(StrEnum):
+    """All recognised intent actions. Replaces ~25 string-literal sites
+    in intent.py, chat.py, workflow.py with one enum reference."""
+
+    SEARCH = "search"
+    PARSE = "parse"
+    TABLE = "table"
+    STORYLINE = "storyline"
+    DOCUMENT = "document"
+    DOWNLOAD = "download"
+    AUTONOMOUS_REVIEW = "autonomous_review"
+    SELECT_DOWNLOADS = "select_downloads"
+    DESELECT_DOWNLOADS = "deselect_downloads"
+    LIST_CONTEXT = "list_context"
+    HIDE_CONTEXT = "hide_context"
+    SHOW_CONTEXT = "show_context"
+    CANCEL_PENDING_INTENT = "cancel_pending_intent"
+    INTENT_PARSE_ERROR = "intent_parse_error"
+    CLARIFY = "clarify"
+    COMPONENT_STATUS = "component_status"
+    RESEARCH_BACKGROUND_SET = "research_background_set"
+    RESEARCH_BACKGROUND_REQUIRED = "research_background_required"
+
+
+class AsyncTaskStatus(StrEnum):
+    """Lifecycle status for an async_tasks row.
+
+    Replaces 5 string-literal sites in state_db.py / lifecycle.py /
+    rag_jobs.py with one enum reference.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DEAD = "dead"
+
+
+class EvidenceSourceKind(StrEnum):
+    PRIMARY_DOCUMENT = "primary_document"
+    STRUCTURED_TABLE = "structured_table"
+    METADATA = "metadata"
+    USER_SUPPLIED = "user_supplied"
+
+
 class VerificationReport(BaseModel):
     claim_id: str | None = None
     claim: str
