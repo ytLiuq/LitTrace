@@ -19,7 +19,11 @@ from littrace.retrieval.rag_refresh import RagRefreshReport, refresh_session_rag
 from littrace.retrieval.rag_profile import load_session_rag_profile
 from littrace.sentinel.cli import run_sentinel
 from littrace.session import load_or_create_session, load_workspace, save_workspace
-from littrace.skill_runner import parse_workspace_skill, search_papers_skill
+from littrace.skill_runner import (
+    execute_downloads_skill,
+    parse_workspace_skill,
+    search_papers_skill,
+)
 from littrace.state_db import EmbeddingJobRecord, state_store_from_config
 
 
@@ -175,10 +179,9 @@ async def run_session_research_background_sync(
     if not config.rag.auto_download_open_access:
         return _skip_background_sync(report, "auto_download_open_access_disabled")
 
-    # Auto-download has been removed: PDFs are only acquired when the user
-    # explicitly invokes the manual download path. Daily background sync is
-    # now a no-op for acquisition; it still refreshes the RAG index for any
-    # papers the user has already downloaded into the workspace.
+    # Daily background sync: pull any new open-access PDFs that the user has
+    # not yet downloaded locally. Bytes go to the object store only — never
+    # to paper_library_dir — so the user's working directory stays clean.
     request = PaperSearchRequest(
         topic=topic,
         discipline=filters.discipline or "materials chemistry",
@@ -208,8 +211,30 @@ async def run_session_research_background_sync(
         active_limit=config.literature_context.active_context_limit,
     )
     workspace.context.filters.research_background_last_sync_at = datetime.now(UTC).isoformat()
+    open_access_ids = [
+        paper.paper_id
+        for paper in workspace.papers.values()
+        if paper.paper_id in {paper.paper_id for paper in accepted_papers}
+        and paper.access_type == AccessType.OPEN_ACCESS
+    ]
+    report.open_access_count = len(open_access_ids)
     parse_report = {"parsed_count": 0}
     report.parsed_count = 0
+    if open_access_ids:
+        download_result = await execute_downloads_skill(
+            config,
+            workspace,
+            DownloadExecutionRequest(
+                paper_ids=open_access_ids,
+                session_id=session.session_id,
+                target="storage_only",
+            ),
+        )
+        report.downloaded_count = download_result.downloaded_count
+        report.requires_login_count = download_result.requires_login_count
+        if report.downloaded_count:
+            workspace, parse_report = await parse_workspace_skill(workspace, config)
+            report.parsed_count = int(parse_report.get("parsed_count", 0) or 0)
     # Persist parsed artifacts before consuming their durable outbox records.
     # The worker owns pgvector writes and embedding-job completion, so freshness
     # reflects the same path that actually produced the vectors.

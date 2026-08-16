@@ -60,7 +60,14 @@ async def execute_downloads(
             _record_task_lifecycle(config, task, "acquisition_queued")
             if not request.dry_run and config.download_retry.enabled:
                 task_store.upsert(task)
-            item, task = await _execute_one(client, config, paper, request.dry_run, task)
+            item, task = await _execute_one(
+                client,
+                config,
+                paper,
+                request.dry_run,
+                task,
+                write_local=(request.target != "storage_only"),
+            )
             _record_terminal_acquisition_event(config, task)
             if not request.dry_run and config.download_retry.enabled:
                 task_store.upsert(task)
@@ -91,6 +98,8 @@ async def _execute_one(
     paper: PaperMetadata,
     dry_run: bool,
     task: DownloadTask,
+    *,
+    write_local: bool = True,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
     _record_task_lifecycle(config, task, "acquisition_started")
     if paper.access_type == AccessType.REQUIRES_LOGIN and paper.doi:
@@ -146,8 +155,9 @@ async def _execute_one(
                         continue
                     if not _looks_like_pdf_bytes(candidate_response.content):
                         continue
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    target_path.write_bytes(candidate_response.content)
+                    if write_local:
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        target_path.write_bytes(candidate_response.content)
                     try:
                         storage_ref = _store_pdf_artifact(
                             config,
@@ -216,8 +226,9 @@ async def _execute_one(
                 error=error,
                 task_id=task.task_id,
             ), task
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(response.content)
+        if write_local:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(response.content)
         try:
             storage_ref = _store_pdf_artifact(
                 config,

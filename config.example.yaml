@@ -34,7 +34,11 @@ rag:
   top_k: 12
   refresh_frequency: "daily"
   auto_refresh_enabled: false
-  auto_download_open_access: false
+  # Daily-update auto-download: when on, the daily RAG job pulls new OA
+  # PDFs automatically but writes them only to the artifact object store
+  # (artifact_storage). User-initiated paths (chat /downloads/execute,
+  # attach-pdf) are unaffected and continue to write both local + storage.
+  auto_download_open_access: true
   login_required_policy: "queue_only"
 
 figure_enrichment:
@@ -85,7 +89,7 @@ paper_download:
   filename_template: "{year}_{first_author}_{short_title}_{doi_hash}.pdf"
   save_metadata_even_if_pdf_skipped: false
   max_concurrent_downloads: 3
-  allow_requires_login_download: false
+  allow_requires_login_download: true
 
 parsing:
   default_parser: "paddleocr"

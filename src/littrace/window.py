@@ -30,11 +30,11 @@ from littrace.state_db import state_store_from_config
 from littrace.evidence.tables import decide_artifact_extraction_need
 from littrace.tui import render_context_lines
 
-# 后台同步 / RAG embedding 集成
+# 后台同步 / RAG daily 集成
 try:
-    from littrace.rag_jobs import run_pending_embedding_jobs  # noqa: F401
+    from littrace.rag_jobs import run_daily_rag_maintenance  # noqa: F401
 except ImportError:  # pragma: no cover - defensive
-    run_pending_embedding_jobs = None  # type: ignore[assignment]
+    run_daily_rag_maintenance = None  # type: ignore[assignment]
 try:
     from littrace.retrieval.rag_refresh import refresh_session_rag_index  # noqa: F401
 except ImportError:  # pragma: no cover - defensive
@@ -121,7 +121,7 @@ class LitTraceWindow:
         self.login_popup = None
         self.rag_busy = False
         self.sync_session_btn: object | None = None
-        self.embedding_refresh_btn: object | None = None
+        self.full_daily_btn: object | None = None
         self.rag_text: object | None = None
         # Slash-command autocomplete popup state.
         self.command_popup: object | None = None
@@ -541,13 +541,13 @@ class LitTraceWindow:
             command=self._trigger_session_sync,
         )
         self.sync_session_btn.grid(row=0, column=0, padx=(0, 4), sticky="ew")
-        self.embedding_refresh_btn = self.ttk.Button(
+        self.full_daily_btn = self.ttk.Button(
             rag_btn_frame,
-            text="立即 Embedding 刷新",
+            text="立即全量 Daily",
             style="Secondary.TButton",
-            command=self._trigger_embedding_refresh,
+            command=self._trigger_full_daily,
         )
-        self.embedding_refresh_btn.grid(row=0, column=1, padx=(4, 0), sticky="ew")
+        self.full_daily_btn.grid(row=0, column=1, padx=(4, 0), sticky="ew")
         self.status_var = self.tk.StringVar(value=f"Session: {self.session.session_id}")
         self.ttk.Label(
             self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w"
@@ -914,8 +914,8 @@ class LitTraceWindow:
             state = "disabled" if busy else "normal"
             if self.sync_session_btn is not None:
                 self.sync_session_btn.configure(state=state)
-            if self.embedding_refresh_btn is not None:
-                self.embedding_refresh_btn.configure(state=state)
+            if self.full_daily_btn is not None:
+                self.full_daily_btn.configure(state=state)
             if label:
                 self.status_var.set(label)
 
@@ -956,32 +956,34 @@ class LitTraceWindow:
 
         self.root.after(0, done)
 
-    def _trigger_embedding_refresh(self) -> None:
+    def _trigger_full_daily(self) -> None:
         if self.rag_busy:
             return
-        if run_pending_embedding_jobs is None:
-            self.status_var.set("RAG 不可用: run_pending_embedding_jobs 未导入")
+        if run_daily_rag_maintenance is None:
+            self.status_var.set("RAG 不可用: run_daily_rag_maintenance 未导入")
             return
-        self._set_rag_busy(True, "正在刷新 Embedding 队列…")
-        threading.Thread(target=self._embedding_refresh_thread, daemon=True).start()
+        self._set_rag_busy(True, "正在执行全量 Daily（自动下载到对象存储）…")
+        threading.Thread(target=self._full_daily_thread, daemon=True).start()
 
-    def _embedding_refresh_thread(self) -> None:
+    def _full_daily_thread(self) -> None:
         try:
-            report = asyncio.run(run_pending_embedding_jobs(self.config))
+            report = asyncio.run(run_daily_rag_maintenance(self.config))
             summary = (
-                f"Embedding 完成: processed={report.processed} "
-                f"failed={report.failed} skipped={report.skipped} "
-                f"outbox={report.outbox_dispatched}/{report.outbox_failed}"
+                f"Daily 完成: refreshed={report.sessions_refreshed} "
+                f"failed={report.sessions_failed} skipped={report.sessions_skipped} "
+                f"jobs={report.embedding_jobs_processed}/{report.embedding_jobs_failed} "
+                f"下载到对象存储={report.downloaded_count}"
             )
             if report.warnings:
                 summary += f" warns={len(report.warnings)}"
         except Exception as exc:
-            summary = f"Embedding 失败: {exc.__class__.__name__}: {exc}"
+            summary = f"Daily 失败: {exc.__class__.__name__}: {exc}"
 
         def done() -> None:
             self.status_var.set(summary)
             self._set_rag_busy(False)
             self._refresh_rag_panel()
+            self._refresh_session_history()
 
         self.root.after(0, done)
 

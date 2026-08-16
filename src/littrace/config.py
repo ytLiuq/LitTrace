@@ -57,7 +57,11 @@ class RagConfig(BaseModel):
     top_k: int = 12
     refresh_frequency: str = "daily"
     auto_refresh_enabled: bool = False
-    auto_download_open_access: bool = False
+    # Daily-update auto-download: when on, the daily RAG job downloads
+    # new OA PDFs automatically — but only into the artifact object store.
+    # Bytes never land in the user's local paper_library_dir from this path.
+    # For local PDFs the user must explicitly invoke a manual download.
+    auto_download_open_access: bool = True
     login_required_policy: str = "queue_only"
 
 
@@ -109,7 +113,9 @@ class PaperDownloadConfig(BaseModel):
     organize_by: str = "year_doi"
     filename_template: str = "{year}_{first_author}_{short_title}_{doi_hash}.pdf"
     save_metadata_even_if_pdf_skipped: bool = False
-    allow_requires_login_download: bool = False
+    # User-initiated paths (chat intent, /downloads/execute, attach-pdf) may
+    # still pull gated PDFs through the local CDP login handoff.
+    allow_requires_login_download: bool = True
     max_concurrent_downloads: int = Field(default=3, ge=1, le=8)
 
 

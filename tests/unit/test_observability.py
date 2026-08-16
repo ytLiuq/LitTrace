@@ -159,8 +159,7 @@ def test_sentinel_run_builds_digest_and_access_queue(monkeypatch, tmp_path):
 
     monkeypatch.setattr("littrace.sentinel.agent.search_papers_skill", fake_search)
     monkeypatch.setattr("littrace.sentinel.agent.resolve_workspace_full_text_skill", fake_resolve)
-    # execute_downloads_skill is no longer imported by sentinel/agent after
-    # auto-download removal; the patch is intentionally skipped.
+    monkeypatch.setattr("littrace.sentinel.agent.execute_downloads_skill", fake_download)
     monkeypatch.setattr("littrace.sentinel.agent.parse_workspace_skill", fake_parse)
     monkeypatch.setattr("littrace.sentinel.agent.extract_tables_skill", fake_extract)
     monkeypatch.setattr("littrace.sentinel.agent.build_quality_report_skill", fake_quality)

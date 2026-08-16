@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from littrace.config import LitTraceConfig
-from littrace.models import AccessType, LiteratureWorkspace, PaperSearchRequest
+from littrace.models import AccessType, DownloadExecutionRequest, LiteratureWorkspace, PaperSearchRequest
 from littrace.sentinel.digest import build_digest_markdown, save_digest
 from littrace.sentinel.resource_pack import ResourcePack, build_resource_pack, save_resource_pack
 from littrace.sentinel.state import AccessTask, SentinelRunSummary, SentinelState, Watchlist
@@ -23,6 +23,7 @@ from littrace.sentinel.storage import (
 from littrace.retrieval.rag_refresh import refresh_session_rag_index
 from littrace.skill_runner import (
     build_quality_report_skill,
+    execute_downloads_skill,
     extract_tables_skill,
     parse_workspace_skill,
     resolve_workspace_full_text_skill,
@@ -109,10 +110,27 @@ class LiteratureSentinel:
         access_tasks = _build_access_tasks(workspace, state)
         state.access_queue = _merge_access_tasks(state.access_queue, access_tasks)
 
-        # Auto-download removed: PDFs are acquired only via the explicit
-        # manual download path. Sentinel reports new candidates and access
-        # queue state without pulling bytes.
+        # Sentinel auto-downloads to the object store only — never to the
+        # user's working directory. Same posture as daily_update: bytes go
+        # to the artifact backend, leaving paper_library_dir clean.
+        downloadable_ids = [
+            paper.paper_id
+            for paper in workspace.papers.values()
+            if paper.access_type == AccessType.OPEN_ACCESS
+            and paper.paper_id in workspace.context.active_papers
+        ]
         downloaded_count = 0
+        if downloadable_ids:
+            download_result = await execute_downloads_skill(
+                self.config,
+                workspace,
+                DownloadExecutionRequest(
+                    paper_ids=downloadable_ids,
+                    session_id=self.store.session_id if hasattr(self.store, "session_id") else None,
+                    target="storage_only",
+                ),
+            )
+            downloaded_count = download_result.downloaded_count
 
         if self.config.sentinel.parse_on_daily:
             workspace, parse_report = await parse_workspace_skill(workspace, self.config)
@@ -201,10 +219,9 @@ class LiteratureSentinel:
         queued_tasks = [task for task in state.access_queue if task.retry_after_login]
         login_papers = [task.paper_id for task in queued_tasks if task.paper_id in workspace.papers]
         downloaded_count = 0
-        # Auto-download removed: even when the user completes the login
-        # gate, the system will not auto-pull the gated PDF. The user must
-        # re-trigger the explicit manual download path. We still surface
-        # which papers were queued so they can act on them.
+        # resume_after_login still doesn't auto-download to local — the user
+        # must re-trigger the explicit manual download path after auth.
+        # We only surface the queued papers so the user can act on them.
         parse_report = {"parsed_count": 0, "warnings": []}
         completed_ids = {
             paper_id

@@ -5,6 +5,7 @@ from enum import StrEnum
 from hashlib import sha256
 from math import isclose
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
@@ -470,6 +471,14 @@ class DownloadExecutionRequest(BaseModel):
     paper_ids: list[str] = Field(default_factory=list)
     dry_run: bool = False
     session_id: str | None = None
+    # Where to land the downloaded PDF:
+    # - "local_and_storage" (default): write the per-session paper_library_dir
+    #   AND mirror to the artifact object store. Used by user-initiated paths
+    #   (chat intent, /downloads/execute, attach-pdf).
+    # - "storage_only": write only to the object store. Used by background
+    #   paths (daily_update, sentinel) so user machines don't get surprise
+    #   PDF files under their working directory.
+    target: Literal["local_and_storage", "storage_only"] = "local_and_storage"
 
 
 class DownloadExecutionItem(BaseModel):

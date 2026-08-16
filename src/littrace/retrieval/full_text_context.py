@@ -8,6 +8,7 @@ from littrace.context import _merge_filters
 from littrace.retrieval.full_text import resolve_full_text_for_papers
 from littrace.models import (
     AccessType,
+    DownloadExecutionRequest,
     LiteratureWorkspace,
     PaperMetadata,
     PaperSearchRequest,
@@ -16,7 +17,7 @@ from littrace.models import (
 )
 from littrace.evidence.parsing import local_pdf_path
 from littrace.retrieval.search import build_query_variants, rank_papers
-from littrace.skill_runner import parse_workspace_skill
+from littrace.skill_runner import execute_downloads_skill, parse_workspace_skill
 from littrace.tool_contracts import ToolCallContext, ToolExecutionLedger, ToolExecutionPolicy
 
 
@@ -61,9 +62,37 @@ async def build_full_text_context(
         elif report.login_required_candidate_count:
             paper.access_type = AccessType.REQUIRES_LOGIN
 
-    # Auto-download removed: full-text context only inspects locally-present
-    # PDFs. URLs are still resolved (so the user knows where to manually pull
-    # from), but no bytes are pulled automatically.
+    # Live-search full-text context: discover OA PDFs and pull them into the
+    # object store only. Local paper_library_dir is left untouched so the
+    # user's working directory stays clean. The user can later run an explicit
+    # /downloads/execute or chat intent to copy a storage-only artifact into
+    # their local paper_library_dir.
+    downloadable = [
+        paper for paper in valid if paper.access_type == AccessType.OPEN_ACCESS and paper.pdf_url
+    ]
+    if downloadable:
+        tool_kwargs = {
+            key: value
+            for key, value in {
+                "context": context,
+                "ledger": ledger,
+                "policy": policy,
+            }.items()
+            if value is not None
+        }
+        download_result = await execute_downloads_skill(
+            config,
+            workspace,
+            DownloadExecutionRequest(
+                paper_ids=[paper.paper_id for paper in downloadable],
+                target="storage_only",
+            ),
+            **tool_kwargs,
+        )
+        for item in download_result.items:
+            if item.error:
+                warnings.append(f"download:{item.paper_id}: {item.error}")
+
     downloaded_ids = [paper.paper_id for paper in valid if local_pdf_path(config, paper).exists()]
     original_active = list(workspace.context.active_papers)
     workspace.context.active_papers = downloaded_ids
