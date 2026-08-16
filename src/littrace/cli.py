@@ -87,6 +87,26 @@ class ShellState:
 
 
 def main() -> None:
+    # A second positional arg that is not a recognised subcommand should
+    # fail loud (exit 1) instead of silently dropping into the REPL shell.
+    if len(sys.argv) > 1 and sys.argv[1].startswith("-"):
+        # Flag-like argv (e.g. --help) goes to the REPL shell.
+        pass
+    elif len(sys.argv) > 1 and sys.argv[1] not in {
+        "sentinel",
+        "rag",
+        "doctor",
+        "metrics",
+        "setup-browser",
+        "publisher-e2e",
+    }:
+        print(
+            f"Unknown subcommand: {sys.argv[1]!r}. "
+            "Run `littrace` with no args for the interactive shell, or pass "
+            "one of: sentinel, rag, doctor, metrics, setup-browser, publisher-e2e.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if len(sys.argv) > 1 and sys.argv[1] == "sentinel":
         config = load_config()
         asyncio.run(_run_sentinel_command(config))
