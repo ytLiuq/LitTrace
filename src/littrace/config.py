@@ -57,7 +57,7 @@ class RagConfig(BaseModel):
     top_k: int = 12
     refresh_frequency: str = "daily"
     auto_refresh_enabled: bool = False
-    auto_download_open_access: bool = True
+    auto_download_open_access: bool = False
     login_required_policy: str = "queue_only"
 
 
@@ -109,7 +109,7 @@ class PaperDownloadConfig(BaseModel):
     organize_by: str = "year_doi"
     filename_template: str = "{year}_{first_author}_{short_title}_{doi_hash}.pdf"
     save_metadata_even_if_pdf_skipped: bool = False
-    allow_requires_login_download: bool = True
+    allow_requires_login_download: bool = False
     max_concurrent_downloads: int = Field(default=3, ge=1, le=8)
 
 

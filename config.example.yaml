@@ -34,7 +34,7 @@ rag:
   top_k: 12
   refresh_frequency: "daily"
   auto_refresh_enabled: false
-  auto_download_open_access: true
+  auto_download_open_access: false
   login_required_policy: "queue_only"
 
 figure_enrichment:
@@ -68,7 +68,7 @@ cdp_downloader:
   chrome_user_data_dir: null
   chrome_profile_name: "Default"
   remote_debugging_port: 19222
-  auto_launch_chrome: true
+  auto_launch_chrome: false
   cloudflare_wait_seconds: 60
   user_action_wait_seconds: 30
   command_timeout_seconds: 60
@@ -85,7 +85,7 @@ paper_download:
   filename_template: "{year}_{first_author}_{short_title}_{doi_hash}.pdf"
   save_metadata_even_if_pdf_skipped: false
   max_concurrent_downloads: 3
-  allow_requires_login_download: true
+  allow_requires_login_download: false
 
 parsing:
   default_parser: "paddleocr"

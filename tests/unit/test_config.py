@@ -102,7 +102,7 @@ def test_write_config_template_creates_yaml(tmp_path):
     assert "unpaywall_email" in text
     assert "browser_act_path" in text
     assert "chrome_profile_name" in text
-    assert "auto_launch_chrome: true" in text
+    assert "auto_launch_chrome: false" in text
     assert "required: false" in text
 
 

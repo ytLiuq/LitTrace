@@ -27,7 +27,7 @@ def write_config_template(path: str | Path = "config.yaml", overwrite: bool = Fa
     raw["api"]["enable_live_search"] = False
     raw["api"]["unpaywall_email"] = "you@example.com"
     raw["cdp_downloader"]["chrome_profile_name"] = "Default"
-    raw["cdp_downloader"]["auto_launch_chrome"] = True
+    raw["cdp_downloader"]["auto_launch_chrome"] = False
     raw["browser"]["browser_act_path"] = "browser-act"
     raw["browser"]["required"] = False
     raw["rag"]["enabled"] = False
