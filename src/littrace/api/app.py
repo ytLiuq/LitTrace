@@ -27,6 +27,27 @@ logger = get_logger("api")
 DOWNLOAD_RETRY_WORKER: DownloadRetryWorker | None = None
 
 
+class _APIBackend:
+    """Single shared backend for every API route module.
+
+    Replaces the 7 duplicate ``_AppProxy`` shims that each route file
+    defined to reach ``api.app.{load_config, _set_workspace, append_trace,
+    WORKSPACE}``. Each route now does
+    ``from littrace.api.app import api_app`` and uses ``api_app`` directly.
+    """
+
+    @property
+    def WORKSPACE(self) -> LiteratureWorkspace:  # noqa: N802 — keep the upper-case API
+        return api_state.get_workspace()
+
+    load_config = staticmethod(_load_config)
+    append_trace = staticmethod(_append_trace)
+    _set_workspace = staticmethod(api_state.set_workspace)
+
+
+api_app = _APIBackend()
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     _start_background_workers()

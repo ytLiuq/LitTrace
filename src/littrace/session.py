@@ -830,33 +830,6 @@ def _session_state_store(
     session: ChatSession,
     config: LitTraceConfig | None = None,
 ):
-    backend = (
-        config.metadata_store.backend
-        if config is not None
-        else getattr(session, "metadata_store_backend", "postgres")
-    )
-    dsn = (
-        config.metadata_store.postgres_dsn
-        if config is not None
-        else getattr(session, "metadata_postgres_dsn", None)
-    )
-    schema_name = (
-        config.metadata_store.schema_name
-        if config is not None
-        else getattr(session, "metadata_schema_name", "littrace")
-    )
-    if backend != "postgres":
-        raise ValueError("metadata_store.backend must be 'postgres' for session state.")
-    if not dsn:
-        raise ValueError("metadata_store.postgres_dsn is required for session state.")
-    return state_store_from_config(
-        LitTraceConfig.model_validate(
-            {
-                "metadata_store": {
-                    "backend": backend,
-                    "postgres_dsn": dsn,
-                    "schema_name": schema_name,
-                }
-            }
-        )
-    )
+    from littrace.state_db import session_state_store
+
+    return session_state_store(session, config)

@@ -1,3 +1,4 @@
+from littrace.api.app import api_app
 from __future__ import annotations
 
 from fastapi import APIRouter
@@ -7,14 +8,6 @@ from littrace.publisher_retrieval import BrowserRetrievalPlan, PublisherEnrichme
 from littrace.supplementary import register_supplementary_links
 
 
-class _AppProxy:
-    def __getattr__(self, name: str):
-        from littrace.api import app as api_app
-
-        return getattr(api_app, name)
-
-
-api_app = _AppProxy()
 
 router = APIRouter()
 

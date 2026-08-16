@@ -1011,3 +1011,38 @@ def state_store_from_config(config: LitTraceConfig) -> PostgresStateStore:
         schema_name=schema_name,
         allow_schema_reset=config.metadata_store.allow_schema_reset,
     )
+
+
+def session_state_store(
+    session: object,
+    config: LitTraceConfig | None = None,
+) -> "PostgresStateStore":
+    """Build a ``PostgresStateStore`` for a chat session.
+
+    Centralises the 3 duplicate ``_session_state_store`` helpers that
+    used to live in ``session.py``, ``runtime/memory.py``, and
+    ``sentinel/storage.py``. When ``config`` is given the helper validates
+    the Postgres metadata and forwards to ``state_store_from_config``;
+    otherwise it falls back to per-session attributes.
+    """
+    if config is not None:
+        require_postgres_metadata(config.metadata_store)
+        return state_store_from_config(config)
+    backend = getattr(session, "metadata_store_backend", "postgres")
+    dsn = getattr(session, "metadata_postgres_dsn", None)
+    schema_name = getattr(session, "metadata_schema_name", "littrace")
+    if backend != "postgres":
+        raise ValueError("metadata_store.backend must be 'postgres' for session state.")
+    if not dsn:
+        raise ValueError("metadata_store.postgres_dsn is required for session state.")
+    return state_store_from_config(
+        LitTraceConfig.model_validate(
+            {
+                "metadata_store": {
+                    "backend": backend,
+                    "postgres_dsn": dsn,
+                    "schema_name": schema_name,
+                }
+            }
+        )
+    )

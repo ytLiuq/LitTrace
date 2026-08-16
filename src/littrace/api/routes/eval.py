@@ -1,3 +1,4 @@
+from littrace.api.app import api_app
 from __future__ import annotations
 
 from pathlib import Path
@@ -24,14 +25,6 @@ from littrace.evaluation.retrieval_eval import RetrievalEvalReport, run_retrieva
 from littrace.skill_runner import build_quality_report_skill
 
 
-class _AppProxy:
-    def __getattr__(self, name: str):
-        from littrace.api import app as api_app
-
-        return getattr(api_app, name)
-
-
-api_app = _AppProxy()
 
 router = APIRouter()
 

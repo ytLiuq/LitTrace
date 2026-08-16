@@ -1,3 +1,4 @@
+from littrace.api.app import api_app
 from __future__ import annotations
 
 from typing import Annotated
@@ -33,14 +34,6 @@ from littrace.skill_runner import build_download_plan_skill, execute_downloads_s
 from littrace.session import load_or_create_session, save_workspace
 
 
-class _AppProxy:
-    def __getattr__(self, name: str):
-        from littrace.api import app as api_app
-
-        return getattr(api_app, name)
-
-
-api_app = _AppProxy()
 
 router = APIRouter()
 

@@ -200,28 +200,9 @@ def load_session_memory(session: "ChatSession") -> SessionMemory:
 
 
 def _session_state_store(session: "ChatSession"):
-    from littrace.state_db import require_postgres_metadata
+    from littrace.state_db import session_state_store
 
-    backend = getattr(session, "metadata_store_backend", "postgres")
-    dsn = getattr(session, "metadata_postgres_dsn", None)
-    schema_name = getattr(session, "metadata_schema_name", "littrace")
-    if backend != "postgres":
-        raise ValueError("metadata_store.backend must be 'postgres' for session memory.")
-    if not dsn:
-        raise ValueError("metadata_store.postgres_dsn is required for session memory.")
-    require_postgres_metadata(type("M", (), {
-        "backend": backend, "postgres_dsn": dsn, "schema_name": schema_name
-    })())
-    config = {
-        "metadata_store": {
-            "backend": backend,
-            "postgres_dsn": dsn,
-            "schema_name": schema_name,
-        }
-    }
-    from littrace.config import LitTraceConfig
-
-    return state_store_from_config(LitTraceConfig.model_validate(config))
+    return session_state_store(session)
 
 
 def append_episode_from_execution_result(
