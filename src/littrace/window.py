@@ -884,7 +884,7 @@ class LitTraceWindow:
 
         try:
             store = state_store_from_config(self.config)
-            report = store.embedding_job_queue_report()
+            report = store.async_tasks_queue_report(kind="embedding_job")
             lines.append("")
             lines.append("Embedding Jobs 队列:")
             lines.append(f"  queued={report.queued} running={report.running}")
@@ -1423,9 +1423,9 @@ class LitTraceWindow:
 
     def _render_session_messages(self) -> None:
         self.chat_text.delete("1.0", self.tk.END)
-        for record in state_store_from_config(self.config).list_messages(self.session.session_id):
-            role = "你" if record.role == "user" else "LitTrace"
-            content = record.content_json or record.content_text
+        for record in state_store_from_config(self.config).list_chat_messages(self.session.session_id):
+            role = "你" if record.get("role") == "user" else "LitTrace"
+            content = record.get("content_json") or record.get("content_text")
             text = _message_text(content)
             if text and (role == "你" or _is_user_effective_reply(text)):
                 bubble_role = "user" if role == "你" else "assistant"

@@ -23,7 +23,6 @@ from littrace.config import LitTraceConfig
 from littrace.lifecycle import enqueue_embedding_outbox
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
 from littrace.state_db import (
-    SessionMessageRecord,
     SessionStateRecord,
     state_store_from_config,
 )
@@ -93,6 +92,13 @@ class ChatSessionSummary(BaseModel):
     paper_count: int = 0
 
 
+def session_path_for(config: LitTraceConfig, session_id: str) -> Path:
+    """Reconstruct the on-disk session root from session_id (root_path is no
+    longer stored in Postgres; the disk path is deterministic from config +
+    session_id)."""
+    return config.storage.sessions_dir / session_id
+
+
 def create_chat_session(config: LitTraceConfig) -> ChatSession:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_id = f"{timestamp}-{uuid4().hex[:8]}"
@@ -123,10 +129,10 @@ def load_or_create_session(
 ) -> ChatSession:
     state_store = state_store_from_config(config)
     if session_id:
-        record = state_store.get_session(session_id)
+        record = state_store.get_session_state(session_id)
         if record is not None:
             return ChatSession.from_root(
-                Path(record.root_path),
+                session_path_for(config, session_id),
                 session_id,
                 snapshot_limit=config.storage.workspace_snapshot_limit,
                 config=config,
@@ -139,10 +145,10 @@ def load_existing_session(
     session_id: str,
 ) -> ChatSession | None:
     state_store = state_store_from_config(config)
-    record = state_store.get_session(session_id)
+    record = state_store.get_session_state(session_id)
     if record is not None:
         return ChatSession.from_root(
-            Path(record.root_path),
+            session_path_for(config, session_id),
             session_id,
             snapshot_limit=config.storage.workspace_snapshot_limit,
             config=config,
@@ -236,15 +242,17 @@ def append_message(
     now = datetime.now().isoformat(timespec="seconds")
     content_json = content if isinstance(content, dict) else {"message": content}
     content_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-    state_store.upsert_message(
-        SessionMessageRecord(
-            session_id=session.session_id,
-            role=role,
-            content_json=content_json if isinstance(content_json, dict) else {},
-            content_text=content_text,
-            created_at=now,
-            updated_at=now,
-        )
+    message_id = uuid4().hex
+    state_store.append_chat_message(
+        session.session_id,
+        {
+            "message_id": message_id,
+            "role": role,
+            "content_json": content_json if isinstance(content_json, dict) else {},
+            "content_text": content_text,
+            "created_at": now,
+            "updated_at": now,
+        },
     )
 
 
@@ -252,7 +260,7 @@ def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSess
     state_store = state_store_from_config(config)
     if state_store is not None:
         summaries: list[ChatSessionSummary] = []
-        for record in state_store.list_sessions(limit=limit):
+        for record in state_store.list_session_states(limit=limit):
             topic = "未命名主题"
             workspace = record.workspace_json if isinstance(record.workspace_json, dict) else {}
             filters = workspace.get("context", {}).get("filters", {}) if isinstance(workspace, dict) else {}
@@ -261,28 +269,30 @@ def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSess
                 if isinstance(topic_value, str) and topic_value.strip():
                     topic = topic_value
             if topic == "未命名主题":
-                for message in state_store.list_messages(record.session_id):
-                    if message.role != "user":
+                for message in state_store.list_chat_messages(record.session_id):
+                    if message.get("role") != "user":
                         continue
                     # Prefer the inner ChatRequest.message field when present;
                     # content_text may be the JSON dump of a dict payload, which
                     # would otherwise become the entire topic string.
-                    inner = message.content_json.get("message")
+                    content_json = message.get("content_json") or {}
+                    inner = content_json.get("message") if isinstance(content_json, dict) else None
                     content = (
                         inner
                         if isinstance(inner, str) and inner.strip()
-                        else message.content_text
+                        else message.get("content_text")
                     )
                     if isinstance(content, str) and content.strip():
                         topic = _summarize_topic(content)
                         break
+            message_count = len(state_store.list_chat_messages(record.session_id))
             summaries.append(
                 ChatSessionSummary(
                     session_id=record.session_id,
-                    root=Path(record.root_path),
+                    root=session_path_for(config, record.session_id),
                     updated_at=record.updated_at,
                     topic=topic,
-                    message_count=len(state_store.list_messages(record.session_id)),
+                    message_count=message_count,
                     # paper_count reflects the active literature context — papers
                     # sitting in the workspace's `papers` map but not promoted to
                     # the active set are not "in the session" yet.
@@ -603,7 +613,7 @@ def _content_type_for_format(format: str | None) -> str | None:
 
 def load_artifact_index(session: ChatSession) -> dict[str, object]:
     state_store = _session_state_store(session)
-    record = state_store.get_session(session.session_id)
+    record = state_store.get_session_state(session.session_id)
     if record is None or not isinstance(record.artifact_index_json, dict):
         return {}
     return record.artifact_index_json
@@ -616,7 +626,7 @@ def _safe_filename(value: str) -> str:
     )
 
 
-def load_memory(session: ChatSession):
+def load_memory(session: ChatSession):  # backward-compat alias
     return load_session_memory(session)
 
 
@@ -693,7 +703,7 @@ def delete_chat_session(
     state_record_count = 0
     if state_store is not None:
         try:
-            state_record_count = state_store.delete_session(
+            state_record_count = state_store.delete_session_state(
                 session.session_id,
             )
         except Exception:
@@ -787,15 +797,14 @@ def _sync_session_state(
     if state_store is None:
         return
     workspace_json = json.loads(workspace.model_dump_json())
-    state_store.upsert_session(
+    state_store.upsert_session_state(
         SessionStateRecord(
             session_id=session.session_id,
-            root_path=str(session.root),
             workspace_sha256=manifest.get("workspace_sha256"),
             workspace_json=workspace_json if isinstance(workspace_json, dict) else {},
             manifest_json=manifest,
             artifact_index_json=artifact_index,
-            memory_json=memory.model_dump(mode="json") if hasattr(memory, "model_dump") else {},
+            memory_view_json=memory.model_dump(mode="json") if hasattr(memory, "model_dump") else {},
             rag_profile_json=rag_profile.model_dump(mode="json") if rag_profile is not None else {},
             revision=int(manifest.get("revision", 0) or 0),
             structured_document_count=workspace.context.filters.structured_document_count,
@@ -808,7 +817,7 @@ def _load_session_record(session: ChatSession) -> SessionStateRecord | None:
     state_store = _session_state_store(session)
     if state_store is None:
         return None
-    return state_store.get_session(session.session_id)
+    return state_store.get_session_state(session.session_id)
 
 
 def _session_state_store(

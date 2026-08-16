@@ -18,7 +18,7 @@ from littrace.models import LiteratureWorkspace, ParsedPaper
 from littrace.rag_jobs import _mark_embedding_job_failed
 from littrace.retrieval.rag_refresh import refresh_session_rag_index
 from littrace.session import create_chat_session
-from littrace.state_db import EmbeddingJobRecord, PostgresStateStore
+from littrace.state_db import AsyncTaskRecord, PostgresStateStore
 
 
 pytestmark = pytest.mark.domain
@@ -65,22 +65,25 @@ def test_embedding_job_failure_moves_to_dead_after_max_attempts():
 
     config = LitTraceConfig(storage=StorageConfig())
     config.download_retry.max_attempts = 3
-    job = EmbeddingJobRecord(
-        job_id="job1",
-        profile_id="profile1",
+    job = AsyncTaskRecord(
+        task_id="job1",
         session_id="s1",
+        kind="embedding_job",
+        profile_id="profile1",
         artifact_id="paper_pdf:p1",
         attempt_count=3,
         status="running",
     )
-    store.enqueue_embedding_job(job)
+    store.enqueue_async_task(job)
 
     _mark_embedding_job_failed(store, job, ValueError("bad pdf"), config)
 
-    rows = store.list_embedding_jobs(session_id="s1", status="dead")
+    rows = store.list_async_tasks(
+        session_id="s1", status="dead", kind="embedding_job"
+    )
     assert len(rows) == 1
     persisted = rows[0]
-    assert persisted.job_id == "job1"
+    assert persisted.task_id == "job1"
     assert persisted.status == "dead"
     assert persisted.next_attempt_at is None
     assert persisted.completed_at is not None

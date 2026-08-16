@@ -24,7 +24,7 @@ from littrace.skill_runner import (
     parse_workspace_skill,
     search_papers_skill,
 )
-from littrace.state_db import EmbeddingJobRecord, state_store_from_config
+from littrace.state_db import AsyncTaskRecord, state_store_from_config
 
 
 class RagDailyJobReport(BaseModel):
@@ -291,15 +291,16 @@ async def run_pending_embedding_jobs(
     # A dispatcher accepting an event is progress, but embedding is only counted
     # as processed after the pgvector refresh succeeds below.
     worker_id = f"{socket.gethostname()}:{uuid4().hex[:12]}"
-    jobs = state_store.claim_pending_embedding_jobs(
+    jobs = state_store.claim_pending_async_tasks(
         worker_id=worker_id,
+        kind="embedding_job",
         limit=limit,
         lease_seconds=max(config.download_retry.interval_seconds * 4, 120.0),
     )
     if not jobs:
         report.finished_at = datetime.now(UTC).isoformat()
         return report
-    jobs_by_session: dict[str, list[EmbeddingJobRecord]] = {}
+    jobs_by_session: dict[str, list[AsyncTaskRecord]] = {}
     for job in jobs:
         jobs_by_session.setdefault(job.session_id, []).append(job)
     for session_id, session_jobs in jobs_by_session.items():
@@ -334,16 +335,16 @@ async def run_pending_embedding_jobs(
             save_workspace(session, workspace, config=config)
             result_json = refresh_report.model_dump(mode="json")
             for job in session_jobs:
-                report.job_ids.append(job.job_id)
+                report.job_ids.append(job.task_id)
                 _mark_embedding_job_completed(state_store, job, result_json)
                 report.processed += 1
         except Exception as exc:
             for job in session_jobs:
-                report.job_ids.append(job.job_id)
+                report.job_ids.append(job.task_id)
                 _mark_embedding_job_failed(state_store, job, exc, config)
                 report.failed += 1
                 report.warnings.append(
-                    f"embedding_job:{job.job_id}:{exc.__class__.__name__}: {exc}"
+                    f"embedding_job:{job.task_id}:{exc.__class__.__name__}: {exc}"
                 )
     report.finished_at = datetime.now(UTC).isoformat()
     return report
@@ -378,7 +379,7 @@ def iter_workspace_session_ids(sessions_dir: Path) -> list[str]:
 def iter_rag_session_ids(config: LitTraceConfig, *, limit: int = 500) -> list[str]:
     state_store = state_store_from_config(config)
     if state_store is not None:
-        return [record.session_id for record in state_store.list_sessions(limit=limit)]
+        return [record.session_id for record in state_store.list_session_states(limit=limit)]
     return iter_workspace_session_ids(config.storage.sessions_dir)
 
 
@@ -442,7 +443,7 @@ def _refresh_interval_for_frequency(frequency: str) -> timedelta | None:
 
 def _mark_embedding_job_completed(
     state_store,
-    job: EmbeddingJobRecord,
+    job: AsyncTaskRecord,
     result_json: dict[str, object],
 ) -> None:
     job.status = "completed"
@@ -453,12 +454,12 @@ def _mark_embedding_job_completed(
     job.lease_owner = None
     job.lease_expires_at = None
     job.last_heartbeat_at = None
-    state_store.update_embedding_job(job)
+    state_store.update_async_task(job)
 
 
 def _mark_embedding_job_failed(
     state_store,
-    job: EmbeddingJobRecord,
+    job: AsyncTaskRecord,
     exc: Exception,
     config: LitTraceConfig,
 ) -> None:
@@ -475,4 +476,4 @@ def _mark_embedding_job_failed(
         job.status = "dead"
         job.next_attempt_at = None
         job.completed_at = datetime.now(UTC).isoformat()
-    state_store.update_embedding_job(job)
+    state_store.update_async_task(job)

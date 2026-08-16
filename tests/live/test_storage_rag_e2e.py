@@ -121,10 +121,10 @@ async def test_download_to_object_storage_and_refresh_rag_embeddings(
     save_workspace(session, workspace, config=config)
 
     state_store = config_state_store(config)
-    lifecycle_events = state_store.list_paper_lifecycle_events(
+    lifecycle_events = state_store.list_chat_events(
         session.session_id,
     )
-    assert {event.event_type for event in lifecycle_events} >= {
+    assert {event.get("event_type") for event in lifecycle_events} >= {
         "discovered_relevant",
         "artifact_stored",
         "acquisition_verified",
@@ -135,14 +135,19 @@ async def test_download_to_object_storage_and_refresh_rag_embeddings(
         embedding_report = await run_pending_embedding_jobs(config)
         assert embedding_report.failed == 0
         processed += embedding_report.processed
-        pending_after = state_store.list_pending_embedding_jobs(limit=20)
+        pending_after = state_store.list_async_tasks(
+            session_id=session.session_id,
+            status="queued",
+            kind="embedding_job",
+        )
         if not pending_after:
             break
     else:
         assert pending_after == []
     assert processed >= 1
-    session_jobs = state_store.list_embedding_jobs(
+    session_jobs = state_store.list_async_tasks(
         session_id=session.session_id,
+        kind="embedding_job",
         limit=20,
     )
     assert session_jobs

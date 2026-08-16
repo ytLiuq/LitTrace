@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from littrace.artifact_store import artifact_store_from_config
 from littrace.config import LitTraceConfig
-from littrace.state_db import EmbeddingJobQueueReport, EmbeddingJobRecord, state_store_from_config
+from littrace.state_db import AsyncTaskQueueReport, AsyncTaskRecord, state_store_from_config
 
 
 class RagDoctorCheck(BaseModel):
@@ -31,8 +31,8 @@ class RagJobsStatusReport(BaseModel):
     schema_version: str = "littrace.rag_jobs_status_report.v1"
     generated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     configured: bool = False
-    queue: EmbeddingJobQueueReport | None = None
-    jobs: list[EmbeddingJobRecord] = Field(default_factory=list)
+    queue: AsyncTaskQueueReport | None = None
+    jobs: list[AsyncTaskRecord] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -49,8 +49,10 @@ def build_rag_jobs_status_report(
         report.warnings.append("metadata_store.backend is not postgres; embedding queue is unavailable")
         return report
     report.configured = True
-    report.queue = store.embedding_job_queue_report()
-    report.jobs = store.list_embedding_jobs(status=status, session_id=session_id, limit=limit)
+    report.queue = store.async_tasks_queue_report(kind="embedding_job")
+    report.jobs = store.list_async_tasks(
+        status=status, session_id=session_id, kind="embedding_job", limit=limit
+    )
     return report
 
 
@@ -63,7 +65,9 @@ def requeue_dead_rag_jobs(
     store = state_store_from_config(config)
     if store is None:
         return 0
-    return store.requeue_dead_embedding_jobs(session_id=session_id, limit=limit)
+    return store.requeue_dead_async_tasks(
+        session_id=session_id, kind="embedding_job", limit=limit
+    )
 
 
 def run_rag_doctor(config: LitTraceConfig) -> RagDoctorReport:

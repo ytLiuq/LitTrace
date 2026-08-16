@@ -19,11 +19,11 @@ from littrace.research_background import (
 )
 from littrace.session import (
     append_message,
-    load_memory,
     load_or_create_session,
     load_workspace,
     save_workspace,
 )
+from littrace.runtime.memory import load_session_memory
 from littrace.skill_runner import export_session_bundle_skill
 from littrace.workflow import run_research_graph, run_search_preview
 
@@ -94,7 +94,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
         return background_response
     request = request.model_copy(update={"session_id": session.session_id})
-    session_memory = load_memory(session)
+    session_memory = load_session_memory(session)
     response, session_workspace = await handle_chat(
         request,
         session_workspace,

@@ -170,18 +170,40 @@ def memory_path_for_session(session: "ChatSession") -> Path:
 
 
 def save_session_memory(session: "ChatSession", memory: SessionMemory) -> Path:
+    """Persist the LLM memory view into ``session_state.memory_view_json``.
+
+    The legacy ``session_memory`` table is gone; memory now lives inside
+    ``session_state``. Returns the on-disk path for backwards compatibility
+    (no file is actually written).
+    """
     path = memory_path_for_session(session)
     store = _session_state_store(session)
-    store.upsert_memory(
-        session.session_id,
-        memory_json=memory.model_dump(mode="json"),
-    )
+    record = store.get_session_state(session.session_id)
+    payload = memory.model_dump(mode="json")
+    if record is None:
+        # First save for this session — synthesize a SessionStateRecord so the
+        # memory view can be persisted independently. The next save_workspace
+        # call will overwrite with the full workspace payload.
+        from littrace.state_db import SessionStateRecord
+
+        store.upsert_session_state(
+            SessionStateRecord(
+                session_id=session.session_id,
+                memory_view_json=payload,
+            )
+        )
+    else:
+        record.memory_view_json = payload
+        store.upsert_session_state(record)
     return path
 
 
 def load_session_memory(session: "ChatSession") -> SessionMemory:
     store = _session_state_store(session)
-    loaded = store.load_memory(session.session_id)
+    record = store.get_session_state(session.session_id)
+    if record is None:
+        return SessionMemory(session_id=session.session_id)
+    loaded = record.memory_view_json
     if not isinstance(loaded, dict):
         return SessionMemory(session_id=session.session_id)
     try:

@@ -125,14 +125,19 @@ def reconcile_session_artifacts(
         records = artifact_registry_from_config(config).list_for_session(session_id=session_id)
         store = artifact_store_from_config(config)
         state_store = state_store_from_config(config)
-        lifecycle = state_store.list_paper_lifecycle_events(session_id)
+        lifecycle = state_store.list_chat_events(session_id)
     except Exception as exc:
         report.warnings.append(f"reconciliation_setup:{exc.__class__.__name__}: {exc}")
         return report
     last_event = {(event.paper_id, event.artifact_id): event.event_type for event in lifecycle}
     completed = {
         (job.artifact_id, job.content_sha256)
-        for job in state_store.list_embedding_jobs(session_id=session_id, status="completed", limit=max(limit * 5, 1000))
+        for job in state_store.list_async_tasks(
+            session_id=session_id,
+            status="completed",
+            kind="embedding_job",
+            limit=max(limit * 5, 1000),
+        )
     }
     for record in records[:limit]:
         report.checked += 1

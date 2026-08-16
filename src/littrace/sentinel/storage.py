@@ -83,7 +83,7 @@ def ensure_sentinel_store(config: LitTraceConfig, watchlist: Watchlist) -> Senti
     from littrace.session import ChatSession, save_workspace
     from littrace.state_db import state_store_from_config
 
-    if state_store_from_config(config).get_session(store.session_id) is None:
+    if state_store_from_config(config).get_session_state(store.session_id) is None:
         save_workspace(
             ChatSession.from_root(store.root, store.session_id, config=config),
             LiteratureWorkspace(),
@@ -118,7 +118,7 @@ def save_sentinel_state(store: SentinelStore, state: SentinelState) -> Path:
     manifest["watchlist"] = state.watchlist.model_dump(mode="json")
     manifest["sentinel_state"] = state.model_dump(mode="json")
     record.manifest_json = manifest
-    _state_store(store).upsert_session(record)
+    _state_store(store).upsert_session_state(record)
     return store.root
 
 
@@ -197,7 +197,7 @@ def _state_store(store: SentinelStore):
 
 
 def _sentinel_record(store: SentinelStore):
-    return _state_store(store).get_session(store.session_id)
+    return _state_store(store).get_session_state(store.session_id)
 
 
 def touch_run_dir(store: SentinelStore, run_id: str) -> Path:

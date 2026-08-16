@@ -9,7 +9,7 @@ from littrace.artifact_ops import ArtifactAuditReport, audit_session_artifacts
 from littrace.config import LitTraceConfig
 from littrace.models import LiteratureWorkspace
 from littrace.session import load_existing_session, load_workspace
-from littrace.state_db import EmbeddingJobRecord, state_store_from_config
+from littrace.state_db import state_store_from_config
 
 
 MetricStatus = Literal["measured", "estimated", "not_measured"]
@@ -57,7 +57,7 @@ def build_session_knowledge_metrics(
     artifact_audit = audit_session_artifacts(config, session.session_id, limit=artifact_limit)
     state_store = state_store_from_config(config)
     try:
-        lifecycle_events = state_store.list_paper_lifecycle_events(session.session_id)
+        lifecycle_events = state_store.list_chat_events(session.session_id)
     except Exception:
         lifecycle_events = []
     relevant_count, _, _ = _relevant_paper_count(workspace)
@@ -265,8 +265,10 @@ def _fresh_embedding_count(
             "estimated",
             "metadata_store is not Postgres; using structured documents as a conservative freshness proxy",
         )
-    jobs = store.list_embedding_jobs(session_id=session_id, limit=max(len(embeddable) * 4, 100))
-    latest_by_artifact: dict[str, EmbeddingJobRecord] = {}
+    jobs = store.list_async_tasks(
+        session_id=session_id, kind="embedding_job", limit=max(len(embeddable) * 4, 100)
+    )
+    latest_by_artifact: dict[str, object] = {}
     for job in jobs:
         existing = latest_by_artifact.get(job.artifact_id)
         if existing is None or job.updated_at > existing.updated_at:
