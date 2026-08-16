@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import datetime
+from pathlib import Path
 
 from littrace.chat import handle_chat
 from littrace.auto_resume import auto_resume_downloaded_pdfs
@@ -28,21 +30,41 @@ from littrace.state_db import state_store_from_config
 from littrace.evidence.tables import decide_artifact_extraction_need
 from littrace.tui import render_context_lines
 
+# 后台同步 / RAG daily 集成
+try:
+    from littrace.rag_jobs import run_daily_rag_maintenance  # noqa: F401
+except ImportError:  # pragma: no cover - defensive
+    run_daily_rag_maintenance = None  # type: ignore[assignment]
+try:
+    from littrace.retrieval.rag_refresh import refresh_session_rag_index  # noqa: F401
+except ImportError:  # pragma: no cover - defensive
+    refresh_session_rag_index = None  # type: ignore[assignment]
 
+
+# Linear-dominant palette with materials-chemistry muted-teal accent.
+# Tones map to Linear's neutral ladder; primary is `#3a8a8c` (muted teal,
+# echoes solution-chemistry, not playful). Serif path is opt-in for
+# paper titles via `PaneTitle.TLabel`.
 DESIGN = {
-    "primary": "#0066cc",
-    "primary_focus": "#0071e3",
-    "primary_on_dark": "#2997ff",
-    "ink": "#1d1d1f",
-    "ink_muted": "#7a7a7a",
-    "canvas": "#ffffff",
-    "parchment": "#f5f5f7",
-    "pearl": "#fafafc",
-    "hairline": "#e0e0e0",
-    "black": "#000000",
-    "dark_tile": "#272729",
-    "on_dark": "#ffffff",
-    "body_muted": "#cccccc",
+    "primary":             "#3a8a8c",
+    "primary_hover":       "#4ea3a5",
+    "primary_focus":       "#4ea3a5",
+    "primary_on_dark":     "#3a8a8c",
+    "ink":                 "#0b0c0e",
+    "ink_muted":           "#5c6068",
+    "ink_subtle":          "#a4a7ad",
+    "canvas":              "#fbfbfc",
+    "parchment":           "#f5f6f6",
+    "pearl":               "#ffffff",
+    "surface_1":           "#ffffff",
+    "surface_2":           "#f7f8f8",
+    "hairline":            "#d8d9dc",
+    "black":               "#0b0c0e",
+    "dark_tile":           "#0f1011",
+    "on_dark":             "#f7f8f8",
+    "body_muted":          "#a4a7ad",
+    "accent_coral":        "#cc785c",
+    "accent_teal_subtle":  "#e6efee",
 }
 
 
@@ -59,10 +81,14 @@ class LitTraceWindow:
         self.context_popup = None
         self.ocr_popup = None
         self.login_popup = None
+        self.rag_busy = False
+        self.sync_session_btn: object | None = None
+        self.full_daily_btn: object | None = None
+        self.rag_text: object | None = None
 
         self.root = self.tk.Tk()
         self.root.title("LitTrace")
-        self.root.geometry("1180x760")
+        self.root.geometry("1280x820")
         self.root.minsize(900, 600)
         self.root.configure(background=DESIGN["parchment"])
 
@@ -72,6 +98,7 @@ class LitTraceWindow:
         self._refresh_context()
         self._refresh_ocr_buttons()
         self._refresh_session_history()
+        self._refresh_rag_panel()
 
     def run(self) -> None:
         self.root.mainloop()
@@ -86,7 +113,7 @@ class LitTraceWindow:
         self.style.configure("Canvas.TFrame", background=DESIGN["parchment"])
         self.style.configure("Nav.TFrame", background=DESIGN["black"])
         self.style.configure("Subnav.TFrame", background=DESIGN["parchment"])
-        self.style.configure("Tile.TFrame", background=DESIGN["canvas"])
+        self.style.configure("Tile.TFrame", background=DESIGN["surface_1"])
         self.style.configure("Pearl.TFrame", background=DESIGN["pearl"])
         self.style.configure(
             "DarkTile.TFrame",
@@ -110,6 +137,15 @@ class LitTraceWindow:
             foreground=DESIGN["ink"],
             font=_font("display"),
         )
+        # PaneTitle — Claude serif path for top-level pane headers only.
+        # Used by 执行 Trace / 历史 Session / 当前文献上下文 / 后台同步 / Daily.
+        self.style.configure(
+            "PaneTitle.TLabel",
+            background=DESIGN["canvas"],
+            foreground=DESIGN["ink"],
+            font=_font("title_serif"),
+        )
+        # Sub-header for short captions inside a pane (sans, body_strong).
         self.style.configure(
             "TileHeader.TLabel",
             background=DESIGN["canvas"],
@@ -128,6 +164,11 @@ class LitTraceWindow:
             foreground=DESIGN["ink_muted"],
             font=_font("fine"),
         )
+        # Hairline separator between right-pane sections.
+        self.style.configure(
+            "Horizontal.TSeparator",
+            background=DESIGN["hairline"],
+        )
         self.style.configure(
             "Primary.TButton",
             background=DESIGN["primary"],
@@ -143,10 +184,12 @@ class LitTraceWindow:
             background=[("active", DESIGN["primary_focus"]), ("pressed", DESIGN["primary"])],
             foreground=[("disabled", DESIGN["body_muted"])],
         )
+        # Secondary utility button — restrained: pearl background, ink foreground.
+        # The teal accent stays reserved for one CTA per row.
         self.style.configure(
             "Secondary.TButton",
             background=DESIGN["pearl"],
-            foreground=DESIGN["primary"],
+            foreground=DESIGN["ink"],
             bordercolor=DESIGN["hairline"],
             lightcolor=DESIGN["pearl"],
             darkcolor=DESIGN["hairline"],
@@ -156,7 +199,7 @@ class LitTraceWindow:
         self.style.map(
             "Secondary.TButton",
             background=[("active", DESIGN["canvas"]), ("pressed", DESIGN["canvas"])],
-            foreground=[("active", DESIGN["primary_focus"])],
+            foreground=[("active", DESIGN["primary"])],
         )
         self.style.configure(
             "DarkUtility.TButton",
@@ -169,20 +212,20 @@ class LitTraceWindow:
         self.style.configure(
             "Slim.Vertical.TScrollbar",
             gripcount=0,
-            background="#d2d2d7",
-            darkcolor="#d2d2d7",
-            lightcolor="#d2d2d7",
+            background=DESIGN["ink_subtle"],
+            darkcolor=DESIGN["ink_subtle"],
+            lightcolor=DESIGN["ink_subtle"],
             troughcolor=DESIGN["canvas"],
             bordercolor=DESIGN["canvas"],
-            arrowcolor="#d2d2d7",
+            arrowcolor=DESIGN["ink_subtle"],
             relief=self.tk.FLAT,
             width=7,
             arrowsize=0,
         )
         self.style.map(
             "Slim.Vertical.TScrollbar",
-            background=[("active", "#b8b8bf"), ("pressed", "#a8a8af")],
-            arrowcolor=[("active", "#b8b8bf"), ("pressed", "#a8a8af")],
+            background=[("active", DESIGN["ink_muted"]), ("pressed", DESIGN["ink_muted"])],
+            arrowcolor=[("active", DESIGN["ink_muted"]), ("pressed", DESIGN["ink_muted"])],
         )
 
     def _build_layout(self) -> None:
@@ -223,7 +266,7 @@ class LitTraceWindow:
         self.context_toggle_button = subnav.grid_slaves(row=0, column=2)[0]
         self.parse_strategy_button = subnav.grid_slaves(row=0, column=3)[0]
 
-        main = self.ttk.Frame(self.root, style="Canvas.TFrame", padding=(24, 28, 24, 16))
+        main = self.ttk.Frame(self.root, style="Canvas.TFrame", padding=(28, 24, 28, 20))
         main.grid(row=1, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
         main.rowconfigure(0, weight=1)
@@ -244,7 +287,7 @@ class LitTraceWindow:
         self.trace_frame.rowconfigure(3, weight=2)
         self.pane.add(self.trace_frame, minsize=260)
 
-        self.ttk.Label(self.trace_frame, text="执行 Trace", style="TileHeader.TLabel").grid(
+        self.ttk.Label(self.trace_frame, text="执行 Trace", style="PaneTitle.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 12)
         )
         self.trace_text = self.tk.Text(
@@ -269,7 +312,7 @@ class LitTraceWindow:
         )
         self.trace_text.grid(row=1, column=0, sticky="nsew")
 
-        self.ttk.Label(self.trace_frame, text="历史 Session", style="TileHeader.TLabel").grid(
+        self.ttk.Label(self.trace_frame, text="历史 Session", style="PaneTitle.TLabel").grid(
             row=2, column=0, sticky="w", pady=(22, 10)
         )
         self.session_history_text = self.tk.Text(
@@ -286,7 +329,7 @@ class LitTraceWindow:
             font=_font("caption"),
             spacing3=6,
         )
-        self.session_history_text.tag_configure("session_current", background="#eef6ff")
+        self.session_history_text.tag_configure("session_current", background=DESIGN["accent_teal_subtle"])
         self.session_history_text.grid(row=3, column=0, sticky="nsew")
 
         chat_frame = self.ttk.Frame(self.pane, style="Tile.TFrame", padding=(20, 18, 20, 16))
@@ -313,7 +356,7 @@ class LitTraceWindow:
         self.chat_text.tag_configure(
             "bubble_user",
             foreground=DESIGN["ink"],
-            background="#dff0ff",
+            background=DESIGN["accent_teal_subtle"],
             font=_font("body"),
             justify=self.tk.RIGHT,
             lmargin1=170,
@@ -382,12 +425,13 @@ class LitTraceWindow:
             self.pane, style="Tile.TFrame", padding=(18, 18, 18, 16)
         )
         self.context_frame.columnconfigure(0, weight=1)
-        self.context_frame.rowconfigure(1, weight=1)
-        self.pane.add(self.context_frame, minsize=300)
+        self.context_frame.rowconfigure(1, weight=3)
+        self.context_frame.rowconfigure(4, weight=1)
+        self.pane.add(self.context_frame, minsize=340)
 
-        self.ttk.Label(self.context_frame, text="当前文献上下文", style="TileHeader.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 12)
-        )
+        self.ttk.Label(
+            self.context_frame, text="当前文献上下文", style="PaneTitle.TLabel"
+        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
         self.context_text = self.tk.Text(
             self.context_frame,
             wrap=self.tk.WORD,
@@ -403,10 +447,51 @@ class LitTraceWindow:
             spacing3=7,
         )
         self.context_text.grid(row=1, column=0, sticky="nsew")
+
+        # 后台同步 / Daily 面板 — 把 daily_update 收编进窗口
+        self.ttk.Separator(self.context_frame, orient="horizontal").grid(
+            row=2, column=0, sticky="ew", pady=(14, 8)
+        )
+        self.ttk.Label(
+            self.context_frame, text="后台同步 / Daily", style="PaneTitle.TLabel"
+        ).grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.rag_text = self.tk.Text(
+            self.context_frame,
+            wrap=self.tk.WORD,
+            padx=0,
+            pady=0,
+            bd=0,
+            relief=self.tk.FLAT,
+            highlightthickness=0,
+            bg=DESIGN["canvas"],
+            fg=DESIGN["ink_muted"],
+            font=_font("caption"),
+            spacing3=4,
+        )
+        self.rag_text.grid(row=4, column=0, sticky="nsew")
+
+        rag_btn_frame = self.ttk.Frame(self.context_frame, style="Tile.TFrame")
+        rag_btn_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        rag_btn_frame.columnconfigure(0, weight=1)
+        rag_btn_frame.columnconfigure(1, weight=1)
+        self.sync_session_btn = self.ttk.Button(
+            rag_btn_frame,
+            text="同步当前 Session",
+            style="Secondary.TButton",
+            command=self._trigger_session_sync,
+        )
+        self.sync_session_btn.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        self.full_daily_btn = self.ttk.Button(
+            rag_btn_frame,
+            text="立即全量 Daily",
+            style="Primary.TButton",
+            command=self._trigger_full_daily,
+        )
+        self.full_daily_btn.grid(row=0, column=1, padx=(4, 0), sticky="ew")
         self.status_var = self.tk.StringVar(value=f"Session: {self.session.session_id}")
         self.ttk.Label(
             self.root, textvariable=self.status_var, style="Status.TLabel", anchor="w"
-        ).grid(row=2, column=0, sticky="ew", padx=32, pady=(0, 10))
+        ).grid(row=2, column=0, sticky="ew", padx=32, pady=(0, 12))
 
     def _configure_copy_bindings(self) -> None:
         self.copy_menu = self.tk.Menu(self.root, tearoff=0)
@@ -526,6 +611,7 @@ class LitTraceWindow:
             self._refresh_ocr_buttons()
             self._refresh_context_popup()
             self._refresh_session_history()
+            self._refresh_rag_panel()
 
         self.root.after(0, apply_response)
 
@@ -574,6 +660,122 @@ class LitTraceWindow:
         lines = render_context_lines(self.workspace)
         self.context_text.delete("1.0", self.tk.END)
         self.context_text.insert(self.tk.END, "\n".join(lines))
+
+    def _refresh_rag_panel(self) -> None:
+        if self.rag_text is None:
+            return
+        lines: list[str] = []
+        filters = self.workspace.context.filters
+        last_sync = getattr(filters, "research_background_last_sync_at", None)
+        downloaded = getattr(filters, "research_background_last_downloaded_count", 0)
+        parsed = getattr(filters, "research_background_last_parsed_count", 0)
+        lines.append(f"Session: {self.session.session_id[:18]}…")
+        lines.append(f"上次同步: {last_sync or '从未'}")
+        lines.append(f"下载 / 解析: {downloaded} / {parsed}")
+
+        try:
+            store = state_store_from_config(self.config)
+            report = store.embedding_job_queue_report()
+            lines.append("")
+            lines.append("Embedding Jobs 队列:")
+            lines.append(f"  queued={report.queued} running={report.running}")
+            lines.append(f"  failed={report.failed} dead={report.dead}")
+            lines.append(f"  total completed={report.completed}")
+        except Exception as exc:
+            lines.append("")
+            lines.append(f"(队列查询失败: {exc.__class__.__name__}: {exc})")
+
+        log_path = Path("logs/rag-daily.log")
+        if log_path.exists():
+            mtime = datetime.fromtimestamp(log_path.stat().st_mtime).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            lines.append("")
+            lines.append(f"最近 launchd daily: {mtime}")
+        else:
+            lines.append("")
+            lines.append("最近 launchd daily: (无 logs/rag-daily.log)")
+
+        self.rag_text.delete("1.0", self.tk.END)
+        self.rag_text.insert(self.tk.END, "\n".join(lines))
+
+    def _set_rag_busy(self, busy: bool, label: str = "") -> None:
+        def apply() -> None:
+            self.rag_busy = busy
+            state = "disabled" if busy else "normal"
+            if self.sync_session_btn is not None:
+                self.sync_session_btn.configure(state=state)
+            if self.full_daily_btn is not None:
+                self.full_daily_btn.configure(state=state)
+            if label:
+                self.status_var.set(label)
+
+        self.root.after(0, apply)
+
+    def _trigger_session_sync(self) -> None:
+        if self.rag_busy:
+            return
+        if refresh_session_rag_index is None:
+            self.status_var.set("RAG 不可用: refresh_session_rag_index 未导入")
+            return
+        self._set_rag_busy(True, "正在同步当前 Session…")
+        threading.Thread(target=self._session_sync_thread, daemon=True).start()
+
+    def _session_sync_thread(self) -> None:
+        try:
+            workspace = load_workspace(self.session)
+            profile, report = asyncio.run(
+                refresh_session_rag_index(self.config, self.session, workspace)
+            )
+            save_workspace(self.session, workspace, config=self.config)
+            self.workspace = workspace
+            summary = (
+                f"同步完成: chunks={report.chunk_count} "
+                f"upserted={report.upserted_count} papers={report.paper_count}"
+            )
+            if report.warnings:
+                summary += f" warns={len(report.warnings)}"
+            if report.skipped:
+                summary += f" skipped({report.skip_reason or 'n/a'})"
+        except Exception as exc:
+            summary = f"同步失败: {exc.__class__.__name__}: {exc}"
+
+        def done() -> None:
+            self.status_var.set(summary)
+            self._set_rag_busy(False)
+            self._refresh_rag_panel()
+
+        self.root.after(0, done)
+
+    def _trigger_full_daily(self) -> None:
+        if self.rag_busy:
+            return
+        if run_daily_rag_maintenance is None:
+            self.status_var.set("RAG 不可用: run_daily_rag_maintenance 未导入")
+            return
+        self._set_rag_busy(True, "正在执行全量 Daily…")
+        threading.Thread(target=self._full_daily_thread, daemon=True).start()
+
+    def _full_daily_thread(self) -> None:
+        try:
+            report = asyncio.run(run_daily_rag_maintenance(self.config))
+            summary = (
+                f"Daily 完成: refreshed={report.sessions_refreshed} "
+                f"failed={report.sessions_failed} skipped={report.sessions_skipped} "
+                f"jobs={report.embedding_jobs_processed}/{report.embedding_jobs_failed}"
+            )
+            if report.warnings:
+                summary += f" warns={len(report.warnings)}"
+        except Exception as exc:
+            summary = f"Daily 失败: {exc.__class__.__name__}: {exc}"
+
+        def done() -> None:
+            self.status_var.set(summary)
+            self._set_rag_busy(False)
+            self._refresh_rag_panel()
+            self._refresh_session_history()
+
+        self.root.after(0, done)
 
     def _refresh_ocr_buttons(self) -> None:
         report = decide_artifact_extraction_need(self.workspace)
@@ -970,7 +1172,7 @@ class LitTraceWindow:
                 foreground=DESIGN["primary"]
                 if item.session_id != self.session.session_id
                 else DESIGN["ink"],
-                background="#eef6ff"
+                background=DESIGN["accent_teal_subtle"]
                 if item.session_id == self.session.session_id
                 else DESIGN["canvas"],
                 lmargin1=3,
@@ -1111,18 +1313,26 @@ def _chat_bubble_tag(role: str) -> str:
 
 
 def _font(token: str) -> tuple[str, int, str]:
-    family = "SF Pro Text"
-    display_family = "SF Pro Display"
+    # Inter is the body face (Linear / Notion / Stripe family). Helvetica Neue
+    # is the platform fallback. Cormorant Garamond is the Claude-derived serif
+    # used ONLY for `display` and `title_serif` (pane headers + paper rows).
+    # Tk falls through the comma-joined family string when the first face is
+    # not installed.
+    sans = "Inter"
+    sans_fallback = "Helvetica Neue"
+    serif = "Cormorant Garamond"
+    serif_fallback = "Iowan Old Style"
     fonts = {
-        "display": (display_family, 22, "bold"),
-        "tagline": (display_family, 17, "bold"),
-        "body": (family, 13, "normal"),
-        "body_strong": (family, 13, "bold"),
-        "caption": (family, 11, "normal"),
-        "button": (family, 12, "normal"),
-        "button_utility": (family, 11, "normal"),
-        "fine": (family, 10, "normal"),
-        "nav": (family, 10, "normal"),
+        "display":      (f"{serif}, {serif_fallback}", 22, "normal"),
+        "title_serif":  (f"{serif}, {serif_fallback}", 18, "normal"),
+        "tagline":      (f"{sans}, {sans_fallback}",   13, "bold"),
+        "body":         (f"{sans}, {sans_fallback}",   13, "normal"),
+        "body_strong":  (f"{sans}, {sans_fallback}",   13, "bold"),
+        "caption":      (f"{sans}, {sans_fallback}",   11, "normal"),
+        "button":       (f"{sans}, {sans_fallback}",   12, "normal"),
+        "button_utility":(f"{sans}, {sans_fallback}",  11, "normal"),
+        "fine":         (f"{sans}, {sans_fallback}",   10, "normal"),
+        "nav":          (f"{sans}, {sans_fallback}",   10, "normal"),
     }
     return fonts.get(token, fonts["body"])
 
