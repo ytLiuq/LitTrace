@@ -50,6 +50,12 @@ littrace-tui = "littrace.tui:main"
 littrace-window = "littrace.window:main"
 littrace-mcp = "littrace.mcp_server:main"
 
+# Plugin entry-point group. Third-party packages may declare a
+# ``[project.entry-points."littrace.skills"]`` block in their own
+# pyproject.toml. Each entry point must resolve to ``register(registry)``.
+# Built-in skills self-register at import time via ``littrace.skills``
+# sub-packages — they do not need entry points.
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
