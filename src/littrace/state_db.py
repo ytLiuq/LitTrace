@@ -87,6 +87,7 @@ class SessionSummaryRecord(BaseModel):
     session_id: str
     updated_at: str
     workspace_sha256: str | None = None
+    workspace_json: dict[str, object] = Field(default_factory=dict)
     revision: int = 0
 
 
@@ -613,7 +614,7 @@ class PostgresStateStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT session_id, workspace_sha256, revision, updated_at
+                SELECT session_id, workspace_sha256, workspace_json, revision, updated_at
                 FROM {s}.session_state
                 ORDER BY updated_at DESC
                 LIMIT %s
@@ -625,8 +626,9 @@ class PostgresStateStore:
             SessionSummaryRecord(
                 session_id=row[0],
                 workspace_sha256=row[1],
-                revision=row[2],
-                updated_at=row[3].isoformat() if hasattr(row[3], "isoformat") else str(row[3]),
+                workspace_json=_from_jsonb(row[2]),
+                revision=row[3],
+                updated_at=row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4]),
             )
             for row in rows
         ]
