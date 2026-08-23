@@ -150,18 +150,30 @@ def load_or_create_session(
     state_store = state_store_from_config(config)
     if session_id:
         record = state_store.get_session_state(session_id)
-        if record is not None:
+        # Archived sessions are treated as if they don't exist — callers
+        # fall through to the "no row" branch and create a fresh session
+        # rather than reviving a deleted workspace.
+        if record is not None and record.status != "archived":
             return ChatSession.from_root(
                 session_path_for(config, session_id),
                 session_id,
                 snapshot_limit=config.storage.workspace_snapshot_limit,
                 config=config,
             )
-        # Caller asked for a specific id but Postgres has no row yet —
-        # honor the id (so chat_trail FKs and the caller's headers line up)
-        # instead of silently minting a new timestamp-based one.
+        # Caller asked for a specific id but Postgres has no row (or it
+        # was archived) — honor the id (so chat_trail FKs and the
+        # caller's headers line up) instead of silently minting a new
+        # timestamp-based one.
         session = _build_session(config, session_id)
-        save_workspace(session, LiteratureWorkspace(), config=config)
+        # Seed a draft placeholder so chat_trail FK references resolve.
+        # Caller's first save will flip status to 'active'.
+        state_store.upsert_session_state(
+            SessionStateRecord(
+                session_id=session.session_id,
+                revision=0,
+                status="draft",
+            )
+        )
         return session
     return create_chat_session(config)
 
@@ -172,7 +184,7 @@ def load_existing_session(
 ) -> ChatSession | None:
     state_store = state_store_from_config(config)
     record = state_store.get_session_state(session_id)
-    if record is not None:
+    if record is not None and record.status != "archived":
         return ChatSession.from_root(
             session_path_for(config, session_id),
             session_id,
@@ -738,7 +750,18 @@ class SessionDeleteReport(BaseModel):
 def delete_chat_session(
     config: LitTraceConfig,
     session_id: str,
+    *,
+    purge_files: bool = False,
 ) -> SessionDeleteReport:
+    """Archive a chat session.
+
+    ``purge_files=False`` (default) is a soft delete: the session_state
+    row flips to status='archived', the on-disk workspace directory is
+    left in place (recoverable), and downstream artifacts (object store
+    blobs, RAG embeddings) are still deleted so storage does not leak.
+    Pass ``purge_files=True`` to also ``shutil.rmtree`` the workspace —
+    that path is irreversible.
+    """
     session = load_existing_session(config, session_id)
     if session is None:
         return SessionDeleteReport(
@@ -793,16 +816,20 @@ def delete_chat_session(
         except Exception:
             pass
 
+    # Soft-delete by default: archive_session_state flips status to
+    # 'archived'. The on-disk workspace stays in place so the row can
+    # be un-archived later (out of scope today but the contract is
+    # ready). purge_files=True removes the directory as well.
     state_record_count = 0
     if state_store is not None:
         try:
-            state_record_count = state_store.delete_session_state(
+            state_record_count = state_store.archive_session_state(
                 session.session_id,
             )
         except Exception:
             pass
 
-    if session.root.exists():
+    if purge_files and session.root.exists():
         shutil.rmtree(session.root, ignore_errors=True)
 
     return SessionDeleteReport(

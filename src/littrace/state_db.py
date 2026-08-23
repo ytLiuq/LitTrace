@@ -1167,6 +1167,24 @@ class PostgresStateStore:
             conn.commit()
         return deleted
 
+    def archive_session_state(self, session_id: str) -> int:
+        """Soft-delete: flip status to 'archived'. The on-disk workspace
+        directory is left in place so the row can be un-archived later.
+        Returns the rowcount (0 if the session was already archived or
+        never existed; 1 on a successful transition).
+        """
+        self._ensure_schema()
+        s = self.schema_name
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE {s}.session_state SET status = 'archived', updated_at = now() "
+                f"WHERE session_id = %s AND status != 'archived'",
+                (session_id,),
+            )
+            updated = cur.rowcount
+            conn.commit()
+        return updated
+
     # --- L2: chat_trail -----------------------------------------------------
 
     def _ensure_chat_trail(self, conn, session_id: str) -> None:
