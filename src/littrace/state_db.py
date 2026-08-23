@@ -597,9 +597,9 @@ class PostgresStateStore:
                 INSERT INTO {s}.session_state (
                     session_id, workspace_sha256, workspace_json, manifest_json,
                     artifact_index_json, memory_view_json, rag_profile_json,
-                    revision, created_at, updated_at
+                    revision, status, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()), now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now()), now())
                 ON CONFLICT (session_id) DO UPDATE SET
                     workspace_sha256 = EXCLUDED.workspace_sha256,
                     workspace_json = EXCLUDED.workspace_json,
@@ -608,6 +608,7 @@ class PostgresStateStore:
                     memory_view_json = EXCLUDED.memory_view_json,
                     rag_profile_json = EXCLUDED.rag_profile_json,
                     revision = EXCLUDED.revision,
+                    status = EXCLUDED.status,
                     updated_at = now()
                 RETURNING created_at, updated_at
                 """,
@@ -620,6 +621,7 @@ class PostgresStateStore:
                     _jsonb(state.memory_view_json),
                     _jsonb(state.rag_profile_json),
                     state.revision,
+                    state.status,
                     state.created_at,
                 ),
             )

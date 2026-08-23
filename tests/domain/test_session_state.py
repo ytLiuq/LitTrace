@@ -308,3 +308,112 @@ def test_delete_session_reports_object_storage_failures(monkeypatch, tmp_path):
     assert report.warnings == [f"object_delete_failed:{len(report.object_delete_failures)}"]
     # Real SQL: registry rows are actually gone after delete_for_session.
     assert registry.list_for_session(session_id=session.session_id) == []
+
+
+def test_status_transitions_through_lifecycle(tmp_path):
+    """draft (seeded by create_chat_session) -> active (first save)
+    -> archived (delete_chat_session).
+
+    Locks down the row-level status movement end-to-end so the next
+    refactor of _sync_session_state or archive_session_state can't
+    silently drop a state.
+    """
+    schema = f"littrace_test_lifecycle_{uuid.uuid4().hex[:8]}"
+    config = LitTraceConfig(
+        storage=StorageConfig(sessions_dir=tmp_path / "sessions"),
+        metadata_store=MetadataStoreConfig(
+            backend="postgres",
+            postgres_dsn=_REAL_DSN,
+            schema_name=schema,
+            allow_schema_reset=True,
+        ),
+    )
+    state_store = state_store_from_config(config)
+    session = create_chat_session(config)
+    record = state_store.get_session_state(session.session_id)
+    assert record is not None
+    # create_chat_session seeds a 'draft' row, not 'active'.
+    assert record.status == "draft"
+    assert record.revision == 0
+    save_workspace(session, LiteratureWorkspace(), config=config)
+    record = state_store.get_session_state(session.session_id)
+    assert record is not None
+    assert record.status == "active"
+    assert record.revision == 1
+    delete_chat_session(config, session.session_id)
+    record = state_store.get_session_state(session.session_id)
+    assert record is not None
+    assert record.status == "archived"
+
+
+def test_archived_session_rejects_writes(tmp_path):
+    """save_workspace and codex CAS commits both raise after archive.
+
+    Verified directly through _save_workspace_locked's _assert_workspace_
+    revision; commit_*_workspace_tool paths covered by the same SELECT.
+    """
+    schema = f"littrace_test_archive_{uuid.uuid4().hex[:8]}"
+    config = LitTraceConfig(
+        storage=StorageConfig(sessions_dir=tmp_path / "sessions"),
+        metadata_store=MetadataStoreConfig(
+            backend="postgres",
+            postgres_dsn=_REAL_DSN,
+            schema_name=schema,
+            allow_schema_reset=True,
+        ),
+    )
+    session = create_chat_session(config)
+    save_workspace(session, LiteratureWorkspace(), config=config)
+    delete_chat_session(config, session.session_id)
+    # Re-loading after archive gives a fresh session (archived treated
+    # as no row), so we still have to operate on the original session
+    # object for the rejected-write assertion.
+    with pytest.raises(RuntimeError, match="Cannot write to archived session"):
+        save_workspace(session, LiteratureWorkspace(), config=config)
+    # And the codex gateway path through commit_agent_workspace_tool
+    # rejects the same way.
+    with pytest.raises(RuntimeError, match="Cannot write to archived session"):
+        state_store_from_config(config).commit_agent_workspace_tool(
+            session_id=session.session_id,
+            idempotency_key="idem-archive-1",
+            tool_name="search_papers",
+            arguments_sha256="x" * 64,
+            expected_revision=1,
+            workspace_json={"context": {"filters": {"workspace_revision": 2}}},
+            workspace_sha256="x" * 64,
+            result_json={},
+            audit_event={},
+        )
+
+
+def test_soft_delete_preserves_disk(tmp_path):
+    """delete_chat_session without purge_files leaves workspace dir intact.
+
+    A subsequent load_or_create_session with the same id then reuses
+    the existing directory — the row is un-archived, not duplicated.
+    """
+    schema = f"littrace_test_softdel_{uuid.uuid4().hex[:8]}"
+    config = LitTraceConfig(
+        storage=StorageConfig(sessions_dir=tmp_path / "sessions"),
+        metadata_store=MetadataStoreConfig(
+            backend="postgres",
+            postgres_dsn=_REAL_DSN,
+            schema_name=schema,
+            allow_schema_reset=True,
+        ),
+    )
+    session = create_chat_session(config)
+    save_workspace(session, LiteratureWorkspace(), config=config)
+    workspace_root = session.root
+    assert workspace_root.exists()
+    delete_chat_session(config, session.session_id)
+    # Soft delete — workspace dir still on disk.
+    assert workspace_root.exists()
+    # Same id is treated as no-row (archived), so a fresh session is
+    # built against the same directory instead of creating a new one.
+    reborn = load_or_create_session(config, session.session_id)
+    assert reborn.root == workspace_root
+    save_workspace(reborn, LiteratureWorkspace(), config=config)
+    record = state_store_from_config(config).get_session_state(session.session_id)
+    assert record is not None
+    assert record.status == "active"
