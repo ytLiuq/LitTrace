@@ -60,6 +60,8 @@ class CodexAppServerChatService:
         request: ChatRequest,
         workspace: LiteratureWorkspace,
         session: ChatSession,
+        *,
+        cancellation: asyncio.Event | None = None,
     ) -> tuple[ChatResponse, LiteratureWorkspace]:
         scratch_dir = self._scratch_dir(session.session_id)
         scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -67,14 +69,16 @@ class CodexAppServerChatService:
             if self.runtime_manager is not None:
                 turn, latest_workspace = await self.runtime_manager.use(
                     lambda client: self._chat_with_client(
-                        client, request, workspace, session, scratch_dir
+                        client, request, workspace, session, scratch_dir,
+                        cancellation,
                     )
                 )
             elif self.client_factory is AppServerClient:
                 manager = self._shared_runtime_manager()
                 turn, latest_workspace = await manager.use(
                     lambda client: self._chat_with_client(
-                        client, request, workspace, session, scratch_dir
+                        client, request, workspace, session, scratch_dir,
+                        cancellation,
                     )
                 )
             else:
@@ -87,13 +91,23 @@ class CodexAppServerChatService:
                 )
                 async with client:
                     turn, latest_workspace = await self._chat_with_client(
-                        client, request, workspace, session, scratch_dir
+                        client, request, workspace, session, scratch_dir,
+                        cancellation,
                     )
         reply = turn.reply or "Codex App Server completed the turn without a text response."
+        # Surface the terminal status as the chat action so the route
+        # layer can route the response into the right action group
+        # (chat vs interrupted vs committed_transport_failure).
+        if turn.status == "interrupted":
+            action = "codex_app_server_interrupted"
+        elif turn.status == "failed":
+            action = "codex_app_server_interrupted_failed"
+        else:
+            action = "codex_app_server_chat"
         return (
             ChatResponse(
                 reply=reply,
-                action="codex_app_server_chat",
+                action=action,
                 session_id=session.session_id,
             ),
             latest_workspace,
@@ -106,6 +120,7 @@ class CodexAppServerChatService:
         workspace: LiteratureWorkspace,
         session: ChatSession,
         scratch_dir: Path,
+        cancellation: asyncio.Event | None = None,
     ):
         runtime = self.config.agent_runtime
         await self._require_authentication(client)
@@ -144,6 +159,7 @@ class CodexAppServerChatService:
             thread_id,
             request.message,
             timeout=runtime.turn_timeout_seconds,
+            cancellation=cancellation,
         )
         latest_workspace = self._latest_workspace(
             session.session_id,

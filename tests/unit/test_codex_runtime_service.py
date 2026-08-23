@@ -67,7 +67,7 @@ class _FakeClient:
     async def call_mcp_tool(self, thread_id, server, tool, arguments):
         return {"content": [{"type": "text", "text": "{}"}], "isError": False}
 
-    async def run_turn(self, thread_id, text, *, timeout):
+    async def run_turn(self, thread_id, text, *, timeout, cancellation=None):
         if type(self).on_turn is not None:
             type(self).on_turn()
         return AppServerTurnResult(

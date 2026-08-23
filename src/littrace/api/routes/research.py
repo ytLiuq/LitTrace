@@ -49,6 +49,12 @@ _APP_SERVER_PERSISTED_ACTIONS = frozenset(
     {
         "codex_app_server_chat",
         "codex_app_server_committed_transport_failure",
+        # Cancellation took the turn down before the route-level save
+        # could run; the MCP gateway has already persisted whatever
+        # mutations the turn committed, so the route must NOT re-save
+        # the workspace and risk double-incrementing revision.
+        "codex_app_server_interrupted",
+        "codex_app_server_interrupted_failed",
     }
 )
 

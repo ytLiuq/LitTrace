@@ -15,7 +15,7 @@ class _AppServerService:
     def __init__(self, _config) -> None:
         pass
 
-    async def chat(self, _request, workspace, _session):
+    async def chat(self, _request, workspace, _session, *, cancellation=None):
         return ChatResponse(reply="app-server", action="codex"), workspace
 
 
@@ -23,7 +23,7 @@ class _FailingAppServerService:
     def __init__(self, _config) -> None:
         pass
 
-    async def chat(self, _request, _workspace, _session):
+    async def chat(self, _request, _workspace, _session, *, cancellation=None):
         raise RuntimeError("transport failed after tool commit")
 
 
