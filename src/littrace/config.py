@@ -220,6 +220,19 @@ class CodexHomeMode(StrEnum):
     SHARED = "shared"
 
 
+class SandboxPolicy(StrEnum):
+    """Three-tier sandbox policy aligned with codex-harness.
+
+    Mirrors the App Server's ``sandbox`` parameter so operators can pick
+    how much filesystem reach a Codex turn gets without hand-editing the
+    thread-start overrides.
+    """
+
+    READ_ONLY = "read-only"
+    WORKSPACE_WRITE = "workspace-write"
+    DANGER_FULL_ACCESS = "danger-full-access"
+
+
 class AgentRuntimeConfig(BaseModel):
     """Execution runtime selected for interactive chat turns.
 
@@ -239,6 +252,9 @@ class AgentRuntimeConfig(BaseModel):
     turn_timeout_seconds: float = 300.0
     fallback_to_legacy: bool = True
     mcp_server_name: str = "littrace"
+    sandbox_policy: SandboxPolicy = SandboxPolicy.READ_ONLY
+    writable_roots: list[Path] = Field(default_factory=list)
+    interrupt_grace_seconds: float = 10.0
 
 
 class HarnessThresholdConfig(BaseModel):
@@ -424,6 +440,22 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
         "LITTRACE_CODEX_FALLBACK_TO_LEGACY",
         config.agent_runtime.fallback_to_legacy,
     )
+    sandbox_env = os.environ.get("LITTRACE_CODEX_SANDBOX")
+    if sandbox_env:
+        config.agent_runtime.sandbox_policy = SandboxPolicy(sandbox_env)
+    writable_roots_env = os.environ.get("LITTRACE_CODEX_WRITABLE_ROOTS")
+    if writable_roots_env:
+        config.agent_runtime.writable_roots = [
+            Path(p).expanduser()
+            for p in writable_roots_env.split(",")
+            if p.strip()
+        ]
+    interrupt_grace_env = os.environ.get("LITTRACE_CODEX_INTERRUPT_GRACE_SECONDS")
+    if interrupt_grace_env:
+        try:
+            config.agent_runtime.interrupt_grace_seconds = float(interrupt_grace_env)
+        except ValueError:
+            pass
     config.llm.api_key = os.environ.get("DEEPSEEK_API_KEY") or config.llm.api_key
     config.llm.base_url = os.environ.get("DEEPSEEK_BASE_URL") or config.llm.base_url
     config.llm.model = os.environ.get("DEEPSEEK_MODEL") or config.llm.model
