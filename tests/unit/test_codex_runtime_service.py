@@ -4,12 +4,13 @@ import asyncio
 from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
+from unittest import mock
 
 import pytest
 
 from littrace.codex_runtime.client import AppServerError, AppServerTurnResult
 from littrace.codex_runtime.service import CodexAppServerChatService
-from littrace.config import LitTraceConfig
+from littrace.config import LitTraceConfig, SandboxPolicy
 from littrace.models import ChatRequest, LiteratureWorkspace
 from littrace.session import ChatSession
 from littrace.state_db import SessionStateRecord
@@ -105,6 +106,7 @@ def test_service_persists_and_resumes_thread_binding(tmp_path: Path) -> None:
     started = _FakeClient.instances[0].started_with
     assert started["sandbox"] == "read-only"
     assert started["approvalPolicy"] == "never"
+    assert "writableRoots" not in started
     mcp = started["config"]["mcp_servers"]["littrace"]
     assert mcp["required"] is True
     assert "search_papers" in mcp["enabled_tools"]
@@ -207,3 +209,116 @@ def test_service_returns_canonical_workspace_after_mcp_mutation(tmp_path: Path) 
     assert returned.context.filters.workspace_revision == 1
     assert store.binding.workspace_revision == 1
     _FakeClient.on_turn = None
+
+
+def test_service_passes_writable_roots_when_workspace_write(tmp_path) -> None:
+    config = LitTraceConfig(
+        agent_runtime=LitTraceConfig.model_fields["agent_runtime"].default_factory(),
+    )
+    config.agent_runtime.sandbox_policy = SandboxPolicy.WORKSPACE_WRITE
+    config.agent_runtime.writable_roots = [tmp_path / "scratch"]
+    session = ChatSession.from_root(tmp_path / "session", "session-1", config=config)
+    service = CodexAppServerChatService(config)
+
+    async def fake_run(self, *_args, **_kwargs):
+        _FakeClient.instances[0].started_with = self.started_with
+        return AppServerTurnResult(
+            thread_id="thr-1", turn_id="turn-1",
+            status="completed", reply="ok", turn={},
+        )
+
+    with mock.patch.object(
+        _FakeClient, "start_thread",
+        lambda self, params: asyncio.sleep(0, asyncio.Future())
+        if False else _FakeClient.instances.__setitem__(
+            len(_FakeClient.instances), self
+        ) or asyncio.sleep(0)
+    ):
+        pass
+
+    # drive directly via the service so we can assert on the captured
+    # thread_overrides without a full chat round-trip.
+    overrides = service._thread_overrides(session.root / "scratch")
+    assert overrides["sandbox"] == "workspace-write"
+    assert overrides["approvalPolicy"] == "on-failure"
+    assert overrides["writableRoots"] == [str(tmp_path / "scratch")]
+
+
+def test_service_omits_writable_roots_for_danger_full_access(tmp_path) -> None:
+    config = LitTraceConfig(
+        agent_runtime=LitTraceConfig.model_fields["agent_runtime"].default_factory(),
+    )
+    config.agent_runtime.sandbox_policy = SandboxPolicy.DANGER_FULL_ACCESS
+    session = ChatSession.from_root(tmp_path / "session", "session-1", config=config)
+    service = CodexAppServerChatService(config)
+    overrides = service._thread_overrides(session.root / "scratch")
+    assert overrides["sandbox"] == "danger-full-access"
+    assert overrides["approvalPolicy"] == "never"
+    assert "writableRoots" not in overrides
+
+
+def test_service_chat_returns_interrupted_action(monkeypatch, tmp_path) -> None:
+    config = LitTraceConfig(
+        agent_runtime=LitTraceConfig.model_fields["agent_runtime"].default_factory(),
+    )
+    session = ChatSession.from_root(tmp_path / "session", "session-1", config=config)
+    store = _BindingStore()
+    # Pre-seed the binding so service skips the upsert (and the FK to
+    # session_state that would otherwise need a Postgres row).
+    from littrace.state_db import AgentThreadBindingRecord
+    store.binding = AgentThreadBindingRecord(
+        session_id=session.session_id,
+        codex_thread_id="thread-existing",
+    )
+    service = CodexAppServerChatService(
+        config, state_store=store, client_factory=_FakeClient,
+    )
+    captured: list[dict[str, object]] = []
+
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None):
+        captured.append({"cancellation": cancellation})
+        return AppServerTurnResult(
+            thread_id=thread_id, turn_id="turn-1",
+            status="interrupted", reply="", turn={},
+        )
+
+    monkeypatch.setattr(_FakeClient, "run_turn", fake_run)
+    cancellation = asyncio.Event()
+    response, _ = asyncio.run(
+        service.chat(
+            ChatRequest(message="hi"), LiteratureWorkspace(), session,
+            cancellation=cancellation,
+        )
+    )
+    assert captured and captured[0]["cancellation"] is cancellation
+    assert response.action == "codex_app_server_interrupted"
+
+
+def test_service_chat_returns_interrupted_failed_action(monkeypatch, tmp_path) -> None:
+    config = LitTraceConfig(
+        agent_runtime=LitTraceConfig.model_fields["agent_runtime"].default_factory(),
+    )
+    session = ChatSession.from_root(tmp_path / "session", "session-1", config=config)
+    store = _BindingStore()
+    from littrace.state_db import AgentThreadBindingRecord
+    store.binding = AgentThreadBindingRecord(
+        session_id=session.session_id,
+        codex_thread_id="thread-existing",
+    )
+    service = CodexAppServerChatService(
+        config, state_store=store, client_factory=_FakeClient,
+    )
+
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None):
+        return AppServerTurnResult(
+            thread_id=thread_id, turn_id="turn-1",
+            status="failed", reply="", turn={},
+        )
+
+    monkeypatch.setattr(_FakeClient, "run_turn", fake_run)
+    response, _ = asyncio.run(
+        service.chat(
+            ChatRequest(message="hi"), LiteratureWorkspace(), session,
+        )
+    )
+    assert response.action == "codex_app_server_interrupted_failed"
