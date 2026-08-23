@@ -312,12 +312,10 @@ def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSess
         summaries: list[ChatSessionSummary] = []
         for record in state_store.list_session_states(limit=limit):
             topic = "未命名主题"
-            workspace = record.workspace_json if isinstance(record.workspace_json, dict) else {}
-            filters = workspace.get("context", {}).get("filters", {}) if isinstance(workspace, dict) else {}
-            if isinstance(filters, dict):
-                topic_value = filters.get("topic")
-                if isinstance(topic_value, str) and topic_value.strip():
-                    topic = topic_value
+            # topic is extracted in SQL via the ->>'topic' JSONB op so the
+            # full workspace_json never crosses the wire for the sidebar.
+            if isinstance(record.topic, str) and record.topic.strip():
+                topic = record.topic
             if topic == "未命名主题":
                 for message in state_store.list_chat_messages(record.session_id):
                     if message.get("role") != "user":
@@ -343,12 +341,10 @@ def list_chat_sessions(config: LitTraceConfig, limit: int = 20) -> list[ChatSess
                     updated_at=record.updated_at,
                     topic=topic,
                     message_count=message_count,
-                    # paper_count reflects the active literature context — papers
-                    # sitting in the workspace's `papers` map but not promoted to
-                    # the active set are not "in the session" yet.
-                    paper_count=len(workspace.get("context", {}).get("active_papers", []))
-                    if isinstance(workspace, dict)
-                    else 0,
+                    # active_paper_count is extracted in SQL via
+                    # jsonb_array_length(workspace_json->'context'->'active_papers')
+                    # so the sidebar doesn't have to fetch workspace_json.
+                    paper_count=record.active_paper_count,
                 )
             )
         summaries.sort(key=lambda item: item.updated_at, reverse=True)

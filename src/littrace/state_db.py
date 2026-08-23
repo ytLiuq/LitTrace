@@ -82,12 +82,17 @@ class SessionStateRecord(BaseModel):
 
 
 class SessionSummaryRecord(BaseModel):
-    """Compact view returned by list_session_states (kept for chat sidebar)."""
+    """Compact view returned by list_session_states (kept for chat sidebar).
+
+    ``topic`` and ``active_paper_count`` are extracted in SQL via JSONB ops
+    so the full workspace_json never crosses the wire for the sidebar.
+    """
 
     session_id: str
     updated_at: str
     workspace_sha256: str | None = None
-    workspace_json: dict[str, object] = Field(default_factory=dict)
+    topic: str | None = None
+    active_paper_count: int = 0
     revision: int = 0
 
 
@@ -622,7 +627,14 @@ class PostgresStateStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT session_id, workspace_sha256, workspace_json, revision, updated_at
+                SELECT session_id,
+                       workspace_sha256,
+                       workspace_json->'context'->'filters'->>'topic' AS topic,
+                       COALESCE(jsonb_array_length(
+                           workspace_json->'context'->'active_papers'
+                       ), 0) AS active_paper_count,
+                       revision,
+                       updated_at
                 FROM {s}.session_state
                 ORDER BY updated_at DESC
                 LIMIT %s
@@ -634,9 +646,10 @@ class PostgresStateStore:
             SessionSummaryRecord(
                 session_id=row[0],
                 workspace_sha256=row[1],
-                workspace_json=_from_jsonb(row[2]),
-                revision=row[3],
-                updated_at=row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4]),
+                topic=row[2],
+                active_paper_count=int(row[3] or 0),
+                revision=row[4],
+                updated_at=row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
             )
             for row in rows
         ]
