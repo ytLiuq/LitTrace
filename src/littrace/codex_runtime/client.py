@@ -209,6 +209,7 @@ class AppServerClient:
         text: str,
         *,
         timeout: float = 300.0,
+        cancellation: asyncio.Event | None = None,
     ) -> AppServerTurnResult:
         queue = self._thread_queues.setdefault(thread_id, asyncio.Queue())
         self._turn_request_tasks.setdefault(thread_id, set())
@@ -226,7 +227,46 @@ class AppServerClient:
 
         async def wait_for_completion() -> AppServerTurnResult:
             while True:
-                message = await queue.get()
+                # select between queue and cancellation event so a caller
+                # cancel doesn't have to wait for the next server frame.
+                get_task = asyncio.create_task(queue.get())
+                if cancellation is not None:
+                    cancel_task = asyncio.create_task(cancellation.wait())
+                    done, pending = await asyncio.wait(
+                        {get_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in pending:
+                        t.cancel()
+                    if get_task in done:
+                        message = get_task.result()
+                    else:
+                        # cancellation fired — issue graceful interrupt
+                        # and wait for the server's terminal event.
+                        await self.cancel_current_turn(
+                            thread_id, turn_id, grace_seconds=10.0
+                        )
+                        # Drain whatever the server sent since we last
+                        # consumed; the terminal event will arrive within
+                        # grace_seconds.
+                        try:
+                            message = await asyncio.wait_for(
+                                queue.get(),
+                                timeout=10.0,
+                            )
+                        except TimeoutError:
+                            # Transport died — guaranteed terminal event
+                            # is 'failed' so the caller can distinguish
+                            # from a clean interrupt.
+                            return AppServerTurnResult(
+                                thread_id=thread_id,
+                                turn_id=turn_id,
+                                status="failed",
+                                reply="",
+                                turn={"id": turn_id, "status": "failed"},
+                            )
+                else:
+                    message = await get_task
                 method = message.get("method")
                 params = message.get("params") or {}
                 if params.get("turnId") != turn_id and (
@@ -265,10 +305,8 @@ class AppServerClient:
             return await asyncio.wait_for(wait_for_completion(), timeout=timeout)
         except TimeoutError as exc:
             try:
-                await self.request(
-                    "turn/interrupt",
-                    {"threadId": thread_id, "turnId": turn_id},
-                    timeout=min(self.request_timeout, 10.0),
+                await self.cancel_current_turn(
+                    thread_id, turn_id, grace_seconds=10.0
                 )
             except AppServerError:
                 pass
@@ -278,6 +316,35 @@ class AppServerClient:
             pending = self._turn_request_tasks.pop(thread_id, None)
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+    async def cancel_current_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        grace_seconds: float = 10.0,
+    ) -> bool:
+        """Issue ``turn/interrupt`` and wait for ``turn/completed``.
+
+        Returns True if the server acknowledged with status='interrupted'
+        within ``grace_seconds``; False if the request failed (transport
+        died, app server rejected, or no terminal event arrived in time).
+        The caller should treat both outcomes as "guaranteed terminal
+        event with status='failed' or 'interrupted'" and stop waiting for
+        turn completion themselves.
+        """
+        try:
+            await asyncio.wait_for(
+                self.request(
+                    "turn/interrupt",
+                    {"threadId": thread_id, "turnId": turn_id},
+                    timeout=grace_seconds,
+                ),
+                timeout=grace_seconds,
+            )
+            return True
+        except (AppServerError, TimeoutError):
+            return False
 
     async def close(self) -> None:
         if self._closed:
