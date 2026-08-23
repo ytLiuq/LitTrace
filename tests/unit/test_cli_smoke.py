@@ -8,6 +8,7 @@ Covers:
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,12 +22,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _run_cli(*args: str, env: dict | None = None, timeout: int = 30) -> subprocess.CompletedProcess:
-    full_env = {
-        "PATH": __import__("os").environ.get("PATH", ""),
-        "HOME": __import__("os").environ.get("HOME", ""),
-        "LITTRACE_RAG_POSTGRES_DSN": "postgresql://littrace:littrace@localhost:5433/littrace",
-        "LITTRACE_LLM_INTENT_PARSER_ENABLED": "false",
-    }
+    # Keep the Windows process environment intact.  In particular,
+    # subprocess creation and socket initialization depend on variables such
+    # as SYSTEMROOT/WINDIR that are absent from a hand-built minimal mapping.
+    full_env = os.environ.copy()
+    full_env.update(
+        {
+            "LITTRACE_RAG_POSTGRES_DSN": "postgresql://littrace:littrace@localhost:5433/littrace",
+            "LITTRACE_LLM_INTENT_PARSER_ENABLED": "false",
+        }
+    )
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -36,6 +41,7 @@ def _run_cli(*args: str, env: dict | None = None, timeout: int = 30) -> subproce
         text=True,
         env=full_env,
         timeout=timeout,
+        check=False,
     )
 
 

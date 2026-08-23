@@ -1,10 +1,10 @@
-from littrace.api.app import api_app
 from __future__ import annotations
 
 from pathlib import Path
 
 from fastapi import APIRouter
 
+from littrace.api.backend import api_app
 from littrace.eval_api import (
     EvalMetricReport,
     full_text_metrics_from_workspace,
@@ -12,16 +12,18 @@ from littrace.eval_api import (
     retrieval_metrics,
     storyline_metrics,
 )
-from littrace.evaluation.golden_eval import GoldenEvalReport, run_golden_eval
+from littrace.evaluation.golden_eval import GoldenEvalReport, _load_cases, run_golden_eval
 from littrace.evaluation.pdf_benchmark import (
     LivePDFBenchmarkReport,
     PDFBenchmarkReport,
     benchmark_pdf_parsing,
     benchmark_single_pdf,
 )
-from littrace.rerank_learning import RerankLearningReport, learn_rerank_policy_from_golden
 from littrace.evaluation.quality_report import QualityReport
+from littrace.evaluation.rag_eval import RagEvalReport, run_rag_golden_eval
 from littrace.evaluation.retrieval_eval import RetrievalEvalReport, run_retrieval_golden_eval
+from littrace.evaluation.task_eval import TaskEvalReport, evaluate_task_runs
+from littrace.rerank_learning import RerankLearningReport, learn_rerank_policy_from_golden
 from littrace.skill_runner import build_quality_report_skill
 
 
@@ -92,6 +94,32 @@ def eval_golden() -> GoldenEvalReport:
 @router.get("/eval/retrieval-golden", response_model=RetrievalEvalReport)
 async def eval_retrieval_golden(live: bool = True) -> RetrievalEvalReport:
     return await run_retrieval_golden_eval(api_app.load_config(), live=live)
+
+
+@router.get("/eval/rag-golden", response_model=RagEvalReport)
+async def eval_rag_golden(top_k: int = 10) -> RagEvalReport:
+    return await run_rag_golden_eval(
+        api_app.load_config(),
+        api_app.WORKSPACE,
+        top_k=top_k,
+    )
+
+
+@router.get("/eval/task-golden", response_model=TaskEvalReport)
+def eval_task_golden(case_id: str) -> TaskEvalReport:
+    config = api_app.load_config()
+    cases = [
+        case
+        for case in _load_cases(config.eval.golden_set_dir)
+        if str(case.get("case_id") or case.get("topic") or "") == case_id
+    ]
+    if not cases:
+        return TaskEvalReport(
+            case_count=0,
+            evidence_grounded_task_success_rate=0.0,
+            warnings=[f"Golden task case not found: {case_id}"],
+        )
+    return evaluate_task_runs(cases, {case_id: api_app.WORKSPACE})
 
 
 @router.get("/eval/rerank-learn", response_model=RerankLearningReport)

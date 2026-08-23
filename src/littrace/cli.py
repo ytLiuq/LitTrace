@@ -23,6 +23,12 @@ from littrace.chrome_profiles import (
 )
 from littrace.config import load_config
 from littrace.config_wizard import write_config_template
+from littrace.download_jobs import (
+    download_jobs_status,
+    requeue_dead_download_jobs,
+    run_download_job_daemon,
+    run_pending_download_jobs,
+)
 from littrace.skill_runner import (
     build_quality_report_skill,
     build_research_plan_skill,
@@ -51,6 +57,12 @@ from littrace.session_metrics import build_session_knowledge_metrics
 from littrace.artifact_ops import reconcile_session_artifacts
 from littrace.evaluation.golden_eval import run_golden_eval
 from littrace.models import ChatRequest, LiteratureWorkspace
+from littrace.parse_jobs import (
+    parse_jobs_status,
+    requeue_dead_parse_jobs,
+    run_parse_job_daemon,
+    run_pending_parse_jobs,
+)
 from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
 from littrace.publisher_connectors import build_publisher_search_plan
 from littrace.publisher_retrieval import (
@@ -75,6 +87,12 @@ from littrace.session import (
 from littrace.publication import render_publication_storyline
 from littrace.evidence.storyline_review import review_storyline
 from littrace.supplementary import attach_supplementary_file
+from littrace.table_jobs import (
+    requeue_dead_table_jobs,
+    run_pending_table_jobs,
+    run_table_job_daemon,
+    table_jobs_status,
+)
 from littrace.evidence.tables import decide_artifact_extraction_need
 
 
@@ -96,6 +114,7 @@ def main() -> None:
         "sentinel",
         "rag",
         "doctor",
+        "jobs",
         "metrics",
         "setup-browser",
         "publisher-e2e",
@@ -103,7 +122,7 @@ def main() -> None:
         print(
             f"Unknown subcommand: {sys.argv[1]!r}. "
             "Run `littrace` with no args for the interactive shell, or pass "
-            "one of: sentinel, rag, doctor, metrics, setup-browser, publisher-e2e.",
+            "one of: sentinel, rag, jobs, doctor, metrics, setup-browser, publisher-e2e.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -114,6 +133,10 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "rag":
         config = load_config()
         asyncio.run(_run_rag_command(config))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "jobs":
+        config = load_config()
+        asyncio.run(_run_jobs_command(config))
         return
     if len(sys.argv) > 1 and sys.argv[1] == "doctor":
         config = load_config()
@@ -375,6 +398,110 @@ async def _run_rag_command(config) -> None:
         )
         return
     print(f"未知 rag 动作: {action}")
+
+
+async def _run_jobs_command(config) -> None:
+    if len(sys.argv) < 4 or sys.argv[2] not in {"download", "parse", "table"}:
+        print(
+            "用法：littrace jobs download|parse|table "
+            "run|daemon|status|requeue-dead [--session SESSION_ID] [--limit N]"
+        )
+        return
+    job_kind = sys.argv[2]
+    action = sys.argv[3]
+    limit = _arg_int("--limit", config.download_retry.batch_size)
+    if action == "run":
+        if job_kind == "download":
+            report = await run_pending_download_jobs(config, limit=limit)
+            details = (
+                f"downloaded: {report.downloaded}\n"
+                f"requires_login: {report.requires_login}"
+            )
+        elif job_kind == "parse":
+            report = await run_pending_parse_jobs(config, limit=limit)
+            details = (
+                f"parsed: {report.parsed}\n"
+                f"parse_failed: {report.parse_failed}\n"
+                f"stale: {report.stale}"
+            )
+        else:
+            report = await run_pending_table_jobs(config, limit=limit)
+            details = (
+                f"performance_cells: {report.performance_cells}\n"
+                f"structured_artifacts: {report.structured_artifacts}\n"
+                f"stale: {report.stale}"
+            )
+        print(f"processed: {report.processed}")
+        print(f"failed: {report.failed}")
+        print(details)
+        if report.job_ids:
+            print("job_ids: " + ", ".join(report.job_ids))
+        if report.warnings:
+            print("warnings: " + "；".join(report.warnings))
+        return
+    if action == "daemon":
+        interval = _arg_float(
+            "--interval-seconds",
+            config.download_retry.interval_seconds,
+        )
+        print(
+            f"{job_kind} job daemon starting: "
+            f"interval_seconds={interval}, batch_size={limit}"
+        )
+        if job_kind == "download":
+            await run_download_job_daemon(
+                config,
+                interval_seconds=interval,
+                limit=limit,
+            )
+        elif job_kind == "parse":
+            await run_parse_job_daemon(
+                config,
+                interval_seconds=interval,
+                limit=limit,
+            )
+        else:
+            await run_table_job_daemon(
+                config,
+                interval_seconds=interval,
+                limit=limit,
+            )
+        return
+    if action == "status":
+        status_args = {
+            "session_id": _arg_value("--session"),
+            "status": _arg_value("--status"),
+            "limit": limit,
+        }
+        if job_kind == "download":
+            queue, jobs = download_jobs_status(config, **status_args)
+        elif job_kind == "parse":
+            queue, jobs = parse_jobs_status(config, **status_args)
+        else:
+            queue, jobs = table_jobs_status(config, **status_args)
+        print(
+            f"queued={queue.queued} running={queue.running} failed={queue.failed} "
+            f"dead={queue.dead} completed={queue.completed} ready={queue.ready_to_claim}"
+        )
+        for job in jobs:
+            print(
+                f"- {job.task_id}: status={job.status} attempts={job.attempt_count} "
+                f"session={job.session_id} error={job.last_error or '-'}"
+            )
+        return
+    if action == "requeue-dead":
+        if job_kind == "download":
+            count = requeue_dead_download_jobs(config, limit=limit)
+        elif job_kind == "parse":
+            count = requeue_dead_parse_jobs(config, limit=limit)
+        else:
+            count = requeue_dead_table_jobs(config, limit=limit)
+        print(f"requeued: {count}")
+        return
+    print(
+        "用法：littrace jobs download|parse|table "
+        "run|daemon|status|requeue-dead [--session SESSION_ID] [--limit N]"
+    )
 
 
 def _run_metrics_command(config) -> None:

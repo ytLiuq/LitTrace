@@ -7,14 +7,21 @@ particular used ``FakeConnection`` substitutes and never touched real SQL.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+from threading import Barrier
 import uuid
 
 import pytest
 
 from littrace.artifact_registry import ArtifactRecord
-from littrace.artifact_store import BlobRef, LocalArtifactStore
-from littrace.config import LitTraceConfig, MetadataStoreConfig, StorageConfig
+from littrace.artifact_store import LocalArtifactStore
+from littrace.config import (
+    ArtifactStorageConfig,
+    LitTraceConfig,
+    MetadataStoreConfig,
+    StorageConfig,
+)
 from littrace.models import ChatRequest, LiteratureWorkspace, PaperMetadata
 from littrace.runtime.memory import load_session_memory
 from littrace.session import (
@@ -97,6 +104,52 @@ def test_session_persists_memory_json(tmp_path):
     memory = load_session_memory(session)
     assert memory.session_id == session.session_id
     assert memory.working.pending_intent == {"actions": ["search"], "topic": "MXene"}
+
+
+def test_concurrent_workspace_saves_keep_one_canonical_revision(tmp_path):
+    schema = f"littrace_test_cas_{uuid.uuid4().hex[:8]}"
+    config = LitTraceConfig(
+        storage=StorageConfig(sessions_dir=tmp_path / "sessions"),
+        metadata_store=MetadataStoreConfig(
+            backend="postgres",
+            postgres_dsn=_REAL_DSN,
+            schema_name=schema,
+            allow_schema_reset=True,
+        ),
+        artifact_storage=ArtifactStorageConfig(local_root=tmp_path / "objects"),
+    )
+    session = create_chat_session(config)
+    writer_a = load_workspace(session)
+    writer_b = load_workspace(session)
+    writer_a.context.filters.topic = "writer-a"
+    writer_b.context.filters.topic = "writer-b"
+    start = Barrier(2)
+
+    def persist(workspace: LiteratureWorkspace) -> str | None:
+        start.wait()
+        try:
+            save_workspace(session, workspace, config=config)
+        except RuntimeError as exc:
+            return str(exc)
+        return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(persist, (writer_a, writer_b)))
+
+    assert sum(outcome is None for outcome in outcomes) == 1
+    assert sum("Workspace revision mismatch" in (outcome or "") for outcome in outcomes) == 1
+
+    canonical = load_workspace(session)
+    materialized = LiteratureWorkspace.model_validate_json(
+        session.workspace_path.read_text(encoding="utf-8")
+    )
+    manifest = json.loads((session.workspace_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert canonical.context.filters.workspace_revision == 2
+    assert materialized.context.filters.workspace_revision == 2
+    assert materialized.context.filters.topic == canonical.context.filters.topic
+    assert canonical.context.filters.topic in {"writer-a", "writer-b"}
+    assert manifest["revision"] == 2
+    assert len(list(session.snapshots_dir.glob("workspace-*.json"))) == 2
 
 
 def test_delete_session_reports_object_storage_failures(monkeypatch, tmp_path):

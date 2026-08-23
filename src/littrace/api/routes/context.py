@@ -1,8 +1,8 @@
-from littrace.api.app import api_app
 from __future__ import annotations
 
 from fastapi import APIRouter
 
+from littrace.api.backend import api_app
 from littrace.citations import citation_records_for_papers
 from littrace.retrieval.full_text import backfill_workspace_by_dois
 from littrace.models import (

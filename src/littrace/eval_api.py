@@ -4,9 +4,10 @@ from pydantic import BaseModel, Field
 
 from littrace.config import LitTraceConfig
 from littrace.evaluation.golden_eval import _load_cases
-from littrace.models import LiteratureWorkspace, coerce_parsed
 from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
+from littrace.evaluation.task_eval import ExpectedPerformanceCell, evaluate_performance_cells
 from littrace.evidence.storyline import build_storyline_from_workspace
+from littrace.models import LiteratureWorkspace, coerce_parsed
 
 
 class EvalMetricReport(BaseModel):
@@ -125,9 +126,17 @@ def parsing_metrics(
     # and at least some parsed content (proxy for metadata completeness)
     metadata_acc = report.parsed_count / active if active else 0.0
 
-    # table_cell_exact_match: not measurable without a golden table set;
-    # use parsed_rate as a proxy
-    table_match = report.parsed_rate
+    expected_cells: list[ExpectedPerformanceCell] = []
+    for case in _load_cases(config.eval.golden_set_dir):
+        raw_cells = case.get("expected_performance_cells")
+        if not isinstance(raw_cells, list):
+            continue
+        expected_cells.extend(
+            ExpectedPerformanceCell.model_validate(item)
+            for item in raw_cells
+            if isinstance(item, dict)
+        )
+    table_report = evaluate_performance_cells(expected_cells, workspace)
 
     # reference_accuracy: fraction of parsed papers with 0 failures
     ref_acc = (
@@ -139,7 +148,10 @@ def parsing_metrics(
     return {
         "metadata_accuracy": round(metadata_acc, 3),
         "section_extraction_accuracy": round(section_acc, 3),
-        "table_cell_exact_match": round(table_match, 3),
+        "table_cell_exact_match": table_report.exact_match,
+        "table_cell_precision": table_report.precision,
+        "table_cell_recall": table_report.recall,
+        "table_cell_gold_count": float(table_report.gold_count),
         "reference_accuracy": round(max(ref_acc, 0.0), 3),
     }
 

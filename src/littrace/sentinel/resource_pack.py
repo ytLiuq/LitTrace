@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from littrace.models import CitationRecord, LiteratureWorkspace, PaperMetadata
-from littrace.tool_contracts import ToolArtifactRef
 from littrace.sentinel.state import SentinelState
+from littrace.tool_contracts import ToolArtifactRef
 
 
 class ResourcePack(BaseModel):
@@ -94,6 +95,17 @@ def save_resource_pack(root: Path, resource_pack: ResourcePack, *, run_id: str |
     target_dir = root / "evidence_base" / "resource_packs"
     target_dir.mkdir(parents=True, exist_ok=True)
     suffix = run_id or (resource_pack.created_at or "pack").replace(":", "")
-    target = target_dir / f"{resource_pack.watchlist_id}-{suffix}.json"
+    watchlist_component = _bounded_filename_component(resource_pack.watchlist_id)
+    target = target_dir / f"{watchlist_component}-{suffix}.json"
     target.write_text(resource_pack.model_dump_json(indent=2), encoding="utf-8")
     return target
+
+
+def _bounded_filename_component(value: str, *, max_length: int = 32) -> str:
+    """Keep Sentinel artifact paths below common Windows path limits."""
+
+    if len(value) <= max_length:
+        return value
+    digest = sha256(value.encode("utf-8")).hexdigest()[:10]
+    prefix_length = max_length - len(digest) - 1
+    return f"{value[:prefix_length]}-{digest}"

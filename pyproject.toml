@@ -26,7 +26,7 @@ parsers = [
   "pypdfium2>=4.30",
 ]
 mcp = [
-  "mcp>=1.0",
+  "mcp>=1.0,<2.0",
 ]
 rag = [
   "psycopg[binary]>=3.2",

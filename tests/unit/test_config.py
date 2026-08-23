@@ -9,11 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from littrace.config import LitTraceConfig, load_config
+from littrace.config import CodexHomeMode, LitTraceConfig, load_config
 from littrace.config_wizard import write_config_template
 from littrace.context import add_papers
 from littrace.models import LiteratureWorkspace, PaperMetadata
-
 
 pytestmark = pytest.mark.unit
 
@@ -104,6 +103,18 @@ def test_write_config_template_creates_yaml(tmp_path):
     assert "chrome_profile_name" in text
     assert "auto_launch_chrome: false" in text
     assert "required: false" in text
+
+
+def test_codex_runtime_home_is_isolated_and_env_overridable(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    assert LitTraceConfig().agent_runtime.codex_home_mode == CodexHomeMode.ISOLATED
+    monkeypatch.setenv("LITTRACE_CODEX_HOME_MODE", "shared")
+    monkeypatch.setenv("LITTRACE_CODEX_HOME", str(tmp_path / "managed-home"))
+
+    config = load_config()
+
+    assert config.agent_runtime.codex_home_mode == CodexHomeMode.SHARED
+    assert config.agent_runtime.codex_home == tmp_path / "managed-home"
 
 
 # ---------------------------------------------------------------------------

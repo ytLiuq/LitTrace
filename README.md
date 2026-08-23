@@ -158,6 +158,8 @@ littrace rag daemon --interval-hours 24
 ```
 
 See `docs/rag_automation.md` for cron and macOS launchd examples.
+See `docs/evaluation.md` for literature-retrieval, chunk-level RAG, exact table
+cell, and evidence-grounded task benchmarks.
 
 ### 验证真实 daily 更新
 

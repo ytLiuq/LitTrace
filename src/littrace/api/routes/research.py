@@ -1,12 +1,12 @@
-from littrace.api.app import api_app
 from __future__ import annotations
 
 from typing import Annotated
 
 from fastapi import APIRouter, Header
 
+from littrace.agent_runtime import handle_agent_chat
 from littrace.api.auth import resolve_request_session
-from littrace.chat import handle_chat
+from littrace.api.backend import api_app
 from littrace.models import (
     ChatRequest,
     ChatResponse,
@@ -22,13 +22,13 @@ from littrace.research_background import (
     set_workspace_research_background,
     workspace_has_research_background,
 )
+from littrace.runtime.memory import load_session_memory
 from littrace.session import (
     append_message,
     load_or_create_session,
     load_workspace,
     save_workspace,
 )
-from littrace.runtime.memory import load_session_memory
 from littrace.skill_runner import export_session_bundle_skill
 from littrace.workflow import run_research_graph, run_search_preview
 
@@ -44,6 +44,13 @@ def _workspace_summary(workspace: LiteratureWorkspace) -> WorkspaceSummary:
 
 
 router = APIRouter()
+
+_APP_SERVER_PERSISTED_ACTIONS = frozenset(
+    {
+        "codex_app_server_chat",
+        "codex_app_server_committed_transport_failure",
+    }
+)
 
 
 @router.post("/search/preview", response_model=WorkspaceSummary)
@@ -72,7 +79,7 @@ async def workflow_research(
     x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
 ) -> ResearchRunResult:
     config = api_app.load_config()
-    auth = resolve_request_session(
+    resolve_request_session(
         config,
         header_session_id=x_littrace_session_id,
     )
@@ -120,7 +127,7 @@ async def chat(
         # the route response stays under 100 KB even for a 200-paper
         # session. The full workspace is still in the session_state row +
         # workspace_dir on disk.
-        background_response.workspace = _workspace_summary(session_workspace)  # type: ignore[assignment]
+        background_response.workspace = _workspace_summary(session_workspace)
         save_workspace(session, session_workspace, config=config)
         append_message(session, "user", request)
         append_message(session, "assistant", background_response)
@@ -132,25 +139,38 @@ async def chat(
         return background_response
     request = request.model_copy(update={"session_id": session.session_id})
     session_memory = load_session_memory(session)
-    response, session_workspace = await handle_chat(
+    response, session_workspace = await handle_agent_chat(
         request,
         session_workspace,
         config,
+        session=session,
         session_memory=session_memory,
     )
     api_app._set_workspace(session_workspace)
     response.session_id = session.session_id
     response.session_root = str(session.root)
     # Project the full workspace down to a summary before returning.
-    response.workspace = _workspace_summary(session_workspace)  # type: ignore[assignment]
-    try:
-        save_workspace(session, api_app.WORKSPACE, config=config)
-    except TypeError:
-        save_workspace(session, api_app.WORKSPACE)
+    response.workspace = _workspace_summary(session_workspace)
+    # App Server domain commands commit their workspace change inside the MCP
+    # Postgres transaction.  Saving again here would turn one logical command
+    # into two revisions and bypass its idempotency boundary.  Read-only App
+    # Server turns likewise have no workspace change to persist.  Legacy
+    # responses still own an in-memory workspace and use the existing save.
+    if _requires_route_workspace_save(response):
+        try:
+            save_workspace(session, api_app.WORKSPACE, config=config)
+        except TypeError:
+            save_workspace(session, api_app.WORKSPACE)
     append_message(session, "user", request)
     append_message(session, "assistant", response)
     api_app.append_trace(config, "chat", {"action": response.action, "session_id": session.session_id})
     return response
+
+
+def _requires_route_workspace_save(response: ChatResponse) -> bool:
+    """Return whether the route, rather than MCP, owns workspace persistence."""
+
+    return response.action not in _APP_SERVER_PERSISTED_ACTIONS
 
 
 @router.post("/sessions/{session_id}/export")
@@ -195,7 +215,7 @@ async def _route_research_background_fast_gate(
                 + "\n".join(f"- {item}" for item in assessment.suggestions)
             ),
             action="research_background_required",
-            workspace=workspace,
+            workspace=WorkspaceSummary.from_workspace(workspace),
             warnings=[assessment.reason or "invalid_research_background"],
         )
     set_workspace_research_background(
@@ -211,7 +231,7 @@ async def _route_research_background_fast_gate(
             "接下来你可以告诉我具体要检索、下载、比较或分析什么。"
         ),
         action="research_background_set",
-        workspace=workspace,
+        workspace=WorkspaceSummary.from_workspace(workspace),
     )
 
 

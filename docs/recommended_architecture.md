@@ -2,22 +2,49 @@
 
 ## 结论
 
-LitTrace 最适合走 **单 Coordinator Agent + Skills/ToolContracts + Session Workspace + Harness/Eval + Optional Review Council** 路线。
+LitTrace 的最终主路径应是 **Codex App Server Coordinator + LitTrace MCP Command Gateway + Postgres Canonical State + Durable Workers + Harness/Eval**。原有 Skills/ToolContracts 继续作为 LitTrace 领域能力边界，Optional Review Council 仍只承担审稿职责。
 
 不要把主路径做成重型多 Agent，也不要把 RAG 作为当前的主记忆层。这个项目的核心价值不是“很多 Agent 互相聊天”，而是：能可靠检索论文、拿到全文、解析 PDF、抽取证据、生成可追溯的表格和研究叙事，并且能被评测体系反复检查。
 
 一句话版本：
 
-> 一个 Coordinator 负责理解用户和调度；Skills/ToolContracts 负责干活；Session Workspace 负责保存事实状态；Docling structured document 负责把 PDF 变成可引用证据；Harness/Eval 负责质量门；多 Agent 只作为可选审稿委员会。
+> Codex App Server 负责对话、线程和工具编排；MCP command 负责经过鉴权、CAS 和幂等保护的领域提交；Postgres 保存唯一事实；LitTrace worker 执行下载、解析和产物生成；Harness/Eval 负责质量门；多 Agent 只作为可选审稿委员会。
 
-## 推荐架构图
+## Codex + LitTrace 最终分工
 
 ```text
 User / CLI / TUI / API / Window
-  -> LitTraceCoordinator
-     -> Intent Confidence + Ambiguity Handling
-     -> MemoryView
-     -> Skill Selection
+  -> Codex App Server (conversation, thread, planning, tool orchestration)
+     -> LitTrace MCP Gateway (thread binding, auth, validation, CAS, idempotency)
+        -> Postgres Canonical State
+           -> session_state / chat_trail / agent_tool_calls
+           -> async_tasks (download, parse, extraction, document jobs)
+        -> LitTrace Durable Workers
+           -> Search / Download / Docling / Tables / Storyline / Documents
+           -> Object Storage + Artifact Registry + pgvector
+        -> Harness / Eval Gates
+  -> Answer / Job Status / Traceable Artifacts
+```
+
+当前已完成的迁移切片：只读 evidence/RAG 工具、`search_papers`、
+`set_download_selection`、`enqueue_download`、`enqueue_parse`、
+`enqueue_table_extraction` 及对应状态工具，以及带租约、重试、dead-letter 恢复的
+download/parse/table workers。命令的 workspace
+修订、审计、幂等回放记录和任务入队处于同一个 Postgres 事务；Codex 不直接下载或
+解析文件。Parse worker 从对象存储校验并物化 PDF，通过 worker lease + workspace
+CAS 将结果合并到最新状态；过期 PDF 结果不会覆盖新上下文。
+
+下一批迁移按同一模式推进：`storyline_job`、`document_job`、
+`autonomous_review_job`。在这些写路径全部迁移前，
+旧 Coordinator 只保留组合流程兼容，不再扩展新的业务逻辑。
+
+## LitTrace 领域内部结构图
+
+```text
+User / CLI / TUI / API / Window
+  -> Codex App Server
+     -> LitTrace MCP Command Gateway
+     -> Legacy Coordinator (migration-only composite workflows)
   -> Skills / ToolContracts
      -> Search
      -> Full-text Resolve
@@ -26,13 +53,8 @@ User / CLI / TUI / API / Window
      -> Table Extraction
      -> Storyline / Report
      -> Quality Report / Export
-  -> Session Workspace
-     -> workspace.json
-     -> workspace/manifest.json
-     -> workspace/artifact_index.json
-     -> workspace/memory.json
-     -> workspace/structured_documents/
-     -> workspace/snapshots/
+  -> Postgres Canonical State + async_tasks
+  -> Filesystem/Object Storage Materialized Views
   -> Harness / Eval Gates
   -> Optional Multi-Agent Review Council
   -> User-facing Answer / Artifacts

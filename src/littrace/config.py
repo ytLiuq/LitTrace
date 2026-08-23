@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from enum import StrEnum
 import os
+from enum import StrEnum
 from pathlib import Path
 
 import yaml
@@ -39,8 +39,9 @@ class MetadataStoreConfig(BaseModel):
     backend: str = "postgres"
     postgres_dsn: str | None = "postgresql://littrace:littrace@localhost:5433/littrace"
     schema_name: str = "littrace"
-    # When True, state_store bootstrap will DROP legacy tables and recreate
-    # the 3-table layout. Default off so a typo in DSN can't nuke data.
+    connect_timeout_seconds: int = 5
+    # When True, state_store bootstrap will DROP legacy tables before creating
+    # the consolidated layout. Default off so a typo in DSN can't nuke data.
     # Override with LITTRACE_ALLOW_SCHEMA_RESET=1 (demo stage only).
     allow_schema_reset: bool = False
 
@@ -201,6 +202,45 @@ class LiteratureContextDefaults(BaseModel):
     preferred_journals: list[str] = Field(default_factory=list)
 
 
+class EvalConfig(BaseModel):
+    golden_set_dir: Path = Path("./eval/golden")
+    rag_golden_set_dir: Path = Path("./eval/rag_golden")
+    traces_dir: Path = Path("./eval/traces")
+
+
+class AgentRuntimeMode(StrEnum):
+    LEGACY = "legacy"
+    CODEX_APP_SERVER = "codex_app_server"
+
+
+class CodexHomeMode(StrEnum):
+    """How the App Server process resolves its Codex state directory."""
+
+    ISOLATED = "isolated"
+    SHARED = "shared"
+
+
+class AgentRuntimeConfig(BaseModel):
+    """Execution runtime selected for interactive chat turns.
+
+    ``legacy`` keeps the existing in-process coordinator.  The App Server
+    runtime is deliberately opt-in while domain mutations move behind
+    controlled, idempotent MCP commands.
+    """
+
+    mode: AgentRuntimeMode = AgentRuntimeMode.LEGACY
+    codex_command: list[str] = Field(default_factory=lambda: ["codex", "app-server"])
+    codex_config_overrides: dict[str, str] = Field(default_factory=dict)
+    codex_home_mode: CodexHomeMode = CodexHomeMode.ISOLATED
+    codex_home: Path = Path("./data/codex-home")
+    scratch_root: Path = Path("./data/codex-runtime")
+    startup_timeout_seconds: float = 20.0
+    request_timeout_seconds: float = 60.0
+    turn_timeout_seconds: float = 300.0
+    fallback_to_legacy: bool = True
+    mcp_server_name: str = "littrace"
+
+
 class HarnessThresholdConfig(BaseModel):
     """Thresholds for harness quality checks — configurable via config.yaml."""
 
@@ -301,6 +341,8 @@ class LitTraceConfig(BaseModel):
     paper_download: PaperDownloadConfig = Field(default_factory=PaperDownloadConfig)
     parsing: ParsingConfig = Field(default_factory=ParsingConfig)
     literature_context: LiteratureContextDefaults = Field(default_factory=LiteratureContextDefaults)
+    eval: EvalConfig = Field(default_factory=EvalConfig)
+    agent_runtime: AgentRuntimeConfig = Field(default_factory=AgentRuntimeConfig)
     harness: HarnessThresholdConfig = Field(default_factory=HarnessThresholdConfig)
     retry: RetryPolicyConfig = Field(default_factory=RetryPolicyConfig)
     cost_budget: CostBudgetConfig = Field(default_factory=CostBudgetConfig)
@@ -358,6 +400,27 @@ def _load_env_file(path: Path) -> None:
 
 
 def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
+    runtime_mode = os.environ.get("LITTRACE_AGENT_RUNTIME")
+    if runtime_mode:
+        config.agent_runtime.mode = AgentRuntimeMode(runtime_mode)
+    codex_command = os.environ.get("LITTRACE_CODEX_COMMAND")
+    if codex_command:
+        config.agent_runtime.codex_command = [
+            part for part in codex_command.split(" ") if part
+        ]
+    scratch_root = os.environ.get("LITTRACE_CODEX_SCRATCH_ROOT")
+    if scratch_root:
+        config.agent_runtime.scratch_root = Path(scratch_root).expanduser()
+    codex_home_mode = os.environ.get("LITTRACE_CODEX_HOME_MODE")
+    if codex_home_mode:
+        config.agent_runtime.codex_home_mode = CodexHomeMode(codex_home_mode)
+    codex_home = os.environ.get("LITTRACE_CODEX_HOME")
+    if codex_home:
+        config.agent_runtime.codex_home = Path(codex_home).expanduser()
+    config.agent_runtime.fallback_to_legacy = _env_bool(
+        "LITTRACE_CODEX_FALLBACK_TO_LEGACY",
+        config.agent_runtime.fallback_to_legacy,
+    )
     config.llm.api_key = os.environ.get("DEEPSEEK_API_KEY") or config.llm.api_key
     config.llm.base_url = os.environ.get("DEEPSEEK_BASE_URL") or config.llm.base_url
     config.llm.model = os.environ.get("DEEPSEEK_MODEL") or config.llm.model
@@ -449,6 +512,12 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     config.metadata_store.schema_name = (
         os.environ.get("LITTRACE_POSTGRES_SCHEMA") or config.metadata_store.schema_name
     )
+    postgres_connect_timeout = os.environ.get("LITTRACE_POSTGRES_CONNECT_TIMEOUT_SECONDS")
+    if postgres_connect_timeout:
+        try:
+            config.metadata_store.connect_timeout_seconds = int(postgres_connect_timeout)
+        except ValueError:
+            pass
     config.metadata_store.allow_schema_reset = _env_bool(
         "LITTRACE_ALLOW_SCHEMA_RESET", config.metadata_store.allow_schema_reset
     )

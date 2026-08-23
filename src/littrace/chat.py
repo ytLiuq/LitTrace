@@ -33,6 +33,7 @@ from littrace.models import (
     WorkspaceSummary,
     LiteratureWorkspace,
     PaperSearchRequest,
+    ResearchRunResult,
     WorkflowTraceStep,
 )
 from littrace.research_writer import (
@@ -126,7 +127,7 @@ async def handle_chat(
                 ChatResponse(
                     reply=_mock_context_refusal(),
                     action="blocked_mock_context",
-                    workspace=workspace,
+                    workspace=WorkspaceSummary.from_workspace(workspace),
                     citations=[],
                     warnings=["当前上下文来自 mock/开发样例，已禁止生成研究结论。"],
                 ),
@@ -151,7 +152,7 @@ async def handle_chat(
                 ChatResponse(
                     reply=_insufficient_real_evidence_reply(workspace),
                     action="insufficient_real_evidence",
-                    workspace=workspace,
+                    workspace=WorkspaceSummary.from_workspace(workspace),
                     citations=_active_citations(workspace),
                     warnings=[f"真实相关文献不足 {MIN_ANALYSIS_PAPERS} 篇，已拒绝生成分析型结论。"],
                 ),
@@ -218,7 +219,7 @@ async def handle_chat(
                         "请检查 LLM 配置（DEEPSEEK_API_KEY / base_url / model）后重试。"
                     ),
                     action="llm_error",
-                    workspace=workspace,
+                    workspace=WorkspaceSummary.from_workspace(workspace),
                     citations=_active_citations(workspace),
                     warnings=[llm_reply.error or "llm_unavailable"],
                 ),
@@ -235,7 +236,7 @@ async def handle_chat(
                     "抽取性能表格，或生成有证据约束的发展脉络。你可以说：检索 2024 年后的 AFM 和 ACS Nano，先别下载，生成性能对比表。"
                 ),
                 action="help",
-                workspace=workspace,
+                workspace=WorkspaceSummary.from_workspace(workspace),
             ),
             intent,
         ),
@@ -267,7 +268,7 @@ def _route_quick_action(
             ChatResponse(
                 reply=_format_current_papers(workspace),
                 action="list_context",
-                workspace=workspace,
+                workspace=WorkspaceSummary.from_workspace(workspace),
                 citations=_active_citations(workspace),
             ),
             intent,
@@ -277,7 +278,7 @@ def _route_quick_action(
             ChatResponse(
                 reply=_format_component_status(),
                 action="component_status",
-                workspace=workspace,
+                workspace=WorkspaceSummary.from_workspace(workspace),
             ),
             intent,
         )
@@ -1106,7 +1107,7 @@ async def _research_background_gate(
                 + "\n".join(f"- {item}" for item in assessment.suggestions)
             ),
             action="research_background_required",
-            workspace=workspace,
+            workspace=WorkspaceSummary.from_workspace(workspace),
             warnings=[assessment.reason or "invalid_research_background"],
         )
 
@@ -1123,7 +1124,7 @@ async def _research_background_gate(
             "接下来你可以告诉我具体要检索、下载、比较或分析什么。"
         ),
         action="research_background_set",
-        workspace=workspace,
+        workspace=WorkspaceSummary.from_workspace(workspace),
     )
 
 

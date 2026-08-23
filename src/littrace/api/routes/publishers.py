@@ -1,8 +1,8 @@
-from littrace.api.app import api_app
 from __future__ import annotations
 
 from fastapi import APIRouter
 
+from littrace.api.backend import api_app
 from littrace.publisher_connectors import PublisherRouteReport, PublisherSearchPlanReport, build_publisher_search_plan, publisher_routes_for_workspace
 from littrace.publisher_retrieval import BrowserRetrievalPlan, PublisherEnrichment, PublisherRetrievalResult, build_browser_retrieval_plan, fetch_publisher_search_results, merge_retrieval_result_into_workspace, parse_publisher_article_html
 from littrace.supplementary import register_supplementary_links

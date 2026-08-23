@@ -71,10 +71,15 @@ class PgvectorRagStore:
         import psycopg
         from pgvector.psycopg import register_vector
 
+        setup_statements = self.setup_sql()
+        extension_statement, *schema_statements = setup_statements
         with psycopg.connect(self.config.rag.postgres_dsn) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(extension_statement)
+            connection.commit()
             register_vector(connection)
             with connection.cursor() as cursor:
-                for statement in self.setup_sql():
+                for statement in schema_statements:
                     cursor.execute(statement)
             connection.commit()
 

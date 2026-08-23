@@ -300,7 +300,9 @@ async def extract_performance_cells(
     """Extract performance metrics from parsed papers using LLM.
 
     A secondary regex pass catches values the LLM missed (e.g. in dense tables).
-    If the LLM call fails entirely, the error is raised -- no silent degradation.
+    When the LLM is intentionally unavailable, extraction degrades explicitly to
+    the regex/structured-table pass and records a harness warning. Runtime LLM
+    failures still raise so transient provider errors are not hidden.
     """
     if config is None:
         from littrace.config import load_config
@@ -310,6 +312,7 @@ async def extract_performance_cells(
     cells: list[PerformanceCell] = []
     artifacts: list[StructuredArtifact] = []
     all_schema_errors: list[str] = []
+    llm_fallback_warnings: list[str] = []
     total_raw_items = 0
 
     for paper_id, parsed in workspace.parsed_papers.items():
@@ -336,16 +339,24 @@ async def extract_performance_cells(
                 workspace=None,
             )
 
-        if not reply.used_llm:
-            raise RuntimeError(f"LLM metric extraction failed for paper {paper_id}: {reply.error}")
-
-        try:
-            raw_cells = json.loads(reply.text)
-            if not isinstance(raw_cells, list):
-                raw_cells = []
-        except (json.JSONDecodeError, TypeError) as exc:
-            logger.warning("llm_json_parse_error", extra={"paper_id": paper_id, "error": str(exc)})
+        if not reply.used_llm and reply.error in {"missing_api_key", "llm_disabled"}:
             raw_cells = []
+            llm_fallback_warnings.append(
+                f"{paper_id}: LLM metric extraction skipped ({reply.error}); "
+                "regex-only fallback used."
+            )
+        elif not reply.used_llm:
+            raise RuntimeError(f"LLM metric extraction failed for paper {paper_id}: {reply.error}")
+        else:
+            try:
+                raw_cells = json.loads(reply.text)
+                if not isinstance(raw_cells, list):
+                    raw_cells = []
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning(
+                    "llm_json_parse_error", extra={"paper_id": paper_id, "error": str(exc)}
+                )
+                raw_cells = []
 
         total_raw_items += len(raw_cells)
         # Dimension 3: schema-validated parsing with error collection
@@ -411,6 +422,7 @@ async def extract_performance_cells(
         schema=schema_result,
         artifact_count=len(artifacts),
     )
+    harness.warnings.extend(llm_fallback_warnings)
     logger.info(
         "extraction_done",
         extra={

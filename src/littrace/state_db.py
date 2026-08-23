@@ -1,10 +1,12 @@
-"""Postgres-backed state store for the consolidated 3-table memory layout.
+"""Postgres-backed state store for LitTrace session and runtime state.
 
 Memory layers (post-consolidation):
   L1 session_state : workspace truth + memory view + artifact index + rag profile
   L2 chat_trail    : append-only messages, snapshot refs, lifecycle events
   L3 async_tasks   : durable queue for embedding jobs + outbox events
   L4 RAGIndex      : pgvector collection (separate schema, not this module)
+  L5 agent_thread_bindings: LitTrace session -> external harness thread
+  L6 agent_tool_calls: exactly-once mutation result and audit identity
 
 Replaces the previous 9-table layout (sessions, session_messages,
 session_memory, session_snapshots, embedding_jobs, artifact_outbox,
@@ -16,6 +18,8 @@ abstract surface.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -86,12 +90,48 @@ class SessionSummaryRecord(BaseModel):
     revision: int = 0
 
 
+class AgentThreadBindingRecord(BaseModel):
+    """Durable identity link between a LitTrace session and a Codex thread."""
+
+    session_id: str
+    codex_thread_id: str
+    runtime_kind: str = "codex_app_server"
+    runtime_version: str | None = None
+    workspace_revision: int = 0
+    status: str = "active"
+    last_error: str | None = None
+    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
+class AgentToolCallRecord(BaseModel):
+    """Durable exactly-once result for a mutating App Server tool call."""
+
+    session_id: str
+    idempotency_key: str
+    tool_name: str
+    arguments_sha256: str
+    expected_revision: int
+    committed_revision: int
+    result_json: dict[str, object] = Field(default_factory=dict)
+    reused: bool = False
+    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
 class AsyncTaskRecord(BaseModel):
-    """L3: durable queue row, kind discriminates embedding_job vs artifact_outbox."""
+    """L3 durable queue row shared by domain jobs and artifact pipelines."""
 
     task_id: str
     session_id: str
-    kind: Literal["embedding_job", "artifact_outbox"]
+    kind: Literal[
+        "embedding_job",
+        "artifact_outbox",
+        "download_job",
+        "parse_job",
+        "table_job",
+        "storyline_job",
+    ]
     artifact_id: str = ""
     event_type: str = ""
     profile_id: str = ""
@@ -141,10 +181,52 @@ class StateStore(Protocol):
 
     # ---- L1: session working state -----------------------------------------
 
-    def upsert_session_state(self, state: SessionStateRecord) -> SessionStateRecord: ...
+    def session_write_lock(self, session_id: str) -> AbstractContextManager[None]: ...
+    def agent_thread_lock(self, session_id: str) -> AbstractContextManager[None]: ...
+    def upsert_session_state(
+        self,
+        state: SessionStateRecord,
+        *,
+        expected_revision: int | None = None,
+    ) -> SessionStateRecord: ...
     def get_session_state(self, session_id: str) -> SessionStateRecord | None: ...
     def list_session_states(self, *, limit: int = 20) -> list[SessionSummaryRecord]: ...
     def delete_session_state(self, session_id: str) -> int: ...
+    def get_agent_thread_binding(
+        self, session_id: str
+    ) -> AgentThreadBindingRecord | None: ...
+    def get_agent_thread_binding_by_thread_id(
+        self, codex_thread_id: str
+    ) -> AgentThreadBindingRecord | None: ...
+    def upsert_agent_thread_binding(
+        self, binding: AgentThreadBindingRecord
+    ) -> AgentThreadBindingRecord: ...
+    def commit_agent_workspace_tool(
+        self,
+        *,
+        session_id: str,
+        idempotency_key: str,
+        tool_name: str,
+        arguments_sha256: str,
+        expected_revision: int,
+        workspace_json: dict[str, object],
+        workspace_sha256: str,
+        result_json: dict[str, object],
+        audit_event: dict[str, object],
+        async_task: AsyncTaskRecord | None = None,
+    ) -> AgentToolCallRecord: ...
+    def commit_async_workspace_result(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        lease_owner: str,
+        expected_revision: int,
+        workspace_json: dict[str, object],
+        workspace_sha256: str,
+        result_json: dict[str, object],
+        audit_event: dict[str, object],
+    ) -> AsyncTaskRecord: ...
 
     # ---- L2: chat trail (messages + snapshot refs + lifecycle events) -------
 
@@ -155,7 +237,7 @@ class StateStore(Protocol):
         self, session_id: str, *, paper_id: str | None = None
     ) -> list[dict[str, object]]: ...
 
-    # ---- L3: async tasks (embedding_job + artifact_outbox) ---------------
+    # ---- L3: async tasks (domain jobs + artifact pipelines) ---------------
 
     def enqueue_async_task(self, task: AsyncTaskRecord) -> AsyncTaskRecord: ...
     def claim_pending_async_tasks(
@@ -198,6 +280,7 @@ class PostgresStateStore:
     dsn: str
     schema_name: str = "littrace"
     allow_schema_reset: bool = False
+    connect_timeout_seconds: int = 5
     _initialized: bool = False
 
     # --- connection helpers -------------------------------------------------
@@ -210,7 +293,7 @@ class PostgresStateStore:
                 "Postgres state storage requires the optional rag extra: "
                 "pip install -e '.[rag]'"
             ) from exc
-        return psycopg.connect(self.dsn)
+        return psycopg.connect(self.dsn, connect_timeout=self.connect_timeout_seconds)
 
     # --- schema bootstrap ---------------------------------------------------
 
@@ -251,6 +334,49 @@ class PostgresStateStore:
                     updated_at TIMESTAMPTZ NOT NULL
                 )
                 """
+            )
+
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {s}.agent_thread_bindings (
+                    session_id TEXT PRIMARY KEY REFERENCES {s}.session_state(session_id)
+                        ON DELETE CASCADE,
+                    codex_thread_id TEXT UNIQUE NOT NULL,
+                    runtime_kind TEXT NOT NULL,
+                    runtime_version TEXT,
+                    workspace_revision INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS agent_thread_bindings_status_idx "
+                f"ON {s}.agent_thread_bindings (status, updated_at)"
+            )
+
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {s}.agent_tool_calls (
+                    session_id TEXT NOT NULL REFERENCES {s}.session_state(session_id)
+                        ON DELETE CASCADE,
+                    idempotency_key TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    arguments_sha256 TEXT NOT NULL,
+                    expected_revision INTEGER NOT NULL,
+                    committed_revision INTEGER NOT NULL,
+                    result_json JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (session_id, idempotency_key)
+                )
+                """
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS agent_tool_calls_tool_idx "
+                f"ON {s}.agent_tool_calls (tool_name, updated_at)"
             )
 
             cur.execute(
@@ -321,6 +447,37 @@ class PostgresStateStore:
 
     # --- L1: session_state --------------------------------------------------
 
+    @contextmanager
+    def session_write_lock(self, session_id: str) -> Iterator[None]:
+        """Serialize full workspace saves for one session across processes.
+
+        The lock is transaction-scoped and lives on a dedicated connection.
+        Workspace writes use other short-lived connections while this one
+        remains open, so every cooperating writer observes one total order.
+        """
+
+        self._ensure_schema()
+        lock_name = f"littrace:session-write:{session_id}"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_name,),
+            )
+            yield
+
+    @contextmanager
+    def agent_thread_lock(self, session_id: str) -> Iterator[None]:
+        """Allow at most one App Server turn per LitTrace session."""
+
+        self._ensure_schema()
+        lock_name = f"littrace:agent-thread:{session_id}"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_name,),
+            )
+            yield
+
     def upsert_session_state(
         self, state: SessionStateRecord, *, expected_revision: int | None = None
     ) -> SessionStateRecord:
@@ -334,7 +491,6 @@ class PostgresStateStore:
         """
         self._ensure_schema()
         s = self.schema_name
-        now = datetime.now(UTC).isoformat()
         with self._connect() as conn, conn.cursor() as cur:
             if expected_revision is not None:
                 cur.execute(
@@ -429,8 +585,7 @@ class PostgresStateStore:
                 f"""
                 SELECT session_id, workspace_sha256, workspace_json, manifest_json,
                        artifact_index_json, memory_view_json, rag_profile_json,
-                       revision, structured_document_count, workspace_snapshot_count,
-                       created_at, updated_at
+                       revision, created_at, updated_at
                 FROM {s}.session_state
                 WHERE session_id = %s
                 """,
@@ -448,10 +603,8 @@ class PostgresStateStore:
             memory_view_json=_from_jsonb(row[5]),
             rag_profile_json=_from_jsonb(row[6]),
             revision=row[7],
-            structured_document_count=row[8],
-            workspace_snapshot_count=row[9],
-            created_at=row[10].isoformat() if hasattr(row[10], "isoformat") else str(row[10]),
-            updated_at=row[11].isoformat() if hasattr(row[11], "isoformat") else str(row[11]),
+            created_at=row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
+            updated_at=row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
         )
 
     def list_session_states(self, *, limit: int = 20) -> list[SessionSummaryRecord]:
@@ -460,8 +613,7 @@ class PostgresStateStore:
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 f"""
-                SELECT session_id, workspace_sha256, revision,
-                       structured_document_count, workspace_snapshot_count, updated_at
+                SELECT session_id, workspace_sha256, revision, updated_at
                 FROM {s}.session_state
                 ORDER BY updated_at DESC
                 LIMIT %s
@@ -474,12 +626,429 @@ class PostgresStateStore:
                 session_id=row[0],
                 workspace_sha256=row[1],
                 revision=row[2],
-                structured_document_count=row[3],
-                workspace_snapshot_count=row[4],
-                updated_at=row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                updated_at=row[3].isoformat() if hasattr(row[3], "isoformat") else str(row[3]),
             )
             for row in rows
         ]
+
+    def get_agent_thread_binding(
+        self, session_id: str
+    ) -> AgentThreadBindingRecord | None:
+        return self._get_agent_thread_binding("session_id", session_id)
+
+    def get_agent_thread_binding_by_thread_id(
+        self, codex_thread_id: str
+    ) -> AgentThreadBindingRecord | None:
+        return self._get_agent_thread_binding("codex_thread_id", codex_thread_id)
+
+    def _get_agent_thread_binding(
+        self,
+        column: Literal["session_id", "codex_thread_id"],
+        value: str,
+    ) -> AgentThreadBindingRecord | None:
+        self._ensure_schema()
+        s = self.schema_name
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT session_id, codex_thread_id, runtime_kind, runtime_version,
+                       workspace_revision, status, last_error, created_at, updated_at
+                FROM {s}.agent_thread_bindings
+                WHERE {column} = %s
+                """,
+                (value,),
+            )
+            row = cur.fetchone()
+        return _row_to_agent_thread_binding(row) if row is not None else None
+
+    def upsert_agent_thread_binding(
+        self, binding: AgentThreadBindingRecord
+    ) -> AgentThreadBindingRecord:
+        self._ensure_schema()
+        s = self.schema_name
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {s}.agent_thread_bindings (
+                    session_id, codex_thread_id, runtime_kind, runtime_version,
+                    workspace_revision, status, last_error, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (session_id) DO UPDATE SET
+                    codex_thread_id = EXCLUDED.codex_thread_id,
+                    runtime_kind = EXCLUDED.runtime_kind,
+                    runtime_version = EXCLUDED.runtime_version,
+                    workspace_revision = EXCLUDED.workspace_revision,
+                    status = EXCLUDED.status,
+                    last_error = EXCLUDED.last_error,
+                    updated_at = now()
+                RETURNING created_at, updated_at
+                """,
+                (
+                    binding.session_id,
+                    binding.codex_thread_id,
+                    binding.runtime_kind,
+                    binding.runtime_version,
+                    binding.workspace_revision,
+                    binding.status,
+                    binding.last_error,
+                    binding.created_at,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        return binding.model_copy(
+            update={
+                "created_at": row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0]),
+                "updated_at": row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]),
+            }
+        )
+
+    def commit_agent_workspace_tool(
+        self,
+        *,
+        session_id: str,
+        idempotency_key: str,
+        tool_name: str,
+        arguments_sha256: str,
+        expected_revision: int,
+        workspace_json: dict[str, object],
+        workspace_sha256: str,
+        result_json: dict[str, object],
+        audit_event: dict[str, object],
+        async_task: AsyncTaskRecord | None = None,
+    ) -> AgentToolCallRecord:
+        """Atomically commit a workspace mutation, optional job, audit, and replay result.
+
+        The primary key makes retries exactly once. Reusing a key with different
+        arguments is rejected rather than returning an unrelated prior result.
+        """
+
+        self._ensure_schema()
+        if not idempotency_key.strip():
+            raise ValueError("idempotency_key must not be empty")
+        if async_task is not None:
+            if async_task.session_id != session_id:
+                raise ValueError("async_task session_id must match the tool session")
+            if async_task.status != "queued" or async_task.attempt_count != 0:
+                raise ValueError("async_task must be a fresh queued task")
+        new_revision = expected_revision + 1
+        context = workspace_json.get("context")
+        filters = context.get("filters") if isinstance(context, dict) else None
+        serialized_revision = (
+            filters.get("workspace_revision") if isinstance(filters, dict) else None
+        )
+        if serialized_revision != new_revision:
+            raise ValueError("workspace_json revision must equal expected_revision + 1")
+        s = self.schema_name
+        lock_name = f"littrace:session-write:{session_id}"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_name,),
+            )
+            cur.execute(
+                f"""
+                SELECT session_id, idempotency_key, tool_name, arguments_sha256,
+                       expected_revision, committed_revision, result_json,
+                       created_at, updated_at
+                FROM {s}.agent_tool_calls
+                WHERE session_id = %s AND idempotency_key = %s
+                FOR UPDATE
+                """,
+                (session_id, idempotency_key),
+            )
+            prior = cur.fetchone()
+            if prior is not None:
+                record = _row_to_agent_tool_call(prior).model_copy(update={"reused": True})
+                if record.tool_name != tool_name or record.arguments_sha256 != arguments_sha256:
+                    raise ValueError(
+                        "idempotency_key was already used with different tool arguments"
+                    )
+                conn.commit()
+                return record
+
+            cur.execute(
+                f"SELECT revision FROM {s}.session_state "
+                "WHERE session_id = %s FOR UPDATE",
+                (session_id,),
+            )
+            current = cur.fetchone()
+            if current is None:
+                raise LookupError(f"LitTrace session state does not exist: {session_id}")
+            current_revision = int(current[0])
+            if current_revision != expected_revision:
+                raise RuntimeError(
+                    f"SessionState CAS mismatch for {session_id}: "
+                    f"expected revision {expected_revision}, got {current_revision}"
+                )
+
+            cur.execute(
+                f"""
+                UPDATE {s}.session_state
+                SET workspace_sha256 = %s,
+                    workspace_json = %s,
+                    manifest_json = manifest_json || %s::jsonb,
+                    revision = %s,
+                    updated_at = now()
+                WHERE session_id = %s
+                """,
+                (
+                    workspace_sha256,
+                    _jsonb(workspace_json),
+                    _jsonb(
+                        {
+                            "revision": new_revision,
+                            "workspace_sha256": workspace_sha256,
+                        }
+                    ),
+                    new_revision,
+                    session_id,
+                ),
+            )
+            cur.execute(
+                f"""
+                UPDATE {s}.agent_thread_bindings
+                SET workspace_revision = %s, updated_at = now()
+                WHERE session_id = %s
+                """,
+                (new_revision, session_id),
+            )
+            self._ensure_chat_trail(conn, session_id)
+            cur.execute(
+                f"""
+                UPDATE {s}.chat_trail
+                SET events = (
+                    SELECT COALESCE(jsonb_agg(elem ORDER BY ord), '[]'::jsonb)
+                    FROM (
+                        SELECT elem, ord
+                        FROM jsonb_array_elements(events)
+                             WITH ORDINALITY AS t(elem, ord)
+                        ORDER BY ord DESC
+                        LIMIT 4999
+                    ) recent
+                ) || %s::jsonb,
+                updated_at = now()
+                WHERE session_id = %s
+                """,
+                (_jsonb([audit_event]), session_id),
+            )
+            if async_task is not None:
+                # This insert shares the transaction with the workspace CAS and
+                # agent_tool_calls replay row. A successful command can never
+                # become visible without its durable background job.
+                cur.execute(
+                    f"""
+                    INSERT INTO {s}.async_tasks (
+                        task_id, session_id, kind, artifact_id, event_type, profile_id,
+                        source_revision, content_sha256, status, attempt_count,
+                        next_attempt_at, last_heartbeat_at, lease_owner,
+                        lease_expires_at, last_error, result_json, created_at,
+                        updated_at, completed_at
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        async_task.task_id,
+                        async_task.session_id,
+                        async_task.kind,
+                        async_task.artifact_id,
+                        async_task.event_type,
+                        async_task.profile_id,
+                        async_task.source_revision,
+                        async_task.content_sha256,
+                        async_task.status,
+                        async_task.attempt_count,
+                        async_task.next_attempt_at,
+                        async_task.last_heartbeat_at,
+                        async_task.lease_owner,
+                        async_task.lease_expires_at,
+                        async_task.last_error,
+                        _jsonb(async_task.result_json),
+                        async_task.created_at,
+                        async_task.updated_at,
+                        async_task.completed_at,
+                    ),
+                )
+            cur.execute(
+                f"""
+                INSERT INTO {s}.agent_tool_calls (
+                    session_id, idempotency_key, tool_name, arguments_sha256,
+                    expected_revision, committed_revision, result_json,
+                    created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, now(), now())
+                RETURNING session_id, idempotency_key, tool_name, arguments_sha256,
+                          expected_revision, committed_revision, result_json,
+                          created_at, updated_at
+                """,
+                (
+                    session_id,
+                    idempotency_key,
+                    tool_name,
+                    arguments_sha256,
+                    expected_revision,
+                    new_revision,
+                    _jsonb(result_json),
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        return _row_to_agent_tool_call(row)
+
+    def commit_async_workspace_result(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        lease_owner: str,
+        expected_revision: int,
+        workspace_json: dict[str, object],
+        workspace_sha256: str,
+        result_json: dict[str, object],
+        audit_event: dict[str, object],
+    ) -> AsyncTaskRecord:
+        """Atomically publish a worker result and complete its leased task.
+
+        Workers perform expensive I/O before entering this transaction. The
+        final merge is protected by workspace CAS and ownership of the queue
+        lease, so a stale or duplicate worker cannot overwrite newer truth.
+        """
+
+        self._ensure_schema()
+        if not lease_owner.strip():
+            raise ValueError("lease_owner must not be empty")
+        new_revision = expected_revision + 1
+        context = workspace_json.get("context")
+        filters = context.get("filters") if isinstance(context, dict) else None
+        serialized_revision = (
+            filters.get("workspace_revision") if isinstance(filters, dict) else None
+        )
+        if serialized_revision != new_revision:
+            raise ValueError("workspace_json revision must equal expected_revision + 1")
+        s = self.schema_name
+        lock_name = f"littrace:session-write:{session_id}"
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_name,),
+            )
+            cur.execute(
+                f"""
+                SELECT task_id, session_id, kind, artifact_id, event_type,
+                       profile_id, source_revision, content_sha256, status,
+                       attempt_count, next_attempt_at, last_heartbeat_at,
+                       lease_owner, lease_expires_at, last_error,
+                       result_json, created_at, updated_at, completed_at
+                FROM {s}.async_tasks
+                WHERE task_id = %s
+                FOR UPDATE
+                """,
+                (task_id,),
+            )
+            task_row = cur.fetchone()
+            if task_row is None:
+                raise LookupError(f"Async task does not exist: {task_id}")
+            task = _row_to_async_task(task_row)
+            if task.session_id != session_id:
+                raise PermissionError("Async task does not belong to the session")
+            if task.status != "running" or task.lease_owner != lease_owner:
+                raise RuntimeError(
+                    f"Async task lease mismatch for {task_id}: "
+                    f"status={task.status}, owner={task.lease_owner!r}"
+                )
+
+            cur.execute(
+                f"SELECT revision FROM {s}.session_state "
+                "WHERE session_id = %s FOR UPDATE",
+                (session_id,),
+            )
+            current = cur.fetchone()
+            if current is None:
+                raise LookupError(f"LitTrace session state does not exist: {session_id}")
+            current_revision = int(current[0])
+            if current_revision != expected_revision:
+                raise RuntimeError(
+                    f"SessionState CAS mismatch for {session_id}: "
+                    f"expected revision {expected_revision}, got {current_revision}"
+                )
+
+            cur.execute(
+                f"""
+                UPDATE {s}.session_state
+                SET workspace_sha256 = %s,
+                    workspace_json = %s,
+                    manifest_json = manifest_json || %s::jsonb,
+                    revision = %s,
+                    updated_at = now()
+                WHERE session_id = %s
+                """,
+                (
+                    workspace_sha256,
+                    _jsonb(workspace_json),
+                    _jsonb(
+                        {
+                            "revision": new_revision,
+                            "workspace_sha256": workspace_sha256,
+                        }
+                    ),
+                    new_revision,
+                    session_id,
+                ),
+            )
+            cur.execute(
+                f"""
+                UPDATE {s}.agent_thread_bindings
+                SET workspace_revision = %s, updated_at = now()
+                WHERE session_id = %s
+                """,
+                (new_revision, session_id),
+            )
+            self._ensure_chat_trail(conn, session_id)
+            cur.execute(
+                f"""
+                UPDATE {s}.chat_trail
+                SET events = (
+                    SELECT COALESCE(jsonb_agg(elem ORDER BY ord), '[]'::jsonb)
+                    FROM (
+                        SELECT elem, ord
+                        FROM jsonb_array_elements(events)
+                             WITH ORDINALITY AS t(elem, ord)
+                        ORDER BY ord DESC
+                        LIMIT 4999
+                    ) recent
+                ) || %s::jsonb,
+                updated_at = now()
+                WHERE session_id = %s
+                """,
+                (_jsonb([audit_event]), session_id),
+            )
+            cur.execute(
+                f"""
+                UPDATE {s}.async_tasks
+                SET status = 'completed',
+                    next_attempt_at = NULL,
+                    last_heartbeat_at = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    last_error = NULL,
+                    result_json = %s,
+                    completed_at = now(),
+                    updated_at = now()
+                WHERE task_id = %s
+                RETURNING task_id, session_id, kind, artifact_id, event_type,
+                          profile_id, source_revision, content_sha256, status,
+                          attempt_count, next_attempt_at, last_heartbeat_at,
+                          lease_owner, lease_expires_at, last_error,
+                          result_json, created_at, updated_at, completed_at
+                """,
+                (_jsonb(result_json), task_id),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        return _row_to_async_task(row)
 
     def update_memory_view(self, session_id: str, payload: dict[str, object]) -> bool:
         """Single-field update of ``session_state.memory_view_json``.
@@ -488,6 +1057,14 @@ class PostgresStateStore:
         concurrent ``save_workspace`` calls don't lose their full-row
         overwrite to a stale read-modify-write on memory.
         """
+        with self.session_write_lock(session_id):
+            return self._update_memory_view_unlocked(session_id, payload)
+
+    def _update_memory_view_unlocked(
+        self,
+        session_id: str,
+        payload: dict[str, object],
+    ) -> bool:
         s = self.schema_name
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -979,6 +1556,34 @@ def _row_to_async_task(row: tuple) -> AsyncTaskRecord:
     )
 
 
+def _row_to_agent_thread_binding(row: tuple) -> AgentThreadBindingRecord:
+    return AgentThreadBindingRecord(
+        session_id=row[0],
+        codex_thread_id=row[1],
+        runtime_kind=row[2],
+        runtime_version=row[3],
+        workspace_revision=row[4],
+        status=row[5],
+        last_error=row[6],
+        created_at=row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7]),
+        updated_at=row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
+    )
+
+
+def _row_to_agent_tool_call(row: tuple) -> AgentToolCallRecord:
+    return AgentToolCallRecord(
+        session_id=row[0],
+        idempotency_key=row[1],
+        tool_name=row[2],
+        arguments_sha256=row[3],
+        expected_revision=row[4],
+        committed_revision=row[5],
+        result_json=_from_jsonb(row[6]),
+        created_at=row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7]),
+        updated_at=row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
+    )
+
+
 def _jsonb(value: object) -> str:
     """Serialize for a JSONB cast. Uses ``ensure_ascii=False`` so non-ASCII
     (Chinese, emoji, etc.) round-trips at native size and GIN-indexed
@@ -1010,13 +1615,14 @@ def state_store_from_config(config: LitTraceConfig) -> PostgresStateStore:
         dsn=dsn,
         schema_name=schema_name,
         allow_schema_reset=config.metadata_store.allow_schema_reset,
+        connect_timeout_seconds=config.metadata_store.connect_timeout_seconds,
     )
 
 
 def session_state_store(
     session: object,
     config: LitTraceConfig | None = None,
-) -> "PostgresStateStore":
+) -> PostgresStateStore:
     """Build a ``PostgresStateStore`` for a chat session.
 
     Centralises the 3 duplicate ``_session_state_store`` helpers that

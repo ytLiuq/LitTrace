@@ -5,7 +5,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from littrace.chat import handle_chat
+from littrace.agent_runtime import handle_agent_chat
 from littrace.auto_resume import auto_resume_downloaded_pdfs
 from littrace.config import load_config
 from littrace.intent import parse_chat_intent
@@ -644,10 +644,11 @@ class LitTraceWindow:
     def _handle_message_thread(self, message: str) -> None:
         try:
             response, workspace = asyncio.run(
-                handle_chat(
+                handle_agent_chat(
                     ChatRequest(message=message, session_id=self.session.session_id),
                     self.workspace,
                     self.config,
+                    session=self.session,
                 )
             )
         except Exception as exc:

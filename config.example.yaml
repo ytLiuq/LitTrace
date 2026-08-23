@@ -17,6 +17,7 @@ metadata_store:
   backend: "postgres"
   postgres_dsn: "postgresql://littrace:littrace@localhost:5433/littrace"
   schema_name: "littrace"
+  connect_timeout_seconds: 5
 
 rag:
   enabled: false
@@ -142,4 +143,26 @@ literature_context:
 
 eval:
   golden_set_dir: "./eval/golden"
+  rag_golden_set_dir: "./eval/rag_golden"
   traces_dir: "./eval/traces"
+
+# Interactive execution runtime. Keep `legacy` during rollout; switch to
+# `codex_app_server` to route synthesis/Q&A and the first controlled mutation
+# (`set_download_selection`) through Codex. Other domain writes remain legacy.
+agent_runtime:
+  mode: "legacy"  # legacy | codex_app_server
+  codex_command: ["codex", "app-server"]
+  # Raw TOML values passed as repeated `codex app-server -c key=value`.
+  # Example compatibility override: {service_tier: '"fast"'}
+  codex_config_overrides: {}
+  # `isolated` prevents global Codex MCP servers, skills, threads, and memory
+  # from entering LitTrace. Authenticate this home once with `codex login`.
+  # `shared` is a temporary migration escape hatch.
+  codex_home_mode: "isolated"  # isolated | shared
+  codex_home: "./data/codex-home"
+  scratch_root: "./data/codex-runtime"
+  startup_timeout_seconds: 20
+  request_timeout_seconds: 60
+  turn_timeout_seconds: 300
+  fallback_to_legacy: true
+  mcp_server_name: "littrace"

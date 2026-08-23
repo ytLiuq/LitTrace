@@ -9,6 +9,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from littrace.artifact_store import BlobRef, artifact_store_from_config
 from littrace.config import LitTraceConfig
 from littrace.llm import vision_completion
 from littrace.models import ParsedPaper
@@ -60,16 +61,14 @@ async def enrich_parsed_figures(
     figures = [figure for figure in parsed.figures if isinstance(figure, dict)]
     for figure in figures[: settings.max_figures_per_job]:
         report.processed += 1
-        path_value = figure.get("asset_path")
-        path = Path(str(path_value)) if path_value else None
-        if path is None or not path.is_file():
+        path, data, content_type = _load_figure_bytes(config, figure)
+        if path is None or data is None:
             report.failed += 1
             report.warnings.append(
                 f"figure:{figure.get('figure_id', report.processed)}:missing_asset"
             )
             continue
 
-        data = path.read_bytes()
         image_sha256 = sha256(data).hexdigest()
         if (
             figure.get("enrichment_status") == "accepted"
@@ -84,7 +83,7 @@ async def enrich_parsed_figures(
             prompt += f"\nFigure caption from the paper:\n{caption}"
         reply = await vision_completion(
             config,
-            image_data_url=_image_data_url(path, data),
+            image_data_url=_image_data_url(path, data, content_type=content_type),
             prompt=prompt,
             json_mode=True,
         )
@@ -133,7 +132,7 @@ async def enrich_parsed_figures(
 
         confirmation_reply = await vision_completion(
             config,
-            image_data_url=_image_data_url(path, data),
+            image_data_url=_image_data_url(path, data, content_type=content_type),
             prompt=_confirmation_prompt(caption, context, analysis),
             json_mode=True,
         )
@@ -196,9 +195,36 @@ async def enrich_parsed_figures(
     return report
 
 
-def _image_data_url(path: Path, data: bytes) -> str:
+def _load_figure_bytes(
+    config: LitTraceConfig,
+    figure: dict[str, object],
+) -> tuple[Path | None, bytes | None, str | None]:
+    path_value = figure.get("asset_path")
+    path = Path(str(path_value)) if path_value else None
+    if path is not None and path.is_file():
+        return path, path.read_bytes(), None
+    raw_ref = figure.get("storage_ref")
+    if not isinstance(raw_ref, dict):
+        return None, None, None
+    try:
+        ref = BlobRef.model_validate(raw_ref)
+        data = artifact_store_from_config(config).get_bytes(ref)
+    except Exception:  # noqa: BLE001 - caller records a bounded missing-asset warning
+        return None, None, None
+    suffix = ".jpg" if ref.content_type == "image/jpeg" else ".png"
+    return Path(f"artifact{suffix}"), data, ref.content_type
+
+
+def _image_data_url(
+    path: Path,
+    data: bytes,
+    *,
+    content_type: str | None = None,
+) -> str:
     suffix = path.suffix.lower()
-    mime = "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
+    mime = content_type or (
+        "image/jpeg" if suffix in {".jpg", ".jpeg"} else "image/png"
+    )
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 

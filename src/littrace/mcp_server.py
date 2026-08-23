@@ -34,8 +34,9 @@ import sys
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 
+from littrace.codex_runtime.gateway import LitTraceToolGateway, app_server_tool_specs
 from littrace.config import LitTraceConfig, load_config
 from littrace.log import get_logger
 from littrace.skill_runner import (
@@ -50,9 +51,10 @@ from littrace.skill_runner import (
 logger = get_logger("mcp_server")
 
 app = Server("littrace")
+APP_SERVER_GATEWAY = os.environ.get("LITTRACE_MCP_GATEWAY", "").strip() == "1"
 
 # Module-level state (MCP servers are single-session by design)
-_config: LitTraceConfig = load_config()
+_config: LitTraceConfig = load_config(os.environ.get("LITTRACE_CONFIG_PATH", "config.yaml"))
 _workspace = None  # LiteratureWorkspace, lazily imported
 
 
@@ -78,7 +80,7 @@ def _get_or_create_mcp_token() -> str:
     return generated
 
 
-MCP_TOKEN = _get_or_create_mcp_token()
+MCP_TOKEN = "" if APP_SERVER_GATEWAY else _get_or_create_mcp_token()
 """The token every call_tool() invocation must include.
 
 Clients send it as the ``token`` argument; a missing or mismatched
@@ -100,6 +102,8 @@ def _get_workspace():
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     """Return the list of available LitTrace tools."""
+    if APP_SERVER_GATEWAY:
+        return [Tool(**spec) for spec in app_server_tool_specs()]
     return [
         Tool(
             name="search_papers",
@@ -233,9 +237,40 @@ async def list_tools() -> list[Tool]:
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
     """Execute a LitTrace tool and return the result as text."""
     global _workspace
+    if APP_SERVER_GATEWAY:
+        meta = app.request_context.meta
+        thread_id = None
+        if meta is not None:
+            thread_id = (meta.model_extra or {}).get("threadId")
+        try:
+            from littrace.state_db import state_store_from_config
+
+            gateway = LitTraceToolGateway(_config, state_store_from_config(_config))
+            payload = await gateway.call(
+                name,
+                arguments,
+                codex_thread_id=str(thread_id or ""),
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(payload, ensure_ascii=False, indent=2),
+                )
+            ]
+        except Exception as exc:  # noqa: BLE001 - MCP must return a structured tool error
+            logger.error("gateway_tool_error", extra={"tool": name, "error": str(exc)})
+            return CallToolResult(
+                isError=True,
+                content=[
+                    TextContent(
+                        type="text",
+                        text=f"LitTrace App Server tool failed: {exc.__class__.__name__}: {exc}",
+                    )
+                ],
+            )
     workspace = _get_workspace()
 
     token = (arguments or {}).get("token", "")
@@ -256,8 +291,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     try:
         if name == "search_papers":
-            from littrace.workflow import run_search_preview
             from littrace.models import PaperSearchRequest
+            from littrace.workflow import run_search_preview
 
             topic = arguments.get("topic", "")
             year_min = arguments.get("year_min", 2023)
@@ -400,9 +435,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         elif name == "run_research":
-            from littrace.workflow import run_research_graph
             from littrace.models import PaperSearchRequest
             from littrace.retrieval.search import build_query_variants
+            from littrace.workflow import run_research_graph
 
             topic = arguments.get("topic", "")
             year_min = arguments.get("year_min", 2023)
@@ -473,7 +508,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - legacy MCP boundary returns tool errors
         logger.error("tool_error", extra={"tool": name, "error": str(exc)})
         return [
             TextContent(

@@ -32,7 +32,7 @@ from littrace.retrieval.rag_profile import (
     save_session_rag_profile,
     session_rag_profile_path,
 )
-from littrace.runtime.memory import build_session_memory, load_session_memory, save_session_memory
+from littrace.runtime.memory import build_session_memory, load_session_memory
 
 
 class ChatSession(BaseModel):
@@ -171,6 +171,31 @@ def save_workspace(
     workspace: LiteratureWorkspace,
     config: LitTraceConfig | None = None,
 ) -> None:
+    expected_revision = _workspace_revision(workspace)
+    state_store = _session_state_store(session, config)
+    with state_store.session_write_lock(session.session_id):
+        _assert_workspace_revision(
+            state_store,
+            session_id=session.session_id,
+            expected_revision=expected_revision,
+        )
+        _save_workspace_locked(
+            session,
+            workspace,
+            config=config,
+            state_store=state_store,
+            expected_revision=expected_revision,
+        )
+
+
+def _save_workspace_locked(
+    session: ChatSession,
+    workspace: LiteratureWorkspace,
+    *,
+    config: LitTraceConfig | None,
+    state_store,
+    expected_revision: int,
+) -> None:
     session.root.mkdir(parents=True, exist_ok=True)
     session.workspace_dir.mkdir(parents=True, exist_ok=True)
     session.structured_documents_dir.mkdir(parents=True, exist_ok=True)
@@ -178,7 +203,7 @@ def save_workspace(
     session.evidence_dir.mkdir(parents=True, exist_ok=True)
     session.releases_dir.mkdir(parents=True, exist_ok=True)
     session.rag_dir.mkdir(parents=True, exist_ok=True)
-    workspace.context.filters.workspace_revision = _next_workspace_revision(session)
+    workspace.context.filters.workspace_revision = expected_revision + 1
     _persist_structured_documents(session, workspace)
     _persist_evidence_and_releases(session, workspace)
     rag_profile = save_session_rag_profile(config, session, workspace) if config is not None else None
@@ -200,7 +225,6 @@ def save_workspace(
         session_id=session.session_id,
         artifact_index=artifact_index,
     )
-    save_session_memory(session, memory)
     manifest = {
         "schema": "littrace.session_workspace.v2",
         "session_id": session.session_id,
@@ -222,13 +246,23 @@ def save_workspace(
         session.artifact_index_path,
         json.dumps(artifact_index, ensure_ascii=False, indent=2),
     )
-    # Manifest is the commit marker and is written only after every artifact.
+    _sync_session_state(
+        session,
+        workspace,
+        manifest,
+        artifact_index,
+        memory,
+        rag_profile,
+        state_store=state_store,
+        expected_revision=expected_revision,
+    )
+    # Postgres is the source of truth. Publish the filesystem commit marker
+    # and external artifact registrations only after the CAS succeeds.
     _atomic_write(
         session.workspace_dir / "manifest.json",
         json.dumps(manifest, ensure_ascii=False, indent=2),
     )
     _register_artifacts(session, artifact_index, config, rag_profile=rag_profile)
-    _sync_session_state(session, workspace, manifest, artifact_index, memory, rag_profile, config)
 
 
 def append_message(
@@ -372,13 +406,29 @@ def _persist_workspace_snapshot(session: ChatSession, workspace: LiteratureWorks
     return target
 
 
-def _next_workspace_revision(session: ChatSession) -> int:
-    manifest_path = session.workspace_dir / "manifest.json"
+def _workspace_revision(workspace: LiteratureWorkspace) -> int:
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return int(manifest.get("revision", 0)) + 1
-    except (OSError, ValueError, json.JSONDecodeError):
-        return 1
+        revision = int(workspace.context.filters.workspace_revision)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("workspace_revision must be an integer") from exc
+    if revision < 0:
+        raise ValueError("workspace_revision must be non-negative")
+    return revision
+
+
+def _assert_workspace_revision(
+    state_store,
+    *,
+    session_id: str,
+    expected_revision: int,
+) -> None:
+    current = state_store.get_session_state(session_id)
+    current_revision = current.revision if current is not None else 0
+    if current_revision != expected_revision:
+        raise RuntimeError(
+            f"Workspace revision mismatch for {session_id}: "
+            f"expected revision {expected_revision}, got {current_revision}"
+        )
 
 
 def _load_latest_snapshot(session: ChatSession) -> LiteratureWorkspace | None:
@@ -791,11 +841,10 @@ def _sync_session_state(
     artifact_index: dict[str, object],
     memory,
     rag_profile,
-    config: LitTraceConfig | None,
+    *,
+    state_store,
+    expected_revision: int,
 ) -> None:
-    state_store = _session_state_store(session, config)
-    if state_store is None:
-        return
     workspace_json = json.loads(workspace.model_dump_json())
     new_revision = int(manifest.get("revision", 0) or 0)
     record = SessionStateRecord(
@@ -808,14 +857,6 @@ def _sync_session_state(
         rag_profile_json=rag_profile.model_dump(mode="json") if rag_profile is not None else {},
         revision=new_revision,
         )
-    # CAS optimistic concurrency: read the prior revision and only update
-    # if it hasn't moved. Prevents lost updates when save_workspace fires
-    # concurrently from two threads.
-    prior = state_store.get_session_state(session.session_id)
-    expected_revision = (prior.revision if prior is not None else -1)
-    if expected_revision == new_revision:
-        # Nothing changed at the row level — skip the write entirely.
-        return
     state_store.upsert_session_state(record, expected_revision=expected_revision)
 
 

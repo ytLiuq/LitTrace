@@ -110,13 +110,6 @@ class AsyncTaskStatus(StrEnum):
     DEAD = "dead"
 
 
-class EvidenceSourceKind(StrEnum):
-    PRIMARY_DOCUMENT = "primary_document"
-    STRUCTURED_TABLE = "structured_table"
-    METADATA = "metadata"
-    USER_SUPPLIED = "user_supplied"
-
-
 class VerificationReport(BaseModel):
     claim_id: str | None = None
     claim: str
@@ -435,6 +428,8 @@ class WorkspaceFilters(BaseModel):
     valid_candidate_count: int = 0
     ranking_policy: str | None = None
     search_diagnostics: dict[str, object] | None = None
+    publisher_search_plan: dict[str, object] | None = None
+    search_completed_at: str | None = None
     source_health: dict[str, dict[str, object]] = Field(default_factory=dict)
     workspace_revision: int = 0
 
@@ -701,7 +696,6 @@ class ChatResponse(BaseModel):
     ambiguous_intent: bool = False
     ambiguity_reasons: list[str] = Field(default_factory=list)
     clarification_questions: list[str] = Field(default_factory=list)
-    workspace: LiteratureWorkspace | None = None
     research_result: ResearchRunResult | None = None
     citations: list[CitationRecord] = Field(default_factory=list)
     download_plan: DownloadPlan | None = None
@@ -709,10 +703,8 @@ class ChatResponse(BaseModel):
     comparison_matrix: "ComparisonMatrixReport | None" = None
     workflow_trace: WorkflowTrace | None = None
     warnings: list[str] = Field(default_factory=list)
-    # ``workspace`` is now a small summary, not the full
-    # ``LiteratureWorkspace``. Stays under 100 KB even for a 200-paper
-    # session. The full payload is in the session_state row + workspace_dir
-    # on disk; callers needing it can hit ``/sessions/{id}/export``.
+    # API responses carry a bounded summary. The complete workspace remains
+    # canonical in session_state and is passed internally between services.
     workspace: "WorkspaceSummary | None" = None
 
 

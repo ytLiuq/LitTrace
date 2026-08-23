@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+
 from littrace.api import state as api_state
 from littrace.api.routes.agents import router as agents_router
 from littrace.api.routes.artifacts import router as artifacts_router
@@ -14,38 +15,17 @@ from littrace.api.routes.publishers import router as publishers_router
 from littrace.api.routes.research import router as research_router
 from littrace.api.routes.sessions import router as sessions_router
 from littrace.api.routes.system import router as system_router
-
+from littrace.codex_runtime.runtime import shutdown_runtime_managers
 from littrace.config import load_config as _load_config
 from littrace.download_tasks import DownloadRetryWorker, download_task_store_from_config
 from littrace.downloads import make_download_retry_handler
+from littrace.log import get_logger, metrics
 from littrace.models import LiteratureWorkspace
 from littrace.tracing import append_trace as _append_trace
-from littrace.log import get_logger, metrics
 
 logger = get_logger("api")
 
 DOWNLOAD_RETRY_WORKER: DownloadRetryWorker | None = None
-
-
-class _APIBackend:
-    """Single shared backend for every API route module.
-
-    Replaces the 7 duplicate ``_AppProxy`` shims that each route file
-    defined to reach ``api.app.{load_config, _set_workspace, append_trace,
-    WORKSPACE}``. Each route now does
-    ``from littrace.api.app import api_app`` and uses ``api_app`` directly.
-    """
-
-    @property
-    def WORKSPACE(self) -> LiteratureWorkspace:  # noqa: N802 — keep the upper-case API
-        return api_state.get_workspace()
-
-    load_config = staticmethod(_load_config)
-    append_trace = staticmethod(_append_trace)
-    _set_workspace = staticmethod(api_state.set_workspace)
-
-
-api_app = _APIBackend()
 
 
 @asynccontextmanager
@@ -55,6 +35,7 @@ async def _lifespan(_app: FastAPI):
         yield
     finally:
         _stop_background_workers()
+        await asyncio.to_thread(shutdown_runtime_managers)
 
 
 app = FastAPI(title="LitTrace API", version="0.1.0", lifespan=_lifespan)

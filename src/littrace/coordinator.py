@@ -30,7 +30,7 @@ class CoordinatorTurn(BaseModel):
 
     intent: ChatIntent | None = None
     task: ResearchTask | None = None
-    workspace: WorkspaceSummary
+    workspace: LiteratureWorkspace
     memory_view: MemoryView
     early_response: ChatResponse | None = None
 
@@ -50,7 +50,7 @@ class LitTraceCoordinator:
             intent = await parse_chat_intent_semantic(message, config)
         except IntentParseError as exc:
             return CoordinatorTurn(
-                workspace=WorkspaceSummary.from_workspace(workspace),
+                workspace=workspace,
                 memory_view=build_memory_view(
                     workspace,
                     purpose="planning",
@@ -75,7 +75,7 @@ class LitTraceCoordinator:
                 workspace.context.filters.pending_intent = None
                 return CoordinatorTurn(
                     intent=intent,
-                    workspace=WorkspaceSummary.from_workspace(workspace),
+                    workspace=workspace,
                     memory_view=build_memory_view(
                         workspace,
                         purpose="planning",
@@ -99,7 +99,7 @@ class LitTraceCoordinator:
             questions = intent.clarification_questions or ["你希望我下一步具体执行什么？"]
             return CoordinatorTurn(
                 intent=intent,
-                workspace=WorkspaceSummary.from_workspace(workspace),
+                workspace=workspace,
                 memory_view=build_memory_view(
                     workspace,
                     purpose="planning",
@@ -121,7 +121,7 @@ class LitTraceCoordinator:
         return CoordinatorTurn(
             intent=intent,
             task=_research_task(intent),
-            workspace=WorkspaceSummary.from_workspace(workspace),
+            workspace=workspace,
             memory_view=build_memory_view(
                 workspace,
                 purpose=_memory_purpose_for_intent(intent),

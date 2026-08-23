@@ -1,10 +1,10 @@
-from littrace.api.app import api_app
 from __future__ import annotations
 
 from typing import Annotated
 
 from fastapi import APIRouter, Header
 
+from littrace.api.backend import api_app
 from littrace.api.auth import resolve_request_session
 from littrace.attachments import (
     AttachmentResult,
