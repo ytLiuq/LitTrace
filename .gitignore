@@ -11,3 +11,10 @@ config.yaml
 sessions/
 *.egg-info/
 tests/integration/.cache/
+
+# macOS metadata
+.DS_Store
+
+# uv lock file (project uses setuptools build backend; uv.lock is only
+# for local uv sync and varies per machine's resolution)
+uv.lock
