@@ -29,9 +29,12 @@ from littrace.session import (
     create_chat_session,
     delete_chat_session,
     list_chat_sessions,
+    load_or_create_session,
     load_workspace,
     save_workspace,
+    _session_state_store,
 )
+from littrace.state_db import SessionStateRecord, state_store_from_config
 
 
 pytestmark = pytest.mark.domain
@@ -106,7 +109,86 @@ def test_session_persists_memory_json(tmp_path):
     assert memory.working.pending_intent == {"actions": ["search"], "topic": "MXene"}
 
 
-def test_concurrent_workspace_saves_keep_one_canonical_revision(tmp_path):
+def test_cas_strict_for_real_writers(tmp_path):
+    """CAS must raise when a zero-writer tries to overwrite a real revision.
+
+    The carve-out allows expected=0 saves against revision<=1 (the
+    baseline seed and the _ensure_chat_trail placeholder), but at
+    revision>=2 the row reflects a real writer's output. A caller that
+    hands in a fresh LiteratureWorkspace() (workspace_revision=0) at
+    that point must be rejected — otherwise concurrent saves can
+    silently drop a writer's output.
+    """
+    schema = f"littrace_test_cas_strict_{uuid.uuid4().hex[:8]}"
+    config = LitTraceConfig(
+        storage=StorageConfig(sessions_dir=tmp_path / "sessions"),
+        metadata_store=MetadataStoreConfig(
+            backend="postgres",
+            postgres_dsn=_REAL_DSN,
+            schema_name=schema,
+            allow_schema_reset=True,
+        ),
+    )
+    session = create_chat_session(config)
+    workspace = LiteratureWorkspace()
+    workspace.papers["p1"] = PaperMetadata(paper_id="p1", title="Real")
+    save_workspace(session, workspace)
+    # session is now at revision=1. Manually bump to revision=2 to
+    # simulate "a real writer has committed".
+    state_store = _session_state_store(session, config)
+    state_store.upsert_session_state(
+        SessionStateRecord(
+            session_id=session.session_id,
+            workspace_json={"revision": 2},
+            manifest_json={"revision": 2},
+            revision=2,
+        )
+    )
+    # A fresh LiteratureWorkspace (default revision=0) must now raise.
+    with pytest.raises(RuntimeError, match="Workspace revision mismatch"):
+        save_workspace(session, LiteratureWorkspace(), config=config)
+
+
+def test_chat_trail_fk_survives_background_first(tmp_path):
+    """record_lifecycle_event before save_workspace must not raise FK.
+
+    _ensure_chat_trail backfills a revision=0 session_state row so the
+    chat_trail FK holds. Background paths (downloads, embedding outbox)
+    hit chat_trail before the chat path has saved anything. The
+    backfill must succeed silently and leave the row in a state the
+    chat path can then bump via save_workspace.
+    """
+    schema = f"littrace_test_fk_{uuid.uuid4().hex[:8]}"
+    config = LitTraceConfig(
+        storage=StorageConfig(sessions_dir=tmp_path / "sessions"),
+        metadata_store=MetadataStoreConfig(
+            backend="postgres",
+            postgres_dsn=_REAL_DSN,
+            schema_name=schema,
+            allow_schema_reset=True,
+        ),
+    )
+    state_store = state_store_from_config(config)
+    new_session_id = f"bg-{uuid.uuid4().hex[:12]}"
+    # Simulate the background path: append a lifecycle event for a
+    # session that has no Postgres row yet.
+    state_store.append_chat_event(
+        new_session_id,
+        {
+            "event_id": "bg-1",
+            "paper_id": "p1",
+            "event_type": "download.completed",
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "task_id": None,
+            "artifact_id": None,
+            "payload": {},
+        },
+    )
+    # The chat path then creates a session with this id and saves a
+    # workspace — the backfilled row must be overwritten, not conflict.
+    session = load_or_create_session(config, new_session_id)
+    save_workspace(session, LiteratureWorkspace(), config=config)
+    assert load_workspace(session).context.filters.workspace_revision == 1
     schema = f"littrace_test_cas_{uuid.uuid4().hex[:8]}"
     config = LitTraceConfig(
         storage=StorageConfig(sessions_dir=tmp_path / "sessions"),
