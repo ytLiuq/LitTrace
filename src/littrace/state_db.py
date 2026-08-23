@@ -67,7 +67,19 @@ def require_postgres_metadata(metadata_store) -> tuple[str, str]:
 
 
 class SessionStateRecord(BaseModel):
-    """L1: workspace truth + memory view + artifact index + rag profile (1 row / session)."""
+    """L1: workspace truth + memory view + artifact index + rag profile (1 row / session).
+
+    ``status`` carries the session lifecycle state — replacing the
+    ``current_revision <= 1`` carve-out that used to mean "not a real
+    writer yet". Values:
+
+      - ``draft``: placeholder row backfilled by ``_ensure_chat_trail``
+        so chat_trail FK holds before the chat path has saved anything.
+      - ``active``: a real ``save_workspace`` has committed at least
+        once; the CAS check on subsequent writes is strict.
+      - ``archived``: ``delete_chat_session`` set it; all writes are
+        rejected until someone un-archives (out of scope for now).
+    """
 
     session_id: str
     workspace_sha256: str | None = None
@@ -77,6 +89,7 @@ class SessionStateRecord(BaseModel):
     memory_view_json: dict[str, object] = Field(default_factory=dict)
     rag_profile_json: dict[str, object] = Field(default_factory=dict)
     revision: int = 0
+    status: Literal["draft", "active", "archived"] = "active"
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -86,6 +99,7 @@ class SessionSummaryRecord(BaseModel):
 
     ``topic`` and ``active_paper_count`` are extracted in SQL via JSONB ops
     so the full workspace_json never crosses the wire for the sidebar.
+    ``status`` lets the sidebar flag archived rows if it ever chooses to.
     """
 
     session_id: str
@@ -93,6 +107,7 @@ class SessionSummaryRecord(BaseModel):
     workspace_sha256: str | None = None
     topic: str | None = None
     active_paper_count: int = 0
+    status: str = "active"
     revision: int = 0
 
 
@@ -336,10 +351,30 @@ class PostgresStateStore:
                     memory_view_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                     rag_profile_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                     revision INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('draft', 'active', 'archived')),
                     created_at TIMESTAMPTZ NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL
                 )
                 """
+            )
+            # Migration for older deployments where ``status`` did not
+            # exist yet. IF NOT EXISTS makes this a no-op on fresh DBs.
+            cur.execute(
+                f"ALTER TABLE {s}.session_state "
+                f"ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'"
+            )
+            # The CHECK constraint lives in the CREATE TABLE above; for
+            # pre-status deployments Postgres did not enforce it. Add
+            # it idempotently via a domain-less CHECK that survives
+            # re-runs.
+            cur.execute(
+                f"DO $$ BEGIN "
+                f"  ALTER TABLE {s}.session_state "
+                f"    ADD CONSTRAINT session_state_status_check "
+                f"    CHECK (status IN ('draft', 'active', 'archived')); "
+                f"EXCEPTION WHEN duplicate_object THEN NULL; "
+                f"END $$"
             )
 
             cur.execute(
@@ -599,7 +634,7 @@ class PostgresStateStore:
                 f"""
                 SELECT session_id, workspace_sha256, workspace_json, manifest_json,
                        artifact_index_json, memory_view_json, rag_profile_json,
-                       revision, created_at, updated_at
+                       revision, status, created_at, updated_at
                 FROM {s}.session_state
                 WHERE session_id = %s
                 """,
@@ -617,8 +652,9 @@ class PostgresStateStore:
             memory_view_json=_from_jsonb(row[5]),
             rag_profile_json=_from_jsonb(row[6]),
             revision=row[7],
-            created_at=row[8].isoformat() if hasattr(row[8], "isoformat") else str(row[8]),
-            updated_at=row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
+            status=row[8] or "active",
+            created_at=row[9].isoformat() if hasattr(row[9], "isoformat") else str(row[9]),
+            updated_at=row[10].isoformat() if hasattr(row[10], "isoformat") else str(row[10]),
         )
 
     def list_session_states(self, *, limit: int = 20) -> list[SessionSummaryRecord]:
@@ -634,8 +670,10 @@ class PostgresStateStore:
                            workspace_json->'context'->'active_papers'
                        ), 0) AS active_paper_count,
                        revision,
+                       status,
                        updated_at
                 FROM {s}.session_state
+                WHERE status != 'archived'
                 ORDER BY updated_at DESC
                 LIMIT %s
                 """,
@@ -649,7 +687,8 @@ class PostgresStateStore:
                 topic=row[2],
                 active_paper_count=int(row[3] or 0),
                 revision=row[4],
-                updated_at=row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                status=row[5] or "active",
+                updated_at=row[6].isoformat() if hasattr(row[6], "isoformat") else str(row[6]),
             )
             for row in rows
         ]
