@@ -17,7 +17,7 @@ from littrace.codex_runtime.runtime import (
     CodexAppServerRuntimeManager,
     shared_runtime_manager,
 )
-from littrace.config import CodexHomeMode, LitTraceConfig
+from littrace.config import CodexHomeMode, LitTraceConfig, SandboxPolicy
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
 from littrace.session import ChatSession
 from littrace.state_db import AgentThreadBindingRecord, StateStore, state_store_from_config
@@ -188,10 +188,19 @@ class CodexAppServerChatService:
         scratch_dir: Path,
     ) -> dict[str, Any]:
         runtime = self.config.agent_runtime
-        return {
+        # approvalPolicy follows sandbox policy: read-only can't write
+        # anything so 'never' is correct; workspace-write only asks on
+        # exec-policy violations ('on-failure'); danger-full-access is
+        # operator-trusted and defaults to 'never'.
+        approval_policy = {
+            SandboxPolicy.READ_ONLY: "never",
+            SandboxPolicy.WORKSPACE_WRITE: "on-failure",
+            SandboxPolicy.DANGER_FULL_ACCESS: "never",
+        }[runtime.sandbox_policy]
+        overrides: dict[str, Any] = {
             "cwd": str(scratch_dir),
-            "approvalPolicy": "never",
-            "sandbox": "read-only",
+            "approvalPolicy": approval_policy,
+            "sandbox": runtime.sandbox_policy.value,
             "serviceName": "littrace",
             "developerInstructions": DEVELOPER_INSTRUCTIONS,
             "config": {
@@ -200,6 +209,16 @@ class CodexAppServerChatService:
                 },
             },
         }
+        # writableRoots only makes sense for workspace-write. Codex
+        # ignores the key on the other two tiers; passing it through
+        # unconditionally would imply an empty whitelist for
+        # danger-full-access, which is the wrong default.
+        if runtime.sandbox_policy == SandboxPolicy.WORKSPACE_WRITE:
+            if runtime.writable_roots:
+                overrides["writableRoots"] = [
+                    str(root) for root in runtime.writable_roots
+                ]
+        return overrides
 
     def _mcp_server_config(self) -> dict[str, Any]:
         project_root = Path(__file__).resolve().parents[3]
