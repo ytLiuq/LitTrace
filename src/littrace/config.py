@@ -255,6 +255,10 @@ class AgentRuntimeConfig(BaseModel):
     sandbox_policy: SandboxPolicy = SandboxPolicy.READ_ONLY
     writable_roots: list[Path] = Field(default_factory=list)
     interrupt_grace_seconds: float = 10.0
+    # Rollout JSONL is opt-in. It is a side-channel for debugging
+    # only — Postgres is still the source of truth.
+    rollout_enabled: bool = False
+    rollout_dir: Path | None = None
 
 
 class HarnessThresholdConfig(BaseModel):
@@ -456,6 +460,13 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
             config.agent_runtime.interrupt_grace_seconds = float(interrupt_grace_env)
         except ValueError:
             pass
+    config.agent_runtime.rollout_enabled = _env_bool(
+        "LITTRACE_CODEX_ROLLOUT_ENABLED",
+        config.agent_runtime.rollout_enabled,
+    )
+    rollout_dir_env = os.environ.get("LITTRACE_CODEX_ROLLOUT_DIR")
+    if rollout_dir_env:
+        config.agent_runtime.rollout_dir = Path(rollout_dir_env).expanduser()
     config.llm.api_key = os.environ.get("DEEPSEEK_API_KEY") or config.llm.api_key
     config.llm.base_url = os.environ.get("DEEPSEEK_BASE_URL") or config.llm.base_url
     config.llm.model = os.environ.get("DEEPSEEK_MODEL") or config.llm.model
