@@ -157,3 +157,94 @@ def test_jsonl_client_is_full_duplex_and_fails_closed(monkeypatch) -> None:
         await asyncio.wait_for(client.close(), timeout=2)
 
     asyncio.run(scenario())
+
+
+def test_orphan_server_request_drained_by_close(monkeypatch) -> None:
+    """A server-initiated request that arrives after turn/completed is
+    caught by close()'s cancel-and-gather — run_turn has already returned
+    by the time it lands, so the per-turn drain can't.
+    """
+    processes: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = _FakeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario() -> None:
+        client = AppServerClient(["codex", "app-server"])
+        await asyncio.wait_for(client.start(), timeout=2)
+        process = processes[0]
+        # Override handle so the second turn/start only emits turn-id +
+        # turn/completed (no approval), letting run_turn return cleanly.
+        # The orphan approval is then pushed after run_turn finishes.
+
+        def delayed_approval_after_turn(message: dict[str, object]) -> None:
+            method = message.get("method")
+            request_id = message.get("id")
+            if method == "initialize":
+                process.feed({"id": request_id, "result": {"userAgent": "codex-test/1"}})
+            elif method == "thread/start":
+                process.feed(
+                    {"id": request_id, "result": {"thread": {"id": "thr-test"}}}
+                )
+            elif method == "turn/start":
+                process.feed(
+                    {
+                        "id": request_id,
+                        "result": {"turn": {"id": "turn-test", "status": "inProgress"}},
+                    }
+                )
+                process.feed(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thr-test",
+                            "turn": {"id": "turn-test", "status": "completed", "items": []},
+                        },
+                    }
+                )
+
+        original_handle = process.handle
+        handle_calls = {"count": 0}
+
+        def selective_handle(message: dict[str, object]) -> None:
+            if message.get("method") == "turn/start":
+                delayed_approval_after_turn(message)
+                handle_calls["count"] += 1
+            elif message.get("id") == "approval-orphan":
+                # the orphan approval response — see below
+                pass
+            else:
+                original_handle(message)
+
+        process.handle = selective_handle  # type: ignore[method-assign]
+        thread = await asyncio.wait_for(
+            client.start_thread({"sandbox": "read-only"}), timeout=2
+        )
+        assert thread["id"] == "thr-test"
+
+        # run_turn returns once turn/completed is delivered. At this
+        # point no approval has been pushed — the fake drops the
+        # approval into stdout one event-loop tick later to simulate a
+        # server request that arrived AFTER run_turn had already
+        # resolved the turn.
+        await asyncio.wait_for(client.run_turn("thr-test", "question"), timeout=2)
+        process.feed(
+            {
+                "id": "approval-orphan",
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thr-test", "turnId": "turn-test"},
+            }
+        )
+        # Give the reader loop a tick to dispatch the orphan.
+        await asyncio.sleep(0)
+
+        # close() must cancel the orphan handler and exit within a
+        # reasonable timeout — if close() ever tried to await it
+        # instead of cancel+gather, this would hang.
+        await asyncio.wait_for(client.close(), timeout=2)
+
+    asyncio.run(scenario())

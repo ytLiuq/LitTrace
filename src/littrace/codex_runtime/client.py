@@ -388,6 +388,13 @@ class AppServerClient:
             task = asyncio.create_task(
                 self._handle_server_request(request_id, method, params)
             )
+            # Every handler is added to _request_tasks so close() can
+            # cancel it if it has not drained by then. _turn_request_tasks
+            # is a stricter per-turn subset used to drain handlers that
+            # arrived during the turn — handlers that arrived AFTER the
+            # turn completed (no entry in _turn_request_tasks for this
+            # thread_id) only live in _request_tasks and are caught by
+            # close()'s cancel-and-gather on shutdown.
             self._request_tasks.add(task)
             task.add_done_callback(self._request_tasks.discard)
             thread_id = params.get("threadId")
