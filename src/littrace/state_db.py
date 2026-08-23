@@ -544,6 +544,7 @@ class PostgresStateStore:
                         memory_view_json = %s,
                         rag_profile_json = %s,
                         revision = %s,
+                        status = %s,
                         updated_at = now()
                     WHERE session_id = %s AND revision = %s
                     RETURNING created_at, updated_at
@@ -556,6 +557,7 @@ class PostgresStateStore:
                         _jsonb(state.memory_view_json),
                         _jsonb(state.rag_profile_json),
                         state.revision,
+                        state.status,
                         state.session_id,
                         expected_revision,
                     ),
@@ -567,11 +569,15 @@ class PostgresStateStore:
                         self.upsert_session_state(state, expected_revision=None)
                         return state
                     # See _assert_workspace_revision in session.py for the
-                    # parallel carve-out. Both checks stay in lockstep so
-                    # the pre-seed (revision=1) and the revision=0 placeholder
-                    # both pass an expected=0 save. At revision>=2 a real
-                    # writer is in play and the CAS must win or raise.
-                    if expected_revision == 0 and current.revision <= 1:
+                    # parallel logic. Both stay in lockstep — archived
+                    # sessions reject all writes, draft + expected=0 lets
+                    # the chat path take over the placeholder, anything
+                    # else is a real CAS contest that must win or raise.
+                    if current.status == "archived":
+                        raise RuntimeError(
+                            f"Cannot write to archived session {state.session_id}"
+                        )
+                    if expected_revision == 0 and current.status == "draft":
                         self.upsert_session_state(state, expected_revision=None)
                         return state
                     raise RuntimeError(
@@ -1178,11 +1184,11 @@ class PostgresStateStore:
                 INSERT INTO {s}.session_state (
                     session_id, workspace_json, manifest_json,
                     artifact_index_json, memory_view_json, rag_profile_json,
-                    revision, created_at, updated_at
+                    revision, status, created_at, updated_at
                 )
                 VALUES (%s, '{{}}'::jsonb, '{{}}'::jsonb,
                         '{{}}'::jsonb, '{{}}'::jsonb, '{{}}'::jsonb,
-                        0, now(), now())
+                        0, 'draft', now(), now())
                 ON CONFLICT (session_id) DO NOTHING
                 """,
                 (session_id,),

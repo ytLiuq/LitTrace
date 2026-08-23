@@ -103,7 +103,17 @@ def create_chat_session(config: LitTraceConfig) -> ChatSession:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_id = f"{timestamp}-{uuid4().hex[:8]}"
     session = _build_session(config, session_id)
-    save_workspace(session, LiteratureWorkspace(), config=config)
+    # Seed a draft placeholder so chat_trail / artifact_registry FK
+    # references resolve immediately. _sync_session_state flips this to
+    # status='active' the first time save_workspace commits real data.
+    state_store = _session_state_store(session, config)
+    state_store.upsert_session_state(
+        SessionStateRecord(
+            session_id=session.session_id,
+            revision=0,
+            status="draft",
+        )
+    )
     return session
 
 
@@ -434,21 +444,34 @@ def _assert_workspace_revision(
     session_id: str,
     expected_revision: int,
 ) -> None:
-    current = state_store.get_session_state(session_id)
-    current_revision = current.revision if current is not None else 0
-    if current_revision == expected_revision:
+    record = state_store.get_session_state(session_id)
+    if record is None:
+        # Brand-new session with no row yet. expected=0 is the only legal
+        # value: the chat path's first save lands revision=1.
+        if expected_revision == 0:
+            return
+        raise RuntimeError(
+            f"Workspace revision mismatch for {session_id}: "
+            f"expected revision {expected_revision}, got 0"
+        )
+    # Archived sessions are read-only. The strictness here is deliberate:
+    # a delete_chat_session flip to 'archived' is meant to freeze the
+    # workspace forever, not just hide it from list_chat_sessions.
+    if record.status == "archived":
+        raise RuntimeError(
+            f"Cannot write to archived session {session_id}"
+        )
+    # Draft rows are the _ensure_chat_trail placeholder. They have no
+    # real workspace yet, so an expected=0 save from the chat path is
+    # legitimately the first real writer; let it through and let the
+    # caller bump status to 'active' via _sync_session_state.
+    if record.status == "draft" and expected_revision == 0:
         return
-    # create_chat_session pre-seeds a row at revision=1 so chat_trail /
-    # artifact_registry / etc. can FK-reference session_state immediately.
-    # Callers that hand in a fresh LiteratureWorkspace() (revision=0) and
-    # save right away should still pass the CAS — they are overwriting the
-    # baseline seed, not competing with another writer.
-    if expected_revision == 0 and current_revision <= 1:
-        return
-    raise RuntimeError(
-        f"Workspace revision mismatch for {session_id}: "
-        f"expected revision {expected_revision}, got {current_revision}"
-    )
+    if record.revision != expected_revision:
+        raise RuntimeError(
+            f"Workspace revision mismatch for {session_id}: "
+            f"expected revision {expected_revision}, got {record.revision}"
+        )
 
 
 def _load_latest_snapshot(session: ChatSession) -> LiteratureWorkspace | None:
@@ -876,6 +899,11 @@ def _sync_session_state(
         memory_view_json=memory.model_dump(mode="json") if hasattr(memory, "model_dump") else {},
         rag_profile_json=rag_profile.model_dump(mode="json") if rag_profile is not None else {},
         revision=new_revision,
+        # First save_workspace promotes the row from the
+        # _ensure_chat_trail 'draft' placeholder into 'active'. Later
+        # saves keep it 'active'. delete_chat_session is what flips to
+        # 'archived' (handled separately, never via _sync_session_state).
+        status="active",
         )
     state_store.upsert_session_state(record, expected_revision=expected_revision)
 

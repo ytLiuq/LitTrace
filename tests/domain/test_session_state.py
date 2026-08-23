@@ -152,11 +152,12 @@ def test_cas_strict_for_real_writers(tmp_path):
 def test_chat_trail_fk_survives_background_first(tmp_path):
     """record_lifecycle_event before save_workspace must not raise FK.
 
-    _ensure_chat_trail backfills a revision=0 session_state row so the
-    chat_trail FK holds. Background paths (downloads, embedding outbox)
-    hit chat_trail before the chat path has saved anything. The
+    _ensure_chat_trail backfills a status='draft' session_state row so
+    the chat_trail FK holds. Background paths (downloads, embedding
+    outbox) hit chat_trail before the chat path has saved anything. The
     backfill must succeed silently and leave the row in a state the
-    chat path can then bump via save_workspace.
+    chat path can then bump via save_workspace, which flips status to
+    'active' alongside revision=1.
     """
     schema = f"littrace_test_fk_{uuid.uuid4().hex[:8]}"
     config = LitTraceConfig(
@@ -185,10 +186,17 @@ def test_chat_trail_fk_survives_background_first(tmp_path):
         },
     )
     # The chat path then creates a session with this id and saves a
-    # workspace — the backfilled row must be overwritten, not conflict.
+    # workspace — the backfilled draft row is overwritten (status flips
+    # to 'active', revision bumps to 1).
     session = load_or_create_session(config, new_session_id)
     save_workspace(session, LiteratureWorkspace(), config=config)
-    assert load_workspace(session).context.filters.workspace_revision == 1
+    loaded = load_workspace(session)
+    assert loaded.context.filters.workspace_revision == 1
+    # And the session_state row in Postgres is now active.
+    canonical = state_store.get_session_state(new_session_id)
+    assert canonical is not None
+    assert canonical.status == "active"
+    assert canonical.revision == 1
     schema = f"littrace_test_cas_{uuid.uuid4().hex[:8]}"
     config = LitTraceConfig(
         storage=StorageConfig(sessions_dir=tmp_path / "sessions"),
@@ -226,12 +234,14 @@ def test_chat_trail_fk_survives_background_first(tmp_path):
         session.workspace_path.read_text(encoding="utf-8")
     )
     manifest = json.loads((session.workspace_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert canonical.context.filters.workspace_revision == 2
-    assert materialized.context.filters.workspace_revision == 2
+    # create_chat_session now seeds revision=0 status='draft', so the
+    # one writer that wins the CAS bump lands at revision=1.
+    assert canonical.context.filters.workspace_revision == 1
+    assert materialized.context.filters.workspace_revision == 1
     assert materialized.context.filters.topic == canonical.context.filters.topic
     assert canonical.context.filters.topic in {"writer-a", "writer-b"}
-    assert manifest["revision"] == 2
-    assert len(list(session.snapshots_dir.glob("workspace-*.json"))) == 2
+    assert manifest["revision"] == 1
+    assert len(list(session.snapshots_dir.glob("workspace-*.json"))) == 1
 
 
 def test_delete_session_reports_object_storage_failures(monkeypatch, tmp_path):
