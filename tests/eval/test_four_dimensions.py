@@ -610,7 +610,6 @@ class TestHarnessConfigFromLitTraceConfig:
             HarnessThresholdConfig,
             RetryPolicyConfig,
             CostBudgetConfig,
-            SchemaValidationConfig,
         )
 
         config = LitTraceConfig(
@@ -627,10 +626,8 @@ class TestHarnessConfigFromLitTraceConfig:
             cost_budget=CostBudgetConfig(
                 budget_warning_threshold=0.9,
             ),
-            schema_validation=SchemaValidationConfig(
-                strict=False,
-                enabled=False,
-            ),
+            schema_validation_strict=False,
+            schema_validation_enabled=False,
         )
         harness_config = HarnessConfig.from_littrace_config(config)
         assert harness_config.performance_confidence_threshold == 0.8

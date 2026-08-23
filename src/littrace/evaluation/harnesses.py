@@ -102,9 +102,16 @@ class HarnessConfig(BaseModel):
             kwargs["max_failure_rate"] = retry_cfg.max_failure_rate
         if cost_cfg is not None:
             kwargs["budget_warning_threshold"] = cost_cfg.budget_warning_threshold
+        # schema_validation used to be a nested SchemaValidationConfig; the
+        # 0a85241 refactor flattened it into top-level booleans on
+        # LitTraceConfig. Prefer the nested object when present, otherwise
+        # fall back to the flat fields (which always exist on the config).
         if schema_cfg is not None:
             kwargs["schema_strict"] = schema_cfg.strict
             kwargs["schema_enabled"] = schema_cfg.enabled
+        else:
+            kwargs["schema_strict"] = getattr(config, "schema_validation_strict", True)
+            kwargs["schema_enabled"] = getattr(config, "schema_validation_enabled", True)
         return cls(**kwargs)
 
 
