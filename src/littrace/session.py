@@ -102,6 +102,18 @@ def session_path_for(config: LitTraceConfig, session_id: str) -> Path:
 def create_chat_session(config: LitTraceConfig) -> ChatSession:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_id = f"{timestamp}-{uuid4().hex[:8]}"
+    session = _build_session(config, session_id)
+    save_workspace(session, LiteratureWorkspace(), config=config)
+    return session
+
+
+def _build_session(config: LitTraceConfig, session_id: str) -> ChatSession:
+    """Create the on-disk directory layout for ``session_id`` and return a
+    ``ChatSession`` handle. No Postgres row is written here — the caller
+    (create_chat_session or load_or_create_session) seeds the row via
+    save_workspace or via the revision=0 placeholder in
+    ``_ensure_chat_trail``.
+    """
     root = config.storage.sessions_dir / session_id
     workspace_dir = root / "workspace"
     artifacts_dir = root / "artifacts"
@@ -113,14 +125,12 @@ def create_chat_session(config: LitTraceConfig) -> ChatSession:
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     structured_documents_dir.mkdir(parents=True, exist_ok=True)
     snapshots_dir.mkdir(parents=True, exist_ok=True)
-    session = ChatSession.from_root(
+    return ChatSession.from_root(
         root,
         session_id,
         snapshot_limit=config.storage.workspace_snapshot_limit,
         config=config,
     )
-    save_workspace(session, LiteratureWorkspace(), config=config)
-    return session
 
 
 def load_or_create_session(
@@ -140,23 +150,7 @@ def load_or_create_session(
         # Caller asked for a specific id but Postgres has no row yet —
         # honor the id (so chat_trail FKs and the caller's headers line up)
         # instead of silently minting a new timestamp-based one.
-        root = config.storage.sessions_dir / session_id
-        workspace_dir = root / "workspace"
-        artifacts_dir = root / "artifacts"
-        structured_documents_dir = workspace_dir / "structured_documents"
-        snapshots_dir = workspace_dir / "snapshots"
-        (workspace_dir / "evidence").mkdir(parents=True, exist_ok=True)
-        (workspace_dir / "releases").mkdir(parents=True, exist_ok=True)
-        (workspace_dir / "rag").mkdir(parents=True, exist_ok=True)
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        structured_documents_dir.mkdir(parents=True, exist_ok=True)
-        snapshots_dir.mkdir(parents=True, exist_ok=True)
-        session = ChatSession.from_root(
-            root,
-            session_id,
-            snapshot_limit=config.storage.workspace_snapshot_limit,
-            config=config,
-        )
+        session = _build_session(config, session_id)
         save_workspace(session, LiteratureWorkspace(), config=config)
         return session
     return create_chat_session(config)

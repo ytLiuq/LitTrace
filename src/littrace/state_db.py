@@ -526,11 +526,11 @@ class PostgresStateStore:
                         # Row vanished between read and CAS; do an INSERT.
                         self.upsert_session_state(state, expected_revision=None)
                         return state
-                    # create_chat_session pre-seeds a row at revision=1 so
-                    # chat_trail / artifact_registry / etc. can FK-reference
-                    # session_state immediately. Callers that save a fresh
-                    # LiteratureWorkspace() (revision=0) right after are
-                    # overwriting the baseline seed, not racing another writer.
+                    # See _assert_workspace_revision in session.py for the
+                    # parallel carve-out. Both checks stay in lockstep so
+                    # the pre-seed (revision=1) and the revision=0 placeholder
+                    # both pass an expected=0 save. At revision>=2 a real
+                    # writer is in play and the CAS must win or raise.
                     if expected_revision == 0 and current.revision <= 1:
                         self.upsert_session_state(state, expected_revision=None)
                         return state
@@ -1116,7 +1116,11 @@ class PostgresStateStore:
         with conn.cursor() as cur:
             # chat_trail has an FK to session_state; background paths (downloads,
             # embedding outbox) may fire before the chat path has saved any
-            # workspace. Backfill a minimal session_state row so the FK holds.
+            # workspace. Backfill a revision=0 session_state row first so the
+            # FK holds. Both INSERTs run in the same connection transaction
+            # (psycopg3 default autocommit=False), so commit/rollback at the
+            # caller's context boundary are atomic — a failed chat_trail
+            # INSERT cannot strand an empty session_state placeholder.
             cur.execute(
                 f"""
                 INSERT INTO {s}.session_state (
