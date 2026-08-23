@@ -137,6 +137,28 @@ def load_or_create_session(
                 snapshot_limit=config.storage.workspace_snapshot_limit,
                 config=config,
             )
+        # Caller asked for a specific id but Postgres has no row yet —
+        # honor the id (so chat_trail FKs and the caller's headers line up)
+        # instead of silently minting a new timestamp-based one.
+        root = config.storage.sessions_dir / session_id
+        workspace_dir = root / "workspace"
+        artifacts_dir = root / "artifacts"
+        structured_documents_dir = workspace_dir / "structured_documents"
+        snapshots_dir = workspace_dir / "snapshots"
+        (workspace_dir / "evidence").mkdir(parents=True, exist_ok=True)
+        (workspace_dir / "releases").mkdir(parents=True, exist_ok=True)
+        (workspace_dir / "rag").mkdir(parents=True, exist_ok=True)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        structured_documents_dir.mkdir(parents=True, exist_ok=True)
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        session = ChatSession.from_root(
+            root,
+            session_id,
+            snapshot_limit=config.storage.workspace_snapshot_limit,
+            config=config,
+        )
+        save_workspace(session, LiteratureWorkspace(), config=config)
+        return session
     return create_chat_session(config)
 
 
@@ -160,7 +182,7 @@ def load_workspace(session: ChatSession) -> LiteratureWorkspace:
     record = _load_session_record(session)
     try:
         if record is None:
-            raise ValueError(f"Session state is missing from Postgres: {session.session_id}")
+            return LiteratureWorkspace()
         return LiteratureWorkspace.model_validate(record.workspace_json)
     except Exception as exc:
         raise ValueError(f"Invalid Postgres workspace state for session {session.session_id}") from exc
@@ -424,11 +446,19 @@ def _assert_workspace_revision(
 ) -> None:
     current = state_store.get_session_state(session_id)
     current_revision = current.revision if current is not None else 0
-    if current_revision != expected_revision:
-        raise RuntimeError(
-            f"Workspace revision mismatch for {session_id}: "
-            f"expected revision {expected_revision}, got {current_revision}"
-        )
+    if current_revision == expected_revision:
+        return
+    # create_chat_session pre-seeds a row at revision=1 so chat_trail /
+    # artifact_registry / etc. can FK-reference session_state immediately.
+    # Callers that hand in a fresh LiteratureWorkspace() (revision=0) and
+    # save right away should still pass the CAS — they are overwriting the
+    # baseline seed, not competing with another writer.
+    if expected_revision == 0 and current_revision <= 1:
+        return
+    raise RuntimeError(
+        f"Workspace revision mismatch for {session_id}: "
+        f"expected revision {expected_revision}, got {current_revision}"
+    )
 
 
 def _load_latest_snapshot(session: ChatSession) -> LiteratureWorkspace | None:

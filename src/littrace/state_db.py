@@ -526,6 +526,14 @@ class PostgresStateStore:
                         # Row vanished between read and CAS; do an INSERT.
                         self.upsert_session_state(state, expected_revision=None)
                         return state
+                    # create_chat_session pre-seeds a row at revision=1 so
+                    # chat_trail / artifact_registry / etc. can FK-reference
+                    # session_state immediately. Callers that save a fresh
+                    # LiteratureWorkspace() (revision=0) right after are
+                    # overwriting the baseline seed, not racing another writer.
+                    if expected_revision == 0 and current.revision <= 1:
+                        self.upsert_session_state(state, expected_revision=None)
+                        return state
                     raise RuntimeError(
                         f"SessionState CAS mismatch for {state.session_id}: "
                         f"expected revision {expected_revision}, got {current.revision}"
