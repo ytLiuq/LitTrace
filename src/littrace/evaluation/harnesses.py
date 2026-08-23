@@ -87,7 +87,6 @@ class HarnessConfig(BaseModel):
         harness_cfg = getattr(config, "harness", None)
         retry_cfg = getattr(config, "retry", None)
         cost_cfg = getattr(config, "cost_budget", None)
-        schema_cfg = getattr(config, "schema_validation", None)
 
         kwargs: dict[str, Any] = {}
         if harness_cfg is not None:
@@ -102,16 +101,12 @@ class HarnessConfig(BaseModel):
             kwargs["max_failure_rate"] = retry_cfg.max_failure_rate
         if cost_cfg is not None:
             kwargs["budget_warning_threshold"] = cost_cfg.budget_warning_threshold
-        # schema_validation used to be a nested SchemaValidationConfig; the
-        # 0a85241 refactor flattened it into top-level booleans on
-        # LitTraceConfig. Prefer the nested object when present, otherwise
-        # fall back to the flat fields (which always exist on the config).
-        if schema_cfg is not None:
-            kwargs["schema_strict"] = schema_cfg.strict
-            kwargs["schema_enabled"] = schema_cfg.enabled
-        else:
-            kwargs["schema_strict"] = getattr(config, "schema_validation_strict", True)
-            kwargs["schema_enabled"] = getattr(config, "schema_validation_enabled", True)
+        # LitTraceConfig carries schema_validation_strict / _enabled as
+        # top-level booleans (post 0a85241 refactor that dropped the nested
+        # SchemaValidationConfig). getattr keeps callers passing ad-hoc
+        # objects working — see test_defaults_when_no_config_sections.
+        kwargs["schema_strict"] = getattr(config, "schema_validation_strict", True)
+        kwargs["schema_enabled"] = getattr(config, "schema_validation_enabled", True)
         return cls(**kwargs)
 
 
