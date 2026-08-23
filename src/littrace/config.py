@@ -357,7 +357,10 @@ class LitTraceConfig(BaseModel):
     publication_require_publishable_claim: bool = True
     # Sentinel (was SentinelConfig)
     sentinel_parse_on_daily: bool = True
-    # Eval paths (was EvalConfig)
+    # Eval paths. The nested ``eval.golden_set_dir`` is the source of
+    # truth — these top-level aliases are kept for backward compatibility
+    # with serialized configs and external scripts. New code should read
+    # ``config.eval.*`` instead.
     eval_golden_set_dir: Path = Path("./eval/golden")
     eval_traces_dir: Path = Path("./eval/traces")
     # Schema validation (was SchemaValidationConfig)
