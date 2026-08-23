@@ -59,6 +59,7 @@ class AppServerClient:
         self._request_tasks: set[asyncio.Task[None]] = set()
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._thread_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._turn_request_tasks: dict[str, set[asyncio.Task[None]]] = {}
         self._next_id = 0
         self._write_lock = asyncio.Lock()
         self._stderr_tail: deque[str] = deque(maxlen=100)
@@ -210,6 +211,7 @@ class AppServerClient:
         timeout: float = 300.0,
     ) -> AppServerTurnResult:
         queue = self._thread_queues.setdefault(thread_id, asyncio.Queue())
+        self._turn_request_tasks.setdefault(thread_id, set())
         result = await self.request(
             "turn/start",
             {
@@ -273,6 +275,9 @@ class AppServerClient:
             raise AppServerError(f"Codex turn timed out: {turn_id}") from exc
         finally:
             self._thread_queues.pop(thread_id, None)
+            pending = self._turn_request_tasks.pop(thread_id, None)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def close(self) -> None:
         if self._closed:
@@ -379,11 +384,18 @@ class AppServerClient:
                 future.set_result(result if isinstance(result, dict) else {})
             return
         if request_id is not None and isinstance(method, str):
+            params = message.get("params") or {}
             task = asyncio.create_task(
-                self._handle_server_request(request_id, method, message.get("params") or {})
+                self._handle_server_request(request_id, method, params)
             )
             self._request_tasks.add(task)
             task.add_done_callback(self._request_tasks.discard)
+            thread_id = params.get("threadId")
+            if isinstance(thread_id, str):
+                turn_tasks = self._turn_request_tasks.get(thread_id)
+                if turn_tasks is not None:
+                    turn_tasks.add(task)
+                    task.add_done_callback(turn_tasks.discard)
             return
         if isinstance(method, str):
             params = message.get("params") or {}
