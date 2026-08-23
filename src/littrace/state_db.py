@@ -837,7 +837,7 @@ class PostgresStateStore:
                 return record
 
             cur.execute(
-                f"SELECT revision FROM {s}.session_state "
+                f"SELECT revision, status FROM {s}.session_state "
                 "WHERE session_id = %s FOR UPDATE",
                 (session_id,),
             )
@@ -845,6 +845,10 @@ class PostgresStateStore:
             if current is None:
                 raise LookupError(f"LitTrace session state does not exist: {session_id}")
             current_revision = int(current[0])
+            if (current[1] or "active") == "archived":
+                raise RuntimeError(
+                    f"Cannot write to archived session {session_id}"
+                )
             if current_revision != expected_revision:
                 raise RuntimeError(
                     f"SessionState CAS mismatch for {session_id}: "
@@ -1029,7 +1033,7 @@ class PostgresStateStore:
                 )
 
             cur.execute(
-                f"SELECT revision FROM {s}.session_state "
+                f"SELECT revision, status FROM {s}.session_state "
                 "WHERE session_id = %s FOR UPDATE",
                 (session_id,),
             )
@@ -1037,6 +1041,10 @@ class PostgresStateStore:
             if current is None:
                 raise LookupError(f"LitTrace session state does not exist: {session_id}")
             current_revision = int(current[0])
+            if (current[1] or "active") == "archived":
+                raise RuntimeError(
+                    f"Cannot write to archived session {session_id}"
+                )
             if current_revision != expected_revision:
                 raise RuntimeError(
                     f"SessionState CAS mismatch for {session_id}: "
