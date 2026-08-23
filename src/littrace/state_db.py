@@ -1114,6 +1114,23 @@ class PostgresStateStore:
     def _ensure_chat_trail(self, conn, session_id: str) -> None:
         s = self.schema_name
         with conn.cursor() as cur:
+            # chat_trail has an FK to session_state; background paths (downloads,
+            # embedding outbox) may fire before the chat path has saved any
+            # workspace. Backfill a minimal session_state row so the FK holds.
+            cur.execute(
+                f"""
+                INSERT INTO {s}.session_state (
+                    session_id, workspace_json, manifest_json,
+                    artifact_index_json, memory_view_json, rag_profile_json,
+                    revision, created_at, updated_at
+                )
+                VALUES (%s, '{{}}'::jsonb, '{{}}'::jsonb,
+                        '{{}}'::jsonb, '{{}}'::jsonb, '{{}}'::jsonb,
+                        0, now(), now())
+                ON CONFLICT (session_id) DO NOTHING
+                """,
+                (session_id,),
+            )
             cur.execute(
                 f"""
                 INSERT INTO {s}.chat_trail (session_id, updated_at)
