@@ -6,7 +6,7 @@ import uuid
 
 import pytest
 
-pytestmark = pytest.mark.domain
+pytestmark = pytest.mark.unit
 
 
 _REAL_DSN = "postgresql://littrace:littrace@localhost:5433/littrace"

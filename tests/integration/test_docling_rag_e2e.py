@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.adapters
+pytestmark = pytest.mark.integration
 
 CACHE_DIR = Path(__file__).parent / ".cache"
 PDF_URL = "https://arxiv.org/pdf/2005.14120"
