@@ -98,6 +98,27 @@ class DownloadRetryConfig(BaseModel):
     base_delay_seconds: float = 60.0
 
 
+class CompactionConfig(BaseModel):
+    """Round 5 settings for the Codex thread-compaction worker.
+
+    ``threshold_turns`` and ``threshold_tokens`` are OR-ed when
+    deciding whether a session is due for compaction. Once a
+    successful ``thread/compact`` RPC runs, ``last_compacted_at``
+    is stamped and the session is ignored for one hour
+    regardless of how fast more turns pile up.
+    """
+
+    enabled: bool = False
+    background_worker_enabled: bool = False
+    interval_seconds: float = 60.0
+    batch_size: int = 5
+    max_attempts: int = 3
+    base_delay_seconds: float = 30.0
+    threshold_turns: int = 30
+    threshold_tokens: int = 50_000
+    request_timeout_seconds: float = 120.0
+
+
 class PaperDownloadConfig(BaseModel):
     mode: DownloadMode = DownloadMode.ASK_EACH_TIME
     organize_by: str = "year_doi"
@@ -354,6 +375,7 @@ class LitTraceConfig(BaseModel):
     rag: RagConfig = Field(default_factory=RagConfig)
     figure_enrichment: FigureEnrichmentConfig = Field(default_factory=FigureEnrichmentConfig)
     download_retry: DownloadRetryConfig = Field(default_factory=DownloadRetryConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     browser: BrowserAutomationConfig = Field(default_factory=BrowserAutomationConfig)
     cdp_downloader: CDPDownloaderConfig = Field(default_factory=CDPDownloaderConfig)
@@ -615,6 +637,48 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     if retry_attempts:
         try:
             config.download_retry.max_attempts = int(retry_attempts)
+        except ValueError:
+            pass
+    config.compaction.enabled = _env_bool(
+        "LITTRACE_COMPACTION_ENABLED", config.compaction.enabled
+    )
+    config.compaction.background_worker_enabled = _env_bool(
+        "LITTRACE_COMPACTION_WORKER", config.compaction.background_worker_enabled
+    )
+    compaction_interval = os.environ.get("LITTRACE_COMPACTION_INTERVAL_SECONDS")
+    if compaction_interval:
+        try:
+            config.compaction.interval_seconds = float(compaction_interval)
+        except ValueError:
+            pass
+    compaction_batch = os.environ.get("LITTRACE_COMPACTION_BATCH_SIZE")
+    if compaction_batch:
+        try:
+            config.compaction.batch_size = int(compaction_batch)
+        except ValueError:
+            pass
+    compaction_attempts = os.environ.get("LITTRACE_COMPACTION_MAX_ATTEMPTS")
+    if compaction_attempts:
+        try:
+            config.compaction.max_attempts = int(compaction_attempts)
+        except ValueError:
+            pass
+    compaction_turns = os.environ.get("LITTRACE_COMPACTION_THRESHOLD_TURNS")
+    if compaction_turns:
+        try:
+            config.compaction.threshold_turns = int(compaction_turns)
+        except ValueError:
+            pass
+    compaction_tokens = os.environ.get("LITTRACE_COMPACTION_THRESHOLD_TOKENS")
+    if compaction_tokens:
+        try:
+            config.compaction.threshold_tokens = int(compaction_tokens)
+        except ValueError:
+            pass
+    compaction_timeout = os.environ.get("LITTRACE_COMPACTION_REQUEST_TIMEOUT_SECONDS")
+    if compaction_timeout:
+        try:
+            config.compaction.request_timeout_seconds = float(compaction_timeout)
         except ValueError:
             pass
     return config
