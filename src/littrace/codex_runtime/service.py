@@ -149,11 +149,17 @@ class CodexAppServerChatService:
         cancellation: asyncio.Event | None = None,
         recorder: RolloutRecorder | None = None,
     ):
-        # The runtime_manager keeps one client across calls. Refresh
-        # the recorder reference so each chat writes to its own file
-        # even when the manager hands back a previously-cached client.
-        if recorder is not None:
-            client._rollout_recorder = recorder
+        # Round 4 P1 step 7: bind the per-thread recorder. The
+        # runtime_manager keeps one client across calls, so two
+        # concurrent chats on different sessions used to trample
+        # each other's JSONL file. The new per-thread dict on
+        # ``client._rollout_recorders`` keys by ``codex_thread_id``,
+        # so binding the new chat's recorder overwrites only that
+        # thread's slot. A follow-up chat on the SAME thread overwrites
+        # it again, which is the desired behaviour.
+        binding = self.state_store.get_agent_thread_binding(session.session_id)
+        if recorder is not None and binding is not None:
+            client.set_rollout_recorder(binding.codex_thread_id, recorder)
         runtime = self.config.agent_runtime
         await self._require_authentication(client)
         thread_overrides = self._thread_overrides(scratch_dir)

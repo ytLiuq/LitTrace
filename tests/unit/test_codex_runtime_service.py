@@ -58,7 +58,19 @@ class _FakeClient:
         # Mirror the real AppServerClient kwarg so rollout injection
         # round-trips through the same kwargs dict.
         self._rollout_recorder = kwargs.get("rollout_recorder")
+        self._rollout_recorders: dict[str, object] = (
+            {"__default__": self._rollout_recorder}
+            if self._rollout_recorder is not None
+            else {}
+        )
         type(self).instances.append(self)
+
+    def set_rollout_recorder(self, thread_id, recorder):  # type: ignore[no-untyped-def]
+        # Round 4 P1 step 7 mirror.
+        if recorder is None:
+            self._rollout_recorders.pop(thread_id, None)
+        else:
+            self._rollout_recorders[thread_id] = recorder
 
     async def __aenter__(self):
         return self

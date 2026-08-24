@@ -50,6 +50,13 @@ class AppServerClient:
         environment: dict[str, str] | None = None,
         rollout_recorder: "RolloutRecorder | None" = None,
     ) -> None:
+        # Round 4 P1 step 7: per-thread_id dict so two chats that
+        # share a single AppServerClient (via the runtime manager
+        # cache) do not trample each other's JSONL file. The
+        # constructor argument is kept for back-compat — when set
+        # we seed the dict under the special key ``"__default__"``
+        # so single-thread callers continue to work without
+        # touching service.py.
         if not command:
             raise ValueError("App Server command must not be empty")
         self.command = list(command)
@@ -71,7 +78,34 @@ class AppServerClient:
         self.initialize_result: dict[str, Any] = {}
         # Optional side-channel log for debugging. None by default so
         # production deployments that do not opt in pay no cost.
-        self._rollout_recorder = rollout_recorder
+        # Round 4 P1 step 7: per-thread_id dict so two chats on
+        # the same cached AppServerClient do not trample each
+        # other's JSONL. Single-thread callers can pass the
+        # ``rollout_recorder=`` ctor arg and we seed a default key.
+        self._rollout_recorders: dict[str, Any] = {}
+        if rollout_recorder is not None:
+            self._rollout_recorders["__default__"] = rollout_recorder
+
+    def set_rollout_recorder(
+        self, thread_id: str, recorder: "RolloutRecorder | None"
+    ) -> None:
+        """Bind (or clear) the per-thread JSONL rollout sink.
+
+        The recorder lives for the duration of one LitTrace session's
+        run_turn cycle; a subsequent chat on a different thread overwrites
+        only that thread's entry. ``recorder=None`` removes the binding
+        so a closed recorder is not invoked again.
+        """
+        if recorder is None:
+            self._rollout_recorders.pop(thread_id, None)
+        else:
+            self._rollout_recorders[thread_id] = recorder
+
+    def _recorder_for(self, thread_id: str | None) -> Any:
+        """Resolve the recorder for a given thread (or the default)."""
+        if thread_id and thread_id in self._rollout_recorders:
+            return self._rollout_recorders[thread_id]
+        return self._rollout_recorders.get("__default__")
 
     @property
     def running(self) -> bool:
@@ -229,8 +263,8 @@ class AppServerClient:
         )
         turn = _required_object(result, "turn")
         turn_id = _required_string(turn, "id")
-        if self._rollout_recorder is not None:
-            self._rollout_recorder.append(
+        if self._recorder_for(thread_id) is not None:
+            self._recorder_for(thread_id).append(
                 type_="turn_start",
                 turn_id=turn_id,
                 thread_id=thread_id,
@@ -302,8 +336,8 @@ class AppServerClient:
                     reply = "\n".join(part for part in completed_messages if part).strip()
                     if not reply:
                         reply = "".join(deltas).strip()
-                    if self._rollout_recorder is not None:
-                        self._rollout_recorder.append(
+                    if self._recorder_for(thread_id) is not None:
+                        self._recorder_for(thread_id).append(
                             type_="turn_complete",
                             turn_id=turn_id,
                             status=status,
@@ -418,9 +452,10 @@ class AppServerClient:
             await asyncio.sleep(0)
         # Close the side-channel rollout recorder last so any
         # pending events queued by the reader still get flushed.
-        if self._rollout_recorder is not None:
-            self._rollout_recorder.close()
-            self._rollout_recorder = None
+        if self._rollout_recorders:
+            for r in self._rollout_recorders.values():
+                r.close()
+            self._rollout_recorders.clear()
         self._fail_pending(AppServerError("Codex App Server client closed"))
 
     async def _write(self, message: dict[str, Any]) -> None:
@@ -500,25 +535,25 @@ class AppServerClient:
             return
         if isinstance(method, str):
             params = message.get("params") or {}
+            thread_id = params.get("threadId")
             # Round 4 P1 step 6: history-compaction events bypass
             # the per-thread queue gate. codex-harness fires these
             # notifications outside any in-flight turn and we want
             # the rollout log to record them regardless.
             if method in {"item/compactedHistory", "thread/compacted"}:
-                if self._rollout_recorder is not None:
-                    self._rollout_recorder.append(
+                if self._recorder_for(thread_id) is not None:
+                    self._recorder_for(thread_id).append(
                         type_="compaction",
                         method=method,
                         params=params,
                     )
                 return
-            thread_id = params.get("threadId")
             if isinstance(thread_id, str) and thread_id in self._thread_queues:
                 # Side-channel rollout log: capture the server
                 # notification before handing it to the turn consumer.
                 # Recorder writes are best-effort and never raise.
-                if self._rollout_recorder is not None:
-                    self._rollout_recorder.append(
+                if self._recorder_for(thread_id) is not None:
+                    self._recorder_for(thread_id).append(
                         type_="event",
                         method=method,
                         params=params,
