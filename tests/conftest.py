@@ -44,11 +44,22 @@ def fixtures_dir() -> Path:
 
 @pytest.fixture(autouse=True)
 def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Scrub littrace env vars so tests start from a known baseline.
+    """Scrub most littrace env vars so tests start from a known baseline.
 
-    Individual tests opt back into specific variables via ``monkeypatch.setenv``.
+    Three prefixes are deliberately preserved because the live and
+    integration test suites depend on them as opt-in gates:
+
+      - LITTRACE_LIVE_*   (e.g. LITTRACE_LIVE_TESTS)
+      - LITTRACE_E2E_*    (e.g. LITTRACE_E2E_EMBEDDING_BASE_URL)
+      - LITTRACE_RAG_*    (e.g. LITTRACE_RAG_POSTGRES_DSN)
+
+    Individual tests opt back into specific variables via
+    ``monkeypatch.setenv``.
     """
+    _PRESERVED_PREFIXES = ("LITTRACE_LIVE_", "LITTRACE_E2E_", "LITTRACE_RAG_")
     for name in list(os.environ):
+        if name.startswith(_PRESERVED_PREFIXES):
+            continue
         if name.startswith("LITTRACE_") or name.startswith("DEEPSEEK_"):
             monkeypatch.delenv(name, raising=False)
 

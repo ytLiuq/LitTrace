@@ -61,12 +61,14 @@ line-length = 100
 target-version = "py311"
 
 [tool.pytest.ini_options]
+addopts = ["-ra", "--strict-markers"]
 markers = [
   "unit: pure-logic unit tests, no I/O",
   "domain: domain integration tests (real components, light fixtures)",
   "api: HTTP/CLI/TUI surface tests",
   "adapters: external adapter integration (docling, paddleocr, browser, downloads)",
-  "live: opt-in tests that access real publishers and local browser/CDP services",
+  "live: opt-in tests that access real publishers and local browser/CDP services; gated by LITTRACE_LIVE_TESTS / LITTRACE_LIVE_DAILY_TESTS / LITTRACE_LIVE_DOWNLOAD_TESTS",
+  "integration: opt-in tests that need pgvector + minio + real PDF; gated by LITTRACE_RAG_POSTGRES_DSN + LITTRACE_RAG_EMBEDDING_* env",
   "eval: evaluation harness tests",
 ]
 testpaths = ["tests"]
