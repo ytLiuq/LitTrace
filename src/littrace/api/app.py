@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -38,7 +39,68 @@ async def _lifespan(_app: FastAPI):
         await asyncio.to_thread(shutdown_runtime_managers)
 
 
-app = FastAPI(title="LitTrace API", version="0.1.0", lifespan=_lifespan)
+# OpenAPI metadata. /docs, /redoc, and /openapi.json are opt-in
+# (set LITTRACE_API_DOCS_ENABLED=1) so production deployments do not
+# leak the internal schema by default.
+_DOCS_ENABLED = os.environ.get("LITTRACE_API_DOCS_ENABLED", "").strip() == "1"
+
+_OPENAPI_TAGS: list[dict[str, str]] = [
+    {
+        "name": "research",
+        "description": "Workspace search, chat and export entry points.",
+    },
+    {
+        "name": "evaluation",
+        "description": "Offline eval harness (golden sets, retrieval, PDF, RAG).",
+    },
+    {
+        "name": "downloads",
+        "description": "Publisher download orchestration and retry queue.",
+    },
+    {
+        "name": "artifacts",
+        "description": "Parse, table extraction, storyline, evidence, reports.",
+    },
+    {
+        "name": "sessions",
+        "description": "Session lifecycle (delete, metrics, knowledge surface).",
+    },
+    {
+        "name": "context",
+        "description": "Workspace context (selections, citations, full-text).",
+    },
+    {
+        "name": "publishers",
+        "description": "Publisher route discovery and enrichment.",
+    },
+    {
+        "name": "system",
+        "description": "Health, metrics, RAG jobs, configuration wizard.",
+    },
+    {
+        "name": "agents",
+        "description": "Runtime components, plans, workflow, quality audits.",
+    },
+]
+
+
+app = FastAPI(
+    title="LitTrace API",
+    version="0.1.0",
+    description=(
+        "LitTrace — evidence-first scientific literature workflow. "
+        "Every endpoint operates on a Postgres-backed session_state; "
+        "the workspace at `config.storage.sessions_dir/<session_id>` is "
+        "the on-disk projection."
+    ),
+    contact={"name": "LitTrace", "url": "https://github.com/ytLiuq/LitTrace"},
+    license_info={"name": "Apache-2.0"},
+    openapi_tags=_OPENAPI_TAGS,
+    lifespan=_lifespan,
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 app.include_router(system_router)
 app.include_router(agents_router)
 app.include_router(context_router)
