@@ -32,6 +32,17 @@ class _BindingStore:
     def get_session_state(self, session_id: str):
         return self.state if self.state and self.state.session_id == session_id else None
 
+    def upsert_session_state(self, state):
+        # Round 4 P1 step 5: status machine (draft / idle / active /
+        # systemError / archived) flips per turn, so the test fake
+        # needs to persist the latest record. Tests that use a fake
+        # client without seeding a session_state row pass ``None``;
+        # treat that as a no-op so the chat path does not crash.
+        if state is None:
+            return None
+        self.state = state.model_copy(deep=True)
+        return state
+
 
 class _FakeClient:
     instances: ClassVar[list[_FakeClient]] = []

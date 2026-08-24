@@ -89,7 +89,14 @@ class SessionStateRecord(BaseModel):
     memory_view_json: dict[str, object] = Field(default_factory=dict)
     rag_profile_json: dict[str, object] = Field(default_factory=dict)
     revision: int = 0
-    status: Literal["draft", "active", "archived"] = "active"
+    # Round 4 P1 step 5: align with codex-harness thread.status vocabulary
+    # (notLoaded / idle / active / systemError / archived). We map
+    # notLoaded to the absence of a session_state row entirely and keep
+    # five values: draft (placeholder, transient), idle (thread bound
+    # but no turn in flight), active (turn in flight), systemError
+    # (transport-level failure, frozen for inspection), archived
+    # (soft delete, read-only).
+    status: Literal["draft", "idle", "active", "systemError", "archived"] = "active"
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -374,7 +381,7 @@ class PostgresStateStore:
                     rag_profile_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                     revision INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'active'
-                        CHECK (status IN ('draft', 'active', 'archived')),
+                        CHECK (status IN ('draft', 'idle', 'active', 'systemError', 'archived')),
                     created_at TIMESTAMPTZ NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL
                 )
@@ -389,13 +396,19 @@ class PostgresStateStore:
             # The CHECK constraint lives in the CREATE TABLE above; for
             # pre-status deployments Postgres did not enforce it. Add
             # it idempotently via a domain-less CHECK that survives
-            # re-runs.
+            # re-runs. Round 4 P1 step 5 widened the status set from
+            # 3 to 5 values (added 'idle' and 'systemError'). An older
+            # database with the previous 3-value CHECK will reject
+            # new writes, so we drop the old constraint first (if it
+            # exists) and add the new one.
             cur.execute(
                 f"DO $$ BEGIN "
                 f"  ALTER TABLE {s}.session_state "
+                f"    DROP CONSTRAINT session_state_status_check; "
+                f"  ALTER TABLE {s}.session_state "
                 f"    ADD CONSTRAINT session_state_status_check "
-                f"    CHECK (status IN ('draft', 'active', 'archived')); "
-                f"EXCEPTION WHEN duplicate_object THEN NULL; "
+                f"    CHECK (status IN ('draft', 'idle', 'active', 'systemError', 'archived')); "
+                f"EXCEPTION WHEN undefined_object OR duplicate_object THEN NULL; "
                 f"END $$"
             )
 
@@ -612,7 +625,7 @@ class PostgresStateStore:
                     # sessions reject all writes, draft + expected=0 lets
                     # the chat path take over the placeholder, anything
                     # else is a real CAS contest that must win or raise.
-                    if current.status == "archived":
+                    if current.status in ("archived", "systemError"):
                         raise RuntimeError(
                             f"Cannot write to archived session {state.session_id}"
                         )
@@ -951,7 +964,7 @@ class PostgresStateStore:
             if current is None:
                 raise LookupError(f"LitTrace session state does not exist: {session_id}")
             current_revision = int(current[0])
-            if (current[1] or "active") == "archived":
+            if (current[1] or "active") in ("archived", "systemError"):
                 raise RuntimeError(
                     f"Cannot write to archived session {session_id}"
                 )
@@ -1147,7 +1160,7 @@ class PostgresStateStore:
             if current is None:
                 raise LookupError(f"LitTrace session state does not exist: {session_id}")
             current_revision = int(current[0])
-            if (current[1] or "active") == "archived":
+            if (current[1] or "active") in ("archived", "systemError"):
                 raise RuntimeError(
                     f"Cannot write to archived session {session_id}"
                 )

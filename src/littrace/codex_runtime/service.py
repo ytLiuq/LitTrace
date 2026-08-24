@@ -186,17 +186,57 @@ class CodexAppServerChatService:
                 )
             )
         thread_id = binding.codex_thread_id
+        # Round 4 P1 step 5: status machine
+        #   draft  --(start/resume)-->  idle
+        #   idle   --(run_turn start)-->  active
+        #   active --(run_turn done)---->  idle
+        #   *      --(transport error)-->  systemError  (frozen)
+        #   *      --(delete_chat_session)--> archived
+        # Only ``archived`` and ``systemError`` reject writes (the
+        # state_db CAS guards); ``draft`` + ``idle`` both accept
+        # revision=0 (chat path takeover) and ``active`` is the
+        # normal real-writer case.
+        current_session = self.state_store.get_session_state(session.session_id)
+        if binding.status in ("draft", "active") and current_session is not None:
+            # first chat: promote the placeholder into idle.
+            self.state_store.upsert_session_state(
+                current_session.model_copy(update={"status": "idle"})
+            )
+        current_session = self.state_store.get_session_state(session.session_id)
+        if current_session is not None:
+            self.state_store.upsert_session_state(
+                current_session.model_copy(update={"status": "active"})
+            )
         await self._require_mcp_connection(client, thread_id)
-        turn = await client.run_turn(
-            thread_id,
-            request.message,
-            timeout=runtime.turn_timeout_seconds,
-            cancellation=cancellation,
-        )
+        try:
+            turn = await client.run_turn(
+                thread_id,
+                request.message,
+                timeout=runtime.turn_timeout_seconds,
+                cancellation=cancellation,
+            )
+        except AppServerError:
+            # Any transport-level failure freezes the session in
+            # systemError so an operator can inspect via the
+            # session_state row rather than watching the chat path
+            # auto-retry against a half-broken connection.
+            current_session = self.state_store.get_session_state(session.session_id)
+            if current_session is not None:
+                self.state_store.upsert_session_state(
+                    current_session.model_copy(update={"status": "systemError"})
+                )
+            raise
         latest_workspace = self._latest_workspace(
             session.session_id,
             fallback=workspace,
         )
+        # Turn completed cleanly — flip back to ``idle`` so a
+        # subsequent chat picks up where we left off.
+        current_session = self.state_store.get_session_state(session.session_id)
+        if current_session is not None:
+            self.state_store.upsert_session_state(
+                current_session.model_copy(update={"status": "idle"})
+            )
         self.state_store.upsert_agent_thread_binding(
             binding.model_copy(
                 update={
