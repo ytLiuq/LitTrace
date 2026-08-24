@@ -43,6 +43,9 @@ class _FakeClient:
         self.stderr_tail = ()
         self.started_with = None
         self.resumed = None
+        # Mirror the real AppServerClient kwarg so rollout injection
+        # round-trips through the same kwargs dict.
+        self._rollout_recorder = kwargs.get("rollout_recorder")
         type(self).instances.append(self)
 
     async def __aenter__(self):
@@ -71,6 +74,18 @@ class _FakeClient:
     async def run_turn(self, thread_id, text, *, timeout, cancellation=None):
         if type(self).on_turn is not None:
             type(self).on_turn()
+        # Mirror what AppServerClient.run_turn writes into the rollout
+        # recorder so the service-layer tests exercise the same
+        # append surface.
+        recorder = getattr(self, "_rollout_recorder", None)
+        if recorder is not None:
+            recorder.append(type_="turn_start", turn_id="turn-1",
+                             thread_id=thread_id, user_text=text)
+            recorder.append(type_="event", method="item/agentMessage/delta",
+                             turn_id="turn-1", params={"delta": text})
+            recorder.append(type_="turn_complete", turn_id="turn-1",
+                             status="completed", reply=f"answer: {text}",
+                             turn={"id": "turn-1", "status": "completed"})
         return AppServerTurnResult(
             thread_id=thread_id,
             turn_id="turn-1",
@@ -322,3 +337,90 @@ def test_service_chat_returns_interrupted_failed_action(monkeypatch, tmp_path) -
         )
     )
     assert response.action == "codex_app_server_interrupted_failed"
+
+
+def test_service_writes_rollout_file_when_enabled(monkeypatch, tmp_path) -> None:
+    config = LitTraceConfig(
+        agent_runtime=LitTraceConfig.model_fields["agent_runtime"].default_factory(),
+    )
+    config.agent_runtime.rollout_enabled = True
+    session = ChatSession.from_root(tmp_path / "session", "session-1", config=config)
+    store = _BindingStore()
+    from littrace.state_db import AgentThreadBindingRecord
+    store.binding = AgentThreadBindingRecord(
+        session_id=session.session_id,
+        codex_thread_id="thread-rollout",
+    )
+    service = CodexAppServerChatService(
+        config, state_store=store, client_factory=_FakeClient,
+    )
+
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None):
+        # Mirror the real AppServerClient.run_turn surface that the
+        # rollout recorder relies on so the service-level test
+        # actually exercises the append path.
+        recorder = getattr(self, "_rollout_recorder", None)
+        if recorder is not None:
+            recorder.append(
+                type_="turn_start", turn_id="turn-1",
+                thread_id=thread_id, user_text=text,
+            )
+            recorder.append(
+                type_="turn_complete", turn_id="turn-1",
+                status="completed", reply="ok",
+            )
+        return AppServerTurnResult(
+            thread_id=thread_id, turn_id="turn-1",
+            status="completed", reply="ok", turn={},
+        )
+
+    monkeypatch.setattr(_FakeClient, "run_turn", fake_run)
+    asyncio.run(
+        service.chat(
+            ChatRequest(message="hi"), LiteratureWorkspace(), session,
+        )
+    )
+
+    rollout_dir = session.root / "rollouts"
+    files = list(rollout_dir.glob("*.jsonl"))
+    assert files, f"expected a rollout JSONL file under {rollout_dir}"
+    # File path itself encodes session_id.
+    assert session.session_id in files[0].name
+    contents = files[0].read_text(encoding="utf-8")
+    assert '"type": "turn_start"' in contents
+    assert '"type": "turn_complete"' in contents
+
+
+def test_service_skips_rollout_when_disabled(monkeypatch, tmp_path) -> None:
+    config = LitTraceConfig(
+        agent_runtime=LitTraceConfig.model_fields["agent_runtime"].default_factory(),
+    )
+    # rollout_enabled stays False (the default).
+    session = ChatSession.from_root(tmp_path / "session", "session-1", config=config)
+    store = _BindingStore()
+    from littrace.state_db import AgentThreadBindingRecord
+    store.binding = AgentThreadBindingRecord(
+        session_id=session.session_id,
+        codex_thread_id="thread-no-rollout",
+    )
+    service = CodexAppServerChatService(
+        config, state_store=store, client_factory=_FakeClient,
+    )
+
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None):
+        return AppServerTurnResult(
+            thread_id=thread_id, turn_id="turn-1",
+            status="completed", reply="ok", turn={},
+        )
+
+    monkeypatch.setattr(_FakeClient, "run_turn", fake_run)
+    asyncio.run(
+        service.chat(
+            ChatRequest(message="hi"), LiteratureWorkspace(), session,
+        )
+    )
+
+    rollout_dir = session.root / "rollouts"
+    assert not rollout_dir.exists(), (
+        "rollout directory must not exist when disabled"
+    )
