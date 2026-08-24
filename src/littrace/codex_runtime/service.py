@@ -185,6 +185,19 @@ class CodexAppServerChatService:
                     workspace_revision=workspace.context.filters.workspace_revision,
                 )
             )
+            # Round 4 P1 step 6: real session_meta write. Round 2
+            # commit 3 (rollout) registered the type but never had a
+            # production code path emit it — the rollout tests
+            # appended it manually. Now the service is the source.
+            if recorder is not None:
+                recorder.append(
+                    type_="session_meta",
+                    session_id=session.session_id,
+                    codex_thread_id=thread_id,
+                    runtime_kind=runtime_kind,
+                    runtime_version=_runtime_version(client),
+                    resume=can_resume,
+                )
         thread_id = binding.codex_thread_id
         # Round 4 P1 step 5: status machine
         #   draft  --(start/resume)-->  idle
@@ -207,6 +220,19 @@ class CodexAppServerChatService:
             self.state_store.upsert_session_state(
                 current_session.model_copy(update={"status": "active"})
             )
+        # Round 4 P1 step 6: turn_context write — capture the
+        # snapshot of thread_overrides the chat is about to send
+        # to the App Server. The dict contains sandbox /
+        # approvalPolicy / cwd / mcp_servers config; it is the
+        # single piece of state the server saw before any tool
+        # response, so the rollout log is the only authoritative
+        # record of "what thread did this turn run in?".
+        if recorder is not None:
+            recorder.append(
+                type_="turn_context",
+                thread_id=thread_id,
+                thread_overrides=thread_overrides,
+            )
         await self._require_mcp_connection(client, thread_id)
         try:
             turn = await client.run_turn(
@@ -215,11 +241,18 @@ class CodexAppServerChatService:
                 timeout=runtime.turn_timeout_seconds,
                 cancellation=cancellation,
             )
-        except AppServerError:
+        except AppServerError as exc:
             # Any transport-level failure freezes the session in
             # systemError so an operator can inspect via the
             # session_state row rather than watching the chat path
             # auto-retry against a half-broken connection.
+            if recorder is not None:
+                recorder.append(
+                    type_="system_error",
+                    error_code=exc.error_code.value,
+                    message=str(exc),
+                    additional_details=exc.additional_details,
+                )
             current_session = self.state_store.get_session_state(session.session_id)
             if current_session is not None:
                 self.state_store.upsert_session_state(

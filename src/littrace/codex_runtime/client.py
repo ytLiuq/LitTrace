@@ -500,6 +500,18 @@ class AppServerClient:
             return
         if isinstance(method, str):
             params = message.get("params") or {}
+            # Round 4 P1 step 6: history-compaction events bypass
+            # the per-thread queue gate. codex-harness fires these
+            # notifications outside any in-flight turn and we want
+            # the rollout log to record them regardless.
+            if method in {"item/compactedHistory", "thread/compacted"}:
+                if self._rollout_recorder is not None:
+                    self._rollout_recorder.append(
+                        type_="compaction",
+                        method=method,
+                        params=params,
+                    )
+                return
             thread_id = params.get("threadId")
             if isinstance(thread_id, str) and thread_id in self._thread_queues:
                 # Side-channel rollout log: capture the server
