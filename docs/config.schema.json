@@ -1,0 +1,1323 @@
+{
+  "$defs": {
+    "APIConfig": {
+      "properties": {
+        "user_agent": {
+          "default": "LitTrace/0.1",
+          "title": "User Agent",
+          "type": "string"
+        },
+        "openalex_api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Openalex Api Key"
+        },
+        "unpaywall_email": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unpaywall Email"
+        },
+        "crossref_mailto": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Crossref Mailto"
+        },
+        "core_api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Core Api Key"
+        },
+        "enable_europe_pmc": {
+          "default": true,
+          "title": "Enable Europe Pmc",
+          "type": "boolean"
+        },
+        "request_timeout_seconds": {
+          "default": 20.0,
+          "title": "Request Timeout Seconds",
+          "type": "number"
+        },
+        "enable_live_search": {
+          "default": false,
+          "title": "Enable Live Search",
+          "type": "boolean"
+        }
+      },
+      "title": "APIConfig",
+      "type": "object"
+    },
+    "AgentRuntimeConfig": {
+      "description": "Execution runtime selected for interactive chat turns.\n\n``legacy`` keeps the existing in-process coordinator.  The App Server\nruntime is deliberately opt-in while domain mutations move behind\ncontrolled, idempotent MCP commands.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/AgentRuntimeMode",
+          "default": "legacy"
+        },
+        "codex_command": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Codex Command",
+          "type": "array"
+        },
+        "codex_config_overrides": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Codex Config Overrides",
+          "type": "object"
+        },
+        "codex_home_mode": {
+          "$ref": "#/$defs/CodexHomeMode",
+          "default": "isolated"
+        },
+        "codex_home": {
+          "default": "data/codex-home",
+          "format": "path",
+          "title": "Codex Home",
+          "type": "string"
+        },
+        "scratch_root": {
+          "default": "data/codex-runtime",
+          "format": "path",
+          "title": "Scratch Root",
+          "type": "string"
+        },
+        "startup_timeout_seconds": {
+          "default": 20.0,
+          "title": "Startup Timeout Seconds",
+          "type": "number"
+        },
+        "request_timeout_seconds": {
+          "default": 60.0,
+          "title": "Request Timeout Seconds",
+          "type": "number"
+        },
+        "turn_timeout_seconds": {
+          "default": 300.0,
+          "title": "Turn Timeout Seconds",
+          "type": "number"
+        },
+        "fallback_to_legacy": {
+          "default": true,
+          "title": "Fallback To Legacy",
+          "type": "boolean"
+        },
+        "mcp_server_name": {
+          "default": "littrace",
+          "title": "Mcp Server Name",
+          "type": "string"
+        },
+        "sandbox_policy": {
+          "$ref": "#/$defs/SandboxPolicy",
+          "default": "read-only"
+        },
+        "writable_roots": {
+          "items": {
+            "format": "path",
+            "type": "string"
+          },
+          "title": "Writable Roots",
+          "type": "array"
+        },
+        "interrupt_grace_seconds": {
+          "default": 10.0,
+          "title": "Interrupt Grace Seconds",
+          "type": "number"
+        },
+        "rollout_enabled": {
+          "default": false,
+          "title": "Rollout Enabled",
+          "type": "boolean"
+        },
+        "rollout_dir": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rollout Dir"
+        }
+      },
+      "title": "AgentRuntimeConfig",
+      "type": "object"
+    },
+    "AgentRuntimeMode": {
+      "enum": [
+        "legacy",
+        "codex_app_server"
+      ],
+      "title": "AgentRuntimeMode",
+      "type": "string"
+    },
+    "ArtifactStorageConfig": {
+      "properties": {
+        "backend": {
+          "default": "local",
+          "title": "Backend",
+          "type": "string"
+        },
+        "local_root": {
+          "default": "data/artifacts",
+          "format": "path",
+          "title": "Local Root",
+          "type": "string"
+        },
+        "bucket": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bucket"
+        },
+        "endpoint_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Endpoint Url"
+        },
+        "region": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Region"
+        },
+        "path_prefix": {
+          "default": "",
+          "title": "Path Prefix",
+          "type": "string"
+        }
+      },
+      "title": "ArtifactStorageConfig",
+      "type": "object"
+    },
+    "BrowserAutomationConfig": {
+      "properties": {
+        "browser_act_path": {
+          "default": "browser-act",
+          "title": "Browser Act Path",
+          "type": "string"
+        },
+        "required": {
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "default_browser_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Default Browser Id"
+        },
+        "default_browser_name": {
+          "default": "littrace-publisher-auth",
+          "title": "Default Browser Name",
+          "type": "string"
+        },
+        "default_browser_type": {
+          "default": "chrome",
+          "title": "Default Browser Type",
+          "type": "string"
+        },
+        "confirm_before_use": {
+          "default": true,
+          "title": "Confirm Before Use",
+          "type": "boolean"
+        },
+        "allow_confirm_browser_fallback": {
+          "default": true,
+          "title": "Allow Confirm Browser Fallback",
+          "type": "boolean"
+        },
+        "chrome_direct_open_retries": {
+          "default": 3,
+          "title": "Chrome Direct Open Retries",
+          "type": "integer"
+        },
+        "chrome_direct_retry_delay_seconds": {
+          "default": 2.0,
+          "title": "Chrome Direct Retry Delay Seconds",
+          "type": "number"
+        }
+      },
+      "title": "BrowserAutomationConfig",
+      "type": "object"
+    },
+    "CDPDownloaderConfig": {
+      "properties": {
+        "cdp_url": {
+          "default": "http://127.0.0.1:19222",
+          "title": "Cdp Url",
+          "type": "string"
+        },
+        "default_output_dir": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Default Output Dir"
+        },
+        "chrome_executable": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chrome Executable"
+        },
+        "chrome_user_data_dir": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Chrome User Data Dir"
+        },
+        "chrome_profile_name": {
+          "default": "Default",
+          "title": "Chrome Profile Name",
+          "type": "string"
+        },
+        "remote_debugging_port": {
+          "default": 19222,
+          "title": "Remote Debugging Port",
+          "type": "integer"
+        },
+        "auto_launch_chrome": {
+          "default": false,
+          "title": "Auto Launch Chrome",
+          "type": "boolean"
+        },
+        "cloudflare_wait_seconds": {
+          "default": 60.0,
+          "title": "Cloudflare Wait Seconds",
+          "type": "number"
+        },
+        "user_action_wait_seconds": {
+          "default": 30.0,
+          "title": "User Action Wait Seconds",
+          "type": "number"
+        },
+        "command_timeout_seconds": {
+          "default": 60.0,
+          "title": "Command Timeout Seconds",
+          "type": "number"
+        },
+        "repository_download_timeout_seconds": {
+          "default": 120.0,
+          "title": "Repository Download Timeout Seconds",
+          "type": "number"
+        },
+        "websocket_reconnect_attempts": {
+          "default": 3,
+          "title": "Websocket Reconnect Attempts",
+          "type": "integer"
+        }
+      },
+      "title": "CDPDownloaderConfig",
+      "type": "object"
+    },
+    "CitationGuardConfig": {
+      "description": "Configuration for the citation guard's claim-hint word list.\n\n``claim_hints`` is a list of keywords that trigger citation checking.\nSentences containing any of these words are considered \"claim-bearing\"\nand must have citation anchors. Extend this list for domain-specific\nvocabulary (e.g. add \"gauge factor\", \"TFT\", \"bandgap\" for sensor research).",
+      "properties": {
+        "claim_hints": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Claim Hints",
+          "type": "array"
+        }
+      },
+      "title": "CitationGuardConfig",
+      "type": "object"
+    },
+    "CodexHomeMode": {
+      "description": "How the App Server process resolves its Codex state directory.",
+      "enum": [
+        "isolated",
+        "shared"
+      ],
+      "title": "CodexHomeMode",
+      "type": "string"
+    },
+    "CostBudgetConfig": {
+      "description": "Token cost budget and tracking configuration.\n\nSet ``max_total_tokens`` to 0 to disable budget enforcement.",
+      "properties": {
+        "max_total_tokens": {
+          "default": 0,
+          "title": "Max Total Tokens",
+          "type": "integer"
+        },
+        "max_tokens_per_call": {
+          "default": 0,
+          "title": "Max Tokens Per Call",
+          "type": "integer"
+        },
+        "price_per_1k_input": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Price Per 1K Input",
+          "type": "object"
+        },
+        "price_per_1k_output": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Price Per 1K Output",
+          "type": "object"
+        },
+        "budget_warning_threshold": {
+          "default": 0.8,
+          "title": "Budget Warning Threshold",
+          "type": "number"
+        },
+        "persist_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Persist Path"
+        },
+        "max_persist_entries": {
+          "default": 5000,
+          "title": "Max Persist Entries",
+          "type": "integer"
+        }
+      },
+      "title": "CostBudgetConfig",
+      "type": "object"
+    },
+    "DoclingParserConfig": {
+      "properties": {
+        "export_markdown": {
+          "default": true,
+          "title": "Export Markdown",
+          "type": "boolean"
+        },
+        "extract_tables": {
+          "default": true,
+          "title": "Extract Tables",
+          "type": "boolean"
+        },
+        "extract_figures": {
+          "default": true,
+          "title": "Extract Figures",
+          "type": "boolean"
+        },
+        "describe_figures": {
+          "default": false,
+          "title": "Describe Figures",
+          "type": "boolean"
+        }
+      },
+      "title": "DoclingParserConfig",
+      "type": "object"
+    },
+    "DownloadMode": {
+      "enum": [
+        "ask_each_time",
+        "download_open_access",
+        "download_selected",
+        "download_all_allowed"
+      ],
+      "title": "DownloadMode",
+      "type": "string"
+    },
+    "DownloadRetryConfig": {
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "background_worker_enabled": {
+          "default": false,
+          "title": "Background Worker Enabled",
+          "type": "boolean"
+        },
+        "interval_seconds": {
+          "default": 30.0,
+          "title": "Interval Seconds",
+          "type": "number"
+        },
+        "batch_size": {
+          "default": 10,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "max_attempts": {
+          "default": 3,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "base_delay_seconds": {
+          "default": 60.0,
+          "title": "Base Delay Seconds",
+          "type": "number"
+        }
+      },
+      "title": "DownloadRetryConfig",
+      "type": "object"
+    },
+    "EvalConfig": {
+      "properties": {
+        "golden_set_dir": {
+          "default": "eval/golden",
+          "format": "path",
+          "title": "Golden Set Dir",
+          "type": "string"
+        },
+        "rag_golden_set_dir": {
+          "default": "eval/rag_golden",
+          "format": "path",
+          "title": "Rag Golden Set Dir",
+          "type": "string"
+        },
+        "traces_dir": {
+          "default": "eval/traces",
+          "format": "path",
+          "title": "Traces Dir",
+          "type": "string"
+        }
+      },
+      "title": "EvalConfig",
+      "type": "object"
+    },
+    "FigureEnrichmentConfig": {
+      "description": "Optional asynchronous multimodal enrichment for extracted figures.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Base Url"
+        },
+        "api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "prompt": {
+          "default": "Analyze this scientific figure conservatively. Return JSON only with exactly these fields: figure_type (string), visual_summary (string), observations (array of strings), ocr_text (array of strings), confidence (number from 0 to 1). Only report details visible in the image or stated in the caption. Do not infer unshown experimental results.",
+          "title": "Prompt",
+          "type": "string"
+        },
+        "max_figures_per_job": {
+          "default": 20,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Max Figures Per Job",
+          "type": "integer"
+        },
+        "min_confidence": {
+          "default": 0.65,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Min Confidence",
+          "type": "number"
+        }
+      },
+      "title": "FigureEnrichmentConfig",
+      "type": "object"
+    },
+    "HarnessThresholdConfig": {
+      "description": "Thresholds for harness quality checks — configurable via config.yaml.",
+      "properties": {
+        "performance_confidence": {
+          "default": 0.65,
+          "title": "Performance Confidence",
+          "type": "number"
+        },
+        "artifact_confidence": {
+          "default": 0.6,
+          "title": "Artifact Confidence",
+          "type": "number"
+        },
+        "storyline_confidence": {
+          "default": 0.7,
+          "title": "Storyline Confidence",
+          "type": "number"
+        },
+        "storyline_chain_min_evidence": {
+          "default": 3,
+          "title": "Storyline Chain Min Evidence",
+          "type": "integer"
+        }
+      },
+      "title": "HarnessThresholdConfig",
+      "type": "object"
+    },
+    "LLMConfig": {
+      "properties": {
+        "provider": {
+          "default": "deepseek",
+          "title": "Provider",
+          "type": "string"
+        },
+        "api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Api Key"
+        },
+        "base_url": {
+          "default": "https://api.deepseek.com",
+          "title": "Base Url",
+          "type": "string"
+        },
+        "model": {
+          "default": "deepseek-chat",
+          "title": "Model",
+          "type": "string"
+        },
+        "fallback_models": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Fallback Models",
+          "type": "array"
+        },
+        "fallback_api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Api Key"
+        },
+        "fallback_base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Base Url"
+        },
+        "fallback_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Fallback Model"
+        },
+        "request_timeout_seconds": {
+          "default": 60.0,
+          "title": "Request Timeout Seconds",
+          "type": "number"
+        },
+        "metric_extraction_timeout_seconds": {
+          "default": 150.0,
+          "title": "Metric Extraction Timeout Seconds",
+          "type": "number"
+        },
+        "temperature": {
+          "default": 0.2,
+          "title": "Temperature",
+          "type": "number"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "intent_parser_enabled": {
+          "default": true,
+          "title": "Intent Parser Enabled",
+          "type": "boolean"
+        }
+      },
+      "title": "LLMConfig",
+      "type": "object"
+    },
+    "LiteratureContextDefaults": {
+      "properties": {
+        "visible_to_user": {
+          "default": true,
+          "title": "Visible To User",
+          "type": "boolean"
+        },
+        "default_year_min": {
+          "default": 2023,
+          "title": "Default Year Min",
+          "type": "integer"
+        },
+        "default_recent_year_min": {
+          "default": 2023,
+          "title": "Default Recent Year Min",
+          "type": "integer"
+        },
+        "active_context_limit": {
+          "default": 15,
+          "title": "Active Context Limit",
+          "type": "integer"
+        },
+        "preferred_disciplines": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Preferred Disciplines",
+          "type": "array"
+        },
+        "preferred_publishers": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Preferred Publishers",
+          "type": "array"
+        },
+        "preferred_journals": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Preferred Journals",
+          "type": "array"
+        }
+      },
+      "title": "LiteratureContextDefaults",
+      "type": "object"
+    },
+    "MetadataStoreConfig": {
+      "properties": {
+        "backend": {
+          "default": "postgres",
+          "title": "Backend",
+          "type": "string"
+        },
+        "postgres_dsn": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "postgresql://littrace:littrace@localhost:5433/littrace",
+          "title": "Postgres Dsn"
+        },
+        "schema_name": {
+          "default": "littrace",
+          "title": "Schema Name",
+          "type": "string"
+        },
+        "connect_timeout_seconds": {
+          "default": 5,
+          "title": "Connect Timeout Seconds",
+          "type": "integer"
+        },
+        "allow_schema_reset": {
+          "default": false,
+          "title": "Allow Schema Reset",
+          "type": "boolean"
+        }
+      },
+      "title": "MetadataStoreConfig",
+      "type": "object"
+    },
+    "PaddleOCRParserConfig": {
+      "properties": {
+        "lang": {
+          "default": "en",
+          "title": "Lang",
+          "type": "string"
+        },
+        "use_angle_cls": {
+          "default": true,
+          "title": "Use Angle Cls",
+          "type": "boolean"
+        },
+        "pdf_render_scale": {
+          "default": 2.0,
+          "title": "Pdf Render Scale",
+          "type": "number"
+        },
+        "max_pages": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Pages"
+        },
+        "ocr_batch_size": {
+          "default": 4,
+          "title": "Ocr Batch Size",
+          "type": "integer"
+        },
+        "ocr_page_workers": {
+          "default": 1,
+          "title": "Ocr Page Workers",
+          "type": "integer"
+        },
+        "cache_enabled": {
+          "default": true,
+          "title": "Cache Enabled",
+          "type": "boolean"
+        },
+        "cache_dir": {
+          "anyOf": [
+            {
+              "format": "path",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cache Dir"
+        }
+      },
+      "title": "PaddleOCRParserConfig",
+      "type": "object"
+    },
+    "PaperDownloadConfig": {
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/DownloadMode",
+          "default": "ask_each_time"
+        },
+        "organize_by": {
+          "default": "year_doi",
+          "title": "Organize By",
+          "type": "string"
+        },
+        "filename_template": {
+          "default": "{year}_{first_author}_{short_title}_{doi_hash}.pdf",
+          "title": "Filename Template",
+          "type": "string"
+        },
+        "save_metadata_even_if_pdf_skipped": {
+          "default": false,
+          "title": "Save Metadata Even If Pdf Skipped",
+          "type": "boolean"
+        },
+        "allow_requires_login_download": {
+          "default": true,
+          "title": "Allow Requires Login Download",
+          "type": "boolean"
+        },
+        "max_concurrent_downloads": {
+          "default": 3,
+          "maximum": 8,
+          "minimum": 1,
+          "title": "Max Concurrent Downloads",
+          "type": "integer"
+        }
+      },
+      "title": "PaperDownloadConfig",
+      "type": "object"
+    },
+    "ParsingConfig": {
+      "properties": {
+        "default_parser": {
+          "default": "docling",
+          "title": "Default Parser",
+          "type": "string"
+        },
+        "parse_strategy": {
+          "default": "auto",
+          "title": "Parse Strategy",
+          "type": "string"
+        },
+        "docling_workers": {
+          "default": 2,
+          "maximum": 4,
+          "minimum": 1,
+          "title": "Docling Workers",
+          "type": "integer"
+        },
+        "preferred_engines": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Preferred Engines",
+          "type": "array"
+        },
+        "docling": {
+          "$ref": "#/$defs/DoclingParserConfig"
+        },
+        "paddleocr": {
+          "$ref": "#/$defs/PaddleOCRParserConfig"
+        }
+      },
+      "title": "ParsingConfig",
+      "type": "object"
+    },
+    "RagConfig": {
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "backend": {
+          "default": "pgvector",
+          "title": "Backend",
+          "type": "string"
+        },
+        "postgres_dsn": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Postgres Dsn"
+        },
+        "schema_name": {
+          "default": "littrace_rag",
+          "title": "Schema Name",
+          "type": "string"
+        },
+        "collection_prefix": {
+          "default": "littrace",
+          "title": "Collection Prefix",
+          "type": "string"
+        },
+        "embedding_provider": {
+          "default": "openai-compatible",
+          "title": "Embedding Provider",
+          "type": "string"
+        },
+        "embedding_base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Base Url"
+        },
+        "embedding_api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Embedding Api Key"
+        },
+        "embedding_model": {
+          "default": "text-embedding-3-small",
+          "title": "Embedding Model",
+          "type": "string"
+        },
+        "embedding_dimension": {
+          "default": 1536,
+          "title": "Embedding Dimension",
+          "type": "integer"
+        },
+        "chunk_target_tokens": {
+          "default": 700,
+          "title": "Chunk Target Tokens",
+          "type": "integer"
+        },
+        "chunk_overlap_tokens": {
+          "default": 120,
+          "title": "Chunk Overlap Tokens",
+          "type": "integer"
+        },
+        "top_k": {
+          "default": 12,
+          "title": "Top K",
+          "type": "integer"
+        },
+        "refresh_frequency": {
+          "default": "daily",
+          "title": "Refresh Frequency",
+          "type": "string"
+        },
+        "auto_refresh_enabled": {
+          "default": false,
+          "title": "Auto Refresh Enabled",
+          "type": "boolean"
+        },
+        "auto_download_open_access": {
+          "default": true,
+          "title": "Auto Download Open Access",
+          "type": "boolean"
+        },
+        "login_required_policy": {
+          "default": "queue_only",
+          "title": "Login Required Policy",
+          "type": "string"
+        }
+      },
+      "title": "RagConfig",
+      "type": "object"
+    },
+    "RateLimitConfig": {
+      "description": "Rate limiting for LLM API calls.\n\nSet ``max_concurrent`` or ``max_requests_per_minute`` to 0 to disable\nthat layer of limiting. Both layers compose: concurrency limits parallel\nin-flight requests, while the sliding-window rate limit caps sustained\nthroughput.",
+      "properties": {
+        "max_concurrent": {
+          "default": 0,
+          "title": "Max Concurrent",
+          "type": "integer"
+        },
+        "max_requests_per_minute": {
+          "default": 0,
+          "title": "Max Requests Per Minute",
+          "type": "integer"
+        }
+      },
+      "title": "RateLimitConfig",
+      "type": "object"
+    },
+    "RetryPolicyConfig": {
+      "description": "Unified retry policy for all HTTP/LLM/external calls.",
+      "properties": {
+        "max_attempts": {
+          "default": 3,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "backoff_strategy": {
+          "default": "exponential",
+          "title": "Backoff Strategy",
+          "type": "string"
+        },
+        "base_delay_seconds": {
+          "default": 0.8,
+          "title": "Base Delay Seconds",
+          "type": "number"
+        },
+        "max_delay_seconds": {
+          "default": 30.0,
+          "title": "Max Delay Seconds",
+          "type": "number"
+        },
+        "max_retry_rate": {
+          "default": 0.5,
+          "title": "Max Retry Rate",
+          "type": "number"
+        },
+        "max_failure_rate": {
+          "default": 0.2,
+          "title": "Max Failure Rate",
+          "type": "number"
+        },
+        "persist_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Persist Path"
+        },
+        "max_persist_entries": {
+          "default": 2000,
+          "title": "Max Persist Entries",
+          "type": "integer"
+        }
+      },
+      "title": "RetryPolicyConfig",
+      "type": "object"
+    },
+    "SandboxPolicy": {
+      "description": "Three-tier sandbox policy aligned with codex-harness.\n\nMirrors the App Server's ``sandbox`` parameter so operators can pick\nhow much filesystem reach a Codex turn gets without hand-editing the\nthread-start overrides.",
+      "enum": [
+        "read-only",
+        "workspace-write",
+        "danger-full-access"
+      ],
+      "title": "SandboxPolicy",
+      "type": "string"
+    },
+    "StorageConfig": {
+      "properties": {
+        "paper_library_dir": {
+          "default": "data/papers",
+          "format": "path",
+          "title": "Paper Library Dir",
+          "type": "string"
+        },
+        "metadata_dir": {
+          "default": "data/metadata",
+          "format": "path",
+          "title": "Metadata Dir",
+          "type": "string"
+        },
+        "cache_dir": {
+          "default": "data/cache",
+          "format": "path",
+          "title": "Cache Dir",
+          "type": "string"
+        },
+        "sessions_dir": {
+          "default": "sessions",
+          "format": "path",
+          "title": "Sessions Dir",
+          "type": "string"
+        },
+        "workspace_snapshot_limit": {
+          "default": 30,
+          "title": "Workspace Snapshot Limit",
+          "type": "integer"
+        }
+      },
+      "title": "StorageConfig",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "storage": {
+      "$ref": "#/$defs/StorageConfig"
+    },
+    "artifact_storage": {
+      "$ref": "#/$defs/ArtifactStorageConfig"
+    },
+    "metadata_store": {
+      "$ref": "#/$defs/MetadataStoreConfig"
+    },
+    "rag": {
+      "$ref": "#/$defs/RagConfig"
+    },
+    "figure_enrichment": {
+      "$ref": "#/$defs/FigureEnrichmentConfig"
+    },
+    "download_retry": {
+      "$ref": "#/$defs/DownloadRetryConfig"
+    },
+    "api": {
+      "$ref": "#/$defs/APIConfig"
+    },
+    "browser": {
+      "$ref": "#/$defs/BrowserAutomationConfig"
+    },
+    "cdp_downloader": {
+      "$ref": "#/$defs/CDPDownloaderConfig"
+    },
+    "llm": {
+      "$ref": "#/$defs/LLMConfig"
+    },
+    "paper_download": {
+      "$ref": "#/$defs/PaperDownloadConfig"
+    },
+    "parsing": {
+      "$ref": "#/$defs/ParsingConfig"
+    },
+    "literature_context": {
+      "$ref": "#/$defs/LiteratureContextDefaults"
+    },
+    "eval": {
+      "$ref": "#/$defs/EvalConfig"
+    },
+    "agent_runtime": {
+      "$ref": "#/$defs/AgentRuntimeConfig"
+    },
+    "harness": {
+      "$ref": "#/$defs/HarnessThresholdConfig"
+    },
+    "retry": {
+      "$ref": "#/$defs/RetryPolicyConfig"
+    },
+    "cost_budget": {
+      "$ref": "#/$defs/CostBudgetConfig"
+    },
+    "rate_limit": {
+      "$ref": "#/$defs/RateLimitConfig"
+    },
+    "citation_guard": {
+      "$ref": "#/$defs/CitationGuardConfig"
+    },
+    "cache_default_ttl_seconds": {
+      "default": 86400,
+      "title": "Cache Default Ttl Seconds",
+      "type": "integer"
+    },
+    "cache_allow_stale_on_source_failure": {
+      "default": true,
+      "title": "Cache Allow Stale On Source Failure",
+      "type": "boolean"
+    },
+    "publication_strict_all_claims": {
+      "default": true,
+      "title": "Publication Strict All Claims",
+      "type": "boolean"
+    },
+    "publication_require_publishable_claim": {
+      "default": true,
+      "title": "Publication Require Publishable Claim",
+      "type": "boolean"
+    },
+    "sentinel_parse_on_daily": {
+      "default": true,
+      "title": "Sentinel Parse On Daily",
+      "type": "boolean"
+    },
+    "eval_golden_set_dir": {
+      "default": "eval/golden",
+      "format": "path",
+      "title": "Eval Golden Set Dir",
+      "type": "string"
+    },
+    "eval_traces_dir": {
+      "default": "eval/traces",
+      "format": "path",
+      "title": "Eval Traces Dir",
+      "type": "string"
+    },
+    "schema_validation_enabled": {
+      "default": true,
+      "title": "Schema Validation Enabled",
+      "type": "boolean"
+    },
+    "schema_validation_strict": {
+      "default": true,
+      "title": "Schema Validation Strict",
+      "type": "boolean"
+    },
+    "schema_validation_drop_invalid": {
+      "default": false,
+      "title": "Schema Validation Drop Invalid",
+      "type": "boolean"
+    }
+  },
+  "title": "LitTraceConfig",
+  "type": "object"
+}
