@@ -13,7 +13,7 @@ import json
 import os
 import shutil
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
@@ -29,14 +29,59 @@ class AppServerProtocolError(AppServerError):
 
 
 @dataclass(frozen=True)
+class Usage:
+    """Mirror of codex-harness's token-usage report.
+
+    OpenAI returns ``prompt_tokens`` / ``completion_tokens`` /
+    ``prompt_tokens_details.cached_tokens``. DeepSeek (and most
+    OpenAI-compatible providers) do not expose the cached_tokens
+    detail, so the field defaults to 0. ``cache_write_input_tokens``
+    is populated only when the model performed an explicit
+    cache-priming call (rare in current usage); ``total_tokens`` is
+    what the operator usually cares about.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    cache_write_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    total_tokens: int = 0
+
+    @classmethod
+    def from_turn_payload(cls, payload: dict[str, Any]) -> "Usage":
+        if not isinstance(payload, dict):
+            return cls()
+        details = payload.get("prompt_tokens_details") or {}
+        if not isinstance(details, dict):
+            details = {}
+        return cls(
+            input_tokens=int(payload.get("prompt_tokens") or 0),
+            output_tokens=int(payload.get("completion_tokens") or 0),
+            reasoning_output_tokens=int(
+                payload.get("reasoning_tokens")
+                or payload.get("completion_tokens_details", {}).get(
+                    "reasoning_tokens", 0
+                )
+                if isinstance(payload.get("completion_tokens_details"), dict)
+                else 0
+            ),
+            cache_write_input_tokens=int(
+                payload.get("cache_creation_input_tokens") or 0
+            ),
+            cache_read_input_tokens=int(details.get("cached_tokens") or 0),
+            total_tokens=int(payload.get("total_tokens") or 0),
+        )
+
+
+@dataclass(frozen=True)
 class AppServerTurnResult:
     thread_id: str
     turn_id: str
     status: str
     reply: str
     turn: dict[str, Any]
-
-
+    usage: Usage = field(default_factory=Usage)
 class AppServerClient:
     """One long-lived, full-duplex App Server process."""
 
@@ -355,6 +400,9 @@ class AppServerClient:
                         status=status,
                         reply=reply,
                         turn=completed_turn,
+                        usage=Usage.from_turn_payload(
+                            completed_turn.get("usage", {})
+                        ),
                     )
 
         try:
