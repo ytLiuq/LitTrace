@@ -513,29 +513,51 @@ class AppServerClient:
                     )
                 await self._thread_queues[thread_id].put(message)
 
+    # codex-harness exposes a 6-word approval decision vocabulary.
+    # LitTrace rejects every approval server-initiated request because
+    # every domain mutation is already mediated by the Mcp Gateway's
+    # own CAS + idempotency check — letting codex run shell / patch
+    # commands would create a second write path. The full vocabulary
+    # is wired so a future deployment that wants to allow some
+    # decisions can flip a flag without rewriting the handler.
+    _APPROVAL_REJECTED_METHODS = frozenset(
+        {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "execCommandApproval",
+            "applyPatchApproval",
+        }
+    )
+
+    async def _reply_approval(
+        self, request_id: int | str, decision: str
+    ) -> None:
+        """Reply to a server-initiated approval request with one of
+        the codex-harness six-word vocabulary entries
+        (``accept`` / ``acceptForSession`` /
+        ``acceptWithExecpolicyAmendment`` /
+        ``applyNetworkPolicyAmendment`` / ``decline`` / ``cancel``).
+        """
+        await self._write(
+            {"id": request_id, "result": {"decision": decision}}
+        )
+
     async def _handle_server_request(
         self,
         request_id: int | str,
         method: str,
         params: dict[str, Any],
     ) -> None:
-        if method in {
-            "item/commandExecution/requestApproval",
-            "item/fileChange/requestApproval",
-        }:
-            await self._write({"id": request_id, "result": {"decision": "decline"}})
-            return
-        if method in {"execCommandApproval", "applyPatchApproval"}:
-            await self._write(
-                {
-                    "id": request_id,
-                    "result": {
-                        "decision": {"denied": {"rejection": "LitTrace runtime is read-only"}}
-                    },
-                }
-            )
+        if method in self._APPROVAL_REJECTED_METHODS:
+            # LitTrace is read-only at the App Server level. Every
+            # mutation goes through the Mcp Gateway's CAS + idempotent
+            # write path, so approving any of these would open a
+            # second write channel.
+            await self._reply_approval(request_id, "decline")
             return
         if method == "mcpServer/elicitation/request":
+            # Elicitation has a 3-state vocabulary (accept / decline
+            # / cancel), distinct from the 6-word approval set.
             await self._write(
                 {
                     "id": request_id,
@@ -544,6 +566,10 @@ class AppServerClient:
             )
             return
         if method == "item/permissions/requestApproval":
+            # Modern codex-harness folds network-policy amendment
+            # into the permissions flow. Returning an empty
+            # permissions set with scope=turn is the documented
+            # "no extra authorization granted" response.
             await self._write(
                 {
                     "id": request_id,
