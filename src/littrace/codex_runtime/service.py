@@ -288,12 +288,21 @@ class CodexAppServerChatService:
             self.state_store.upsert_session_state(
                 current_session.model_copy(update={"status": "idle"})
             )
+        # Round 5 compaction worker bookkeeping: bump turn_count
+        # and record the latest Usage.total_tokens so the worker
+        # can decide whether a thread has crossed the configured
+        # threshold. Usage is optional (older fakes do not set it)
+        # so the default 0 keeps the math safe.
+        total_tokens = turn.usage.total_tokens if turn.usage else 0
+        new_turn_count = (binding.turn_count or 0) + 1
         self.state_store.upsert_agent_thread_binding(
             binding.model_copy(
                 update={
                     "workspace_revision": latest_workspace.context.filters.workspace_revision,
                     "status": "active",
                     "last_error": None,
+                    "turn_count": new_turn_count,
+                    "last_total_tokens": total_tokens,
                 }
             )
         )
