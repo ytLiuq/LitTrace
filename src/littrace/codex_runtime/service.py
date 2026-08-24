@@ -18,6 +18,11 @@ from littrace.codex_runtime.runtime import (
     shared_runtime_manager,
 )
 from littrace.config import CodexHomeMode, LitTraceConfig, SandboxPolicy
+from littrace.codex_runtime.errors import (
+    BadRequestError,
+    InternalServerError,
+    UnauthorizedError,
+)
 from littrace.codex_runtime.rollout import RolloutRecorder, rollout_path_for
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
 from littrace.session import ChatSession
@@ -170,7 +175,7 @@ class CodexAppServerChatService:
             thread = await client.start_thread(thread_overrides)
             thread_id = str(thread.get("id") or "")
             if not thread_id:
-                raise AppServerError("thread/start did not return a thread id")
+                raise BadRequestError("thread/start did not return a thread id")
             binding = self.state_store.upsert_agent_thread_binding(
                 AgentThreadBindingRecord(
                     session_id=session.session_id,
@@ -335,12 +340,12 @@ class CodexAppServerChatService:
         runtime = self.config.agent_runtime
         if runtime.codex_home_mode == CodexHomeMode.ISOLATED:
             home = runtime.codex_home.expanduser().resolve()
-            raise AppServerError(
+            raise UnauthorizedError(
                 "The isolated LitTrace Codex home is not authenticated. "
                 f"Set CODEX_HOME={home!s} and run `codex login` once, or explicitly "
                 "set agent_runtime.codex_home_mode=shared during migration."
             )
-        raise AppServerError("Codex App Server is not authenticated")
+        raise UnauthorizedError("Codex App Server is not authenticated")
 
     async def _require_mcp_connection(
         self,
@@ -354,8 +359,22 @@ class CodexAppServerChatService:
             "get_workspace_context",
             {},
         )
+        # Round 4 P0 step 4: round 3 commit 3 wrapped gateway
+        # responses in McpResponse. The App Server's in-tree call_mcp_tool
+        # path returns the raw JSON-RPC ``result`` dict, so a
+        # successful health probe looks like ``{"success": True, ...}``
+        # while a failing one looks like ``{"success": False,
+        # "error": {"code": "...", ...}}``. Check both shapes.
+        if isinstance(result, dict) and result.get("success") is False:
+            err = result.get("error") or {}
+            raise BadRequestError(
+                f"LitTrace MCP health check failed: {err.get('message') or result.get('content')}",
+                additional_details=err,
+            )
         if result.get("isError") is True:
-            raise AppServerError(f"LitTrace MCP health check failed: {result.get('content')}")
+            raise InternalServerError(
+                f"LitTrace MCP health check failed: {result.get('content')}"
+            )
 
     def _latest_workspace(
         self,

@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 
 from littrace.codex_runtime.client import AppServerError, AppServerTurnResult
+from littrace.codex_runtime.errors import UnauthorizedError
 from littrace.codex_runtime.service import CodexAppServerChatService
 from littrace.config import LitTraceConfig, SandboxPolicy
 from littrace.models import ChatRequest, LiteratureWorkspace
@@ -178,7 +179,7 @@ def test_isolated_home_requires_its_own_login(tmp_path: Path) -> None:
     )
 
     with pytest.raises(
-        AppServerError,
+        UnauthorizedError,
         match="isolated LitTrace Codex home is not authenticated",
     ):
         asyncio.run(
