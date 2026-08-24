@@ -146,6 +146,16 @@ class AgentThreadBindingRecord(BaseModel):
     workspace_revision: int = 0
     status: str = "active"
     last_error: str | None = None
+    # Round 5 compaction worker fields. ``turn_count`` is incremented
+    # by ``_chat_with_client`` at the end of every turn;
+    # ``last_total_tokens`` carries the most recent ``Usage.total_tokens``
+    # for the threshold check; ``last_compacted_at`` is set by
+    # ``run_pending_compaction`` after a successful ``thread/compact``
+    # RPC, and is used to enforce a one-hour back-off between
+    # worker-driven compactions of the same thread.
+    turn_count: int = 0
+    last_total_tokens: int = 0
+    last_compacted_at: str | None = None
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
@@ -177,6 +187,7 @@ class AsyncTaskRecord(BaseModel):
         "parse_job",
         "table_job",
         "storyline_job",
+        "compaction_job",
     ]
     artifact_id: str = ""
     event_type: str = ""
@@ -290,6 +301,13 @@ class StateStore(Protocol):
     # ---- L3: async tasks (domain jobs + artifact pipelines) ---------------
 
     def enqueue_async_task(self, task: AsyncTaskRecord) -> AsyncTaskRecord: ...
+    def compaction_due_sessions(
+        self,
+        *,
+        threshold_turns: int,
+        threshold_tokens: int,
+        limit: int = 20,
+    ) -> list[tuple[str, str, int, int]]: ...
     def claim_pending_async_tasks(
         self,
         *,
@@ -423,6 +441,9 @@ class PostgresStateStore:
                     workspace_revision INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'active',
                     last_error TEXT,
+                    turn_count INTEGER NOT NULL DEFAULT 0,
+                    last_total_tokens INTEGER NOT NULL DEFAULT 0,
+                    last_compacted_at TEXT,
                     created_at TIMESTAMPTZ NOT NULL,
                     updated_at TIMESTAMPTZ NOT NULL
                 )
@@ -431,6 +452,22 @@ class PostgresStateStore:
             cur.execute(
                 f"CREATE INDEX IF NOT EXISTS agent_thread_bindings_status_idx "
                 f"ON {s}.agent_thread_bindings (status, updated_at)"
+            )
+            # Round 5: migration path for older deployments where
+            # agent_thread_bindings does not yet carry the three
+            # compaction fields. ADD COLUMN IF NOT EXISTS is
+            # idempotent; the DO $$ … EXCEPTION block keeps the
+            # already-deployed path alive on re-runs.
+            cur.execute(
+                f"DO $$ BEGIN "
+                f"  ALTER TABLE {s}.agent_thread_bindings "
+                f"    ADD COLUMN turn_count INTEGER NOT NULL DEFAULT 0; "
+                f"  ALTER TABLE {s}.agent_thread_bindings "
+                f"    ADD COLUMN last_total_tokens INTEGER NOT NULL DEFAULT 0; "
+                f"  ALTER TABLE {s}.agent_thread_bindings "
+                f"    ADD COLUMN last_compacted_at TEXT; "
+                f"EXCEPTION WHEN duplicate_column THEN NULL; "
+                f"END $$"
             )
 
             cur.execute(
@@ -1535,6 +1572,52 @@ class PostgresStateStore:
                 "updated_at": str(row[2]),
             }
         )
+
+    def compaction_due_sessions(
+        self,
+        *,
+        threshold_turns: int,
+        threshold_tokens: int,
+        limit: int = 20,
+    ) -> list[tuple[str, str, int, int]]:
+        """Return ``(session_id, codex_thread_id, turn_count, last_total_tokens)``
+        for sessions whose Codex thread is a compaction candidate.
+
+        A session is due when:
+          - its session_state status is ``idle`` or ``active``
+            (skipping ``draft`` / ``systemError`` / ``archived``),
+          - the binding has either reached ``threshold_turns`` or
+            ``threshold_tokens`` since the last compaction, and
+          - it has not been compacted in the last hour
+            (``last_compacted_at`` is null or older than
+            ``now() - interval '1 hour'``).
+
+        Bounded by ``limit``; highest-turn sessions first so the
+        worker drains the worst offenders.
+        """
+        self._ensure_schema()
+        s = self.schema_name
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT b.session_id, b.codex_thread_id,
+                       b.turn_count, b.last_total_tokens
+                FROM {s}.agent_thread_bindings b
+                JOIN {s}.session_state s2
+                  ON s2.session_id = b.session_id
+                WHERE s2.status IN ('idle', 'active')
+                  AND (b.turn_count >= %s OR b.last_total_tokens >= %s)
+                  AND (b.last_compacted_at IS NULL
+                       OR b.last_compacted_at < (now() - interval '1 hour'))
+                ORDER BY b.turn_count DESC
+                LIMIT %s
+                """,
+                (threshold_turns, threshold_tokens, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            (str(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in rows
+        ]
 
     def claim_pending_async_tasks(
         self,
