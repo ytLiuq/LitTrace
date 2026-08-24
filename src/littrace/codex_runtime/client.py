@@ -14,7 +14,10 @@ import os
 import shutil
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
+
+if TYPE_CHECKING:
+    from littrace.codex_runtime.rollout import RolloutRecorder
 
 
 class AppServerError(RuntimeError):
@@ -45,6 +48,7 @@ class AppServerClient:
         request_timeout: float = 60.0,
         stream_limit: int = 8 * 1024 * 1024,
         environment: dict[str, str] | None = None,
+        rollout_recorder: "RolloutRecorder | None" = None,
     ) -> None:
         if not command:
             raise ValueError("App Server command must not be empty")
@@ -65,6 +69,9 @@ class AppServerClient:
         self._stderr_tail: deque[str] = deque(maxlen=100)
         self._closed = False
         self.initialize_result: dict[str, Any] = {}
+        # Optional side-channel log for debugging. None by default so
+        # production deployments that do not opt in pay no cost.
+        self._rollout_recorder = rollout_recorder
 
     @property
     def running(self) -> bool:
@@ -222,6 +229,13 @@ class AppServerClient:
         )
         turn = _required_object(result, "turn")
         turn_id = _required_string(turn, "id")
+        if self._rollout_recorder is not None:
+            self._rollout_recorder.append(
+                type_="turn_start",
+                turn_id=turn_id,
+                thread_id=thread_id,
+                user_text=text,
+            )
         completed_messages: list[str] = []
         deltas: list[str] = []
 
@@ -288,6 +302,14 @@ class AppServerClient:
                     reply = "\n".join(part for part in completed_messages if part).strip()
                     if not reply:
                         reply = "".join(deltas).strip()
+                    if self._rollout_recorder is not None:
+                        self._rollout_recorder.append(
+                            type_="turn_complete",
+                            turn_id=turn_id,
+                            status=status,
+                            reply=reply,
+                            turn=completed_turn,
+                        )
                     if status not in {"completed", "interrupted"}:
                         error = completed_turn.get("error")
                         raise AppServerError(
@@ -394,6 +416,11 @@ class AppServerClient:
         if transport is not None:
             transport.close()
             await asyncio.sleep(0)
+        # Close the side-channel rollout recorder last so any
+        # pending events queued by the reader still get flushed.
+        if self._rollout_recorder is not None:
+            self._rollout_recorder.close()
+            self._rollout_recorder = None
         self._fail_pending(AppServerError("Codex App Server client closed"))
 
     async def _write(self, message: dict[str, Any]) -> None:
@@ -475,6 +502,15 @@ class AppServerClient:
             params = message.get("params") or {}
             thread_id = params.get("threadId")
             if isinstance(thread_id, str) and thread_id in self._thread_queues:
+                # Side-channel rollout log: capture the server
+                # notification before handing it to the turn consumer.
+                # Recorder writes are best-effort and never raise.
+                if self._rollout_recorder is not None:
+                    self._rollout_recorder.append(
+                        type_="event",
+                        method=method,
+                        params=params,
+                    )
                 await self._thread_queues[thread_id].put(message)
 
     async def _handle_server_request(
