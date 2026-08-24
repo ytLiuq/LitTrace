@@ -108,18 +108,19 @@ def save_session_rag_profile(
                 "last_refresh_error": existing.last_refresh_error,
             }
         )
-    target = session_rag_profile_path(session)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
+    # Round 3 topic B: rag profile now lives in
+    # session_state.rag_profile_json (Postgres). The disk mirror under
+    # <session>/workspace/rag/profile.json is no longer written; the
+    # helper functions session_rag_profile_path / session_rag_dir are
+    # kept for now so external scripts that import them do not break.
     return profile
 
 
 def persist_session_rag_profile(session: object, profile: RagProfile) -> RagProfile:
-    target = session_rag_profile_path(session)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    profile = profile.model_copy(update={"updated_at": datetime.now(UTC).isoformat()})
-    target.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
-    return profile
+    # Round 3 topic B: rag profile is now persisted to Postgres by
+    # the caller (save_workspace_locked's _sync_session_state). This
+    # helper only updates the in-memory updated_at and returns.
+    return profile.model_copy(update={"updated_at": datetime.now(UTC).isoformat()})
 
 
 def load_session_rag_profile(session: object) -> RagProfile | None:
