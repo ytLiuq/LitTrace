@@ -118,6 +118,7 @@ def main() -> None:
         "metrics",
         "setup-browser",
         "publisher-e2e",
+        "compaction",
     }:
         print(
             f"Unknown subcommand: {sys.argv[1]!r}. "
@@ -133,6 +134,10 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "rag":
         config = load_config()
         asyncio.run(_run_rag_command(config))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "compaction":
+        config = load_config()
+        asyncio.run(_run_compaction_command(config))
         return
     if len(sys.argv) > 1 and sys.argv[1] == "jobs":
         config = load_config()
@@ -217,6 +222,30 @@ async def _run_publisher_e2e_command(
         print(f"error={report.last_error}")
     if report.warnings:
         print("warnings=" + "；".join(report.warnings))
+
+
+async def _run_compaction_command(config) -> None:
+    from littrace.codex_runtime.compaction import (
+        run_pending_compaction,
+        run_pending_compaction_daemon,
+    )
+
+    if len(sys.argv) > 2 and sys.argv[2] == "daemon":
+        interval = 60.0
+        for arg in sys.argv[3:]:
+            if arg.startswith("--interval-seconds="):
+                interval = float(arg.split("=", 1)[1])
+        await run_pending_compaction_daemon(
+            config, interval_seconds=interval, run_immediately=True,
+        )
+        return
+    report = await run_pending_compaction(config)
+    print(
+        f"compaction finished: enqueued={report.enqueued} "
+        f"succeeded={report.succeeded} failed={report.failed}"
+    )
+    for warning in report.warnings:
+        print(f"  - {warning}")
 
 
 async def _run_sentinel_command(config) -> None:

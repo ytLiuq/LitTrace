@@ -32,6 +32,7 @@ logger = get_logger("api")
 LITTRACE_API_VERSION = "0.4"
 
 DOWNLOAD_RETRY_WORKER: DownloadRetryWorker | None = None
+COMPACTION_WORKER: "CompactionWorker | None" = None  # type: ignore[name-defined]
 
 
 @asynccontextmanager
@@ -186,26 +187,62 @@ WORKSPACE = api_state.get_workspace()
 
 def _start_background_workers() -> None:
     global DOWNLOAD_RETRY_WORKER
+    global COMPACTION_WORKER
     config = load_config()
-    if not config.download_retry.background_worker_enabled:
-        return
-    DOWNLOAD_RETRY_WORKER = DownloadRetryWorker(
-        download_task_store_from_config(config),
-        make_download_retry_handler(config),
-        interval_seconds=config.download_retry.interval_seconds,
-        batch_size=config.download_retry.batch_size,
-    )
-    DOWNLOAD_RETRY_WORKER.start()
-    logger.info("download_retry_worker_started")
+    if config.download_retry.background_worker_enabled:
+        DOWNLOAD_RETRY_WORKER = DownloadRetryWorker(
+            download_task_store_from_config(config),
+            make_download_retry_handler(config),
+            interval_seconds=config.download_retry.interval_seconds,
+            batch_size=config.download_retry.batch_size,
+        )
+        DOWNLOAD_RETRY_WORKER.start()
+        logger.info("download_retry_worker_started")
+    if config.compaction.background_worker_enabled:
+        from littrace.codex_runtime.compaction import CompactionWorker
+        from littrace.codex_runtime.runtime import shared_runtime_manager
+
+        # Reuse the existing runtime manager cache. The worker just
+        # calls ``get_client`` / ``release_client`` so the App
+        # Server process is started exactly once across both
+        # background workers.
+        manager = shared_runtime_manager(
+            (
+                ("codex", "app-server"),
+                config.agent_runtime.startup_timeout_seconds,
+                config.agent_runtime.request_timeout_seconds,
+                tuple(),
+            ),
+            ("codex", "app-server"),
+            client_options={},
+        )
+        COMPACTION_WORKER = CompactionWorker(
+            state_store_from_config(config),
+            interval_seconds=config.compaction.interval_seconds,
+            batch_size=config.compaction.batch_size,
+            threshold_turns=config.compaction.threshold_turns,
+            threshold_tokens=config.compaction.threshold_tokens,
+        )
+        # Stash the manager on the worker so run_pending_compaction
+        # can pick it up at the CLI / async path. (Daemon threads
+        # only do the cheap scan; the actual RPC runs via
+        # run_pending_compaction on the asyncio loop.)
+        COMPACTION_WORKER._runtime_manager = manager  # type: ignore[attr-defined]
+        COMPACTION_WORKER.start()
+        logger.info("compaction_worker_started")
 
 
 def _stop_background_workers() -> None:
     global DOWNLOAD_RETRY_WORKER
-    if DOWNLOAD_RETRY_WORKER is None:
-        return
-    DOWNLOAD_RETRY_WORKER.stop(timeout=5.0)
-    DOWNLOAD_RETRY_WORKER = None
-    logger.info("download_retry_worker_stopped")
+    global COMPACTION_WORKER
+    if DOWNLOAD_RETRY_WORKER is not None:
+        DOWNLOAD_RETRY_WORKER.stop(timeout=5.0)
+        DOWNLOAD_RETRY_WORKER = None
+        logger.info("download_retry_worker_stopped")
+    if COMPACTION_WORKER is not None:
+        COMPACTION_WORKER.stop(timeout=5.0)
+        COMPACTION_WORKER = None
+        logger.info("compaction_worker_stopped")
 
 
 def load_config(path: str = "config.yaml"):
