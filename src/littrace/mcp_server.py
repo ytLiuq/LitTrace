@@ -254,20 +254,39 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 arguments,
                 codex_thread_id=str(thread_id or ""),
             )
+            # Round 4 P0 step 3: wrap the tool's raw dict in the
+            # McpResponse envelope so the MCP client gets
+            # {success, data, warnings, error?} on every call. The
+            # legacy 8-tool branch (below) keeps its hand-built
+            # dict — the envelope is opt-in for the app-server
+            # path only because codex-harness clients need the
+            # explicit shape.
+            from littrace.codex_runtime.gateway import (
+                McpResponse,
+                ok_envelope,
+            )
+            envelope = ok_envelope(payload if isinstance(payload, dict) else {})
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps(payload, ensure_ascii=False, indent=2),
+                    text=envelope.model_dump_json(),
                 )
             ]
         except Exception as exc:  # noqa: BLE001 - MCP must return a structured tool error
             logger.error("gateway_tool_error", extra={"tool": name, "error": str(exc)})
+            from littrace.codex_runtime.errors import CodexErrorCode
+            from littrace.codex_runtime.gateway import err_envelope
+            error_code = getattr(exc, "error_code", CodexErrorCode.OTHER)
+            envelope = err_envelope(
+                error_code,
+                f"{exc.__class__.__name__}: {exc}",
+            )
             return CallToolResult(
                 isError=True,
                 content=[
                     TextContent(
                         type="text",
-                        text=f"LitTrace App Server tool failed: {exc.__class__.__name__}: {exc}",
+                        text=envelope.model_dump_json(),
                     )
                 ],
             )

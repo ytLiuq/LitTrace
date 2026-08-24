@@ -7,11 +7,86 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
 
+from pydantic import BaseModel, Field
+
+from littrace.codex_runtime.errors import (
+    AppServerError,
+    CodexErrorCode,
+)
 from littrace.config import LitTraceConfig
 from littrace.evaluation.quality_report import build_quality_report
 from littrace.models import LiteratureWorkspace, coerce_parsed
 from littrace.retrieval.rag_search import search_workspace_rag
 from littrace.state_db import AgentThreadBindingRecord, AsyncTaskRecord, StateStore
+
+
+class McpError(BaseModel):
+    """Mirror of codex-harness's structured error envelope."""
+
+    code: CodexErrorCode
+    message: str
+    details: dict[str, Any] | None = None
+
+
+class McpResponse(BaseModel):
+    """Uniform ``{success, error, data, warnings}`` envelope.
+
+    Every gateway tool returns an instance of this class. The
+    serialised form (via ``model_dump(mode="json")``) is what the
+    MCP stdio server writes to ``TextContent.text``. Downstream
+    consumers dispatch on ``success`` first and then look at
+    ``data`` / ``error`` / ``warnings``.
+
+    ``__getitem__`` and ``__contains__`` look up keys in ``data``
+    first, falling back to envelope-level fields. This keeps the
+    pre-envelope test contract (``assert result["xxx"] == ...``)
+    working so the rollout can be incremental.
+    """
+
+    success: bool
+    data: dict[str, Any] | None = None
+    error: McpError | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+    def __getitem__(self, key: str) -> Any:
+        if self.data is not None and key in self.data:
+            return self.data[key]
+        if key in ("success", "data", "error", "warnings"):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> bool:
+        if not isinstance(key, str):
+            return False
+        if self.data is not None and key in self.data:
+            return True
+        return key in ("success", "data", "error", "warnings")
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+def ok_envelope(
+    data: dict[str, Any], warnings: list[str] | None = None
+) -> McpResponse:
+    return McpResponse(
+        success=True, data=data, warnings=warnings or [],
+    )
+
+
+def err_envelope(
+    code: CodexErrorCode,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> McpResponse:
+    return McpResponse(
+        success=False,
+        error=McpError(code=code, message=message, details=details),
+    )
 
 READ_ONLY_TOOL_NAMES = (
     "get_workspace_context",
