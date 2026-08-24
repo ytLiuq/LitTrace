@@ -150,6 +150,12 @@ def main(argv: list[str] | None = None) -> int:
     log.info("scanning %s (dry_run=%s)", sessions_dir, args.dry_run)
     store = state_store_from_config(config)
     if not args.dry_run:
+        # ``_ensure_schema`` is idempotent and adds the round-5
+        # compaction columns (``turn_count`` /
+        # ``last_total_tokens`` / ``last_compacted_at``) on
+        # ``agent_thread_bindings`` if a previous deployment has not
+        # yet picked them up. New deployments get them from the
+        # CREATE TABLE branch.
         store._ensure_schema()  # type: ignore[attr-defined]
 
     counts = {"migrated": 0, "skipped": 0, "would-migrate": 0}
