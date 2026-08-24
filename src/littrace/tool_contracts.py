@@ -348,6 +348,20 @@ def run_sync_tool(
 
 
 LITTRACE_TOOL_CONTRACTS: dict[str, ToolContract] = {
+    "skill_creator": ToolContract(
+        name="skill_creator",
+        category="meta",
+        description="Generate a SKILL.md + run.py skeleton for a new skill.",
+        input_schema="skill_name + description + when_to_use",
+        output_schema="dict[str, str]",
+    ),
+    "review_agent": ToolContract(
+        name="review_agent",
+        category="meta",
+        description="Self-check the current workspace before submission.",
+        input_schema="ChatSession + LiteratureWorkspace",
+        output_schema="dict with score and findings",
+    ),
     "build_research_plan": ToolContract(
         name="build_research_plan",
         category="planning",
