@@ -232,46 +232,85 @@ def save_workspace(
         )
 
 
-def _save_workspace_locked(
+def _ensure_session_dirs(session: ChatSession) -> None:
+    """mkdir the on-disk directories that downstream artifact fallouts
+    (parse, evidence, rag, releases) write into. The session root is
+    also created so that callers running on a fresh checkout do not
+    trip a ``FileNotFoundError`` before the first save.
+    """
+    for path in (
+        session.root,
+        session.workspace_dir,
+        session.structured_documents_dir,
+        session.snapshots_dir,
+        session.evidence_dir,
+        session.releases_dir,
+        session.rag_dir,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def _bump_workspace_revision(
+    workspace: LiteratureWorkspace, expected_revision: int,
+) -> int:
+    """Set ``workspace.context.filters.workspace_revision`` to
+    ``expected_revision + 1`` and return the new value. The increment
+    is the only place that touches the revision counter, so the
+    caller knows the post-condition exactly.
+    """
+    new_revision = expected_revision + 1
+    workspace.context.filters.workspace_revision = new_revision
+    return new_revision
+
+
+def _compute_workspace_sha256(workspace: LiteratureWorkspace) -> str:
+    """Return a stable content hash for the workspace JSON.
+
+    Used to detect a CAS mismatch and to index the snapshot side
+    table. The hash covers the full JSON dump including
+    ``context.filters.workspace_revision`` so the same logical
+    workspace always hashes the same way.
+    """
+    return sha256(workspace.model_dump_json(indent=2).encode("utf-8")).hexdigest()
+
+
+def _apply_rag_metadata_to_workspace(
+    workspace: LiteratureWorkspace,
+    rag_profile: Any,
+    config: LitTraceConfig,
+) -> None:
+    """Copy the relevant fields from a built ``RagProfile`` into the
+    workspace's ``context.filters`` so downstream consumers can read
+    them from a single source.
+    """
+    workspace.context.filters.rag_profile = rag_profile.model_dump(mode="json")
+    workspace.context.filters.rag_enabled = config.rag.enabled
+    workspace.context.filters.rag_backend = config.rag.backend
+    workspace.context.filters.rag_source_routes = list(rag_profile.source_routes)
+    workspace.context.filters.rag_last_refreshed_at = rag_profile.last_refreshed_at
+
+
+def _build_save_manifest(
     session: ChatSession,
     workspace: LiteratureWorkspace,
     *,
+    artifact_index: dict[str, object],
+    memory: Any,
+    rag_profile: Any,
     config: LitTraceConfig | None,
-    state_store,
-    expected_revision: int,
-) -> None:
-    session.root.mkdir(parents=True, exist_ok=True)
-    session.workspace_dir.mkdir(parents=True, exist_ok=True)
-    session.structured_documents_dir.mkdir(parents=True, exist_ok=True)
-    session.snapshots_dir.mkdir(parents=True, exist_ok=True)
-    session.evidence_dir.mkdir(parents=True, exist_ok=True)
-    session.releases_dir.mkdir(parents=True, exist_ok=True)
-    session.rag_dir.mkdir(parents=True, exist_ok=True)
-    workspace.context.filters.workspace_revision = expected_revision + 1
-    _persist_structured_documents(session, workspace)
-    _persist_evidence_and_releases(session, workspace)
-    rag_profile = save_session_rag_profile(config, session, workspace) if config is not None else None
-    if rag_profile is not None:
-        workspace.context.filters.rag_profile = rag_profile.model_dump(mode="json")
-        workspace.context.filters.rag_enabled = config.rag.enabled
-        workspace.context.filters.rag_backend = config.rag.backend
-        workspace.context.filters.rag_source_routes = list(rag_profile.source_routes)
-        workspace.context.filters.rag_last_refreshed_at = rag_profile.last_refreshed_at
-    workspace_json = workspace.model_dump_json(indent=2)
-    workspace_sha256 = sha256(workspace_json.encode("utf-8")).hexdigest()
-    artifact_index = _build_artifact_index(
-        session, workspace, snapshot_path=None, config=config,
-    )
-    workspace.context.filters.artifact_index = artifact_index
-    memory = build_session_memory(
-        workspace,
-        session_id=session.session_id,
-        artifact_index=artifact_index,
-    )
-    manifest = {
+    workspace_sha256: str,
+    revision: int,
+) -> dict[str, object]:
+    """Assemble the manifest dict that the JSON mirror used to hold.
+
+    Postgres is the source of truth, but the same dict is embedded
+    into ``session_state.manifest_json`` for callers that want a
+    single round-trip read.
+    """
+    return {
         "schema": "littrace.session_workspace.v2",
         "session_id": session.session_id,
-        "revision": workspace.context.filters.workspace_revision,
+        "revision": revision,
         "workspace_sha256": workspace_sha256,
         "storage_mode": "session-workspace",
         "artifact_storage": artifact_index.get("storage"),
@@ -284,6 +323,35 @@ def _save_workspace_locked(
         "structured_document_count": workspace.context.filters.structured_document_count,
         "workspace_snapshot_count": workspace.context.filters.workspace_snapshot_count,
     }
+
+
+def _register_postgres_artifacts(
+    session: ChatSession,
+    workspace: LiteratureWorkspace,
+    manifest: dict[str, object],
+    artifact_index: dict[str, object],
+    memory: Any,
+    rag_profile: Any,
+    *,
+    config: LitTraceConfig | None,
+    state_store: Any,
+    expected_revision: int,
+) -> None:
+    """The three post-CAS steps in a fixed order:
+
+      1. ``_sync_session_state`` — the CAS update / INSERT that makes
+         the new revision visible to other readers.
+      2. ``_capture_workspace_snapshot`` — append the per-revision
+         row to the snapshot side table.
+      3. ``_register_artifacts`` — register blob references with the
+         artifact registry so future RAG rebuilds can find the files.
+
+    Steps 1 and 2 must run in that order — the snapshot must not
+    exist for a revision that is not yet visible in
+    ``session_state``. Step 3 is last because it is the only one
+    that talks to ``artifact_store`` and should not happen for a
+    revision that did not actually commit.
+    """
     _sync_session_state(
         session,
         workspace,
@@ -294,16 +362,71 @@ def _save_workspace_locked(
         state_store=state_store,
         expected_revision=expected_revision,
     )
-    # Postgres is the source of truth. Append the per-revision
-    # snapshot to the side table after the CAS row commits so a
-    # snapshot never exists for a revision that is not yet visible.
     _capture_workspace_snapshot(
         session,
         workspace,
         state_store=state_store,
-        workspace_sha256=workspace_sha256,
+        workspace_sha256=manifest["workspace_sha256"],
     )
     _register_artifacts(session, artifact_index, config, rag_profile=rag_profile)
+
+
+def _save_workspace_locked(
+    session: ChatSession,
+    workspace: LiteratureWorkspace,
+    *,
+    config: LitTraceConfig | None,
+    state_store,
+    expected_revision: int,
+) -> None:
+    """Compose the save pipeline from the single-purpose helpers.
+
+    Each step is a one-call expression so a future change to any
+    one (e.g. a new ``_build_manifest`` field, or a different
+    directory layout) lands in a clearly bounded function.
+    """
+    _ensure_session_dirs(session)
+    _persist_structured_documents(session, workspace)
+    _persist_evidence_and_releases(session, workspace)
+    rag_profile = (
+        save_session_rag_profile(config, session, workspace)
+        if config is not None
+        else None
+    )
+    if rag_profile is not None and config is not None:
+        _apply_rag_metadata_to_workspace(workspace, rag_profile, config)
+    new_revision = _bump_workspace_revision(workspace, expected_revision)
+    workspace_sha256 = _compute_workspace_sha256(workspace)
+    artifact_index = _build_artifact_index(
+        session, workspace, snapshot_path=None, config=config,
+    )
+    workspace.context.filters.artifact_index = artifact_index
+    memory = build_session_memory(
+        workspace,
+        session_id=session.session_id,
+        artifact_index=artifact_index,
+    )
+    manifest = _build_save_manifest(
+        session,
+        workspace,
+        artifact_index=artifact_index,
+        memory=memory,
+        rag_profile=rag_profile,
+        config=config,
+        workspace_sha256=workspace_sha256,
+        revision=new_revision,
+    )
+    _register_postgres_artifacts(
+        session,
+        workspace,
+        manifest,
+        artifact_index,
+        memory,
+        rag_profile,
+        config=config,
+        state_store=state_store,
+        expected_revision=expected_revision,
+    )
 
 
 def append_message(
