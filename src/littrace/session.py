@@ -24,6 +24,7 @@ from littrace.lifecycle import enqueue_embedding_outbox
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
 from littrace.state_db import (
     SessionStateRecord,
+    SessionStateSnapshotRecord,
     state_store_from_config,
 )
 from littrace.retrieval.pgvector_store import PgvectorRagStore
@@ -252,12 +253,11 @@ def _save_workspace_locked(
         workspace.context.filters.rag_source_routes = list(rag_profile.source_routes)
         workspace.context.filters.rag_last_refreshed_at = rag_profile.last_refreshed_at
     workspace_json = workspace.model_dump_json(indent=2)
-    _atomic_write(session.workspace_path, workspace_json)
-    snapshot_path = _persist_workspace_snapshot(session, workspace)
-    artifact_index = _build_artifact_index(session, workspace, snapshot_path, config=config)
+    workspace_sha256 = sha256(workspace_json.encode("utf-8")).hexdigest()
+    artifact_index = _build_artifact_index(
+        session, workspace, snapshot_path=None, config=config,
+    )
     workspace.context.filters.artifact_index = artifact_index
-    workspace_json = workspace.model_dump_json(indent=2)
-    _atomic_write(session.workspace_path, workspace_json)
     memory = build_session_memory(
         workspace,
         session_id=session.session_id,
@@ -267,23 +267,18 @@ def _save_workspace_locked(
         "schema": "littrace.session_workspace.v2",
         "session_id": session.session_id,
         "revision": workspace.context.filters.workspace_revision,
-        "workspace_sha256": sha256(workspace_json.encode("utf-8")).hexdigest(),
+        "workspace_sha256": workspace_sha256,
         "storage_mode": "session-workspace",
         "artifact_storage": artifact_index.get("storage"),
         "rag_enabled": bool(rag_profile and config and config.rag.enabled),
         "rag": rag_profile.model_dump(mode="json") if rag_profile is not None else None,
         "rag_profile_path": str(session_rag_profile_path(session)),
-        "workspace_path": str(session.workspace_path),
         "structured_documents_dir": str(session.structured_documents_dir),
         "artifact_index_path": str(session.artifact_index_path),
         "snapshots_dir": str(session.snapshots_dir),
         "structured_document_count": workspace.context.filters.structured_document_count,
         "workspace_snapshot_count": workspace.context.filters.workspace_snapshot_count,
     }
-    _atomic_write(
-        session.artifact_index_path,
-        json.dumps(artifact_index, ensure_ascii=False, indent=2),
-    )
     _sync_session_state(
         session,
         workspace,
@@ -294,11 +289,14 @@ def _save_workspace_locked(
         state_store=state_store,
         expected_revision=expected_revision,
     )
-    # Postgres is the source of truth. Publish the filesystem commit marker
-    # and external artifact registrations only after the CAS succeeds.
-    _atomic_write(
-        session.workspace_dir / "manifest.json",
-        json.dumps(manifest, ensure_ascii=False, indent=2),
+    # Postgres is the source of truth. Append the per-revision
+    # snapshot to the side table after the CAS row commits so a
+    # snapshot never exists for a revision that is not yet visible.
+    _capture_workspace_snapshot(
+        session,
+        workspace,
+        state_store=state_store,
+        workspace_sha256=workspace_sha256,
     )
     _register_artifacts(session, artifact_index, config, rag_profile=rag_profile)
 
@@ -428,16 +426,32 @@ def _persist_evidence_and_releases(session: ChatSession, workspace: LiteratureWo
         _atomic_write(target, snapshot.model_dump_json(indent=2))
 
 
-def _persist_workspace_snapshot(session: ChatSession, workspace: LiteratureWorkspace) -> Path:
-    existing = sorted(session.snapshots_dir.glob("workspace-*.json"))
+def _capture_workspace_snapshot(
+    session: ChatSession,
+    workspace: LiteratureWorkspace,
+    *,
+    state_store,
+    workspace_sha256: str,
+) -> None:
+    """Append the workspace to the Postgres snapshots side table.
+
+    The on-disk ``<session.root>/workspace/snapshots/workspace-*.json``
+    files were dropped in round 3 topic B; this function is the new
+    home for per-revision history. ``state_store.upsert_session_snapshot``
+    is INSERT ON CONFLICT DO NOTHING, so re-saving the same revision
+    is a no-op rather than overwriting prior history.
+    """
+    snapshot_count = state_store.list_session_snapshots(session.session_id, limit=1000)
     limit = max(1, int(getattr(session, "snapshot_limit", 30)))
-    for stale in existing[: max(0, len(existing) - limit + 1)]:
-        stale.unlink(missing_ok=True)
-    workspace.context.filters.workspace_snapshot_count = min(len(existing) + 1, limit)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    target = session.snapshots_dir / f"workspace-{timestamp}.json"
-    _atomic_write(target, workspace.model_dump_json(indent=2))
-    return target
+    workspace.context.filters.workspace_snapshot_count = min(len(snapshot_count) + 1, limit)
+    state_store.upsert_session_snapshot(
+        SessionStateSnapshotRecord(
+            session_id=session.session_id,
+            revision=workspace.context.filters.workspace_revision,
+            workspace_sha256=workspace_sha256,
+            workspace_json=json.loads(workspace.model_dump_json()),
+        )
+    )
 
 
 def _workspace_revision(workspace: LiteratureWorkspace) -> int:
@@ -569,14 +583,17 @@ def _build_artifact_index(
             format="json",
             filename="current.json",
         ),
-        artifact_entry(
-            kind="workspace_snapshot",
-            artifact_id=snapshot_path.stem,
-            path=snapshot_path,
-            format="json",
-            filename=snapshot_path.name,
-        ),
     ]
+    if snapshot_path is not None:
+        artifacts.append(
+            artifact_entry(
+                kind="workspace_snapshot",
+                artifact_id=snapshot_path.stem,
+                path=snapshot_path,
+                format="json",
+                filename=snapshot_path.name,
+            )
+        )
     if config is not None:
         for paper_id, paper in workspace.papers.items():
             pdf_path = target_pdf_path(config, paper)

@@ -51,11 +51,14 @@ def test_session_folder_persists_workspace_and_messages(tmp_path):
     save_workspace(session, workspace)
     append_message(session, "user", ChatRequest(message="hello"))
 
-    assert session.workspace_path.exists()
+    # Postgres is the source of truth (round 3 topic B): the
+    # workspace.json / manifest.json / artifact_index.json disk
+    # mirrors are no longer written. The remaining disk paths
+    # are for parse / evidence / release / rag / snapshot
+    # artifact fallouts, which still exist.
     assert session.workspace_dir == session.root / "workspace"
     assert session.structured_documents_dir == session.root / "workspace" / "structured_documents"
     assert session.structured_documents_dir.exists()
-    assert session.artifact_index_path.exists()
     assert session.snapshots_dir.exists()
     assert session.evidence_dir.exists()
     assert session.releases_dir.exists()
@@ -80,10 +83,13 @@ def test_session_persists_user_scoped_rag_profile(tmp_path):
 
     save_workspace(session, workspace, config=config)
 
-    profile_path = session.workspace_dir / "rag" / "profile.json"
-    manifest_path = session.workspace_dir / "manifest.json"
-    profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # rag/profile.json and manifest.json are no longer written
+    # (round 3 topic B); the canonical data lives in Postgres.
+    store = _session_state_store(session, config)
+    record = store.get_session_state(session.session_id)
+    assert record is not None
+    profile = record.rag_profile_json
+    manifest = record.manifest_json
 
     assert profile["session_id"] == session.session_id
     assert profile["backend"] == "pgvector"
@@ -230,10 +236,13 @@ def test_chat_trail_fk_survives_background_first(tmp_path):
     assert sum("Workspace revision mismatch" in (outcome or "") for outcome in outcomes) == 1
 
     canonical = load_workspace(session)
-    materialized = LiteratureWorkspace.model_validate_json(
-        session.workspace_path.read_text(encoding="utf-8")
-    )
-    manifest = json.loads((session.workspace_dir / "manifest.json").read_text(encoding="utf-8"))
+    # Postgres is the source of truth (round 3 topic B) — no
+    # workspace.json or manifest.json on disk.
+    materialized = canonical
+    store = _session_state_store(session, config)
+    record = store.get_session_state(session.session_id)
+    assert record is not None
+    manifest = record.manifest_json
     # create_chat_session now seeds revision=0 status='draft', so the
     # one writer that wins the CAS bump lands at revision=1.
     assert canonical.context.filters.workspace_revision == 1
@@ -241,7 +250,11 @@ def test_chat_trail_fk_survives_background_first(tmp_path):
     assert materialized.context.filters.topic == canonical.context.filters.topic
     assert canonical.context.filters.topic in {"writer-a", "writer-b"}
     assert manifest["revision"] == 1
-    assert len(list(session.snapshots_dir.glob("workspace-*.json"))) == 1
+    # Snapshots now live in session_state_snapshots, not on disk.
+    snapshots = _session_state_store(session).list_session_snapshots(
+        session.session_id
+    )
+    assert len(snapshots) == 1
 
 
 def test_delete_session_reports_object_storage_failures(monkeypatch, tmp_path):
