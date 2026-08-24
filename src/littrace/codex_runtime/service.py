@@ -18,6 +18,7 @@ from littrace.codex_runtime.runtime import (
     shared_runtime_manager,
 )
 from littrace.config import CodexHomeMode, LitTraceConfig, SandboxPolicy
+from littrace.codex_runtime.rollout import RolloutRecorder, rollout_path_for
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
 from littrace.session import ChatSession
 from littrace.state_db import AgentThreadBindingRecord, StateStore, state_store_from_config
@@ -65,35 +66,55 @@ class CodexAppServerChatService:
     ) -> tuple[ChatResponse, LiteratureWorkspace]:
         scratch_dir = self._scratch_dir(session.session_id)
         scratch_dir.mkdir(parents=True, exist_ok=True)
-        async with _agent_binding_lock(self.state_store, session.session_id):
-            if self.runtime_manager is not None:
-                turn, latest_workspace = await self.runtime_manager.use(
-                    lambda client: self._chat_with_client(
-                        client, request, workspace, session, scratch_dir,
-                        cancellation,
-                    )
+        # Optional side-channel rollout log for debugging. Opt-in via
+        # config.agent_runtime.rollout_enabled; never on by default.
+        recorder: RolloutRecorder | None = None
+        if self.config.agent_runtime.rollout_enabled:
+            recorder = RolloutRecorder(
+                rollout_path_for(
+                    session, base_dir=self.config.agent_runtime.rollout_dir,
                 )
-            elif self.client_factory is AppServerClient:
-                manager = self._shared_runtime_manager()
-                turn, latest_workspace = await manager.use(
-                    lambda client: self._chat_with_client(
-                        client, request, workspace, session, scratch_dir,
-                        cancellation,
+            )
+            recorder.open()
+        try:
+            async with _agent_binding_lock(self.state_store, session.session_id):
+                if self.runtime_manager is not None:
+                    turn, latest_workspace = await self.runtime_manager.use(
+                        lambda client: self._chat_with_client(
+                            client, request, workspace, session, scratch_dir,
+                            cancellation, recorder,
+                        )
                     )
-                )
-            else:
-                # Custom factories are intentionally ephemeral.  This keeps
-                # unit/integration fakes deterministic and gives embedders an
-                # explicit runtime_manager injection point for reuse.
-                client = self.client_factory(
-                    self._codex_command(),
-                    **self._client_options(),
-                )
-                async with client:
-                    turn, latest_workspace = await self._chat_with_client(
-                        client, request, workspace, session, scratch_dir,
-                        cancellation,
+                elif self.client_factory is AppServerClient:
+                    manager = self._shared_runtime_manager(
+                        rollout_recorder=recorder,
                     )
+                    turn, latest_workspace = await manager.use(
+                        lambda client: self._chat_with_client(
+                            client, request, workspace, session, scratch_dir,
+                            cancellation, recorder,
+                        )
+                    )
+                else:
+                    # Custom factories are intentionally ephemeral.
+                    # They typically inject their own fake client, so
+                    # the recorder injection happens via client_factory
+                    # closure rather than through runtime_manager.
+                    client = self.client_factory(
+                        self._codex_command(),
+                        **self._client_options(rollout_recorder=recorder),
+                    )
+                    async with client:
+                        turn, latest_workspace = await self._chat_with_client(
+                            client, request, workspace, session, scratch_dir,
+                            cancellation, recorder,
+                        )
+        finally:
+            # Close the recorder after the App Server has returned the
+            # terminal event so any straggler frames (orphan
+            # notifications after turn/completed) still get appended.
+            if recorder is not None:
+                recorder.close()
         reply = turn.reply or "Codex App Server completed the turn without a text response."
         # Surface the terminal status as the chat action so the route
         # layer can route the response into the right action group
@@ -121,7 +142,13 @@ class CodexAppServerChatService:
         session: ChatSession,
         scratch_dir: Path,
         cancellation: asyncio.Event | None = None,
+        recorder: RolloutRecorder | None = None,
     ):
+        # The runtime_manager keeps one client across calls. Refresh
+        # the recorder reference so each chat writes to its own file
+        # even when the manager hands back a previously-cached client.
+        if recorder is not None:
+            client._rollout_recorder = recorder
         runtime = self.config.agent_runtime
         await self._require_authentication(client)
         thread_overrides = self._thread_overrides(scratch_dir)
@@ -176,17 +203,27 @@ class CodexAppServerChatService:
         )
         return turn, latest_workspace
 
-    def _client_options(self) -> dict[str, Any]:
+    def _client_options(
+        self,
+        *,
+        rollout_recorder: RolloutRecorder | None = None,
+    ) -> dict[str, Any]:
         runtime = self.config.agent_runtime
-        return {
+        options: dict[str, Any] = {
             "startup_timeout": runtime.startup_timeout_seconds,
             "request_timeout": runtime.request_timeout_seconds,
             "environment": self._codex_environment(),
         }
+        if rollout_recorder is not None:
+            options["rollout_recorder"] = rollout_recorder
+        return options
 
-    def _shared_runtime_manager(self) -> CodexAppServerRuntimeManager:
+    def _shared_runtime_manager(
+        self,
+        rollout_recorder: RolloutRecorder | None = None,
+    ) -> CodexAppServerRuntimeManager:
         command = self._codex_command()
-        options = self._client_options()
+        options = self._client_options(rollout_recorder=rollout_recorder)
         key = (
             tuple(command),
             options["startup_timeout"],

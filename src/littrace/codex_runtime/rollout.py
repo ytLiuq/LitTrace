@@ -29,7 +29,13 @@ log = logging.getLogger(__name__)
 
 
 class RolloutRecorder:
-    """Synchronous append-only writer for codex turn events."""
+    """Synchronous append-only writer for codex turn events.
+
+    One LitTrace session maps to one JSONL file. Individual turns
+    are tagged via the ``turn_id`` field on each event so an
+    operator can ``jq 'select(.turn_id == "...")'`` to carve out a
+    single turn without juggling multiple files.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -94,16 +100,14 @@ class RolloutRecorder:
 
 def rollout_path_for(
     session: "ChatSession",
-    turn_id: str,
     *,
     base_dir: Path | None = None,
 ) -> Path:
-    """Resolve the per-turn JSONL path for a session.
+    """Resolve the per-session JSONL path.
 
-    ``base_dir=None`` puts the file under
-    ``<session.root>/rollouts/`` so each LitTrace session owns its
-    own rollout tree and the operator can ``rm -rf`` the directory
-    when archiving a session.
+    ``base_dir=None`` puts the file under ``<session.root>/rollouts/``
+    so each LitTrace session owns its own rollout tree and the
+    operator can ``rm -rf`` the directory when archiving a session.
     """
     root = base_dir if base_dir is not None else session.root / "rollouts"
-    return root / f"rollout-{session.session_id}-{turn_id}.jsonl"
+    return root / f"rollout-{session.session_id}.jsonl"
