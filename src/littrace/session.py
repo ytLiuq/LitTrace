@@ -43,7 +43,13 @@ class ChatSession(BaseModel):
     metadata_schema_name: str = "littrace"
     root: Path
     workspace_dir: Path
-    workspace_path: Path
+    # workspace_path / artifact_index_path on the JSON mirror
+    # are gone in round 3 topic B — Postgres is the source of truth.
+    # We still carry artifact_index_path so the artifact_index dict
+    # can be persisted to disk for parse outputs, but the JSON
+    # workspace.json / artifact_index.json / manifest.json files
+    # are no longer written here. messages_path remains as a dead
+    # field (never written) for now.
     messages_path: Path
     artifacts_dir: Path
     artifact_index_path: Path
@@ -71,7 +77,6 @@ class ChatSession(BaseModel):
             metadata_schema_name=config.metadata_store.schema_name if config is not None else "littrace",
             root=root,
             workspace_dir=workspace_dir,
-            workspace_path=root / "workspace.json",
             messages_path=root / "messages.jsonl",
             artifacts_dir=root / "artifacts",
             artifact_index_path=workspace_dir / "artifact_index.json",
@@ -500,15 +505,6 @@ def _assert_workspace_revision(
         )
 
 
-def _load_latest_snapshot(session: ChatSession) -> LiteratureWorkspace | None:
-    for snapshot in sorted(session.snapshots_dir.glob("workspace-*.json"), reverse=True):
-        try:
-            return LiteratureWorkspace.model_validate_json(snapshot.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-    return None
-
-
 def _atomic_write(path: Path, content: str) -> None:
     """Durably replace one workspace artifact without exposing a partial file."""
 
@@ -576,10 +572,14 @@ def _build_artifact_index(
         return entry
 
     artifacts: list[dict[str, object]] = [
+        # workspace.json is no longer on disk (round 3 topic B). The
+        # "current" workspace lives in session_state.workspace_json
+        # so we record a metadata-only entry that points operators at
+        # the Postgres row instead of a file path.
         artifact_entry(
             kind="workspace",
             artifact_id="current",
-            path=session.workspace_path,
+            path=None,
             format="json",
             filename="current.json",
         ),

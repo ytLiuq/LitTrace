@@ -319,7 +319,14 @@ async def _run_rag_command(config) -> None:
         for session_dir in sorted(root.iterdir()):
             if not session_dir.is_dir() or session_dir.name == "sentinel":
                 continue
-            if not (session_dir / "workspace.json").exists():
+            # Postgres is the source of truth (round 3 topic B). A
+            # session is "live" when it has a session_state row;
+            # sessions that have a directory but no Postgres row are
+            # pre-migration leftovers and the migration script
+            # handles them. Skip them here so refresh-all does not
+            # touch cold backups.
+            session_id = session_dir.name
+            if state_store_from_config(config).get_session_state(session_id) is None:
                 continue
             try:
                 session = load_or_create_session(config, session_dir.name)

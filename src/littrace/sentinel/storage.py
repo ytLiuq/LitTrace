@@ -17,8 +17,9 @@ class SentinelStore:
     watchlist_id: str
     root: Path
     workspace_dir: Path
-    workspace_path: Path
-    messages_path: Path
+    # workspace_path / messages_path removed in round 3 topic B —
+    # Postgres is the source of truth. Sentinel subscribes to chat
+    # traffic through the same StateStore surface the chat path uses.
     artifacts_dir: Path
     artifact_index_path: Path
     snapshots_dir: Path
@@ -53,8 +54,6 @@ def get_sentinel_store(config: LitTraceConfig, watchlist_id: str) -> SentinelSto
         watchlist_id=watchlist_id,
         root=root,
         workspace_dir=workspace_dir,
-        workspace_path=root / "workspace.json",
-        messages_path=root / "messages.jsonl",
         artifacts_dir=artifacts_dir,
         artifact_index_path=workspace_dir / "artifact_index.json",
         snapshots_dir=snapshots_dir,
@@ -144,8 +143,7 @@ def save_sentinel_workspace(
             "session_id": store.session_id,
             "root": store.root,
             "workspace_dir": store.workspace_dir,
-            "workspace_path": store.workspace_path,
-            "messages_path": store.messages_path,
+            "messages_path": store.root / "messages.jsonl",  # never written
             "artifacts_dir": store.artifacts_dir,
             "artifact_index_path": store.artifact_index_path,
             "snapshots_dir": store.snapshots_dir,
@@ -171,8 +169,7 @@ def load_sentinel_workspace(store: SentinelStore) -> LiteratureWorkspace:
             "session_id": store.session_id,
             "root": store.root,
             "workspace_dir": store.workspace_dir,
-            "workspace_path": store.workspace_path,
-            "messages_path": store.messages_path,
+            "messages_path": store.root / "messages.jsonl",  # never written
             "artifacts_dir": store.artifacts_dir,
             "artifact_index_path": store.artifact_index_path,
             "snapshots_dir": store.snapshots_dir,

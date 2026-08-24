@@ -368,11 +368,16 @@ def iter_workspace_session_ids(sessions_dir: Path) -> list[str]:
     if not sessions_dir.exists():
         return []
     session_ids: list[str] = []
+    store = state_store_from_config(config)
     for session_dir in sorted(sessions_dir.iterdir()):
         if not session_dir.is_dir() or session_dir.name == "sentinel":
             continue
-        if (session_dir / "workspace.json").exists():
-            session_ids.append(session_dir.name)
+        # Round 3 topic B: Postgres is the source of truth. Only
+        # sessions with a session_state row are live; pre-migration
+        # disk-only leftovers are skipped.
+        if store.get_session_state(session_dir.name) is None:
+            continue
+        session_ids.append(session_dir.name)
     return session_ids
 
 
