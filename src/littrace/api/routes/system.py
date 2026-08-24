@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
+from pydantic import BaseModel
 
 from littrace.access_layer.browser_sessions import BrowserActStatus, check_browser_act
 from littrace.config import load_config
@@ -20,9 +21,15 @@ from littrace.retrieval.source_router import route_sources
 router = APIRouter(tags=["system"])
 
 
-@router.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+class HealthResponse(BaseModel):
+    """Cheap liveness probe used by container orchestrators."""
+
+    status: str
+
+
+@router.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    return HealthResponse(status="ok")
 
 
 @router.get("/metrics")
