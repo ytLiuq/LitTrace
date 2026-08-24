@@ -111,6 +111,24 @@ class SessionSummaryRecord(BaseModel):
     revision: int = 0
 
 
+class SessionStateSnapshotRecord(BaseModel):
+    """Per-revision snapshot of a session's workspace.
+
+    Snapshots are append-only — a given (session_id, revision) is
+    written at most once. The table is the new home for what used to
+    live under ``<session.root>/workspace/snapshots/workspace-*.json``
+    on disk, so the workspace single-source-of-truth refactor (round
+    3 topic B) can drop the JSON files without losing the ability
+    to replay or diff a past revision.
+    """
+
+    session_id: str
+    revision: int
+    workspace_sha256: str | None = None
+    workspace_json: dict[str, object] = Field(default_factory=dict)
+    captured_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
 class AgentThreadBindingRecord(BaseModel):
     """Durable identity link between a LitTrace session and a Codex thread."""
 
@@ -204,6 +222,10 @@ class StateStore(Protocol):
 
     def session_write_lock(self, session_id: str) -> AbstractContextManager[None]: ...
     def agent_thread_lock(self, session_id: str) -> AbstractContextManager[None]: ...
+    def upsert_session_snapshot(self, snapshot: SessionStateSnapshotRecord) -> None: ...
+    def list_session_snapshots(
+        self, session_id: str, *, limit: int = 20,
+    ) -> list[SessionStateSnapshotRecord]: ...
     def upsert_session_state(
         self,
         state: SessionStateRecord,
@@ -396,6 +418,23 @@ class PostgresStateStore:
             cur.execute(
                 f"CREATE INDEX IF NOT EXISTS agent_thread_bindings_status_idx "
                 f"ON {s}.agent_thread_bindings (status, updated_at)"
+            )
+
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {s}.session_state_snapshots (
+                    session_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    workspace_sha256 TEXT,
+                    workspace_json JSONB NOT NULL,
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (session_id, revision)
+                )
+                """
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS session_state_snapshots_captured_idx "
+                f"ON {s}.session_state_snapshots (session_id, captured_at DESC)"
             )
 
             cur.execute(
@@ -697,6 +736,71 @@ class PostgresStateStore:
                 revision=row[4],
                 status=row[5] or "active",
                 updated_at=row[6].isoformat() if hasattr(row[6], "isoformat") else str(row[6]),
+            )
+            for row in rows
+        ]
+
+    def upsert_session_snapshot(
+        self, snapshot: SessionStateSnapshotRecord
+    ) -> None:
+        """Append a workspace snapshot. Insert-only on the (session_id,
+        revision) primary key — repeated saves for the same revision
+        are no-ops rather than overwrites.
+        """
+        self._ensure_schema()
+        s = self.schema_name
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO {s}.session_state_snapshots
+                    (session_id, revision, workspace_sha256,
+                     workspace_json, captured_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s, now()))
+                ON CONFLICT (session_id, revision) DO NOTHING
+                """,
+                (
+                    snapshot.session_id,
+                    snapshot.revision,
+                    snapshot.workspace_sha256,
+                    _jsonb(snapshot.workspace_json),
+                    snapshot.captured_at,
+                ),
+            )
+            conn.commit()
+
+    def list_session_snapshots(
+        self, session_id: str, *, limit: int = 20,
+    ) -> list[SessionStateSnapshotRecord]:
+        """Return the most recent snapshots for a session, newest first.
+
+        The (session_id, revision) primary key means revisions never
+        duplicate, so this is effectively a time-ordered history of
+        the workspace.
+        """
+        self._ensure_schema()
+        s = self.schema_name
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT session_id, revision, workspace_sha256,
+                       workspace_json, captured_at
+                FROM {s}.session_state_snapshots
+                WHERE session_id = %s
+                ORDER BY captured_at DESC
+                LIMIT %s
+                """,
+                (session_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            SessionStateSnapshotRecord(
+                session_id=row[0],
+                revision=int(row[1]),
+                workspace_sha256=row[2],
+                workspace_json=_from_jsonb(row[3]),
+                captured_at=row[4].isoformat()
+                if hasattr(row[4], "isoformat")
+                else str(row[4]),
             )
             for row in rows
         ]
