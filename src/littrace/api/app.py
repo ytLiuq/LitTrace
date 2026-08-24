@@ -42,8 +42,6 @@ async def _lifespan(_app: FastAPI):
 # OpenAPI metadata. /docs, /redoc, and /openapi.json are opt-in
 # (set LITTRACE_API_DOCS_ENABLED=1) so production deployments do not
 # leak the internal schema by default.
-_DOCS_ENABLED = os.environ.get("LITTRACE_API_DOCS_ENABLED", "").strip() == "1"
-
 _OPENAPI_TAGS: list[dict[str, str]] = [
     {
         "name": "research",
@@ -84,61 +82,85 @@ _OPENAPI_TAGS: list[dict[str, str]] = [
 ]
 
 
-app = FastAPI(
-    title="LitTrace API",
-    version="0.1.0",
-    description=(
-        "LitTrace — evidence-first scientific literature workflow. "
-        "Every endpoint operates on a Postgres-backed session_state; "
-        "the workspace at `config.storage.sessions_dir/<session_id>` is "
-        "the on-disk projection."
-    ),
-    contact={"name": "LitTrace", "url": "https://github.com/ytLiuq/LitTrace"},
-    license_info={"name": "Apache-2.0"},
-    openapi_tags=_OPENAPI_TAGS,
-    lifespan=_lifespan,
-    docs_url="/docs" if _DOCS_ENABLED else None,
-    redoc_url="/redoc" if _DOCS_ENABLED else None,
-    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
-)
-app.include_router(system_router)
-app.include_router(agents_router)
-app.include_router(context_router)
-app.include_router(downloads_router)
-app.include_router(publishers_router)
-app.include_router(eval_router)
-app.include_router(research_router)
-app.include_router(sessions_router)
-app.include_router(artifacts_router)
+def _build_docs_urls() -> tuple[str | None, str | None, str | None]:
+    """Return (docs_url, redoc_url, openapi_url) from the env var.
+
+    Exposed so the test suite can construct a second app instance
+    with docs enabled (FastAPI reads these only at construction).
+    """
+    enabled = os.environ.get("LITTRACE_API_DOCS_ENABLED", "").strip() == "1"
+    if enabled:
+        return "/docs", "/redoc", "/openapi.json"
+    return None, None, None
 
 
-@app.middleware("http")
-async def log_requests(request, call_next):
-    """Log every HTTP request with method, path, status and duration."""
-    import time as _time
+def make_app() -> FastAPI:
+    """Construct a fresh FastAPI instance with all routes wired.
 
-    start = _time.perf_counter()
-    response = await call_next(request)
-    duration_ms = round((_time.perf_counter() - start) * 1000, 2)
-    metrics.record(
-        "http_request_ms",
-        duration_ms,
-        labels={
-            "method": request.method,
-            "path": request.url.path,
-            "status": str(response.status_code),
-        },
+    Used by ``tests/api/test_openapi.py`` to build a docs-enabled
+    app on demand. The module-level ``app`` below is the production
+    instance, built once at import time.
+    """
+    docs_url, redoc_url, openapi_url = _build_docs_urls()
+    instance = FastAPI(
+        title="LitTrace API",
+        version="0.1.0",
+        description=(
+            "LitTrace — evidence-first scientific literature workflow. "
+            "Every endpoint operates on a Postgres-backed session_state; "
+            "the workspace at `config.storage.sessions_dir/<session_id>` is "
+            "the on-disk projection."
+        ),
+        contact={"name": "LitTrace", "url": "https://github.com/ytLiuq/LitTrace"},
+        license_info={"name": "Apache-2.0"},
+        openapi_tags=_OPENAPI_TAGS,
+        lifespan=_lifespan,
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+        openapi_url=openapi_url,
     )
-    logger.info(
-        "http_request",
-        extra={
-            "method": request.method,
-            "path": request.url.path,
-            "status": response.status_code,
-            "duration_ms": duration_ms,
-        },
-    )
-    return response
+    instance.include_router(system_router)
+    instance.include_router(agents_router)
+    instance.include_router(context_router)
+    instance.include_router(downloads_router)
+    instance.include_router(publishers_router)
+    instance.include_router(eval_router)
+    instance.include_router(research_router)
+    instance.include_router(sessions_router)
+    instance.include_router(artifacts_router)
+
+    @instance.middleware("http")
+    async def log_requests(request, call_next):
+        """Log every HTTP request with method, path, status and duration."""
+        import time as _time
+
+        start = _time.perf_counter()
+        response = await call_next(request)
+        duration_ms = round((_time.perf_counter() - start) * 1000, 2)
+        metrics.record(
+            "http_request_ms",
+            duration_ms,
+            labels={
+                "method": request.method,
+                "path": request.url.path,
+                "status": str(response.status_code),
+            },
+        )
+        logger.info(
+            "http_request",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        return response
+
+    return instance
+
+
+app = make_app()
 
 
 WORKSPACE = api_state.get_workspace()
