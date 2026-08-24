@@ -157,7 +157,19 @@ class CodexAppServerChatService:
         # so binding the new chat's recorder overwrites only that
         # thread's slot. A follow-up chat on the SAME thread overwrites
         # it again, which is the desired behaviour.
+        # Round 4 P2 step 10: serialise the binding read-modify-write.
+        # ``session_write_lock`` already takes the
+        # ``littrace:session-write:{session_id}`` advisory lock for
+        # the workspace body; taking the same lock here keeps the
+        # binding lookup and upsert atomic against a concurrent
+        # ``service.chat`` on the same session so we never end up
+        # with two ``codex_thread_id`` rows for one LitTrace
+        # session_id. The lock is released as soon as this ``with``
+        # block exits, so the workspace body write that follows is
+        # not held under this lock.
         binding = self.state_store.get_agent_thread_binding(session.session_id)
+        with self.state_store.session_write_lock(session.session_id):
+            binding = self.state_store.get_agent_thread_binding(session.session_id)
         if recorder is not None and binding is not None:
             client.set_rollout_recorder(binding.codex_thread_id, recorder)
         runtime = self.config.agent_runtime

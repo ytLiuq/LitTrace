@@ -22,6 +22,11 @@ class _BindingStore:
         self.binding = None
         self.state = None
 
+    def session_write_lock(self, _session_id):
+        # Round 4 P2 step 10: in-memory no-op.
+        from contextlib import nullcontext
+        return nullcontext()
+
     def get_agent_thread_binding(self, session_id: str):
         return self.binding if self.binding and self.binding.session_id == session_id else None
 
