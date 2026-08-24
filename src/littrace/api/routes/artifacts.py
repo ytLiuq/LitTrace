@@ -28,7 +28,7 @@ from littrace.evidence.tables import (
 )
 
 
-router = APIRouter()
+router = APIRouter(tags=["artifacts"])
 
 
 @router.post("/parse/context", response_model=LiteratureWorkspace)

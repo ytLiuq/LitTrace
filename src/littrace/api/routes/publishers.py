@@ -9,7 +9,7 @@ from littrace.supplementary import register_supplementary_links
 
 
 
-router = APIRouter()
+router = APIRouter(tags=["publishers"])
 
 
 @router.get("/publishers/routes", response_model=PublisherRouteReport)

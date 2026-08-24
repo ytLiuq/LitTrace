@@ -28,7 +28,7 @@ from littrace.skill_runner import build_quality_report_skill
 
 
 
-router = APIRouter()
+router = APIRouter(tags=["evaluation"])
 
 
 @router.post("/eval/retrieval", response_model=EvalMetricReport)

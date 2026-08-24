@@ -12,7 +12,7 @@ from littrace.models import ReviewLoopReport
 from littrace.research_planner import ResearchPlan
 from littrace.skill_runner import build_research_plan_skill
 
-router = APIRouter(prefix="/agents")
+router = APIRouter(prefix="/agents", tags=["agents"])
 
 
 @router.get("/components", response_model=list[RuntimeComponentStatus])

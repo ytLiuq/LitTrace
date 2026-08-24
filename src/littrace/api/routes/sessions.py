@@ -10,7 +10,7 @@ from littrace.session_metrics import SessionKnowledgeMetricsReport, build_sessio
 from littrace.session import SessionDeleteReport, delete_chat_session
 
 
-router = APIRouter()
+router = APIRouter(tags=["sessions"])
 
 
 @router.delete("/sessions/{session_id}", response_model=SessionDeleteReport)

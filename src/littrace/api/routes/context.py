@@ -16,7 +16,7 @@ from littrace.skill_runner import audit_citation_links_skill, resolve_workspace_
 
 
 
-router = APIRouter()
+router = APIRouter(tags=["context"])
 
 
 @router.get("/context", response_model=LiteratureWorkspace)

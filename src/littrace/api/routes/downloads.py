@@ -35,7 +35,7 @@ from littrace.session import load_or_create_session, save_workspace
 
 
 
-router = APIRouter()
+router = APIRouter(tags=["downloads"])
 
 
 @router.get("/downloads/progress", response_model=list[PublisherDownloadProgress])

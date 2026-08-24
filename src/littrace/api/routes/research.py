@@ -43,7 +43,7 @@ def _workspace_summary(workspace: LiteratureWorkspace) -> WorkspaceSummary:
     return WorkspaceSummary.from_workspace(workspace)
 
 
-router = APIRouter()
+router = APIRouter(tags=["research"])
 
 _APP_SERVER_PERSISTED_ACTIONS = frozenset(
     {

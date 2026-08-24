@@ -17,7 +17,7 @@ from littrace.rag_ops import (
 )
 from littrace.retrieval.source_router import route_sources
 
-router = APIRouter()
+router = APIRouter(tags=["system"])
 
 
 @router.get("/health")
