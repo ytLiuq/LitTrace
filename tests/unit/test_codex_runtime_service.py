@@ -21,6 +21,9 @@ class _BindingStore:
     def __init__(self) -> None:
         self.binding = None
         self.state = None
+        self.compaction_due_calls: list[tuple[int, int, int]] = []
+        self.enqueued_tasks: list[AsyncTaskRecord] = []
+        self.bindings: dict[str, AgentThreadBindingRecord] = {}
 
     def session_write_lock(self, _session_id):
         # Round 4 P2 step 10: in-memory no-op.
@@ -28,14 +31,20 @@ class _BindingStore:
         return nullcontext()
 
     def get_agent_thread_binding(self, session_id: str):
-        return self.binding if self.binding and self.binding.session_id == session_id else None
+        b = self.bindings.get(session_id)
+        if b is not None and b.session_id == session_id:
+            return b
+        return None
 
     def upsert_agent_thread_binding(self, binding):
+        self.bindings[binding.session_id] = binding
         self.binding = binding
         return binding
 
     def get_session_state(self, session_id: str):
-        return self.state if self.state and self.state.session_id == session_id else None
+        if self.state is not None and self.state.session_id == session_id:
+            return self.state
+        return None
 
     def upsert_session_state(self, state):
         # Round 4 P1 step 5: status machine (draft / idle / active /
@@ -48,10 +57,70 @@ class _BindingStore:
         self.state = state.model_copy(deep=True)
         return state
 
+    def compaction_due_sessions(
+        self, *, threshold_turns, threshold_tokens, limit,
+    ):
+        from datetime import UTC, datetime, timedelta
+        self.compaction_due_calls.append(
+            (threshold_turns, threshold_tokens, limit)
+        )
+        out: list[tuple[str, str, int, int]] = []
+        for sid, binding in self.bindings.items():
+            # Mirror the production query: drive the decision off
+            # the session_state status (which is what the Postgres
+            # JOIN looks at), not the binding row, because
+            # ``archived`` / ``systemError`` / ``draft`` only show
+            # up on session_state — the binding always defaults to
+            # ``active``.
+            if self.state is not None and self.state.session_id == sid:
+                if self.state.status not in ("active", "idle"):
+                    continue
+            if (
+                binding.turn_count < threshold_turns
+                and binding.last_total_tokens < threshold_tokens
+            ):
+                continue
+            if (
+                binding.turn_count < threshold_turns
+                and binding.last_total_tokens < threshold_tokens
+            ):
+                continue
+            last = binding.last_compacted_at
+            if last and last >= (datetime.now(UTC) - timedelta(hours=1)).isoformat():
+                continue
+            out.append(
+                (binding.session_id, binding.codex_thread_id,
+                 binding.turn_count, binding.last_total_tokens)
+            )
+        out.sort(key=lambda r: -r[2])
+        return out[:limit]
+
+    def enqueue_async_task(self, task):
+        self.enqueued_tasks.append(task)
+        return task
+
+    def list_async_tasks(self, *, kind=None, status=None, limit=20):
+        rows = list(self.enqueued_tasks)
+        if kind is not None:
+            rows = [r for r in rows if r.kind == kind]
+        if status is not None:
+            rows = [r for r in rows if r.status == status]
+        return rows[:limit]
+
+    def update_async_task(self, task):
+        # Replace in place by task_id; mirror the Postgres
+        # ``update_async_task`` semantics.
+        for i, existing in enumerate(self.enqueued_tasks):
+            if existing.task_id == task.task_id:
+                self.enqueued_tasks[i] = task
+                break
+        return task
+
 
 class _FakeClient:
     instances: ClassVar[list[_FakeClient]] = []
     on_turn: ClassVar[Callable[[], None] | None] = None
+    compact_calls: ClassVar[list[str]] = []
 
     def __init__(self, command, **kwargs) -> None:
         self.command = command
@@ -99,6 +168,14 @@ class _FakeClient:
 
     async def call_mcp_tool(self, thread_id, server, tool, arguments):
         return {"content": [{"type": "text", "text": "{}"}], "isError": False}
+
+    async def compact_thread(self, thread_id, *, timeout=10.0):
+        # Round 5 test stub. Real AppServerClient.compact_thread
+        # fires ``thread/compact`` and returns a server reply; the
+        # fake just records the call so a test can assert it ran
+        # (or did not run) without involving the real RPC plumbing.
+        type(self).compact_calls.append(thread_id)
+        return {"ok": True, "thread_id": thread_id}
 
     async def run_turn(self, thread_id, text, *, timeout, cancellation=None):
         if type(self).on_turn is not None:
