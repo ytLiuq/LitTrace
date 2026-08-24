@@ -421,6 +421,26 @@ class AppServerClient:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
+    async def compact_thread(
+        self, thread_id: str, *, timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Ask the App Server to compact the conversation history.
+
+        codex-harness replies with the new compacted-history blob
+        plus any "compactedHistory" notification. LitTrace fires this
+        lazily: ``RagProfile.last_refreshed_at`` advancing is enough
+        signal to most callers, so we do not invoke compact on the
+        critical path. The method is here for tooling that needs to
+        force a compaction (e.g. before pulling a session snapshot
+        into cold storage).
+        """
+        result = await self.request(
+            "thread/compact",
+            {"threadId": thread_id},
+            timeout=timeout,
+        )
+        return result
+
     async def cancel_current_turn(
         self,
         thread_id: str,

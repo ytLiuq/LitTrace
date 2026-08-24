@@ -26,6 +26,11 @@ from littrace.tracing import append_trace as _append_trace
 
 logger = get_logger("api")
 
+# Round 4 P3 step 12: bump on every breaking change to the HTTP
+# surface. Clients pin the value they were written against and can
+# reject / migrate on a mismatch.
+LITTRACE_API_VERSION = "0.4"
+
 DOWNLOAD_RETRY_WORKER: DownloadRetryWorker | None = None
 
 
@@ -128,6 +133,19 @@ def make_app() -> FastAPI:
     instance.include_router(research_router)
     instance.include_router(sessions_router)
     instance.include_router(artifacts_router)
+
+    @instance.middleware("http")
+    async def add_api_version(request, call_next):
+        """Stamp every response with ``X-LitTrace-API-Version``.
+
+        Round 4 P3 step 12: clients can pin the version they were
+        written against and reject on mismatch. The header is on
+        every response (success and error alike) so a 500 still
+        tells the client which wire version was hit.
+        """
+        response = await call_next(request)
+        response.headers["X-LitTrace-API-Version"] = LITTRACE_API_VERSION
+        return response
 
     @instance.middleware("http")
     async def log_requests(request, call_next):
