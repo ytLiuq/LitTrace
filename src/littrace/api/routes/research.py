@@ -226,7 +226,6 @@ async def chat_stream(
         return _sse_response(_single_done())
 
     request = request.model_copy(update={"session_id": session.session_id})
-    session_memory = load_session_memory(session)
     queue: asyncio.Queue = asyncio.Queue()
 
     def _enqueue_delta(delta: str) -> None:
@@ -241,7 +240,6 @@ async def chat_stream(
             request,
             session_workspace,
             session,
-            session_memory=session_memory,
             on_delta=_enqueue_delta,
         )
     )
@@ -263,6 +261,9 @@ async def chat_stream(
         try:
             response, latest_workspace = await chat_task
         except Exception as exc:
+            # Surface the failure as a structured ``error`` event so a
+            # client can render a retry affordance; close the response
+            # cleanly so EventSource auto-reconnect does not loop.
             yield _sse_event("error", {
                 "code": "codex_app_server_chat_failed",
                 "message": f"{exc.__class__.__name__}: {exc}",
