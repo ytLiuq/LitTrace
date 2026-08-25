@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from littrace.attachments import attach_pdf_to_paper, check_download_presence
 from littrace.workflow_status import build_workflow_status
@@ -119,6 +121,7 @@ def main() -> None:
         "setup-browser",
         "publisher-e2e",
         "compaction",
+        "eval-from-rollout",
     }:
         print(
             f"Unknown subcommand: {sys.argv[1]!r}. "
@@ -138,6 +141,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "compaction":
         config = load_config()
         asyncio.run(_run_compaction_command(config))
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "eval-from-rollout":
+        _run_eval_from_rollout_command(sys.argv[2:])
         return
     if len(sys.argv) > 1 and sys.argv[1] == "jobs":
         config = load_config()
@@ -586,6 +592,113 @@ def _run_metrics_command(config) -> None:
         )
     if report.warnings:
         print("warnings: " + "；".join(report.warnings))
+
+
+def _run_eval_from_rollout_command(argv: list[str]) -> None:
+    """CLI driver for ``littrace eval-from-rollout <path>``.
+
+    Round 10 step 2: converts rollout JSONL traces to harness
+    check items and prints the resulting reports. Defaults to
+    the two standard checks (``check_citations`` and
+    ``check_retry_health``); callers can pick a subset with
+    ``--checks``. ``--report`` writes a JSON dump so CI can
+    attach the result as a build artifact.
+    """
+    from littrace.evaluation.harnesses import HarnessConfig, HarnessEngine
+    from littrace.evaluation.rollout_eval import convert_directory, merge_bundles
+
+    if not argv or argv[0].startswith("-"):
+        print(
+            "usage: littrace eval-from-rollout <rollout-dir-or-file> "
+            "[--checks check_citations,check_retry_health] "
+            "[--report out.json] [--performance-confidence-threshold F] "
+            "[--max-retry-rate F] [--max-failure-rate F]",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    path = Path(argv[0])
+    checks_filter = _arg_value("--checks")
+    report_path = _arg_value("--report")
+    perf_threshold = _arg_float("--performance-confidence-threshold", 0.6)
+    max_retry_rate = _arg_float("--max-retry-rate", 0.5)
+    max_failure_rate = _arg_float("--max-failure-rate", 0.2)
+
+    bundles = convert_directory(path)
+    if not bundles:
+        print(f"no rollout JSONL files under {path}", file=sys.stderr)
+        sys.exit(1)
+    items_map = merge_bundles(bundles)
+    config = HarnessConfig(
+        performance_confidence_threshold=perf_threshold,
+        max_retry_rate=max_retry_rate,
+        max_failure_rate=max_failure_rate,
+    )
+    selected = checks_filter.split(",") if checks_filter else [
+        "check_citations",
+        "check_retry_health",
+    ]
+    engine = HarnessEngine(config=config)
+    # ``run_with_deps`` is single-target. The CLI runs every
+    # selected check independently and we skip any name the
+    # registry does not know so an operator can pass an
+    # arbitrary subset.
+    reports: dict[str, Any] = {}
+    for name in selected:
+        if engine.registry.get(name) is None:
+            print(f"  skip unknown check: {name}")
+            continue
+        items = items_map.get(name, [])
+        reports[name] = engine.run(name, items)
+
+    json_payload: list[dict[str, object]] = []
+    for name, report in reports.items():
+        print(f"=== {name} ===")
+        print(f"  passed: {report.passed}")
+        print(f"  score: {report.score:.2f}")
+        print(f"  item_count: {report.item_count}")
+        for finding in report.findings:
+            # ``Severity`` is a plain str subclass, not a
+            # ``StrEnum``, so ``str(finding.severity)`` is the
+            # canonical way to render the level.
+            print(
+                f"  - [{finding.severity}] {finding.message}"
+                + (f" (paper={finding.paper_id})" if finding.paper_id else "")
+            )
+        json_payload.append({
+            "check": name,
+            "passed": report.passed,
+            "score": report.score,
+            "item_count": report.item_count,
+            "errors": report.errors,
+            "warnings": report.warnings,
+        })
+    print()
+    print(
+        f"sessions: {sum(1 for b in bundles if b.session_id)}  "
+        f"turns: {len(items_map.get('__turns__', []))}  "
+        f"tool_calls: {len(items_map.get('__tool_calls__', []))}  "
+        f"errors: {len(items_map.get('__errors__', []))}"
+    )
+    if report_path:
+        Path(report_path).write_text(
+            json.dumps(
+                {
+                    "rollout_path": str(path),
+                    "checks": selected,
+                    "reports": json_payload,
+                    "summary": {
+                        "sessions": sum(1 for b in bundles if b.session_id),
+                        "turns": len(items_map.get("__turns__", [])),
+                        "tool_calls": len(items_map.get("__tool_calls__", [])),
+                        "errors": len(items_map.get("__errors__", [])),
+                    },
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        print(f"report: {report_path}")
 
 
 def _print_rag_refresh_report(report) -> None:

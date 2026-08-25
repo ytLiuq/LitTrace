@@ -236,21 +236,52 @@ class RolloutConverter:
                 # ``agentMessage`` payload that names the cited
                 # paper_ids. Extract a thin ``CitationRecord``
                 # so the standard ``check_citations`` harness
-                # can audit them.
+                # can audit them. ``access_url`` is a HttpUrl
+                # so we have to skip empty strings rather than
+                # produce an unparseable record.
                 params = event.get("params") or {}
                 item = params.get("item") or {}
                 if method == "item/completed" and isinstance(item, dict):
                     cited_ids = item.get("cited_paper_ids") or []
-                    cited_text = item.get("text") or bucket.reply if bucket else ""
+                    # Prefer the agentMessage text the rollout
+                    # captured for this specific item; fall
+                    # back to the per-turn reply when the
+                    # agentMessage payload is empty.
+                    turn_id = event.get("turn_id") or ""
+                    cited_text = item.get("text") or ""
+                    if not cited_text and turn_id and turn_id in turns:
+                        cited_text = turns[turn_id].reply
                     for paper_id in cited_ids:
-                        citations.append(
-                            CitationRecord(
-                                paper_id=str(paper_id),
-                                citation_text=str(cited_text),
-                                access_url="",
-                                link_status=LinkStatus.UNCHECKED,
-                            )
-                        )
+                        # ``CitationRecord.access_url`` is a
+                        # required ``HttpUrl``. The rollout
+                        # captures citations without a URL
+                        # because the model did not link
+                        # out — substitute an ``about:blank``
+                        # placeholder so the converter can
+                        # still produce a record. The harness
+                        # check treats ``link_status`` as the
+                        # authoritative signal anyway, so a
+                        # missing URL just shows up as
+                        # ``UNCHECKED`` and the existing
+                        # ``check_citations`` remediation hint
+                        # ("Re-run citation link audit or
+                        # manually verify the URL") fires.
+                        record_kwargs: dict[str, Any] = {
+                            "paper_id": str(paper_id),
+                            "citation_text": str(cited_text),
+                            "access_url": "http://about.local/citation-placeholder",
+                            "link_status": LinkStatus.UNCHECKED,
+                        }
+                        access_url = item.get("access_url")
+                        if access_url:
+                            record_kwargs["access_url"] = access_url
+                        try:
+                            citations.append(CitationRecord(**record_kwargs))
+                        except Exception:
+                            # Skip records we cannot construct
+                            # so a single malformed item does
+                            # not abort the whole conversion.
+                            continue
             elif event_type == "system_error":
                 turn_id = event.get("turn_id")
                 if turn_id and turn_id in turns:
