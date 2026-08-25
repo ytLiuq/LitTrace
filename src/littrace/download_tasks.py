@@ -258,6 +258,23 @@ class PostgresDownloadTaskStore:
                 WHERE status IN ('queued', 'failed')
                 """
             )
+            # Live E2E surfaced: older deployments created the table
+            # without the ``(session_id, paper_id)`` unique constraint
+            # the upsert path relies on. ``CREATE TABLE IF NOT EXISTS``
+            # is a no-op for those, so add the constraint idempotently.
+            conn.execute(
+                f"""
+                DO $$
+                BEGIN
+                    ALTER TABLE {self.schema_name}.download_tasks
+                        ADD CONSTRAINT download_tasks_session_paper_uk
+                        UNIQUE (session_id, paper_id);
+                EXCEPTION
+                    WHEN duplicate_object THEN NULL;
+                    WHEN duplicate_table THEN NULL;
+                END $$
+                """
+            )
             conn.execute(
                 f"ALTER TABLE {self.schema_name}.download_tasks DROP COLUMN IF EXISTS user_id CASCADE"
             )
