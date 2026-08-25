@@ -177,7 +177,7 @@ class _FakeClient:
         type(self).compact_calls.append(thread_id)
         return {"ok": True, "thread_id": thread_id}
 
-    async def run_turn(self, thread_id, text, *, timeout, cancellation=None):
+    async def run_turn(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
         if type(self).on_turn is not None:
             type(self).on_turn()
         # Mirror what AppServerClient.run_turn writes into the rollout
@@ -396,7 +396,7 @@ def test_service_chat_returns_interrupted_action(monkeypatch, tmp_path) -> None:
     )
     captured: list[dict[str, object]] = []
 
-    async def fake_run(self, thread_id, text, *, timeout, cancellation=None):
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
         captured.append({"cancellation": cancellation})
         return AppServerTurnResult(
             thread_id=thread_id, turn_id="turn-1",
@@ -430,7 +430,7 @@ def test_service_chat_returns_interrupted_failed_action(monkeypatch, tmp_path) -
         config, state_store=store, client_factory=_FakeClient,
     )
 
-    async def fake_run(self, thread_id, text, *, timeout, cancellation=None):
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
         return AppServerTurnResult(
             thread_id=thread_id, turn_id="turn-1",
             status="failed", reply="", turn={},
@@ -461,7 +461,7 @@ def test_service_writes_rollout_file_when_enabled(monkeypatch, tmp_path) -> None
         config, state_store=store, client_factory=_FakeClient,
     )
 
-    async def fake_run(self, thread_id, text, *, timeout, cancellation=None):
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
         # Mirror the real AppServerClient.run_turn surface that the
         # rollout recorder relies on so the service-level test
         # actually exercises the append path.
@@ -513,7 +513,7 @@ def test_service_skips_rollout_when_disabled(monkeypatch, tmp_path) -> None:
         config, state_store=store, client_factory=_FakeClient,
     )
 
-    async def fake_run(self, thread_id, text, *, timeout, cancellation=None):
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
         return AppServerTurnResult(
             thread_id=thread_id, turn_id="turn-1",
             status="completed", reply="ok", turn={},

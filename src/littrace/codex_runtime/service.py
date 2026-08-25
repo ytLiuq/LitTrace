@@ -68,6 +68,7 @@ class CodexAppServerChatService:
         session: ChatSession,
         *,
         cancellation: asyncio.Event | None = None,
+        on_delta=None,
     ) -> tuple[ChatResponse, LiteratureWorkspace]:
         scratch_dir = self._scratch_dir(session.session_id)
         scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -87,7 +88,7 @@ class CodexAppServerChatService:
                     turn, latest_workspace = await self.runtime_manager.use(
                         lambda client: self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
-                            cancellation, recorder,
+                            cancellation, recorder, on_delta,
                         )
                     )
                 elif self.client_factory is AppServerClient:
@@ -97,7 +98,7 @@ class CodexAppServerChatService:
                     turn, latest_workspace = await manager.use(
                         lambda client: self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
-                            cancellation, recorder,
+                            cancellation, recorder, on_delta,
                         )
                     )
                 else:
@@ -112,7 +113,7 @@ class CodexAppServerChatService:
                     async with client:
                         turn, latest_workspace = await self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
-                            cancellation, recorder,
+                            cancellation, recorder, on_delta,
                         )
         finally:
             # Close the recorder after the App Server has returned the
@@ -148,6 +149,7 @@ class CodexAppServerChatService:
         scratch_dir: Path,
         cancellation: asyncio.Event | None = None,
         recorder: RolloutRecorder | None = None,
+        on_delta=None,
     ):
         # Round 4 P1 step 7: bind the per-thread recorder. The
         # runtime_manager keeps one client across calls, so two
@@ -258,6 +260,7 @@ class CodexAppServerChatService:
                 request.message,
                 timeout=runtime.turn_timeout_seconds,
                 cancellation=cancellation,
+                on_delta=on_delta,
             )
         except AppServerError as exc:
             # Any transport-level failure freezes the session in
