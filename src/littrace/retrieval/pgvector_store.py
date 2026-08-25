@@ -244,8 +244,12 @@ class PgvectorRagStore:
             # the per-query latency reproducible.
             ef_search = getattr(self.config.rag, "hnsw_ef_search", None)
             if ef_search is not None:
+                # Postgres ``SET`` does not accept query parameters;
+                # the value is inlined as a literal. ``ef_search``
+                # comes from the validated ``RagConfig`` so the
+                # injection surface is bounded to integer inputs.
                 with connection.cursor() as cursor:
-                    cursor.execute("SET hnsw.ef_search = %s", (int(ef_search),))
+                    cursor.execute(f"SET hnsw.ef_search = {int(ef_search)}")
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
