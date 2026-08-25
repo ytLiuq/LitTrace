@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import APIRouter, Header
+from fastapi.responses import StreamingResponse
 
 from littrace.agent_runtime import handle_agent_chat
 from littrace.api.auth import resolve_request_session
 from littrace.api.backend import api_app
+from littrace.codex_runtime.service import CodexAppServerChatService
 from littrace.models import (
     ChatRequest,
     ChatResponse,
@@ -171,6 +176,137 @@ async def chat(
     append_message(session, "assistant", response)
     api_app.append_trace(config, "chat", {"action": response.action, "session_id": session.session_id})
     return response
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    request: ChatRequest,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> StreamingResponse:
+    """Server-Sent Events variant of ``/chat``.
+
+    The App Server pushes ``item/agentMessage/delta`` frames as the
+    LLM streams. We forward each one as a ``delta`` SSE event and
+    close the stream with a ``done`` event carrying the final
+    ``ChatResponse`` shape. A failure mid-stream produces an
+    ``error`` event with a stable code so the client can render a
+    retry affordance.
+
+    The legacy ``POST /chat`` endpoint remains untouched — clients
+    that cannot consume SSE keep the buffered JSON response.
+    """
+    config = api_app.load_config()
+    auth = resolve_request_session(
+        config,
+        route_session_id=request.session_id,
+        header_session_id=x_littrace_session_id,
+    )
+    session = load_or_create_session(config, auth.session_id)
+    session_workspace = load_workspace(session)
+    background_response = await _route_research_background_fast_gate(
+        request,
+        session_workspace,
+        config,
+    )
+    if background_response is not None:
+        api_app._set_workspace(session_workspace)
+        background_response.session_id = session.session_id
+        background_response.session_root = str(session.root)
+        background_response.workspace = _workspace_summary(session_workspace)
+        save_workspace(session, session_workspace, config=config)
+        append_message(session, "user", request)
+        append_message(session, "assistant", background_response)
+        api_app.append_trace(
+            config,
+            "chat_stream",
+            {"action": background_response.action, "session_id": session.session_id},
+        )
+        async def _single_done() -> AsyncIterator[bytes]:
+            yield _sse_event("done", background_response.model_dump(mode="json"))
+        return _sse_response(_single_done())
+
+    request = request.model_copy(update={"session_id": session.session_id})
+    session_memory = load_session_memory(session)
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _enqueue_delta(delta: str) -> None:
+        # The callback runs on the App Server's reader task; push
+        # into an asyncio.Queue so the StreamingResponse generator
+        # can yield without blocking the transport.
+        queue.put_nowait(("delta", delta))
+
+    service = CodexAppServerChatService(config)
+    chat_task = asyncio.create_task(
+        service.chat(
+            request,
+            session_workspace,
+            session,
+            session_memory=session_memory,
+            on_delta=_enqueue_delta,
+        )
+    )
+
+    async def _stream() -> AsyncIterator[bytes]:
+        try:
+            while True:
+                if chat_task.done() and queue.empty():
+                    break
+                try:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                if kind == "delta":
+                    yield _sse_event("delta", {"delta": payload})
+        except asyncio.CancelledError:
+            chat_task.cancel()
+            raise
+        try:
+            response, latest_workspace = await chat_task
+        except Exception as exc:
+            yield _sse_event("error", {
+                "code": "codex_app_server_chat_failed",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            })
+            return
+        api_app._set_workspace(latest_workspace)
+        response.session_id = session.session_id
+        response.session_root = str(session.root)
+        response.workspace = _workspace_summary(latest_workspace)
+        if _requires_route_workspace_save(response):
+            try:
+                save_workspace(session, api_app.WORKSPACE, config=config)
+            except TypeError:
+                save_workspace(session, api_app.WORKSPACE)
+        append_message(session, "user", request)
+        append_message(session, "assistant", response)
+        api_app.append_trace(
+            config,
+            "chat_stream",
+            {"action": response.action, "session_id": session.session_id},
+        )
+        yield _sse_event("done", response.model_dump(mode="json"))
+
+    return _sse_response(_stream())
+
+
+def _sse_response(generator: AsyncIterator[bytes]) -> StreamingResponse:
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+def _sse_event(event: str, data: dict[str, object]) -> bytes:
+    # ``data:`` line carries the JSON payload, terminated by a
+    # blank line. ``event:`` line is the SSE event name so a
+    # EventSource client can attach an ``addEventListener``.
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
 
 
 def _requires_route_workspace_save(response: ChatResponse) -> bool:
