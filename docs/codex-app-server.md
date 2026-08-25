@@ -140,7 +140,9 @@ the full-duplex App Server connection.
 
 - Durable commands/workers for storyline, document generation, and autonomous
   review.
-- Streaming App Server deltas into the current HTTP/Desktop UI.
+- Streaming App Server deltas into the current HTTP/Desktop UI. ✅ done in Round 6
+  via `POST /chat/stream` (text/event-stream). See "Streaming chat"
+  below for the SSE protocol contract.
 - Cancellation/steering UI and a multi-process pool for higher concurrency.
 - Replacing the legacy route-level save with an explicit asynchronous
   filesystem/materialized-view projector after all domain writes use MCP
@@ -149,3 +151,76 @@ the full-duplex App Server connection.
   state and RAG; the dedicated Codex home may retain thread execution context
   and Codex's own memory files, but LitTrace does not read them as canonical
   scientific state.
+
+## Streaming chat (Round 6)
+
+`POST /chat` is the buffered JSON variant. `POST /chat/stream` is its
+SSE counterpart and is the recommended path for the desktop GUI and
+the future Web UI so a multi-thousand-word literature review does
+not appear all at once after a 30-second wait.
+
+### Endpoint
+
+```
+POST /chat/stream
+Content-Type: application/json
+X-LitTrace-Session-Id: <optional; same as request.session_id>
+
+{"message": "...", "session_id": "..."}
+```
+
+Response:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+X-Accel-Buffering: no
+Connection: keep-alive
+```
+
+### Event protocol
+
+Each event is two lines plus a blank line terminator. The `event:`
+line carries the SSE event name; the `data:` line carries a JSON
+payload.
+
+```
+event: delta
+data: {"delta": "好的，按灵敏度排序"}
+
+event: delta
+data: {"delta": "我推荐这 5 篇："}
+
+event: done
+data: {"reply": "完整的 reply 文本",
+       "action": "codex_app_server_chat",
+       "session_id": "...",
+       "session_root": "...",
+       "workspace": {...WorkspaceSummary...}}
+```
+
+Event types:
+
+  * `delta` — one per `item/agentMessage/delta` frame received from
+    the App Server. `data.delta` is the raw text fragment.
+  * `done` — terminal event. `data` is a full `ChatResponse` so
+    clients that only consume the SSE stream can render the final
+    state without a follow-up `GET /sessions/.../messages` call.
+  * `error` — emitted when the chat service raises mid-stream.
+    `data.code` is a stable identifier
+    (`codex_app_server_chat_failed`) and `data.message` carries the
+    exception's class name plus message.
+
+### Compatibility
+
+`POST /chat` is unchanged. Clients that cannot consume SSE keep the
+buffered JSON response, including the full workspace summary. The
+desktop GUI migrates first; CLI users stay on `/chat`.
+
+### Cancellation
+
+Closing the HTTP response (browser tab close, `EventSource.close()`)
+propagates to the chat task and cancels the underlying App Server
+turn, matching the behaviour of the legacy `/chat` route's
+`asyncio.Event` cancellation channel.
