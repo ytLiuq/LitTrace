@@ -15,11 +15,7 @@ pytestmark = pytest.mark.live
 
 # ---- test_live_download.py ----
 
-
-
 import os
-
-import pytest
 
 from littrace.config import ArtifactStorageConfig, StorageConfig, load_config
 from littrace.downloads import execute_downloads
@@ -63,38 +59,7 @@ async def test_live_mdpi_pdf_download(tmp_path):
 
 # ---- test_live_search.py ----
 
-import httpx
-import pytest
 
-
-@pytest.mark.anyio
-
-
-
-import os
-from pathlib import Path
-from uuid import uuid4
-
-import pytest
-
-from littrace.artifact_registry import artifact_registry_from_config
-from littrace.artifact_store import BlobRef, artifact_store_from_config
-from littrace.config import (
-    ArtifactStorageConfig,
-    MetadataStoreConfig,
-    StorageConfig,
-    load_config,
-)
-from littrace.rag_jobs import run_daily_rag_maintenance
-from littrace.research_background import assess_research_background, set_workspace_research_background
-from littrace.retrieval.rag_search import search_session_rag
-from littrace.retrieval.search import filter_papers_by_retrieval_policy
-from littrace.session import create_chat_session, load_workspace, save_workspace
-from littrace.sentinel.agent import LiteratureSentinel
-from littrace.sentinel.state import Watchlist
-
-
-@pytest.mark.live
 @pytest.mark.anyio
 async def test_live_daily_update_runs_discovery_and_downloads(tmp_path: Path):
     if os.environ.get("LITTRACE_LIVE_DAILY_TESTS") != "1":
@@ -257,15 +222,11 @@ async def test_live_daily_update_syncs_session_background_to_storage_and_rag(tmp
 
 # ---- test_live_validation_matrix.py ----
 
-
-
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 
 ROOT = Path(__file__).parents[1]
