@@ -97,7 +97,7 @@ def save_session_rag_profile(
     workspace: LiteratureWorkspace,
 ) -> RagProfile:
     profile = build_session_rag_profile(config, session, workspace)
-    existing = load_session_rag_profile(session)
+    existing = load_session_rag_profile(session, config=config)
     if existing is not None and existing.profile_id == profile.profile_id:
         profile = profile.model_copy(
             update={
@@ -123,7 +123,29 @@ def persist_session_rag_profile(session: object, profile: RagProfile) -> RagProf
     return profile.model_copy(update={"updated_at": datetime.now(UTC).isoformat()})
 
 
-def load_session_rag_profile(session: object) -> RagProfile | None:
+def load_session_rag_profile(
+    session: object,
+    config: "LitTraceConfig | None" = None,
+) -> RagProfile | None:
+    # Round 3 topic B: rag profile lives in session_state.rag_profile_json
+    # (Postgres). The disk mirror is only kept as a cold backup. Try the
+    # Postgres path first when ``config`` is supplied so callers that
+    # migrated no longer see ``None`` for sessions that have a saved
+    # profile in the state store. Fall back to disk for tests / scripts
+    # that exercise the loader without a Postgres connection.
+    if config is not None:
+        try:
+            from littrace.state_db import state_store_from_config
+
+            store = state_store_from_config(config)
+            if store is not None:
+                record = store.get_session_state(getattr(session, "session_id"))
+                if record is not None and record.rag_profile_json:
+                    return RagProfile.model_validate(record.rag_profile_json)
+        except Exception:
+            # Fall through to the disk mirror if the state store is
+            # unavailable or the row is not yet migrated.
+            pass
     path = session_rag_profile_path(session)
     if not path.exists():
         return None

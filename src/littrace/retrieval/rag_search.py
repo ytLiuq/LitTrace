@@ -25,7 +25,7 @@ async def search_session_rag(
     *,
     top_k: int | None = None,
 ) -> RagSearchResult | None:
-    profile = load_session_rag_profile(session)
+    profile = load_session_rag_profile(session, config=config)
     if profile is None:
         return None
     if profile.backend != "pgvector" or not config.rag.enabled or config.rag.backend != "pgvector":

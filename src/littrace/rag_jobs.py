@@ -137,7 +137,7 @@ async def run_daily_rag_maintenance(config: LitTraceConfig) -> RagDailyJobReport
                 report.sessions_skipped += 0 if background_report.rag_refreshed else 1
                 report.warnings.extend(background_report.warnings)
                 continue
-            profile = load_session_rag_profile(session)
+            profile = load_session_rag_profile(session, config=config)
             skip_reason = _rag_refresh_skip_reason(profile)
             if skip_reason is not None:
                 report.sessions_skipped += 1

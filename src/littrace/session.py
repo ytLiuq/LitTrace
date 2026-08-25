@@ -949,7 +949,7 @@ def delete_chat_session(
     )
 
     embedded_chunk_count = 0
-    profile = load_session_rag_profile(session)
+    profile = load_session_rag_profile(session, config=config)
     if profile is not None and config.rag.backend == "pgvector" and config.rag.postgres_dsn:
         try:
             embedded_chunk_count = PgvectorRagStore(config, profile).delete_session()
