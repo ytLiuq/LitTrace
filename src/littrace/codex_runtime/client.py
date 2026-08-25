@@ -14,7 +14,7 @@ import os
 import shutil
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 
 if TYPE_CHECKING:
     from littrace.codex_runtime.rollout import RolloutRecorder
@@ -296,6 +296,7 @@ class AppServerClient:
         *,
         timeout: float = 300.0,
         cancellation: asyncio.Event | None = None,
+        on_delta: "Callable[[str], Awaitable[None] | None] | None" = None,
     ) -> AppServerTurnResult:
         queue = self._thread_queues.setdefault(thread_id, asyncio.Queue())
         self._turn_request_tasks.setdefault(thread_id, set())
@@ -371,6 +372,24 @@ class AppServerClient:
                     delta = params.get("delta")
                     if isinstance(delta, str):
                         deltas.append(delta)
+                        # Stream hook: callers that need to forward
+                        # deltas to an HTTP response (SSE) or a desktop
+                        # GUI renderer install an ``on_delta`` callback.
+                        # The callback may be sync or async; we await
+                        # the coroutine if it is one and otherwise
+                        # fire-and-forget. Errors are swallowed so a
+                        # single bad consumer cannot poison the
+                        # transport — the deltas are also accumulated
+                        # locally for the terminal reply, so a
+                        # failing consumer can never truncate the
+                        # final text.
+                        if on_delta is not None:
+                            try:
+                                result_cb = on_delta(delta)
+                                if asyncio.iscoroutine(result_cb):
+                                    await result_cb
+                            except Exception:
+                                pass
                 elif method == "item/completed":
                     item = params.get("item") or {}
                     if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
