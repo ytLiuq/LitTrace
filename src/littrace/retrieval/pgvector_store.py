@@ -6,7 +6,7 @@ from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
-from littrace.config import LitTraceConfig
+from littrace.config import LitTraceConfig, RagConfig
 from littrace.retrieval.rag_profile import RagProfile
 
 
@@ -65,7 +65,7 @@ class PgvectorRagStore:
         )
 
     def setup_sql(self) -> list[str]:
-        return pgvector_setup_sql(self.profile)
+        return pgvector_setup_sql(self.profile, self.config.rag)
 
     def ensure_schema(self) -> None:
         import psycopg
@@ -237,6 +237,15 @@ class PgvectorRagStore:
         table = self.collection.qualified_table
         with psycopg.connect(self.config.rag.postgres_dsn) as connection:
             register_vector(connection)
+            # Round 7 step 2: the HNSW ``ef_search`` knob is a
+            # session-level GUC, not an index option. The default
+            # of 40 is fine for small corpora; the benchmark script
+            # can sweep it. Setting it on each connection makes
+            # the per-query latency reproducible.
+            ef_search = getattr(self.config.rag, "hnsw_ef_search", None)
+            if ef_search is not None:
+                with connection.cursor() as cursor:
+                    cursor.execute("SET hnsw.ef_search = %s", (int(ef_search),))
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
@@ -274,7 +283,7 @@ class PgvectorRagStore:
         ]
 
 
-def pgvector_setup_sql(profile: RagProfile) -> list[str]:
+def pgvector_setup_sql(profile: RagProfile, rag_config: "RagConfig | None" = None) -> list[str]:
     collection = PgvectorCollection(
         schema_name=profile.postgres_schema,
         table_name=profile.collection_name,
@@ -308,9 +317,46 @@ def pgvector_setup_sql(profile: RagProfile) -> list[str]:
         f"ON {table} (profile_id)",
         f"CREATE INDEX IF NOT EXISTS {quote_ident(profile.collection_name + '_paper_idx')} "
         f"ON {table} (paper_id)",
-        f"CREATE INDEX IF NOT EXISTS {quote_ident(profile.collection_name + '_embedding_hnsw_idx')} "
-        f"ON {table} USING hnsw (embedding vector_cosine_ops)",
+        *_ann_index_statements(table, profile, rag_config),
     ]
+
+
+def _ann_index_statements(
+    table: str,
+    profile: RagProfile,
+    rag_config: "RagConfig | None",
+) -> list[str]:
+    """Generate the CREATE INDEX statement for the configured ANN family.
+
+    Round 7 step 2: surface the ``index_kind`` switch from
+    ``RagConfig``. ``hnsw`` is the default (recall-biased);
+    ``ivfflat`` trains once and is faster to build but slightly
+    worse on recall; ``none`` skips the index entirely so a tiny
+    corpus gets a sequential scan. Operators tune ``hnsw_m`` /
+    ``hnsw_ef_construction`` / ``hnsw_ef_search`` and
+    ``ivfflat_lists`` in ``config.yaml``.
+    """
+    kind = getattr(rag_config, "index_kind", "hnsw") if rag_config else "hnsw"
+    index_name = f"{profile.collection_name}_embedding_{kind}_idx"
+    if kind == "hnsw":
+        m = getattr(rag_config, "hnsw_m", 16)
+        ef_construction = getattr(rag_config, "hnsw_ef_construction", 64)
+        return [
+            f"CREATE INDEX IF NOT EXISTS {quote_ident(index_name)} "
+            f"ON {table} USING hnsw (embedding vector_cosine_ops) "
+            f"WITH (m = {int(m)}, ef_construction = {int(ef_construction)})"
+        ]
+    if kind == "ivfflat":
+        lists = getattr(rag_config, "ivfflat_lists", 100)
+        return [
+            f"CREATE INDEX IF NOT EXISTS {quote_ident(index_name)} "
+            f"ON {table} USING ivfflat (embedding vector_cosine_ops) "
+            f"WITH (lists = {int(lists)})"
+        ]
+    # ``kind == "none"`` — no ANN index. A btree on profile_id is
+    # already created above; that is enough for the planner to
+    # skip the table scan when the corpus is small.
+    return []
 
 
 def quote_ident(value: str) -> str:
