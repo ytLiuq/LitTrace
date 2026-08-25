@@ -94,3 +94,68 @@ curl "http://127.0.0.1:8000/quality"
 Run RAG evaluation only after the current session has parsed documents and a
 fresh RAG index. The API returns a warning instead of inventing scores when the
 workspace has no searchable RAG profile.
+
+## Rollout → eval pipeline (Round 10)
+
+The side-channel rollout JSONL (Round 2C `RolloutRecorder`) and the
+offline eval harness (`littrace.evaluation.harnesses`) are bridged
+by `littrace.evaluation.rollout_eval`. One LitTrace session
+produces one JSONL file with five event types
+(`session_meta`, `turn_context`, `turn_start`, `event`,
+`turn_complete`, `compaction`, `system_error`); the converter
+groups events by `turn_id` and emits typed items the existing
+harness checks already accept:
+
+| Harness check          | Items produced from rollout                              |
+|------------------------|---------------------------------------------------------|
+| `check_citations`      | `CitationRecord` extracted from `item/completed`         |
+| `check_retry_health`   | `RetryHealthItem` aggregated from MCP tool calls         |
+| (custom)               | `TurnRecord` / `ToolCallRecord` for operator-defined checks |
+
+Run the converter end-to-end against a rollouts directory:
+
+```bash
+littrace eval-from-rollout data/sessions/*/rollouts \
+    --checks check_citations,check_retry_health \
+    --report eval.json
+```
+
+Or invoke it from a CI script:
+
+```bash
+uv run python scripts/run_rollout_to_eval.py \
+    data/sessions/<id>/rollouts --report eval.json
+```
+
+The output JSON looks like:
+
+```json
+{
+  "rollout_path": "data/sessions/abc/rollouts",
+  "checks": ["check_citations", "check_retry_health"],
+  "reports": [
+    {"check": "check_citations", "passed": false, "score": 0.0,
+     "item_count": 2, "errors": ["..."], "warnings": []},
+    {"check": "check_retry_health", "passed": true, "score": 1.0,
+     "item_count": 2, "errors": [], "warnings": []}
+  ],
+  "summary": {"sessions": 2, "turns": 2, "tool_calls": 3, "errors": 1}
+}
+```
+
+### Limitations
+
+  * `RetryHealthItem.failure_rate` requires an `error_code` on
+    the per-turn bucket; the rollout's `system_error` event
+    plumbs that field but per-tool `item/completed` failures
+    are not currently annotated. A future round can extend
+    `RolloutRecorder` to capture per-tool status without
+    breaking the wire format.
+  * `CitationRecord.access_url` is a required `HttpUrl`; when
+    the rollout does not capture an access URL the converter
+    substitutes `http://about.local/citation-placeholder` so
+    `check_citations` still flags the row as `UNCHECKED` and
+    surfaces the remediation hint.
+  * Cross-turn repeats are NOT treated as retries; the
+    aggregator only counts a repeat when the same method
+    fires more than once in the same `turn_id`.
