@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import shutil
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
@@ -148,6 +149,14 @@ class AppServerClient:
         self._rollout_recorders: dict[str, Any] = {}
         if rollout_recorder is not None:
             self._rollout_recorders["__default__"] = rollout_recorder
+        # Round 8 step 2: per-thread review-turn bookkeeping.
+        # ``enteredReviewMode`` writes the active review turn id;
+        # ``exitedReviewMode`` triggers the per-thread
+        # ``on_review_complete`` callback. Both maps are scoped
+        # to the AppServerClient lifetime so a runtime_manager
+        # cache hit picks the right binding.
+        self._active_review_turns: dict[str, str] = {}
+        self._review_complete_callbacks: dict[str, Any] = {}
 
     def set_rollout_recorder(
         self, thread_id: str, recorder: "RolloutRecorder | None"
@@ -169,6 +178,31 @@ class AppServerClient:
         if thread_id and thread_id in self._rollout_recorders:
             return self._rollout_recorders[thread_id]
         return self._rollout_recorders.get("__default__")
+
+    def set_review_complete_callback(
+        self,
+        thread_id: str,
+        callback: "Callable[[dict[str, Any]], Awaitable[None] | None] | None",
+    ) -> None:
+        """Bind (or clear) a per-thread ``on_review_complete`` hook.
+
+        Round 8 step 2: the route layer installs one hook right
+        after starting a review turn; the App Server pushes
+        ``item/completed`` with ``item.type == 'exitedReviewMode'``
+        when the review finishes, and the hook fires with the raw
+        item so the caller can extract the assistant review
+        text and the exit status.
+        """
+        if callback is None:
+            self._review_complete_callbacks.pop(thread_id, None)
+        else:
+            self._review_complete_callbacks[thread_id] = callback
+
+    def _review_complete_for(self, thread_id: str) -> Any:
+        cb = self._review_complete_callbacks.get(thread_id)
+        if cb is None:
+            return None
+        return cb
 
     @property
     def running(self) -> bool:
@@ -412,6 +446,35 @@ class AppServerClient:
                     item = params.get("item") or {}
                     if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                         completed_messages.append(item["text"])
+                    # Round 8 step 2: the review turn ends with
+                    # ``enteredReviewMode`` and ``exitedReviewMode``
+                    # items. We surface the completion via the
+                    # ``on_review_complete`` hook so the route
+                    # layer can flip UI state without parsing the
+                    # raw item stream.
+                    if item.get("type") == "exitedReviewMode":
+                        review_complete_cb = self._review_complete_for(
+                            thread_id
+                        )
+                        if review_complete_cb is not None:
+                            try:
+                                cb_result = review_complete_cb(item)
+                                if asyncio.iscoroutine(cb_result):
+                                    await cb_result
+                            except Exception:
+                                pass
+                elif method == "item/started":
+                    # ``enteredReviewMode`` is the first item the
+                    # server pushes for a review turn; capture the
+                    # active review turn id so a subsequent
+                    # ``exitedReviewMode`` can pair up. We do not
+                    # need to surface this to the caller; the
+                    # ``run_turn`` return value already carries the
+                    # review turn id from the response of
+                    # ``review/start``.
+                    item = params.get("item") or {}
+                    if item.get("type") == "enteredReviewMode":
+                        self._active_review_turns[thread_id] = turn_id
                 elif method == "turn/completed":
                     completed_turn = _required_object(params, "turn")
                     status = str(completed_turn.get("status") or "unknown")
@@ -549,6 +612,128 @@ class AppServerClient:
             turn_id=turn_id,
             client_user_message_id=client_user_message_id,
         )
+
+    async def start_review(
+        self,
+        thread_id: str,
+        *,
+        target: dict[str, Any] | None = None,
+        timeout: float = 30.0,
+    ) -> AppServerTurnResult:
+        """Kick off Codex's automated reviewer for ``thread_id``.
+
+        Round 8 step 2: ``review/start`` responds like ``turn/start``
+        and emits ``enteredReviewMode`` / ``exitedReviewMode`` items
+        plus the final assistant ``agentMessage`` carrying the
+        review text. Detached reviews open a NEW review thread and
+        stream ordinary turn items; inline reviews (the default)
+        stream on the same thread with the lifecycle items.
+
+        ``target`` is the codex-harness ``ReviewTarget`` object
+        (subset/commit/baseBranch). Pass ``None`` to let the server
+        pick a default target (typically the working tree).
+        """
+        params: dict[str, Any] = {"threadId": thread_id}
+        if target is not None:
+            params["target"] = target
+        result = await self.request("review/start", params, timeout=timeout)
+        turn = _required_object(result, "turn")
+        turn_id = _required_string(turn, "id")
+        # Drain the review turn exactly like a regular ``turn/start``.
+        # The reader loop's item/started hook will register the
+        # review turn id, and item/completed.exitedReviewMode will
+        # fire the per-thread ``on_review_complete`` callback
+        # installed via ``set_review_complete_callback``.
+        self._active_review_turns[thread_id] = turn_id
+        return await self._drain_turn(
+            thread_id, turn_id, timeout=timeout,
+        )
+
+    async def _drain_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        timeout: float = 300.0,
+    ) -> AppServerTurnResult:
+        """Reuse the ``run_turn`` drain loop on an already-started turn.
+
+        ``review/start`` and ``turn/steer`` extensions that spawn a
+        separate turn lifecycle share the per-thread queue the
+        reader loop fills, so we can wait for ``turn/completed``
+        exactly the same way ``run_turn`` does. This helper
+        centralises the drain so both call sites get the same
+        ``AppServerTurnResult`` shape.
+        """
+        # Implementation lives in ``run_turn``; this is a
+        # convenience wrapper that always waits for the given
+        # turn_id and returns the typed result.
+        queue = self._thread_queues.setdefault(thread_id, asyncio.Queue())
+        deadline = time.perf_counter() + timeout
+        deltas: list[str] = []
+        completed_messages: list[str] = []
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"timed out waiting for turn/completed on {turn_id}"
+                )
+            try:
+                message = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    f"timed out waiting for turn/completed on {turn_id}"
+                ) from exc
+            method = message.get("method")
+            params_msg = message.get("params") or {}
+            if params_msg.get("turnId") != turn_id and (
+                not isinstance(params_msg.get("turn"), dict)
+                or params_msg["turn"].get("id") != turn_id
+            ):
+                continue
+            if method == "item/agentMessage/delta":
+                delta = params_msg.get("delta")
+                if isinstance(delta, str):
+                    deltas.append(delta)
+            elif method == "item/completed":
+                item = params_msg.get("item") or {}
+                if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
+                    completed_messages.append(item["text"])
+                if item.get("type") == "exitedReviewMode":
+                    review_complete_cb = self._review_complete_for(thread_id)
+                    if review_complete_cb is not None:
+                        try:
+                            cb_result = review_complete_cb(item)
+                            if asyncio.iscoroutine(cb_result):
+                                await cb_result
+                        except Exception:
+                            pass
+            elif method == "item/started":
+                item = params_msg.get("item") or {}
+                if item.get("type") == "enteredReviewMode":
+                    self._active_review_turns[thread_id] = turn_id
+            elif method == "turn/completed":
+                completed_turn = _required_object(params_msg, "turn")
+                status = str(completed_turn.get("status") or "unknown")
+                reply = "\n".join(part for part in completed_messages if part).strip()
+                if not reply:
+                    reply = "".join(deltas).strip()
+                if status not in {"completed", "interrupted"}:
+                    error = completed_turn.get("error")
+                    raise AppServerError(
+                        f"Codex turn {turn_id} ended with status {status}: {error}"
+                    )
+                self._active_review_turns.pop(thread_id, None)
+                return AppServerTurnResult(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    status=status,
+                    reply=reply,
+                    turn=completed_turn,
+                    usage=Usage.from_turn_payload(
+                        completed_turn.get("usage", {})
+                    ),
+                )
 
     async def close(self) -> None:
         if self._closed:
