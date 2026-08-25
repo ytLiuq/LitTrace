@@ -514,8 +514,38 @@ class CodexAppServerChatService:
             "env": env,
             "required": True,
             "startup_timeout_sec": self.config.agent_runtime.startup_timeout_seconds,
-            "enabled_tools": list(APP_SERVER_TOOL_NAMES),
+            # Round 13 step 3: round 4 enumerated only the
+            # 15 built-in tools; round 13 augments that with
+            # every third-party ``littrace.mcp_servers``
+            # plugin tool the installer has dropped on the
+            # Python path. Built-in names always come first
+            # so the App Server cannot accidentally advertise
+            # a plugin shadow.
+            "enabled_tools": list(self._enabled_mcp_tools()),
         }
+
+    def _enabled_mcp_tools(self) -> list[str]:
+        """Merge the built-in tool names with third-party plugin
+        tools discovered via the ``littrace.mcp_servers``
+        entry-point group.
+
+        The merge is name-unique and preserves the order of
+        the built-in list; plugin names are appended in
+        alphabetical order so a future operator can sort
+        ``littrace plugin list`` against the same set.
+        """
+        names = list(APP_SERVER_TOOL_NAMES)
+        try:
+            from littrace.marketplace import list_plugins
+            for entry in list_plugins().by_group("littrace.mcp_servers"):
+                if entry.name and entry.name not in names:
+                    names.append(entry.name)
+        except Exception:  # pragma: no cover - defensive
+            log.warning(
+                "failed to enumerate littrace.mcp_servers plugins",
+                exc_info=True,
+            )
+        return names
 
     def _codex_command(self) -> list[str]:
         command = list(self.config.agent_runtime.codex_command)

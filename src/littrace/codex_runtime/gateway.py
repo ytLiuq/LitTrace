@@ -441,6 +441,46 @@ class LitTraceToolGateway:
     def __init__(self, config: LitTraceConfig, state_store: StateStore) -> None:
         self.config = config
         self.state_store = state_store
+        # Round 13 step 3: third-party plugins installed via
+        # the ``littrace.mcp_servers`` entry-point group
+        # can extend the tool catalog without modifying this
+        # file. ``external_tools`` is the merged name set;
+        # ``external_handlers`` maps tool name -> async
+        # callable. ``apply_external_plugins`` walks the
+        # marketplace discovery result and registers each
+        # plugin's tools.
+        self.external_tools: dict[str, dict[str, Any]] = {}
+        self.external_handlers: dict[str, Any] = {}
+
+    def register_external_tool(
+        self,
+        *,
+        name: str,
+        spec: dict[str, Any],
+        handler: Any,
+    ) -> None:
+        """Install one third-party MCP tool into the gateway.
+
+        ``spec`` is the JSON-Schema-shaped tool description the
+        App Server uses to advertise the tool to the model;
+        ``handler`` is the async callable that resolves the
+        tool's call. The gateway's ``call`` method already
+        delegates to ``external_handlers`` once a tool name
+        is registered, so the only contract the plugin has
+        to honour is ``async def handler(name, args, *,
+        codex_thread_id) -> dict[str, Any]``.
+        """
+        if not name or not isinstance(spec, dict):
+            raise ValueError("third-party tool requires a non-empty name and dict spec")
+        self.external_tools[name] = spec
+        self.external_handlers[name] = handler
+
+    def list_external_tool_specs(self) -> list[dict[str, Any]]:
+        """JSON-Schema list used by the App Server thread/start
+        payload to advertise the registered third-party tools
+        alongside the 15 built-in LitTrace tools.
+        """
+        return list(self.external_tools.values())
 
     def load_workspace(
         self,
@@ -464,6 +504,15 @@ class LitTraceToolGateway:
         *,
         codex_thread_id: str,
     ) -> dict[str, Any]:
+        # Round 13 step 3: third-party MCP servers register
+        # via the gateway's ``external_handlers`` map; the
+        # built-in allowlist is still the source of truth for
+        # the 15 LitTrace tools.
+        if name in self.external_handlers:
+            handler = self.external_handlers[name]
+            return await handler(
+                name, arguments or {}, codex_thread_id=codex_thread_id,
+            )
         if name not in APP_SERVER_TOOL_NAMES:
             raise PermissionError(f"Tool is not in the App Server allowlist: {name}")
         args = arguments or {}

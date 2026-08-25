@@ -53,6 +53,52 @@ logger = get_logger("mcp_server")
 app = Server("littrace")
 APP_SERVER_GATEWAY = os.environ.get("LITTRACE_MCP_GATEWAY", "").strip() == "1"
 
+# Round 13 step 3: lazy, process-wide gateway singleton so the
+# third-party ``littrace.mcp_servers`` plugins are registered
+# exactly once per process. The gateway's ``external_handlers``
+# and ``external_tools`` maps survive across tool calls; the
+# per-call state (workspace, workspace_sha256, etc.) is still
+# reconstructed from the request's threadId inside
+# ``gateway.call``.
+_GATEWAY: "LitTraceToolGateway | None" = None
+_GATEWAY_PLUGINS_APPLIED = False
+
+
+def _get_gateway() -> "LitTraceToolGateway":
+    """Lazily construct + plugin-load the gateway singleton.
+
+    First call wires up the in-tree gateway, then runs the
+    marketplace discovery and registers every
+    ``littrace.mcp_servers`` plugin against it. Subsequent
+    calls reuse the same gateway instance so third-party
+    tools installed via ``pip install`` between requests
+    are picked up at the next cold start.
+    """
+    global _GATEWAY, _GATEWAY_PLUGINS_APPLIED
+    if _GATEWAY is None:
+        from littrace.state_db import state_store_from_config
+        _GATEWAY = LitTraceToolGateway(_config, state_store_from_config(_config))
+    if not _GATEWAY_PLUGINS_APPLIED:
+        try:
+            from littrace.marketplace import list_plugins
+            from littrace.marketplace.discovery import ENTRY_POINT_MCP_SERVERS
+            result = list_plugins()
+            warnings = result.apply(
+                mcp_gateway=_GATEWAY,
+            )
+            for warning in warnings:
+                log.warning(
+                    "external MCP plugin load failed: %s",
+                    warning,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning(
+                "external MCP plugin scan failed: %s",
+                exc,
+            )
+        _GATEWAY_PLUGINS_APPLIED = True
+    return _GATEWAY
+
 # Module-level state (MCP servers are single-session by design)
 _config: LitTraceConfig = load_config(os.environ.get("LITTRACE_CONFIG_PATH", "config.yaml"))
 _workspace = None  # LiteratureWorkspace, lazily imported
@@ -246,9 +292,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         if meta is not None:
             thread_id = (meta.model_extra or {}).get("threadId")
         try:
-            from littrace.state_db import state_store_from_config
-
-            gateway = LitTraceToolGateway(_config, state_store_from_config(_config))
+            gateway = _get_gateway()
             payload = await gateway.call(
                 name,
                 arguments,
