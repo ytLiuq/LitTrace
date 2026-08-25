@@ -11,7 +11,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from littrace.codex_runtime.client import AppServerClient, AppServerError
+from littrace.codex_runtime.client import (
+    AppServerClient,
+    AppServerError,
+    AppServerTurnResult,
+    SteerTurnResult,
+)
 from littrace.codex_runtime.gateway import APP_SERVER_TOOL_NAMES
 from littrace.codex_runtime.runtime import (
     CodexAppServerRuntimeManager,
@@ -311,6 +316,105 @@ class CodexAppServerChatService:
         )
         return turn, latest_workspace
 
+    async def steer(
+        self,
+        session: ChatSession,
+        turn_id: str,
+        text: str,
+        *,
+        client_user_message_id: str | None = None,
+    ) -> "SteerTurnResult":
+        """Forward a mid-turn input to the active App Server turn.
+
+        Round 8 step 3: thin wrapper over
+        ``AppServerClient.steer_turn`` that resolves the binding
+        from the session id and reuses the shared runtime
+        manager so the call lands on the same process the chat
+        turn started on.
+        """
+        binding = self.state_store.get_agent_thread_binding(session.session_id)
+        if binding is None:
+            raise AppServerError(
+                f"no active codex thread for session {session.session_id}"
+            )
+        manager = self._shared_runtime_manager()
+        async with manager.use(
+            lambda client: client.steer_turn(
+                binding.codex_thread_id,
+                turn_id,
+                text,
+                client_user_message_id=client_user_message_id,
+            )
+        ) as result:
+            return result
+
+    async def start_review(
+        self,
+        session: ChatSession,
+        *,
+        target: dict[str, Any] | None = None,
+        on_review_complete=None,
+    ) -> "AppServerTurnResult":
+        """Kick off a codex review turn on the session's thread.
+
+        Round 8 step 3: thin wrapper over
+        ``AppServerClient.start_review`` that resolves the
+        binding, installs a per-thread ``on_review_complete``
+        callback on the shared runtime manager, and returns
+        the typed ``AppServerTurnResult`` for the review turn.
+        The callback fires from the reader loop when
+        ``item/completed`` carries ``exitedReviewMode``.
+        """
+        binding = self.state_store.get_agent_thread_binding(session.session_id)
+        if binding is None:
+            raise AppServerError(
+                f"no active codex thread for session {session.session_id}"
+            )
+        manager = self._shared_runtime_manager()
+        async with manager.use(
+            lambda client: _start_review_through(
+                client, binding.codex_thread_id, target, on_review_complete
+            )
+        ) as result:
+            return result
+
+    async def cancel_turn_with_reason(
+        self,
+        session: ChatSession,
+        turn_id: str,
+        *,
+        reason: str,
+    ) -> bool:
+        """Cancel an in-flight turn and record the reason on the binding.
+
+        Round 8 step 3: the legacy ``cancel_current_turn`` does
+        not surface *why* a turn was cancelled (user pressed
+        Esc, compaction triggered, model loop detected, etc.).
+        The route layer passes the reason through; we record it
+        in the binding's ``last_error`` column so an operator
+        can later inspect why a turn ended without
+        status='completed'.
+
+        Returns True if the App Server acknowledged
+        ``turn/interrupt`` with a terminal event; False on a
+        transport failure (the caller should treat the turn as
+        terminated either way).
+        """
+        binding = self.state_store.get_agent_thread_binding(session.session_id)
+        if binding is None:
+            return False
+        manager = self._shared_runtime_manager()
+        ack = await manager.use(
+            lambda client: client.cancel_current_turn(
+                binding.codex_thread_id, turn_id,
+            )
+        )
+        if ack:
+            self.state_store.upsert_agent_thread_binding(
+                binding.model_copy(update={"last_error": f"cancelled: {reason}"})
+            )
+        return ack
+
     def _client_options(
         self,
         *,
@@ -499,9 +603,28 @@ def _runtime_version(client: AppServerClient) -> str | None:
     if isinstance(user_agent, str) and user_agent:
         return user_agent
     for line in client.stderr_tail:
-        if "codex" in line.lower() and "version" in line.lower():
-            return line[-200:]
+        line = line.strip()
+        if "codex" in line.lower():
+            return line
     return None
+
+
+async def _start_review_through(
+    client: AppServerClient,
+    thread_id: str,
+    target: dict[str, Any] | None,
+    on_review_complete,
+) -> AppServerTurnResult:
+    """Install the per-thread review-complete callback and start the review.
+
+    Round 8 step 3 helper: the callback needs to land on the
+    SAME client instance the App Server is pushing notifications
+    to. ``manager.use`` already guarantees that (it hands the
+    active client to the lambda), so we install the hook
+    before calling ``start_review``.
+    """
+    client.set_review_complete_callback(thread_id, on_review_complete)
+    return await client.start_review(thread_id, target=target)
 
 
 def _prepend_path(value: str, existing: str | None) -> str:
