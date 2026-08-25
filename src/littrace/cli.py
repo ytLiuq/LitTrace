@@ -122,6 +122,7 @@ def main() -> None:
         "publisher-e2e",
         "compaction",
         "eval-from-rollout",
+        "plugin",
     }:
         print(
             f"Unknown subcommand: {sys.argv[1]!r}. "
@@ -144,6 +145,9 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "eval-from-rollout":
         _run_eval_from_rollout_command(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "plugin":
+        _run_plugin_command(sys.argv[2:])
         return
     if len(sys.argv) > 1 and sys.argv[1] == "jobs":
         config = load_config()
@@ -592,6 +596,73 @@ def _run_metrics_command(config) -> None:
         )
     if report.warnings:
         print("warnings: " + "；".join(report.warnings))
+
+
+def _run_plugin_command(argv: list[str]) -> None:
+    """CLI driver for ``littrace plugin list|info``.
+
+    Round 13 step 2: read-only introspection of the entry-point
+    plugins that ``pip install`` has dropped on the Python
+    path. ``plugin list`` prints every entry point grouped by
+    distribution; ``plugin info <name>`` prints one entry
+    point's full payload (callable module + docstring).
+    """
+    from littrace.marketplace import list_plugins, plugin_info
+
+    if not argv or argv[0] in {"-h", "--help"}:
+        print(
+            "usage: littrace plugin list\n"
+            "       littrace plugin info <name>\n"
+            "\n"
+            "Third-party plugins are discovered via Python entry-point\n"
+            "groups: littrace.skills, littrace.mcp_servers,\n"
+            "littrace.harnesses. Install a plugin with\n"
+            "``pip install <package>`` and it shows up here.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    sub = argv[0]
+    if sub == "list":
+        result = list_plugins()
+        if not result.entries:
+            print("no third-party LitTrace plugins installed.")
+            return
+        # Group by distribution so a single ``pip install``
+        # surfaces as one block.
+        by_dist: dict[str, list[Any]] = {}
+        for entry in result.entries:
+            by_dist.setdefault(entry.dist or "(unknown)", []).append(entry)
+        for dist, entries in sorted(by_dist.items()):
+            print(f"== {dist} ==")
+            for entry in sorted(entries, key=lambda e: (e.group, e.name)):
+                print(
+                    f"  [{entry.group:<22s}] {entry.name:<32s} "
+                    f"-> {entry.value.__module__}.{entry.value.__qualname__}"
+                )
+        if result.failures:
+            print()
+            print("load failures:")
+            for failure in result.failures:
+                print(f"  - {failure}")
+        return
+    if sub == "info":
+        if len(argv) < 2:
+            print(
+                "usage: littrace plugin info <name> "
+                "(<name> matches either an entry-point name or "
+                "a distribution name)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        info = plugin_info(argv[1])
+        if info is None:
+            print(f"plugin not found: {argv[1]!r}", file=sys.stderr)
+            sys.exit(1)
+        for key, value in info.items():
+            print(f"{key}: {value}")
+        return
+    print(f"unknown plugin subcommand: {sub!r}", file=sys.stderr)
+    sys.exit(2)
 
 
 def _run_eval_from_rollout_command(argv: list[str]) -> None:
