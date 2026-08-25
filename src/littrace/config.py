@@ -6,6 +6,7 @@ from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field
+from typing import Literal
 
 
 class DownloadMode(StrEnum):
@@ -68,6 +69,23 @@ class RagConfig(BaseModel):
     # For local PDFs the user must explicitly invoke a manual download.
     auto_download_open_access: bool = True
     login_required_policy: str = "queue_only"
+    # --- Round 7: ANN index tuning --------------------------------------
+    # ``index_kind`` selects the pgvector index family:
+    #   * ``"hnsw"``  — default, recall-biased, good for up to ~1M rows.
+    #   * ``"ivfflat"`` — train-once, faster build, slightly lower recall.
+    #   * ``"none"``   — disable ANN; useful for tiny corpora (<1k rows)
+    #                   where the planner prefers a sequential scan.
+    # The HNSW parameters are the standard pgvector knobs: ``m`` is
+    # the degree of each node, ``ef_construction`` trades build
+    # time for graph quality, and ``ef_search`` is the per-query
+    # search beam. Defaults are pgvector's; larger values lift
+    # recall at the cost of latency. Benchmark script
+    # (``scripts/benchmark_pgvector.py``) measures both axes.
+    index_kind: Literal["hnsw", "ivfflat", "none"] = "hnsw"
+    hnsw_m: int = 16
+    hnsw_ef_construction: int = 64
+    hnsw_ef_search: int = 40
+    ivfflat_lists: int = 100
 
 
 class FigureEnrichmentConfig(BaseModel):
