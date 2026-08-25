@@ -13,8 +13,14 @@ from littrace.api.auth import resolve_request_session
 from littrace.api.backend import api_app
 from littrace.codex_runtime.service import CodexAppServerChatService
 from littrace.models import (
+    ChatCancelRequest,
+    ChatCancelResponse,
     ChatRequest,
     ChatResponse,
+    ChatReviewRequest,
+    ChatReviewResponse,
+    ChatSteerRequest,
+    ChatSteerResponse,
     LiteratureWorkspace,
     PaperSearchRequest,
     ResearchRunRequest,
@@ -314,6 +320,145 @@ def _requires_route_workspace_save(response: ChatResponse) -> bool:
     """Return whether the route, rather than MCP, owns workspace persistence."""
 
     return response.action not in _APP_SERVER_PERSISTED_ACTIONS
+
+
+@router.post("/chat/steer")
+async def chat_steer(
+    request: ChatSteerRequest,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> "ChatSteerResponse":
+    """Forward a mid-turn user input to the active App Server turn.
+
+    Round 8 step 4: the desktop GUI uses this to redirect an
+    in-flight turn without cancelling it (e.g. ``"actually
+    focus on the failing tests first"``). The server returns
+    ``active_turn_not_steerable`` for review / manual
+    compaction turns, which surfaces as ``AppServerError`` and
+    is rendered as a 409 by the route.
+    """
+    config = api_app.load_config()
+    auth = resolve_request_session(
+        config,
+        route_session_id=request.session_id,
+        header_session_id=x_littrace_session_id,
+    )
+    session = load_or_create_session(config, auth.session_id)
+    service = CodexAppServerChatService(config)
+    result = await service.steer(
+        session,
+        turn_id=request.turn_id,
+        text=request.text,
+        client_user_message_id=request.client_user_message_id,
+    )
+    api_app.append_trace(
+        config,
+        "chat_steer",
+        {"turn_id": request.turn_id, "session_id": session.session_id},
+    )
+    return ChatSteerResponse(
+        turn_id=result.turn_id,
+        thread_id=result.thread_id,
+        client_user_message_id=result.client_user_message_id,
+        session_id=session.session_id,
+    )
+
+
+@router.post("/chat/review")
+async def chat_review(
+    request: ChatReviewRequest,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> "ChatReviewResponse":
+    """Kick off Codex's automated reviewer on the session's thread.
+
+    Round 8 step 4: invokes ``review/start`` and returns the
+    review turn id. The actual review text is delivered via
+    the on-review-complete hook installed by the service
+    layer; clients poll the session state or subscribe to a
+    future notification stream for the verdict. The route
+    is intentionally synchronous so a CLI caller can pipe
+    the next prompt based on the review turn id.
+    """
+    config = api_app.load_config()
+    auth = resolve_request_session(
+        config,
+        route_session_id=request.session_id,
+        header_session_id=x_littrace_session_id,
+    )
+    session = load_or_create_session(config, auth.session_id)
+    service = CodexAppServerChatService(config)
+
+    completion: dict[str, object] = {}
+
+    def _on_complete(item: dict[str, object]) -> None:
+        completion["item"] = item
+
+    result = await service.start_review(
+        session,
+        target=request.target,
+        on_review_complete=_on_complete,
+    )
+    api_app.append_trace(
+        config,
+        "chat_review",
+        {
+            "turn_id": result.turn_id,
+            "session_id": session.session_id,
+            "status": result.status,
+        },
+    )
+    return ChatReviewResponse(
+        turn_id=result.turn_id,
+        thread_id=result.thread_id,
+        status=result.status,
+        review_text=result.reply,
+        exit_item=completion.get("item"),
+        session_id=session.session_id,
+    )
+
+
+@router.post("/chat/{turn_id}/cancel")
+async def chat_cancel(
+    turn_id: str,
+    request: ChatCancelRequest,
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> "ChatCancelResponse":
+    """Cancel an in-flight turn and record the reason on the binding.
+
+    Round 8 step 4: supersedes the implicit cancellation
+    channel on ``/chat``. Callers pass a structured ``reason``
+    (e.g. ``"user_pressed_esc"`` or ``"compaction_triggered"``)
+    so an operator can later inspect the binding's
+    ``last_error`` column to triage why a turn was abandoned.
+    """
+    config = api_app.load_config()
+    auth = resolve_request_session(
+        config,
+        route_session_id=request.session_id,
+        header_session_id=x_littrace_session_id,
+    )
+    session = load_or_create_session(config, auth.session_id)
+    service = CodexAppServerChatService(config)
+    acknowledged = await service.cancel_turn_with_reason(
+        session,
+        turn_id=turn_id,
+        reason=request.reason,
+    )
+    api_app.append_trace(
+        config,
+        "chat_cancel",
+        {
+            "turn_id": turn_id,
+            "session_id": session.session_id,
+            "reason": request.reason,
+            "acknowledged": acknowledged,
+        },
+    )
+    return ChatCancelResponse(
+        turn_id=turn_id,
+        session_id=session.session_id,
+        reason=request.reason,
+        acknowledged=acknowledged,
+    )
 
 
 @router.post("/sessions/{session_id}/export")

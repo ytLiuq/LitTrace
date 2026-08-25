@@ -972,3 +972,73 @@ class StorylineClaim(BaseModel):
 LiteratureWorkspace.model_rebuild()
 ResearchRunResult.model_rebuild()
 ChatResponse.model_rebuild()
+
+
+# ---------------------------------------------------------------------------
+# Round 8: thread steering + review + cancel-with-reason request / response
+# models. Kept here (instead of in routes/research.py) so the
+# generated OpenAPI surface shows the same schema regardless of
+# where the route is mounted, and so a generated client can
+# share types with the SSE streaming route.
+# ---------------------------------------------------------------------------
+
+
+class ChatSteerRequest(BaseModel):
+    """Body of ``POST /chat/steer``.
+
+    Mirrors the codex-harness ``turn/steer`` request parameters:
+    ``turn_id`` identifies the active turn the input lands on,
+    ``text`` is the additional user input, and the optional
+    ``client_user_message_id`` echoes back in the corresponding
+    ``userMessage`` item so the caller can correlate stream
+    notifications.
+    """
+
+    turn_id: str
+    text: str
+    client_user_message_id: str | None = None
+    session_id: str | None = None
+
+
+class ChatSteerResponse(BaseModel):
+    turn_id: str
+    thread_id: str
+    client_user_message_id: str | None = None
+    session_id: str | None = None
+
+
+class ChatReviewRequest(BaseModel):
+    """Body of ``POST /chat/review``."""
+
+    target: dict[str, object] | None = None
+    session_id: str | None = None
+
+
+class ChatReviewResponse(BaseModel):
+    turn_id: str
+    thread_id: str
+    status: str
+    review_text: str = ""
+    exit_item: dict[str, object] | None = None
+    session_id: str | None = None
+
+
+class ChatCancelRequest(BaseModel):
+    """Body of ``POST /chat/{turn_id}/cancel``.
+
+    ``reason`` is a free-form short string. The service layer
+    stamps it into ``agent_thread_bindings.last_error`` so an
+    operator can later distinguish user-triggered cancellations
+    (Esc) from worker-triggered ones (compaction) from
+    model-loop bailouts.
+    """
+
+    reason: str
+    session_id: str | None = None
+
+
+class ChatCancelResponse(BaseModel):
+    turn_id: str
+    session_id: str | None = None
+    reason: str
+    acknowledged: bool
