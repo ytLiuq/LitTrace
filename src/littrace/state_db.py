@@ -366,212 +366,25 @@ class PostgresStateStore:
     # --- schema bootstrap ---------------------------------------------------
 
     def _ensure_schema(self) -> None:
+        """Bring the schema up to date.
+
+        Round 7 cleanup: the DDL statements live in
+        ``littrace.state_db.schema`` so this method can
+        focus on the connect / commit lifecycle. The
+        schema module owns the order of CREATE / ALTER /
+        CREATE INDEX statements and is the single source
+        of truth for which tables exist.
+        """
         if self._initialized:
             return
-        s = self.schema_name
+        from littrace.state_db_schema import execute_statements
+
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {s}")
-
-            # DROP legacy tables ONLY when the operator has explicitly
-            # enabled schema reset. Default off — protects production /
-            # shared DSNs from accidental data loss on every boot.
-            if self.allow_schema_reset:
-                for old in (
-                    "artifact_outbox",
-                    "embedding_jobs",
-                    "paper_lifecycle_events",
-                    "session_messages",
-                    "session_memory",
-                    "session_snapshots",
-                    "sessions",
-                ):
-                    cur.execute(f"DROP TABLE IF EXISTS {s}.{old} CASCADE")
-
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {s}.session_state (
-                    session_id TEXT PRIMARY KEY,
-                    workspace_sha256 TEXT,
-                    workspace_json JSONB NOT NULL,
-                    manifest_json JSONB NOT NULL,
-                    artifact_index_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                    memory_view_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                    rag_profile_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                    revision INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'active'
-                        CHECK (status IN ('draft', 'idle', 'active', 'systemError', 'archived')),
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL
-                )
-                """
+            execute_statements(
+                cur,
+                self.schema_name,
+                allow_schema_reset=self.allow_schema_reset,
             )
-            # Migration for older deployments where ``status`` did not
-            # exist yet. IF NOT EXISTS makes this a no-op on fresh DBs.
-            cur.execute(
-                f"ALTER TABLE {s}.session_state "
-                f"ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'"
-            )
-            # The CHECK constraint lives in the CREATE TABLE above; for
-            # pre-status deployments Postgres did not enforce it. Add
-            # it idempotently via a domain-less CHECK that survives
-            # re-runs. Round 4 P1 step 5 widened the status set from
-            # 3 to 5 values (added 'idle' and 'systemError'). An older
-            # database with the previous 3-value CHECK will reject
-            # new writes, so we drop the old constraint first (if it
-            # exists) and add the new one.
-            cur.execute(
-                f"DO $$ BEGIN "
-                f"  ALTER TABLE {s}.session_state "
-                f"    DROP CONSTRAINT session_state_status_check; "
-                f"  ALTER TABLE {s}.session_state "
-                f"    ADD CONSTRAINT session_state_status_check "
-                f"    CHECK (status IN ('draft', 'idle', 'active', 'systemError', 'archived')); "
-                f"EXCEPTION WHEN undefined_object OR duplicate_object THEN NULL; "
-                f"END $$"
-            )
-
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {s}.agent_thread_bindings (
-                    session_id TEXT PRIMARY KEY REFERENCES {s}.session_state(session_id)
-                        ON DELETE CASCADE,
-                    codex_thread_id TEXT UNIQUE NOT NULL,
-                    runtime_kind TEXT NOT NULL,
-                    runtime_version TEXT,
-                    workspace_revision INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    last_error TEXT,
-                    turn_count INTEGER NOT NULL DEFAULT 0,
-                    last_total_tokens INTEGER NOT NULL DEFAULT 0,
-                    last_compacted_at TEXT,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS agent_thread_bindings_status_idx "
-                f"ON {s}.agent_thread_bindings (status, updated_at)"
-            )
-            # Round 5: migration path for older deployments where
-            # agent_thread_bindings does not yet carry the three
-            # compaction fields. ADD COLUMN IF NOT EXISTS is
-            # idempotent; the DO $$ … EXCEPTION block keeps the
-            # already-deployed path alive on re-runs.
-            cur.execute(
-                f"DO $$ BEGIN "
-                f"  ALTER TABLE {s}.agent_thread_bindings "
-                f"    ADD COLUMN turn_count INTEGER NOT NULL DEFAULT 0; "
-                f"  ALTER TABLE {s}.agent_thread_bindings "
-                f"    ADD COLUMN last_total_tokens INTEGER NOT NULL DEFAULT 0; "
-                f"  ALTER TABLE {s}.agent_thread_bindings "
-                f"    ADD COLUMN last_compacted_at TEXT; "
-                f"EXCEPTION WHEN duplicate_column THEN NULL; "
-                f"END $$"
-            )
-
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {s}.session_state_snapshots (
-                    session_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL,
-                    workspace_sha256 TEXT,
-                    workspace_json JSONB NOT NULL,
-                    captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (session_id, revision)
-                )
-                """
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS session_state_snapshots_captured_idx "
-                f"ON {s}.session_state_snapshots (session_id, captured_at DESC)"
-            )
-
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {s}.agent_tool_calls (
-                    session_id TEXT NOT NULL REFERENCES {s}.session_state(session_id)
-                        ON DELETE CASCADE,
-                    idempotency_key TEXT NOT NULL,
-                    tool_name TEXT NOT NULL,
-                    arguments_sha256 TEXT NOT NULL,
-                    expected_revision INTEGER NOT NULL,
-                    committed_revision INTEGER NOT NULL,
-                    result_json JSONB NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL,
-                    PRIMARY KEY (session_id, idempotency_key)
-                )
-                """
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS agent_tool_calls_tool_idx "
-                f"ON {s}.agent_tool_calls (tool_name, updated_at)"
-            )
-
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {s}.chat_trail (
-                    session_id TEXT PRIMARY KEY REFERENCES {s}.session_state(session_id)
-                        ON DELETE CASCADE,
-                    messages JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    snapshot_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    events JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    updated_at TIMESTAMPTZ NOT NULL,
-                    CONSTRAINT chat_trail_messages_cap CHECK (jsonb_array_length(messages) <= 5000),
-                    CONSTRAINT chat_trail_events_cap   CHECK (jsonb_array_length(events)   <= 5000)
-                )
-                """
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS chat_trail_messages_idx ON {s}.chat_trail USING GIN (messages)"
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS chat_trail_events_idx ON {s}.chat_trail USING GIN (events)"
-            )
-
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {s}.async_tasks (
-                    task_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    artifact_id TEXT NOT NULL DEFAULT '',
-                    event_type TEXT NOT NULL DEFAULT '',
-                    profile_id TEXT NOT NULL DEFAULT '',
-                    source_revision TEXT NOT NULL DEFAULT '',
-                    content_sha256 TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL,
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    next_attempt_at TIMESTAMPTZ,
-                    last_heartbeat_at TIMESTAMPTZ,
-                    lease_owner TEXT,
-                    lease_expires_at TIMESTAMPTZ,
-                    last_error TEXT,
-                    result_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL,
-                    completed_at TIMESTAMPTZ
-                )
-                """
-            )
-            cur.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS async_tasks_idempotency_idx "
-                f"ON {s}.async_tasks (session_id, artifact_id, kind, content_sha256)"
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS async_tasks_pending_idx "
-                f"ON {s}.async_tasks (status, next_attempt_at)"
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS async_tasks_lease_idx "
-                f"ON {s}.async_tasks (lease_expires_at)"
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS async_tasks_session_idx "
-                f"ON {s}.async_tasks (session_id, status)"
-            )
-
             conn.commit()
         self._initialized = True
 
