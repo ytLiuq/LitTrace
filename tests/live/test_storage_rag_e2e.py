@@ -153,7 +153,7 @@ async def test_download_to_object_storage_and_refresh_rag_embeddings(
     assert session_jobs
     assert all(job.status == "completed" for job in session_jobs)
 
-    loaded_profile = load_session_rag_profile(session)
+    loaded_profile = load_session_rag_profile(session, config=config)
     assert loaded_profile is not None
     store = PgvectorRagStore(config, loaded_profile)
     query_embedding = (await embedding_client_from_config(config, loaded_profile).embed_texts(["attention mechanisms"]))[0]

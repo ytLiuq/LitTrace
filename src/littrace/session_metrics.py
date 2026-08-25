@@ -142,8 +142,9 @@ def _today_discovery_count(workspace: LiteratureWorkspace, lifecycle_events=()) 
 
     today = datetime.now(UTC).date()
     discovered_lifecycle = {
-        event.paper_id for event in lifecycle_events
-        if event.event_type == "discovered_relevant" and _is_today(event.occurred_at, today)
+        event.get("paper_id") for event in lifecycle_events
+        if event.get("event_type") == "discovered_relevant"
+        and _is_today(event.get("occurred_at"), today)
     }
     if discovered_lifecycle:
         return len(discovered_lifecycle), "measured", "unique discovered_relevant lifecycle events today (UTC)"
@@ -216,10 +217,10 @@ def _acquisition_metric(events, stored_pdf_count: int, relevant_count: int, trun
     terminal_tasks: dict[str, str] = {}
     retryable = 0
     for event in events:
-        if event.event_type == "acquisition_failed_retryable":
+        if event.get("event_type") == "acquisition_failed_retryable":
             retryable += 1
-        if event.event_type in terminal:
-            terminal_tasks[event.task_id or event.paper_id] = event.event_type
+        if event.get("event_type") in terminal:
+            terminal_tasks[event.get("task_id") or event.get("paper_id")] = event.get("event_type")
     if terminal_tasks:
         verified = sum(event == "acquisition_verified" for event in terminal_tasks.values())
         auth = sum(event == "acquisition_auth_required" for event in terminal_tasks.values())
