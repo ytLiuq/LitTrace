@@ -296,9 +296,19 @@ class RolloutConverter:
                 )
 
         turn_records: list[TurnRecord] = []
+        # Same model-output filter as the retry aggregator:
+        # count unique MCP tool invocations, not lifecycle
+        # notifications.
+        model_output = {
+            "item/agentMessage/delta",
+            "item/completed",
+            "item/started",
+        }
         for turn_id, bucket in turns.items():
-            # Count distinct tool-call methods for ``tool_call_count``.
-            unique_methods = {m for m in bucket.tool_call_methods if m}
+            unique_tool_methods = {
+                m for m in bucket.tool_call_methods
+                if m and m not in model_output
+            }
             turn_records.append(
                 TurnRecord(
                     session_id=bucket.session_id,
@@ -308,7 +318,7 @@ class RolloutConverter:
                     reply=bucket.reply,
                     started_at=bucket.started_at,
                     completed_at=bucket.completed_at,
-                    tool_call_count=len(unique_methods),
+                    tool_call_count=len(unique_tool_methods),
                     error_code=bucket.error_code,
                 )
             )
@@ -342,14 +352,31 @@ def _aggregate_retry_health(tool_calls: list[ToolCallRecord]) -> list[RetryHealt
     "caller has to annotate" case via the audit_message field
     in the items so a future patch can plumb per-tool status
     through the rollout append surface.
+
+    ``item/completed`` and ``item/agentMessage/delta`` are
+    *model output* notifications, not MCP tool calls, so they
+    are filtered out before the retry aggregation runs.
+    Otherwise every turn would inflate the retry health
+    bucket with one fake tool call.
     """
+    # Method names that are App Server lifecycle notifications
+    # rather than MCP tool invocations. The list is the union
+    # of every ``item/*`` notification the App Server pushes
+    # on a successful turn.
+    _MODEL_OUTPUT_METHODS = frozenset(
+        {
+            "item/agentMessage/delta",
+            "item/completed",
+            "item/started",
+        }
+    )
     bucket: dict[str, dict[str, int]] = defaultdict(
         lambda: {"total": 0, "retries": 0, "failed": 0}
     )
     method_counts_per_turn: dict[tuple[str, str], int] = defaultdict(int)
     for call in tool_calls:
         method = call.method
-        if not method:
+        if not method or method in _MODEL_OUTPUT_METHODS:
             continue
         bucket[method]["total"] += 1
         method_counts_per_turn[(call.turn_id, method)] += 1
