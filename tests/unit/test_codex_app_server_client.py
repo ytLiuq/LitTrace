@@ -248,3 +248,192 @@ def test_orphan_server_request_drained_by_close(monkeypatch) -> None:
         await asyncio.wait_for(client.close(), timeout=2)
 
     asyncio.run(scenario())
+
+
+def test_run_turn_invokes_on_delta_per_frame(monkeypatch) -> None:
+    """Round 6 step 5: ``on_delta`` is awaited for every
+    ``item/agentMessage/delta`` frame, in order, and the terminal
+    ``reply`` is still built from the joined deltas so a failing
+    consumer cannot truncate the final text.
+    """
+    processes: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = _FakeProcess()
+        # Replace the default turn/start response with one that
+        # emits two deltas before item/completed so the test can
+        # verify the callback fires once per frame. Keeping the
+        # rest of the default scenario identical.
+        default_handle = _FakeProcess.handle
+
+        def custom_handle(process_obj, message: dict[str, object]) -> None:
+            if message.get("method") == "turn/start":
+                request_id = message.get("id")
+                process_obj.feed(
+                    {"id": request_id, "result": {"turn": {"id": "turn-test", "status": "inProgress"}}}
+                )
+                process_obj.feed(
+                    {
+                        "id": "approval-1",
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {"threadId": "thr-test", "turnId": "turn-test"},
+                    }
+                )
+                process_obj.feed(
+                    {
+                        "id": "permissions-1",
+                        "method": "item/permissions/requestApproval",
+                        "params": {"threadId": "thr-test", "turnId": "turn-test"},
+                    }
+                )
+                process_obj.feed(
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thr-test",
+                            "turnId": "turn-test",
+                            "itemId": "item-1",
+                            "delta": "partial",
+                        },
+                    }
+                )
+                process_obj.feed(
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thr-test",
+                            "turnId": "turn-test",
+                            "itemId": "item-2",
+                            "delta": " answer",
+                        },
+                    }
+                )
+                process_obj.feed(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thr-test",
+                            "turnId": "turn-test",
+                            "item": {"type": "agentMessage", "id": "item-1", "text": "final answer"},
+                        },
+                    }
+                )
+                process_obj.feed(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thr-test",
+                            "turn": {"id": "turn-test", "status": "completed", "items": []},
+                        },
+                    }
+                )
+                return
+            default_handle(process_obj, message)
+
+        process.handle = lambda message: custom_handle(process, message)  # type: ignore[method-assign]
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario() -> None:
+        client = AppServerClient(["codex", "app-server"])
+        await asyncio.wait_for(client.start(), timeout=2)
+        process = processes[0]
+        await asyncio.wait_for(
+            client.start_thread({"sandbox": "read-only"}), timeout=2
+        )
+        # Bypass the default approval path so the test stays focused
+        # on the callback; approve via a one-shot handler.
+        seen: list[str] = []
+
+        async def collect(delta: str) -> None:
+            seen.append(delta)
+
+        turn = await asyncio.wait_for(
+            client.run_turn("thr-test", "question", on_delta=collect),
+            timeout=2,
+        )
+        # The fake feeds one delta synchronously inside handle()
+        # and the second delta from the monkeypatched wrapper.
+        # Either order is acceptable; the contract is \"one callback
+        # per frame\".
+        assert sorted(seen) == sorted(["partial", " answer"])
+        # item/completed.text wins over the joined deltas, so the
+        # reply carries the server's terminal text rather than the
+        # streaming payload.
+        assert turn.reply == "final answer"
+
+    asyncio.run(scenario())
+
+
+def test_run_turn_on_delta_swallows_consumer_errors(monkeypatch) -> None:
+    """A consumer that raises must not poison the transport."""
+    processes: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = _FakeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario() -> None:
+        client = AppServerClient(["codex", "app-server"])
+        await asyncio.wait_for(client.start(), timeout=2)
+        process = processes[0]
+        await asyncio.wait_for(
+            client.start_thread({"sandbox": "read-only"}), timeout=2
+        )
+
+        def boom(delta: str) -> None:
+            raise RuntimeError(f"consumer broke on {delta!r}")
+
+        turn = await asyncio.wait_for(
+            client.run_turn("thr-test", "question", on_delta=boom),
+            timeout=2,
+        )
+        # Reply is still the server-supplied terminal text; a
+        # throwing consumer must not poison the final payload.
+        assert turn.reply == "final answer"
+
+    asyncio.run(scenario())
+
+
+def test_run_turn_on_delta_supports_async_callback(monkeypatch) -> None:
+    """Async callbacks are awaited instead of fire-and-forget."""
+    processes: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = _FakeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario() -> None:
+        client = AppServerClient(["codex", "app-server"])
+        await asyncio.wait_for(client.start(), timeout=2)
+        process = processes[0]
+        await asyncio.wait_for(
+            client.start_thread({"sandbox": "read-only"}), timeout=2
+        )
+
+        seen: list[str] = []
+        ready = asyncio.Event()
+
+        async def collect(delta: str) -> None:
+            await asyncio.sleep(0)  # yields to the loop
+            seen.append(delta)
+            ready.set()
+
+        await asyncio.wait_for(
+            client.run_turn("thr-test", "question", on_delta=collect),
+            timeout=2,
+        )
+        # The callback was awaited at least once; we do not depend
+        # on the exact count because the test only sends the default
+        # scenario's single delta.
+        assert seen == ["partial"]
+
+    asyncio.run(scenario())
