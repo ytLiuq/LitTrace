@@ -224,3 +224,119 @@ Closing the HTTP response (browser tab close, `EventSource.close()`)
 propagates to the chat task and cancels the underlying App Server
 turn, matching the behaviour of the legacy `/chat` route's
 `asyncio.Event` cancellation channel.
+
+## Mid-turn steering and review (Round 8)
+
+Beyond the buffered `POST /chat` and SSE `POST /chat/stream`
+endpoints, LitTrace exposes the three additional codex-harness
+turn-lifecycle surfaces the desktop GUI and the future Web UI
+need to redirect or inspect an in-flight turn.
+
+### `POST /chat/steer`
+
+Append user input to a running regular turn without cancelling
+it. Implemented on top of the codex-harness `turn/steer` RPC
+([openai/codex#10821](https://github.com/openai/codex/pull/10821)).
+
+Request:
+
+```json
+{
+  "turn_id": "turn-existing-1",
+  "text": "actually focus on the failing tests first",
+  "client_user_message_id": "client-msg-r8-1",
+  "session_id": "r8-smoke-steer"
+}
+```
+
+Response:
+
+```json
+{
+  "turn_id": "turn-existing-1",
+  "thread_id": "thr-r8",
+  "client_user_message_id": "client-msg-r8-1",
+  "session_id": "r8-smoke-steer"
+}
+```
+
+The server rejects steering against review or manual
+compaction turns; the route surfaces the
+`active_turn_not_steerable` error so the client can render an
+actionable message instead of a generic 5xx.
+
+### `POST /chat/review`
+
+Kick off Codex's automated reviewer for the session's thread.
+Implemented on top of the `review/start` RPC. The service layer
+installs a per-thread `on_review_complete` callback BEFORE the
+RPC fires so the reader loop's `item/completed` /
+`exitedReviewMode` handler can flip the UI to "review complete"
+without parsing the raw item stream.
+
+Request:
+
+```json
+{
+  "target": { "type": "commit", "sha": "deadbeef" },
+  "session_id": "r8-smoke-review"
+}
+```
+
+Response:
+
+```json
+{
+  "turn_id": "turn-review-r8",
+  "status": "completed",
+  "review_text": "verdict: ship it",
+  "exit_item": { "type": "exitedReviewMode", "id": "r1" },
+  "session_id": "r8-smoke-review"
+}
+```
+
+`review_text` is the joined deltas of the review's final
+`agentMessage`. `exit_item` is the raw `exitedReviewMode` item
+so a future CLI pipeline can inspect sub-fields without
+re-parsing the assistant text.
+
+### `POST /chat/{turn_id}/cancel`
+
+Cancel an in-flight turn and stamp the reason on the binding.
+Replaces the implicit cancellation channel on `POST /chat` with
+a structured reason that operators can later inspect in
+`agent_thread_bindings.last_error`.
+
+Request:
+
+```json
+{
+  "reason": "user_pressed_esc",
+  "session_id": "r8-smoke-cancel"
+}
+```
+
+Response:
+
+```json
+{
+  "turn_id": "turn-abc",
+  "reason": "user_pressed_esc",
+  "acknowledged": true,
+  "session_id": "r8-smoke-cancel"
+}
+```
+
+`acknowledged` is `true` if the App Server replied to
+`turn/interrupt` with a terminal event within the grace window,
+`false` if the request failed at the transport layer (in which
+case the caller should treat the turn as terminated regardless).
+
+### Compatibility
+
+All three routes are additive. Existing `POST /chat` and
+`POST /chat/stream` clients continue to work unchanged. The
+`turn/steer` and `review/start` calls require the App Server
+to be configured for `codex app-server` mode
+(`LITTRACE_AGENT_RUNTIME=codex_app_server`); the legacy
+coordinator rejects them with 503.
