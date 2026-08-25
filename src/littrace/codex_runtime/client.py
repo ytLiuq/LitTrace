@@ -82,6 +82,24 @@ class AppServerTurnResult:
     reply: str
     turn: dict[str, Any]
     usage: Usage = field(default_factory=Usage)
+
+
+@dataclass(frozen=True)
+class SteerTurnResult:
+    """Outcome of a successful ``turn/steer`` call (Round 8).
+
+    The server returns ``{"turnId": <id>}`` for the *active* turn
+    that accepted the steering input. It does NOT emit a new
+    ``turn/started`` and it does NOT return a fresh turn id —
+    steering extends the existing turn. ``client_user_message_id``
+    is what the call site sent so the caller can correlate
+    ``item/started`` notifications on the corresponding user
+    message back to this steer request.
+    """
+
+    thread_id: str
+    turn_id: str
+    client_user_message_id: str | None = None
 class AppServerClient:
     """One long-lived, full-duplex App Server process."""
 
@@ -488,6 +506,49 @@ class AppServerClient:
             return True
         except (AppServerError, TimeoutError):
             return False
+
+    async def steer_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        text: str,
+        *,
+        client_user_message_id: str | None = None,
+        timeout: float = 30.0,
+    ) -> SteerTurnResult:
+        """Append user input to an already in-flight turn.
+
+        Round 8 step 1: the codex-harness ``turn/steer`` RPC
+        (added upstream in PR #10821) is the documented way to
+        redirect a running regular turn without starting a new
+        one. The server rejects the call when the active turn is
+        a review or a manual compaction, so ``AppServerError``
+        surfaces as ``ActiveTurnNotSteerableError`` to the caller.
+
+        Wire shape::
+
+            -> {"id": N, "method": "turn/steer",
+                "params": {"threadId": ..., "expectedTurnId": ...,
+                           "input": [{"type": "text", "text": ...}],
+                           "clientUserMessageId": ...?}}
+            <- {"id": N, "result": {"turnId": <active turn id>}}
+        """
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "input": [{"type": "text", "text": text}],
+        }
+        if client_user_message_id is not None:
+            params["clientUserMessageId"] = client_user_message_id
+        result = await self.request("turn/steer", params, timeout=timeout)
+        # The server echoes the active turn id; we trust the
+        # caller's ``turn_id`` argument so a malicious or stale
+        # echo does not desync the binder.
+        return SteerTurnResult(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            client_user_message_id=client_user_message_id,
+        )
 
     async def close(self) -> None:
         if self._closed:
