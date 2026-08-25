@@ -895,9 +895,10 @@ class PostgresStateStore:
                 f"""
                 INSERT INTO {s}.agent_thread_bindings (
                     session_id, codex_thread_id, runtime_kind, runtime_version,
-                    workspace_revision, status, last_error, created_at, updated_at
+                    workspace_revision, status, last_error, turn_count,
+                    last_total_tokens, last_compacted_at, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                 ON CONFLICT (session_id) DO UPDATE SET
                     codex_thread_id = EXCLUDED.codex_thread_id,
                     runtime_kind = EXCLUDED.runtime_kind,
@@ -905,6 +906,9 @@ class PostgresStateStore:
                     workspace_revision = EXCLUDED.workspace_revision,
                     status = EXCLUDED.status,
                     last_error = EXCLUDED.last_error,
+                    turn_count = EXCLUDED.turn_count,
+                    last_total_tokens = EXCLUDED.last_total_tokens,
+                    last_compacted_at = EXCLUDED.last_compacted_at,
                     updated_at = now()
                 RETURNING created_at, updated_at
                 """,
@@ -916,6 +920,9 @@ class PostgresStateStore:
                     binding.workspace_revision,
                     binding.status,
                     binding.last_error,
+                    binding.turn_count,
+                    binding.last_total_tokens,
+                    binding.last_compacted_at,
                     binding.created_at,
                 ),
             )
@@ -1608,7 +1615,7 @@ class PostgresStateStore:
                 WHERE s2.status IN ('idle', 'active')
                   AND (b.turn_count >= %s OR b.last_total_tokens >= %s)
                   AND (b.last_compacted_at IS NULL
-                       OR b.last_compacted_at < (now() - interval '1 hour'))
+                       OR b.last_compacted_at::timestamptz < (now() - interval '1 hour'))
                 ORDER BY b.turn_count DESC
                 LIMIT %s
                 """,
