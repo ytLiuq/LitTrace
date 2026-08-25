@@ -9,6 +9,7 @@ from littrace.codex_runtime.service import CodexAppServerChatService
 from littrace.config import LitTraceConfig
 from littrace.intent import parse_chat_intent
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
+from littrace.runtime.memory import load_session_memory
 from littrace.session import ChatSession, load_workspace
 
 _LEGACY_DOMAIN_ACTIONS = {
@@ -32,12 +33,16 @@ async def handle_agent_chat(
     config: LitTraceConfig,
     *,
     session: ChatSession,
-    session_memory=None,
     cancellation: asyncio.Event | None = None,
 ) -> tuple[ChatResponse, LiteratureWorkspace]:
     """Route migrated capabilities to App Server and remaining mutations to legacy code."""
 
     if config.agent_runtime.mode != "codex_app_server":
+        # Legacy path keeps the session_memory contract for
+        # backward compatibility; the App Server path drops it
+        # because the Codex-runtime stream is the canonical
+        # context surface.
+        session_memory = load_session_memory(session)
         return await handle_legacy_chat(
             request,
             workspace,
@@ -62,6 +67,7 @@ async def handle_agent_chat(
         or ("parse" in actions and not parse_only)
         or ("table" in actions and not table_only)
     ):
+        session_memory = load_session_memory(session)
         return await handle_legacy_chat(
             request,
             workspace,
@@ -97,11 +103,15 @@ async def handle_agent_chat(
                 ),
                 workspace,
             )
+        # The fallback path passes ``session_memory=None`` so
+        # the legacy coordinator rebuilds memory from the
+        # freshly-loaded workspace rather than from a stale
+        # snapshot that pre-dates the App Server turn.
         response, updated_workspace = await handle_legacy_chat(
             request,
             workspace,
             config,
-            session_memory=session_memory,
+            session_memory=None,
         )
         response.warnings.append(f"codex_app_server_fallback: {exc}")
         return response, updated_workspace

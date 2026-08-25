@@ -33,7 +33,6 @@ from littrace.research_background import (
     set_workspace_research_background,
     workspace_has_research_background,
 )
-from littrace.runtime.memory import load_session_memory
 from littrace.session import (
     append_message,
     load_or_create_session,
@@ -155,13 +154,11 @@ async def chat(
         )
         return background_response
     request = request.model_copy(update={"session_id": session.session_id})
-    session_memory = load_session_memory(session)
     response, session_workspace = await handle_agent_chat(
         request,
         session_workspace,
         config,
         session=session,
-        session_memory=session_memory,
     )
     api_app._set_workspace(session_workspace)
     response.session_id = session.session_id
