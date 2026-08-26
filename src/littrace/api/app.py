@@ -5,6 +5,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from littrace.api import state as api_state
 from littrace.api.routes.agents import router as agents_router
@@ -16,6 +17,7 @@ from littrace.api.routes.publishers import router as publishers_router
 from littrace.api.routes.research import router as research_router
 from littrace.api.routes.sessions import router as sessions_router
 from littrace.api.routes.system import router as system_router
+from littrace.codex_runtime.errors import AppServerError, CodexErrorCode
 from littrace.codex_runtime.runtime import shutdown_runtime_managers
 from littrace.config import load_config as _load_config
 from littrace.download_tasks import DownloadRetryWorker, download_task_store_from_config
@@ -175,6 +177,56 @@ def make_app() -> FastAPI:
             },
         )
         return response
+
+    # Round 7 CR pass 2 fix: the App Server transport raises
+    # typed ``AppServerError`` subclasses (``UnauthorizedError``,
+    # ``BadRequestError``,`` ``ActiveTurnNotSteerableError``,
+    # ``ContextWindowExceededError``, etc.). Without this
+    # handler FastAPI would surface them as 500 + a generic
+    # message, losing the typed-error value the round 4
+    # design documented. The mapping below turns every
+    # CodexErrorCode into the HTTP status the operator
+    # expects:
+    #
+    #   400 — bad_request / active_turn_not_steerable
+    #   401 — unauthorized
+    #   402 — session_budget_exceeded / usage_limit_exceeded
+    #   500 — internal_server_error / sandbox_error / context_window_exceeded / other
+    _CODEX_ERROR_HTTP_STATUS: dict[str, int] = {
+        CodexErrorCode.BAD_REQUEST.value: 400,
+        CodexErrorCode.ACTIVE_TURN_NOT_STEERABLE.value: 409,
+        CodexErrorCode.UNAUTHORIZED.value: 401,
+        CodexErrorCode.SESSION_BUDGET_EXCEEDED.value: 402,
+        CodexErrorCode.USAGE_LIMIT_EXCEEDED.value: 402,
+        CodexErrorCode.INTERNAL_SERVER_ERROR.value: 500,
+        CodexErrorCode.SANDBOX_ERROR.value: 500,
+        CodexErrorCode.CONTEXT_WINDOW_EXCEEDED.value: 500,
+        CodexErrorCode.OTHER.value: 500,
+    }
+
+    @instance.exception_handler(AppServerError)
+    async def _handle_app_server_error(
+        _request, exc: AppServerError,
+    ) -> JSONResponse:
+        code = exc.error_code.value if exc.error_code else CodexErrorCode.OTHER.value
+        status_code = _CODEX_ERROR_HTTP_STATUS.get(code, 500)
+        logger.warning(
+            "app_server_error",
+            extra={
+                "error_code": code,
+                "status_code": status_code,
+                "error_message": str(exc),
+                "details": exc.additional_details,
+            },
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "code": code,
+                "message": str(exc),
+                "additional_details": exc.additional_details,
+            },
+        )
 
     return instance
 
