@@ -38,7 +38,16 @@ Usage::
 
     items_by_check = convert_directory("data/rollouts")
     engine = HarnessEngine()
-    reports = engine.run_with_deps("check_retry_health", items_by_check)
+    # ``run_with_deps`` is single-target; the CLI runs every
+    # selected check independently (see
+    # ``src/littrace/cli.py::_run_eval_from_rollout_command``).
+    # The example below uses ``run`` directly because a single
+    # check has no dependency to resolve.
+    reports = {
+        "check_citations": engine.run(
+            "check_citations", items_by_check["check_citations"],
+        ),
+    }
 """
 
 from __future__ import annotations
