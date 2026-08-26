@@ -3,10 +3,19 @@
 Round 10 step 1: bridge the gap between the side-channel rollout
 log (Round 2C ``RolloutRecorder``) and the offline eval harness
 (``littrace.evaluation.harnesses``). One LitTrace session
-produces one JSONL file with five event types
-(``session_meta``, ``turn_context``, ``turn_start``, ``event``,
-``turn_complete``, ``compaction``, ``system_error``). This
-module groups events by ``turn_id`` and emits typed items that
+produces one JSONL file with seven event types written by
+the round 2C ``RolloutRecorder``:
+
+  1. ``session_meta``
+  2. ``turn_context``
+  3. ``turn_start``
+  4. ``event`` (covers every App Server notification: delta,
+     tool calls, lifecycle items)
+  5. ``turn_complete``
+  6. ``compaction``
+  7. ``system_error``
+
+This module groups events by ``turn_id`` and emits typed items that
 the existing harness checks already accept:
 
   * ``CitationRecord`` for ``check_citations`` (citations the
@@ -72,12 +81,19 @@ class TurnRecord:
 
 
 @dataclass(frozen=True)
-class ToolCallRecord:
+class RolloutToolCallRecord:
     """One MCP / approval event captured in a rollout trace.
 
     Round 10 surfaces this for future harness checks (e.g. a
     "stale approval rate" audit). The dataclass is exported
     so R10-3 tests can assert on the converter output.
+
+    Renamed from ``ToolCallRecord`` to ``RolloutToolCallRecord``
+    in the round 7 CR pass because the bare name collided
+    with ``littrace.tool_contracts.ToolCallRecord`` (the
+    older Pydantic model that captures the per-MCP-call
+    record in the App Server gateway). They share no
+    fields; the bare name was ambiguous at import time.
     """
 
     session_id: str
@@ -102,7 +118,7 @@ class RolloutEvaluationBundle:
     turns: list[TurnRecord]
     citations: list[CitationRecord]
     retries: list[RetryHealthItem]
-    tool_calls: list[ToolCallRecord]
+    tool_calls: list[RolloutToolCallRecord]
     errors: list[dict[str, Any]]
 
     def to_check_items(self) -> dict[str, list[Any]]:
@@ -189,7 +205,7 @@ class RolloutConverter:
         session_id: str | None = None
         thread_id: str | None = None
         turns: dict[str, _TurnBucket] = {}
-        tool_calls: list[ToolCallRecord] = []
+        tool_calls: list[RolloutToolCallRecord] = []
         citations: list[CitationRecord] = []
         errors: list[dict[str, Any]] = []
 
@@ -219,7 +235,7 @@ class RolloutConverter:
                 turn_id = event.get("turn_id") or ""
                 if method:
                     tool_calls.append(
-                        ToolCallRecord(
+                        RolloutToolCallRecord(
                             session_id=event.get("session_id") or session_id or "",
                             turn_id=turn_id,
                             method=method,
@@ -338,7 +354,7 @@ class RolloutConverter:
         return self.to_bundle().to_check_items()
 
 
-def _aggregate_retry_health(tool_calls: list[ToolCallRecord]) -> list[RetryHealthItem]:
+def _aggregate_retry_health(tool_calls: list[RolloutToolCallRecord]) -> list[RetryHealthItem]:
     """Bucket tool calls by method and compute retry / failure rates.
 
     The rollout captures only one frame per MCP tool call, so we

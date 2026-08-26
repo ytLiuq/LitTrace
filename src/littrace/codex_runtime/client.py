@@ -533,6 +533,15 @@ class AppServerClient:
         critical path. The method is here for tooling that needs to
         force a compaction (e.g. before pulling a session snapshot
         into cold storage).
+
+        Round 7 CR note: the upstream codex-harness API for
+        explicit compaction is now ``thread/compact/start`` (the
+        bare ``thread/compact`` is a deprecated alias that the
+        server may drop in a future release). LitTrace still
+        uses the legacy method because round 5 was tested against
+        a codex-harness build that shipped the alias. When the
+        upstream upgrade lands, swap this call to the new RPC
+        and remove the comment.
         """
         result = await self.request(
             "thread/compact",
