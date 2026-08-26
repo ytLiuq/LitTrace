@@ -147,9 +147,28 @@ def _get_workspace():
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    """Return the list of available LitTrace tools."""
+    """Return the list of available LitTrace tools.
+
+    Round 13 fix: under ``LITTRACE_MCP_GATEWAY=1`` the App
+    Server gateway mode merges the 15 built-in tool specs
+    with every third-party ``littrace.mcp_servers`` plugin
+    spec the installer has dropped on the Python path.
+    Without this merge the App Server never advertises the
+    plugin tools to the model — the plugin would be
+    installed but invisible. The legacy 8-tool branch is
+    unchanged.
+    """
     if APP_SERVER_GATEWAY:
-        return [Tool(**spec) for spec in app_server_tool_specs()]
+        specs = list(app_server_tool_specs())
+        try:
+            specs.extend(_get_gateway().list_external_tool_specs())
+        except Exception:  # pragma: no cover - defensive
+            log.warning(
+                "external MCP plugin enumeration failed; "
+                "advertising built-in tools only",
+                exc_info=True,
+            )
+        return [Tool(**spec) for spec in specs]
     return [
         Tool(
             name="search_papers",

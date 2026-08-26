@@ -469,9 +469,26 @@ class LitTraceToolGateway:
         is registered, so the only contract the plugin has
         to honour is ``async def handler(name, args, *,
         codex_thread_id) -> dict[str, Any]``.
+
+        Round 13 fix: ``spec["name"]`` (when present) MUST
+        match the `` ``argument. The gateway keys
+        ``external_tools`` and ``external_handlers`` on the
+        ``name`` argument; the App Server advertises on
+        ``spec["name"]``. A mismatch produces a routing
+        failure that is hard to debug from the caller side.
         """
         if not name or not isinstance(spec, dict):
-            raise ValueError("third-party tool requires a non-empty name and dict spec")
+            raise ValueError(
+                "third-party tool requires a non-empty name and dict spec"
+            )
+        spec_name = spec.get("name")
+        if spec_name and spec_name != name:
+            raise ValueError(
+                f"third-party tool spec['name'] ({spec_name!r}) must match "
+                f"the registration name ({name!r}); the gateway keys on "
+                f"the registration name and the App Server advertises "
+                f"on spec['name']"
+            )
         self.external_tools[name] = spec
         self.external_handlers[name] = handler
 

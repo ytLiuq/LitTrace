@@ -135,3 +135,71 @@ def test_handler_returning_non_dict_is_wrapped() -> None:
         assert result == [{"id": "1", "title": "first"}]
 
     asyncio.run(scenario())
+
+def test_register_external_tool_rejects_name_spec_mismatch() -> None:
+    """Round 13 fix: a plugin whose ``spec["name"]`` does not
+    match the registration ``name`` is rejected. The gateway
+    keys ``external_tools`` / ``external_handlers`` on the
+    registration name; the App Server advertises on
+    ``spec["name"]``. Allowing a mismatch would advertise
+    one tool to the model but route another, which is
+    impossible to debug from the caller side.
+    """
+    gw = _gateway()
+    with pytest.raises(ValueError, match="must match"):
+        gw.register_external_tool(
+            name="vendor_search",
+            spec={
+                "name": "shadow_search",
+                "description": "spec name does not match key",
+            },
+            handler=lambda name, args, *, codex_thread_id: {},
+        )
+    # The tool was NOT installed.
+    assert "vendor_search" not in gw.external_tools
+    assert "vendor_search" not in gw.external_handlers
+
+
+def test_register_external_tool_allows_missing_spec_name() -> None:
+    """A plugin that does not set ``spec["name"]`` is still
+    accepted; the App Server only sees the registration
+    name. The fix only fires when ``spec["name"]`` is
+    explicitly set to a conflicting value.
+    """
+    gw = _gateway()
+    gw.register_external_tool(
+        name="vendor_search",
+        spec={"description": "no spec name; spec key is canonical"},
+        handler=lambda name, args, *, codex_thread_id: {},
+    )
+    assert "vendor_search" in gw.external_tools
+
+
+def test_list_external_specs_merge_with_builtins_in_gateway() -> None:
+    """Round 13 fix: ``list_external_tool_specs()`` returns
+    third-party specs that ``list_tools()`` under
+    ``LITTRACE_MCP_GATEWAY=1`` will merge with the built-ins.
+    Previously the gateway only returned the built-ins, so
+    R13 plugin tools were installed but invisible to the
+    App Server.
+    """
+    gw = _gateway()
+    gw.register_external_tool(
+        name="vendor_search",
+        spec={
+            "name": "vendor_search",
+            "description": "vendor catalog",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": ["q"],
+            },
+        },
+        handler=lambda name, args, *, codex_thread_id: {},
+    )
+    specs = gw.list_external_tool_specs()
+    assert {s["name"] for s in specs} == {"vendor_search"}
+    # The spec round-trips through the gateway without losing
+    # the JSON-Schema body — that is what the App Server
+    # uses to teach the model how to call the tool.
+    assert specs[0]["inputSchema"]["required"] == ["q"]
