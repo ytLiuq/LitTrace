@@ -65,8 +65,15 @@ class CellResult:
     ef_search: int | None
     p50_ms: float
     p95_ms: float
-    recall_at_10: float
     rows_per_second: float
+    # ``recall_at_k`` is a class variable so each cell gets a
+    # per-call recall column whose name mirrors the operator's
+    # ``--top-k`` argument (the round 7 benchmark used to
+    # hardcode ``recall_at_10``; a future operator who ran
+    # the script with ``--top-k 5`` would have been confused
+    # by the column name). ``recall_at_k`` is set in
+    # ``_benchmark_one`` after the per-cell key is known.
+    recall_at_k: float = 0.0
     notes: str = ""
 
 
@@ -226,7 +233,7 @@ def _benchmark_one(
         ef_search=ef_search,
         p50_ms=round(p50, 2),
         p95_ms=round(p95, 2),
-        recall_at_10=round(statistics.mean(recalls), 4),
+        recall_at_k=round(statistics.mean(recalls), 4),
         rows_per_second=round(size / populate_seconds, 1) if populate_seconds else 0.0,
     )
 
@@ -307,14 +314,14 @@ def main() -> None:
                     ef_search=ef_search,
                     p50_ms=0.0,
                     p95_ms=0.0,
-                    recall_at_10=0.0,
+                    recall_at_k=0.0,
                     rows_per_second=0.0,
                     notes=f"{exc.__class__.__name__}: {exc}",
                 )
             cells.append(cell)
             print(
                 f"  p50={cell.p50_ms:>7.2f}ms  p95={cell.p95_ms:>7.2f}ms  "
-                f"recall@{args.top_k}={cell.recall_at_10:.4f}"
+                f"recall@{args.top_k}={cell.recall_at_k:.4f}"
             )
 
     report: dict[str, Any] = {
@@ -324,7 +331,17 @@ def main() -> None:
         "hnsw_m": args.hnsw_m,
         "hnsw_ef_construction": args.hnsw_ef_construction,
         "ivfflat_lists": args.ivfflat_lists,
-        "cells": [asdict(c) for c in cells],
+        # Project ``recall_at_k`` to ``recall_at_<top_k>`` so
+        # the column name matches the operator's --top-k
+        # argument (the JSON consumer reading the report does
+        # not have to guess).
+        "cells": [
+            {
+                **asdict(c),
+                f"recall_at_{args.top_k}": asdict(c).pop("recall_at_k"),
+            }
+            for c in cells
+        ],
     }
     with open(args.report, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
