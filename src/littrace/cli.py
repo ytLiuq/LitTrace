@@ -43,6 +43,7 @@ from littrace.retrieval.full_text import (
 )
 from littrace.retrieval.rag_refresh import refresh_session_rag_index
 from littrace.retrieval.rag_search import search_session_rag
+from littrace.research_background import set_workspace_research_background
 from littrace.rag_jobs import (
     iter_sentinel_watchlist_ids,
     iter_workspace_session_ids,
@@ -895,7 +896,7 @@ async def run_shell() -> None:
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /browser-login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "
-        "/dashboard /doctor /setup-browser /quality /agents /workflow /quality-audits /plan topic /init-config /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /retrieval-eval /rerank-learn /publisher-session-test /export /quit"
+        "/dashboard /doctor /setup-browser /quality /agents /workflow /quality-audits /plan topic /init-config /set-bg topic /ocr-choice /storyline-report /storyline-review /benchmark /golden-eval /retrieval-eval /rerank-learn /publisher-session-test /export /quit"
     )
     print("对话例子：选择第 1、3 篇下载；全部下载；取消选择第 2 篇；生成发展脉络。")
     print(f"session: {state.session_id}")
@@ -1031,6 +1032,30 @@ async def run_shell() -> None:
             print(f"Config: {'created' if result.created else 'not changed'} at {result.path}")
             if result.warnings:
                 print("注意：" + "；".join(result.warnings))
+            continue
+        if message.startswith("/set-bg "):
+            # Set the session's long-term research background so
+            # downstream commands (``/search-papers``,
+            # ``/downloads/...``, ``/storyline``) skip the
+            # fast-gate clarification and the workspace is
+            # tagged with a real topic. Mirrors the
+            # ``POST /chat`` research-background handler in
+            # the FastAPI layer so a TUI user does not have
+            # to start the API server to bootstrap a session.
+            background = message.removeprefix("/set-bg ").strip()
+            if not background:
+                print("用法：/set-bg 我研究的是<材料>在<场景>中的<问题>")
+                continue
+            state.workspace = set_workspace_research_background(
+                state.workspace,
+                background,
+            )
+            save_workspace(session, state.workspace, config=config)
+            filters = state.workspace.context.filters
+            print(f"研究背景已设置 (status={filters.research_background_status})")
+            print(f"  主题: {filters.topic}")
+            print(f"  时间: {filters.research_background_set_at}")
+            print("接下来可以 /search-papers /downloads/plan 等。")
             continue
         if message == "/parse":
             message = "解析当前文献全文"
