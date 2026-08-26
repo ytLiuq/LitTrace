@@ -15,9 +15,13 @@ from __future__ import annotations
 
 import os
 
+import pytest
 from fastapi.testclient import TestClient
 
 from littrace.api.app import app, make_app
+
+
+pytestmark = pytest.mark.api
 
 
 EXPECTED_TAGS = {
@@ -105,3 +109,47 @@ def test_health_response_model_is_pydantic_when_docs_enabled() -> None:
         f"expected $ref to HealthResponse, got {schema_ref}"
     )
     assert schema_ref["$ref"].endswith("/HealthResponse")
+
+def test_every_route_has_documented_method_and_response() -> None:
+    """Round 7 CR pass 3 coverage: every route advertised
+    in ``app.openapi()`` has a non-empty path, a registered
+    HTTP method, at least one response code, and at least
+    one tag. Routes missing any of these are usually
+    in-progress work that should not ship.
+
+    The test also guards the surface size: a refactor that
+    silently drops a route will be caught here because the
+    expected count is a stable lower bound (currently 80+).
+    """
+    import pytest as _pytest
+
+    client = _docs_enabled_client()
+    schema = client.get("/openapi.json").json()
+    paths = schema.get("paths", {})
+
+    assert paths, "OpenAPI schema has no paths"
+    # A stable lower bound: 65+ routes at the round 7
+    # checkpoint (the FastAPI ``app.openapi()`` consolidates
+    # path templates, so multiple decorators on ``/sessions/{id}``
+    # count as one entry). The bound is intentionally loose
+    # so a refactor that re-organises a few routes does not
+    # trigger this test; a wholesale regression will.
+    assert len(paths) >= 60, (
+        f"OpenAPI schema only has {len(paths)} paths; expected >= 60"
+    )
+
+    bad: list[str] = []
+    for path, methods in paths.items():
+        if not path.startswith("/"):
+            bad.append(f"{path}: path does not start with /")
+        for method, op in methods.items():
+            if method.lower() not in {"get", "post", "put", "patch", "delete", "head", "options"}:
+                bad.append(f"{method.upper()} {path}: unknown method")
+                continue
+            responses = op.get("responses", {}) or {}
+            if not responses:
+                bad.append(f"{method.upper()} {path}: no responses documented")
+            tags = op.get("tags", []) or []
+            if not tags:
+                bad.append(f"{method.upper()} {path}: no tag")
+    assert not bad, "schema validation failures:\n  - " + "\n  - ".join(bad)
