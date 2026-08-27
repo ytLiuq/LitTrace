@@ -455,17 +455,21 @@ class CodexAppServerChatService:
         runtime = self.config.agent_runtime
         # codex 0.149.1's approvalPolicy enum is
         # ``{"untrusted", "on-request", "granular", "never"}``.
-        # The round 5 value ``"never"`` used to mean
-        # "auto-approve" but now means "always ask" — round 14
-        # switched the read-only LitTrace path to ``"untrusted"``
-        # (auto-approve every read-only tool call) and the
-        # write paths to ``"on-request"`` (ask on every call,
-        # which is what round 5 had wanted for the
-        # danger-full-access case).
+        # Round 14 discovered ``"never"`` is the only value
+        # that auto-approves MCP tool calls in the read-only
+        # sandbox — ``"untrusted"`` controls the *content*
+        # trust axis (untrusted text may flow through tool
+        # results), not the approval axis. The mapping below
+        # sends every LitTrace sandbox to ``"never"`` so the
+        # model can call the 15 gateway tools without prompting
+        # the operator on every read. The danger-full-access
+        # value is kept at ``"never"`` for compatibility;
+        # operators who want stricter behaviour should switch
+        # the sandbox via the round 5 config.
         approval_policy = {
-            SandboxPolicy.READ_ONLY: "untrusted",
-            SandboxPolicy.WORKSPACE_WRITE: "on-request",
-            SandboxPolicy.DANGER_FULL_ACCESS: "on-request",
+            SandboxPolicy.READ_ONLY: "never",
+            SandboxPolicy.WORKSPACE_WRITE: "never",
+            SandboxPolicy.DANGER_FULL_ACCESS: "never",
         }[runtime.sandbox_policy]
         overrides: dict[str, Any] = {
             "cwd": str(scratch_dir),

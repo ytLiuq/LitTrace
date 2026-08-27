@@ -122,6 +122,7 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
                 "Use this before answering questions about the active literature session."
             ),
             "inputSchema": empty_schema,
+            "readOnlyHint": True,
         },
         {
             "name": "get_download_jobs",
@@ -141,6 +142,7 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
                 },
                 "additionalProperties": False,
             },
+            "readOnlyHint": True,
         },
         {
             "name": "get_parse_jobs",
@@ -160,6 +162,7 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
                 },
                 "additionalProperties": False,
             },
+            "readOnlyHint": True,
         },
         {
             "name": "get_table_jobs",
@@ -179,6 +182,7 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
                 },
                 "additionalProperties": False,
             },
+            "readOnlyHint": True,
         },
         {
             "name": "get_storyline_jobs",
@@ -198,6 +202,7 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
                 },
                 "additionalProperties": False,
             },
+            "readOnlyHint": True,
         },
         {
             "name": "search_workspace_rag",
@@ -211,6 +216,7 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
                 "required": ["query"],
                 "additionalProperties": False,
             },
+            "readOnlyHint": True,
         },
         {
             "name": "get_paper_status",
@@ -221,6 +227,7 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
                 "required": ["paper_id"],
                 "additionalProperties": False,
             },
+            "readOnlyHint": True,
         },
         {
             "name": "get_evidence",
@@ -233,11 +240,13 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
                 },
                 "additionalProperties": False,
             },
+            "readOnlyHint": True,
         },
         {
             "name": "quality_report",
             "description": "Compute LitTrace's read-only evidence and citation quality report.",
             "inputSchema": empty_schema,
+            "readOnlyHint": True,
         },
     ]
 
