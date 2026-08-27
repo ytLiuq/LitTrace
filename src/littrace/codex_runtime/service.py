@@ -68,6 +68,68 @@ workspace happens to be empty.
 """
 
 
+# Round 16: phrasings the upstream codex App Server uses when it cannot
+# — or the model thinks it cannot — call an MCP tool. Match the reply
+# against this list so ``fallback_to_legacy`` can take over.
+#
+# Categories:
+#   1. Upstream exec-mode guard (codex 0.140-0.150 stdio path):
+#      "approval policy", "requires approval", "需要批准".
+#   2. ChatGPT.app bundled codex 0.149.0-alpha.4.3 model confusion
+#      — the tool actually returned success:true but the model
+#      misread an empty-but-valid workspace as a refusal:
+#      "工具调用被拒绝 / 被系统拒绝 / 被运行环境拦截" and the
+#      English variants. The model's confused phrasing is stable
+#      enough that a substring match is reliable.
+_REFUSAL_PATTERNS: tuple[str, ...] = (
+    # Upstream exec-mode
+    "approval policy",
+    "需要批准",
+    "requires approval",
+    # Model confused on empty-but-valid response
+    "工具调用被拒绝",
+    "工具调用被系统拒绝",
+    "工具调用连续被拒绝",
+    "工具调用被运行环境拦截",
+    "工具调用被工具层拒绝",
+    "工具调用被工具端拒绝",
+    "工具调用刚被拒绝",
+    "工具调用未获授权",
+    "工具侧拒绝",
+    "运行环境拦截",
+    "工具层拒绝",
+    "工具端拒绝",
+    "tool call was rejected",
+    "tool call was denied",
+    "tool calls were rejected",
+)
+
+
+def _looks_like_refusal(reply: str) -> bool:
+    """Return True if ``reply`` looks like the codex App Server
+    refusing an MCP tool call (either the upstream guard or the
+    model's confused misread of an empty-but-valid response)."""
+    if not reply:
+        return False
+    lowered = reply.lower()
+    if any(pattern in reply for pattern in _REFUSAL_PATTERNS):
+        return True
+    # English variants that only appear in lowercased form. The
+    # upstream codex's "Tool call was denied..." phrasing is
+    # common in the confused-model replies, so match it directly.
+    return any(
+        marker in lowered
+        for marker in (
+            "tool call rejected",
+            "tool call denied",
+            "tool call was rejected",
+            "tool call was denied",
+            "tool calls were rejected",
+            "tool calls were denied",
+        )
+    )
+
+
 class CodexAppServerChatService:
     """Bind one LitTrace session to one durable Codex thread."""
 
@@ -145,24 +207,14 @@ class CodexAppServerChatService:
             if recorder is not None:
                 recorder.close()
         reply = turn.reply or "Codex App Server completed the turn without a text response."
-        # codex 0.140-0.150's app-server (stdio) path does not allow MCP tool
-        # calls under any approvalPolicy value — the upstream exec-mode
-        # guard (``core/src/tools/network_approval.rs``) returns a 200
-        # with a refusal-styled reply rather than raising. Detect that
-        # pattern and surface it as an AppServerError so the
-        # ``fallback_to_legacy`` path in ``agent_runtime`` can hand the
-        # turn to LitTrace's native chat coordinator.
-        if (
-            "approval policy" in reply
-            or "需要批准" in reply
-            or "requires approval" in reply.lower()
-        ):
+        if _looks_like_refusal(reply):
             raise AppServerError(
                 error_code=CodexErrorCode.UNAUTHORIZED,
                 message=(
-                    "Codex app-server rejected MCP tool calls under the "
-                    "current approval policy. Falling back to LitTrace's "
-                    f"native chat path. Upstream reply: {reply[:200]}"
+                    "Codex app-server refused MCP tool calls (either via "
+                    "the upstream exec-mode guard or because the model "
+                    "misread an empty-but-valid response). Falling back "
+                    f"to LitTrace's native chat path. Upstream reply: {reply[:200]}"
                 ),
             )
         # Surface the terminal status as the chat action so the route

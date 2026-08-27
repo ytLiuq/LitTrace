@@ -530,3 +530,54 @@ def test_service_skips_rollout_when_disabled(monkeypatch, tmp_path) -> None:
     assert not rollout_dir.exists(), (
         "rollout directory must not exist when disabled"
     )
+
+
+def test_looks_like_refusal_matches_upstream_guard_patterns() -> None:
+    """Round 16: the upstream codex App Server exec-mode guard
+    refuses with English and Chinese phrasings; both must trigger
+    the legacy fallback."""
+    from littrace.codex_runtime.service import _looks_like_refusal
+
+    upstream_guard = (
+        "MCP tool call requires approval, but approval policy is never",
+        "LitTrace 工具调用需要批准，但当前审批策略为 never",
+        "Tool call requires approval before proceeding",
+    )
+    for reply in upstream_guard:
+        assert _looks_like_refusal(reply), f"upstream guard missed: {reply!r}"
+
+
+def test_looks_like_refusal_matches_model_confusion_patterns() -> None:
+    """Round 16: the ChatGPT.app bundled codex reaches the MCP
+    server fine (the tool returns success:true) but the model
+    then misreads the empty-but-valid response as a refusal and
+    declines to call any further tool. Its confused phrasing is
+    stable enough that substring matching covers it."""
+    from littrace.codex_runtime.service import _looks_like_refusal
+
+    model_confusion = (
+        "LitTrace 的 `get_workspace_context` 工具调用被系统拒绝",
+        "工作区上下文读取刚被工具层拒绝",
+        "LitTrace MCP 工具调用被运行环境拦截",
+        "工具调用连续被拒绝",
+        "The tool call was rejected by the active session",
+        "Tool call was denied because the workspace is empty",
+    )
+    for reply in model_confusion:
+        assert _looks_like_refusal(reply), f"model confusion missed: {reply!r}"
+
+
+def test_looks_like_refusal_ignores_normal_replies() -> None:
+    """Round 16: normal assistant replies must not be flagged as
+    refusals even if they happen to contain trigger substrings
+    like "rejected" in unrelated contexts."""
+    from littrace.codex_runtime.service import _looks_like_refusal
+
+    benign = (
+        "Here are the top 3 papers for MXene pressure sensor 2024.",
+        "I'll search the workspace now.",
+        "The previous results were rejected by the user, so I'm trying again.",
+        "",
+    )
+    for reply in benign:
+        assert not _looks_like_refusal(reply), f"false positive: {reply!r}"
