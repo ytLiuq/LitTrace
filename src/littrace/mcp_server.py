@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
 import sys
+from pathlib import Path
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -104,23 +106,56 @@ _config: LitTraceConfig = load_config(os.environ.get("LITTRACE_CONFIG_PATH", "co
 _workspace = None  # LiteratureWorkspace, lazily imported
 
 
+def _token_path() -> Path:
+    """Path to the persistent MCP token file.
+
+    Lives under ``CODEX_HOME`` (when set) or the user's ``~/.codex``
+    default. Round 14 CR discovered the prior one-shot token was
+    regenerated on every mcp_server boot, which made it impossible
+    for a long-lived codex subprocess to hand the token to a fresh
+    mcp_server boot — every handshake failed. Persisting under
+    ``CODEX_HOME`` ensures both the LitTrace parent and the codex
+    subprocess agree on the same string across restarts.
+    """
+    codex_home = os.environ.get("CODEX_HOME") or str(Path.home() / ".codex")
+    return Path(codex_home) / "littrace-mcp.token"
+
+
 def _get_or_create_mcp_token() -> str:
     """Return the auth token for this MCP server.
 
-    If ``LITTRACE_MCP_TOKEN`` is set, use it (so the operator can pin a
-    stable token in the host MCP config). Otherwise generate a fresh
-    token at startup and print it once to stderr — the operator has to
-    paste it into the MCP client config. This avoids a no-auth default
-    while still allowing zero-config first-run.
+    Priority: explicit ``LITTRACE_MCP_TOKEN`` env var > persisted
+    token file > freshly generated token (also written to the
+    persisted file). The persisted-file path makes the token
+    stable across multiple ``littrace mcp_server`` / ``codex
+    app-server`` boots so the parent LitTrace process and the
+    codex subprocess agree on a single shared secret.
     """
     explicit = os.environ.get("LITTRACE_MCP_TOKEN", "").strip()
     if explicit:
         return explicit
+    path = _token_path()
+    if path.exists():
+        stored = path.read_text(encoding="utf-8").strip()
+        if stored:
+            return stored
     generated = "mcp-" + secrets.token_urlsafe(24)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(generated, encoding="utf-8")
+    except OSError as exc:
+        # Filesystem is read-only or sandboxed; fall back to
+        # the one-shot log so the operator can still see the
+        # value and paste it into the MCP client config.
+        logger.warning(
+            "mcp_token_persist_failed: path=%s err=%s",
+            path, exc.__class__.__name__,
+        )
     print(
         f"[mcp] LITTRACE_MCP_TOKEN not set. Generated one-shot token:\n"
         f"      {generated}\n"
-        f"      Paste it into the MCP client config or set LITTRACE_MCP_TOKEN={generated}",
+        f"      Persisted to {path}. Set LITTRACE_MCP_TOKEN={generated} "
+        f"to pin a stable value.",
         file=sys.stderr,
     )
     return generated

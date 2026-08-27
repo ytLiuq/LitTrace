@@ -507,6 +507,18 @@ class CodexAppServerChatService:
             env["LITTRACE_POSTGRES_DSN"] = self.config.metadata_store.postgres_dsn
         if self.config.rag.postgres_dsn:
             env["LITTRACE_RAG_POSTGRES_DSN"] = self.config.rag.postgres_dsn
+        # Round 14 CR: codex spawns the MCP server as a
+        # subprocess. The mcp_server side now persists its
+        # token under ``CODEX_HOME/littrace-mcp.token`` so it
+        # is stable across restarts; mirror it into the
+        # subprocess env so the parent LitTrace and the mcp
+        # subprocess agree on the same secret without forcing
+        # the operator to paste a one-shot token into the codex
+        # config.
+        from littrace.mcp_server import _token_path
+        token_path = _token_path()
+        if token_path.exists():
+            env["LITTRACE_MCP_TOKEN"] = token_path.read_text(encoding="utf-8").strip()
         return {
             "command": sys.executable,
             "args": ["-m", "littrace.mcp_server"],
