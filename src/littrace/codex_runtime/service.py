@@ -17,6 +17,7 @@ from littrace.codex_runtime.client import (
     AppServerTurnResult,
     SteerTurnResult,
 )
+from littrace.codex_runtime.errors import CodexErrorCode
 from littrace.codex_runtime.gateway import APP_SERVER_TOOL_NAMES
 from littrace.codex_runtime.runtime import (
     CodexAppServerRuntimeManager,
@@ -40,13 +41,30 @@ canonical source of scientific truth; Codex thread history is execution memory o
 Use only tools on the `littrace` MCP server for facts and changes involving the active session.
 Never infer that a filesystem file is canonical. Do not mutate files or run shell commands.
 The currently supported domain mutations are `set_download_selection`, `search_papers`,
-`enqueue_download`, `enqueue_parse`, and `enqueue_table_extraction`. Call `get_workspace_context`
-immediately before a mutation, pass the returned workspace revision, and use a stable idempotency
-key for retries of one intended change. Search only when the user asks for literature discovery; it
-atomically replaces the current ranked result workspace. Download, parse, and table extraction
-commands only submit durable work; explain that they are queued and use the matching job-status
-tool when the user asks for progress. Other mutations must be handled by the legacy LitTrace
-domain workflow. Keep evidence and paper identifiers in answers when available.
+`enqueue_download`, `enqueue_parse`, and `enqueue_table_extraction`.
+
+WORKFLOW FOR A LITERATURE-DISCOVERY REQUEST:
+1. Call `search_papers` first with the topic + year_min + limit. Do NOT call
+   `get_workspace_context` beforehand — its `workspace_revision: 0` on an empty
+   session does not block a search.
+2. After `search_papers` returns, summarise the returned `papers` array
+   directly (titles, DOIs, journal, year, access type).
+3. Only after a mutating tool (search, set_download_selection, enqueue_*) has
+   been called should you call `get_workspace_context` to verify the new
+   workspace revision; pass that revision forward on any subsequent mutation
+   in the same turn.
+
+WORKFLOW FOR ANY OTHER MUTATION:
+Call `get_workspace_context` first, pass the returned workspace revision, and
+use a stable idempotency key for retries of one intended change. Download, parse,
+and table extraction commands only submit durable work; explain that they are
+queued and use the matching job-status tool when the user asks for progress.
+Other mutations must be handled by the legacy LitTrace domain workflow. Keep
+evidence and paper identifiers in answers when available.
+
+If a tool returns a successful 200 response, treat that as the authoritative
+result — do not reinterpret the reply as "rejected" or "denied" because the
+workspace happens to be empty.
 """
 
 
@@ -127,6 +145,26 @@ class CodexAppServerChatService:
             if recorder is not None:
                 recorder.close()
         reply = turn.reply or "Codex App Server completed the turn without a text response."
+        # codex 0.140-0.150's app-server (stdio) path does not allow MCP tool
+        # calls under any approvalPolicy value — the upstream exec-mode
+        # guard (``core/src/tools/network_approval.rs``) returns a 200
+        # with a refusal-styled reply rather than raising. Detect that
+        # pattern and surface it as an AppServerError so the
+        # ``fallback_to_legacy`` path in ``agent_runtime`` can hand the
+        # turn to LitTrace's native chat coordinator.
+        if (
+            "approval policy" in reply
+            or "需要批准" in reply
+            or "requires approval" in reply.lower()
+        ):
+            raise AppServerError(
+                error_code=CodexErrorCode.UNAUTHORIZED,
+                message=(
+                    "Codex app-server rejected MCP tool calls under the "
+                    "current approval policy. Falling back to LitTrace's "
+                    f"native chat path. Upstream reply: {reply[:200]}"
+                ),
+            )
         # Surface the terminal status as the chat action so the route
         # layer can route the response into the right action group
         # (chat vs interrupted vs committed_transport_failure).
@@ -453,23 +491,23 @@ class CodexAppServerChatService:
         scratch_dir: Path,
     ) -> dict[str, Any]:
         runtime = self.config.agent_runtime
-        # codex 0.149.1's approvalPolicy enum is
+        # codex 0.140-0.150 ``approvalPolicy`` enum is
         # ``{"untrusted", "on-request", "granular", "never"}``.
-        # Round 14 discovered ``"never"`` is the only value
-        # that auto-approves MCP tool calls in the read-only
-        # sandbox — ``"untrusted"`` controls the *content*
-        # trust axis (untrusted text may flow through tool
-        # results), not the approval axis. The mapping below
-        # sends every LitTrace sandbox to ``"never"`` so the
-        # model can call the 15 gateway tools without prompting
-        # the operator on every read. The danger-full-access
-        # value is kept at ``"never"`` for compatibility;
-        # operators who want stricter behaviour should switch
-        # the sandbox via the round 5 config.
+        # Round 14 (npm codex 0.149/0.150) tested "untrusted" +
+        # "on-request" + "granular" — every value rejected MCP
+        # tool calls in app-server (stdio) mode with
+        # "MCP tool call requires approval, but approval policy
+        # is never". The bug is in codex's exec-mode path
+        # (``core/src/tools/network_approval.rs``).
+        # Switching to the ChatGPT.app bundled codex (which has
+        # ``guardian_approval`` feature enabled) lets the user
+        # approve via ChatGPT.app dialogs, so we send
+        # ``"on-request"`` — every MCP call triggers an
+        # approval prompt in the ChatGPT.app GUI.
         approval_policy = {
-            SandboxPolicy.READ_ONLY: "never",
-            SandboxPolicy.WORKSPACE_WRITE: "never",
-            SandboxPolicy.DANGER_FULL_ACCESS: "never",
+            SandboxPolicy.READ_ONLY: "on-request",
+            SandboxPolicy.WORKSPACE_WRITE: "on-request",
+            SandboxPolicy.DANGER_FULL_ACCESS: "on-request",
         }[runtime.sandbox_policy]
         overrides: dict[str, Any] = {
             "cwd": str(scratch_dir),

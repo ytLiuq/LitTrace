@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from littrace.chat import handle_chat as handle_legacy_chat
+from littrace.codex_runtime.errors import AppServerError
 from littrace.codex_runtime.service import CodexAppServerChatService
 from littrace.config import LitTraceConfig
 from littrace.intent import parse_chat_intent
@@ -78,7 +79,7 @@ async def handle_agent_chat(
         return await CodexAppServerChatService(config).chat(
             request, workspace, session, cancellation=cancellation,
         )
-    except Exception as exc:
+    except AppServerError as exc:
         if not config.agent_runtime.fallback_to_legacy:
             raise
         # A mutating MCP tool may have committed before a later model/transport

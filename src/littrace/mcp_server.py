@@ -344,7 +344,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         meta = app.request_context.meta
         thread_id = None
         if meta is not None:
-            thread_id = (meta.model_extra or {}).get("threadId")
+            thread_id = (
+                (meta.model_extra or {}).get("threadId")
+                or getattr(meta, "threadId", None)
+                or getattr(meta, "thread_id", None)
+            )
         try:
             gateway = _get_gateway()
             payload = await gateway.call(

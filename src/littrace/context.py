@@ -13,12 +13,27 @@ from littrace.models import PaperSearchRequest
 
 
 def _merge_filters(filters: WorkspaceFilters, updates: dict | WorkspaceFilters) -> None:
-    """Merge a dict or WorkspaceFilters into an existing WorkspaceFilters in-place."""
+    """Merge a dict or WorkspaceFilters into an existing WorkspaceFilters in-place.
+
+    WorkspaceFilters is configured with ``extra="ignore"`` so old persisted
+    sessions can load even when fields are renamed or added. This helper
+    therefore drops unknown keys silently rather than raising — the next
+    round-trip through ``WorkspaceFilters.model_validate`` will discard
+    them for free. Legacy callers that pass known-only filters still get
+    the same behaviour as before; the only change is the tolerance window.
+    """
     if isinstance(updates, WorkspaceFilters):
         updates = updates.model_dump(exclude_none=True)
-    unknown = sorted(set(updates) - set(WorkspaceFilters.model_fields))
+    known = set(WorkspaceFilters.model_fields)
+    unknown = sorted(set(updates) - known)
     if unknown:
-        raise ValueError(f"Unknown workspace filter keys: {', '.join(unknown)}")
+        import logging
+        logging.getLogger(__name__).debug(
+            "_merge_filters dropped unknown keys: %s", ", ".join(unknown),
+        )
+        updates = {k: v for k, v in updates.items() if k in known}
+    if not updates:
+        return
     validated = WorkspaceFilters.model_validate({**filters.model_dump(), **updates})
     for key in updates:
         setattr(filters, key, getattr(validated, key))

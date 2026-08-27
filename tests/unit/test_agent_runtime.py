@@ -24,7 +24,11 @@ class _FailingAppServerService:
         pass
 
     async def chat(self, _request, _workspace, _session, *, cancellation=None):
-        raise RuntimeError("transport failed after tool commit")
+        from littrace.codex_runtime.errors import AppServerError, CodexErrorCode
+        raise AppServerError(
+            message="transport failed after tool commit",
+            error_code=CodexErrorCode.OTHER,
+        )
 
 
 def _session(tmp_path, config: LitTraceConfig) -> ChatSession:

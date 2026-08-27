@@ -226,7 +226,7 @@ def test_service_persists_and_resumes_thread_binding(tmp_path: Path) -> None:
     assert store.binding.codex_thread_id == "thread-1"
     started = _FakeClient.instances[0].started_with
     assert started["sandbox"] == "read-only"
-    assert started["approvalPolicy"] == "never"
+    assert started["approvalPolicy"] == "on-request"
     assert "writableRoots" not in started
     mcp = started["config"]["mcp_servers"]["littrace"]
     assert mcp["required"] is True
@@ -361,7 +361,7 @@ def test_service_passes_writable_roots_when_workspace_write(tmp_path) -> None:
     # thread_overrides without a full chat round-trip.
     overrides = service._thread_overrides(session.root / "scratch")
     assert overrides["sandbox"] == "workspace-write"
-    assert overrides["approvalPolicy"] == "never"
+    assert overrides["approvalPolicy"] == "on-request"
     assert overrides["writableRoots"] == [str(tmp_path / "scratch")]
 
 
@@ -374,7 +374,7 @@ def test_service_omits_writable_roots_for_danger_full_access(tmp_path) -> None:
     service = CodexAppServerChatService(config)
     overrides = service._thread_overrides(session.root / "scratch")
     assert overrides["sandbox"] == "danger-full-access"
-    assert overrides["approvalPolicy"] == "never"
+    assert overrides["approvalPolicy"] == "on-request"
     assert "writableRoots" not in overrides
 
 

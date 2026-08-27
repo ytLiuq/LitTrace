@@ -1268,12 +1268,19 @@ def _workspace_context(
     active_ids = list(workspace.context.active_papers)
     papers = [workspace.papers[paper_id] for paper_id in active_ids if paper_id in workspace.papers]
     filters = workspace.context.filters
+    paper_count = len(workspace.papers)
+    is_empty = (
+        paper_count == 0
+        and len(workspace.parsed_papers) == 0
+        and filters.workspace_revision == 0
+        and filters.topic is None
+    )
     return {
         "session_id": binding.session_id,
         "workspace_revision": filters.workspace_revision,
         "topic": filters.topic,
         "research_background": filters.research_background,
-        "paper_count": len(workspace.papers),
+        "paper_count": paper_count,
         "active_paper_count": len(active_ids),
         "parsed_paper_count": len(workspace.parsed_papers),
         "performance_cell_count": len(workspace.performance_cells),
@@ -1281,6 +1288,17 @@ def _workspace_context(
         "selected_for_download": list(workspace.context.selected_for_download),
         "papers": [paper.model_dump(mode="json") for paper in papers[:100]],
         "truncated": len(papers) > 100,
+        # Round 16: surface a session-state hint so models do not
+        # misinterpret an empty but valid workspace as a tool-call
+        # refusal. ``is_empty_session=True`` means "no errors, just
+        # nothing has been searched yet — call search_papers next".
+        "is_empty_session": is_empty,
+        "hint": (
+            "Workspace is empty. Call search_papers to populate it before "
+            "running mutations or comparisons."
+            if is_empty
+            else None
+        ),
     }
 
 
