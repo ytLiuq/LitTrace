@@ -453,14 +453,19 @@ class CodexAppServerChatService:
         scratch_dir: Path,
     ) -> dict[str, Any]:
         runtime = self.config.agent_runtime
-        # approvalPolicy follows sandbox policy: read-only can't write
-        # anything so 'never' is correct; workspace-write only asks on
-        # exec-policy violations ('on-failure'); danger-full-access is
-        # operator-trusted and defaults to 'never'.
+        # codex 0.149.1's approvalPolicy enum is
+        # ``{"untrusted", "on-request", "granular", "never"}``.
+        # The round 5 value ``"never"`` used to mean
+        # "auto-approve" but now means "always ask" — round 14
+        # switched the read-only LitTrace path to ``"untrusted"``
+        # (auto-approve every read-only tool call) and the
+        # write paths to ``"on-request"`` (ask on every call,
+        # which is what round 5 had wanted for the
+        # danger-full-access case).
         approval_policy = {
-            SandboxPolicy.READ_ONLY: "never",
-            SandboxPolicy.WORKSPACE_WRITE: "on-failure",
-            SandboxPolicy.DANGER_FULL_ACCESS: "never",
+            SandboxPolicy.READ_ONLY: "untrusted",
+            SandboxPolicy.WORKSPACE_WRITE: "on-request",
+            SandboxPolicy.DANGER_FULL_ACCESS: "on-request",
         }[runtime.sandbox_policy]
         overrides: dict[str, Any] = {
             "cwd": str(scratch_dir),
