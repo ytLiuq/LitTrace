@@ -261,7 +261,24 @@ class PostgresDownloadTaskStore:
             # Live E2E surfaced: older deployments created the table
             # without the ``(session_id, paper_id)`` unique constraint
             # the upsert path relies on. ``CREATE TABLE IF NOT EXISTS``
-            # is a no-op for those, so add the constraint idempotently.
+            # is a no-op for those, so dedup any pre-existing
+            # duplicate rows (keep the most recently updated) and
+            # then add the constraint idempotently. ``UniqueViolation``
+            # (SQLSTATE 23505) is a different error code from
+            # ``duplicate_object`` and is what hits when the table
+            # already holds duplicates, so the dedup step must run
+            # FIRST or the operator's deployment is stuck unable to
+            # upgrade the schema.
+            conn.execute(
+                f"""
+                DELETE FROM {self.schema_name}.download_tasks d
+                USING {self.schema_name}.download_tasks newer
+                WHERE d.session_id = newer.session_id
+                  AND d.paper_id = newer.paper_id
+                  AND d.task_id <> newer.task_id
+                  AND d.updated_at < newer.updated_at
+                """
+            )
             conn.execute(
                 f"""
                 DO $$
@@ -270,6 +287,10 @@ class PostgresDownloadTaskStore:
                         ADD CONSTRAINT download_tasks_session_paper_uk
                         UNIQUE (session_id, paper_id);
                 EXCEPTION
+                    -- 42P07 (duplicate_object): constraint already exists.
+                    -- 42710 (duplicate_table): PG error code for the
+                    --   same situation; PG 16 reports it under both
+                    --   class names.
                     WHEN duplicate_object THEN NULL;
                     WHEN duplicate_table THEN NULL;
                 END $$
