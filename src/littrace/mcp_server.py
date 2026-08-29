@@ -89,12 +89,12 @@ def _get_gateway() -> "LitTraceToolGateway":
                 mcp_gateway=_GATEWAY,
             )
             for warning in warnings:
-                log.warning(
+                logger.warning(
                     "external MCP plugin load failed: %s",
                     warning,
                 )
         except Exception as exc:  # pragma: no cover - defensive
-            log.warning(
+            logger.warning(
                 "external MCP plugin scan failed: %s",
                 exc,
             )
@@ -143,6 +143,17 @@ def _get_or_create_mcp_token() -> str:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(generated, encoding="utf-8")
+        # Round 17 CR: the persisted token is a long-lived shared
+        # secret (parent LitTrace and the codex subprocess both
+        # consume it). Default umask 022 leaves the file 0644 and
+        # world-readable on a multi-user system, so explicitly
+        # tighten to 0o600. On Windows ``os.chmod`` is mostly a
+        # no-op for NTFS but the call is still safe; on read-only
+        # or FAT filesystems we degrade gracefully.
+        try:
+            os.chmod(path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
     except OSError as exc:
         # Filesystem is read-only or sandboxed; fall back to
         # the one-shot log so the operator can still see the
@@ -198,7 +209,7 @@ async def list_tools() -> list[Tool]:
         try:
             specs.extend(_get_gateway().list_external_tool_specs())
         except Exception:  # pragma: no cover - defensive
-            log.warning(
+            logger.warning(
                 "external MCP plugin enumeration failed; "
                 "advertising built-in tools only",
                 exc_info=True,
