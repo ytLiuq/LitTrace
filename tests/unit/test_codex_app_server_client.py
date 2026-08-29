@@ -437,3 +437,224 @@ def test_run_turn_on_delta_supports_async_callback(monkeypatch) -> None:
         assert seen == ["partial"]
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Round 17: ``mcpServer/elicitation/request`` opt-in handler hook.
+#
+# The LitTrace TUI installs an async callback on the shared
+# AppServerClient so an MCP-tool approval prompt can block until the
+# operator presses Y/N. The previous contract was an unconditional
+# decline. These tests pin the new contract:
+#
+#   1. No handler installed -> decline (back-compat).
+#   2. Handler installed -> its return value is sent back.
+#   3. Handler raises -> we still send decline, the App Server
+#      does not hang.
+#   4. set_elicitation_handler(None) reverts to the auto-decline path.
+# ---------------------------------------------------------------------------
+
+
+def test_elicitation_no_handler_auto_declines(monkeypatch) -> None:
+    """When no handler is set, the existing auto-decline path must
+    still fire so headless callers keep their contract."""
+    processes: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = _FakeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario() -> None:
+        client = AppServerClient(["codex", "app-server"])
+        await asyncio.wait_for(client.start(), timeout=2)
+        process = processes[0]
+        await asyncio.wait_for(
+            client.start_thread({"sandbox": "read-only"}), timeout=2
+        )
+        # Feed a single elicitation request directly. No handler is
+        # installed; the client must reply with the documented
+        # decline envelope.
+        process.feed(
+            {
+                "id": "elic-1",
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "server": "littrace",
+                    "tool": "search_papers",
+                    "arguments": {"topic": "MXene"},
+                },
+            }
+        )
+        # Yield enough ticks for the reader loop to dispatch and
+        # write the response.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        response = next(
+            item for item in process.stdin.messages if item.get("id") == "elic-1"
+        )
+        assert response["result"] == {
+            "action": "decline",
+            "content": None,
+            "_meta": None,
+        }
+        await asyncio.wait_for(client.close(), timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_elicitation_handler_return_value_is_relayed(monkeypatch) -> None:
+    """When a handler is installed, its return value is sent as the
+    JSON-RPC ``result`` so the TUI's Y/N modal lands on the App Server."""
+    processes: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = _FakeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario() -> None:
+        client = AppServerClient(["codex", "app-server"])
+        await asyncio.wait_for(client.start(), timeout=2)
+        process = processes[0]
+        await asyncio.wait_for(
+            client.start_thread({"sandbox": "read-only"}), timeout=2
+        )
+        seen_params: list[dict[str, object]] = []
+        # Mimic the TUI handler: park a future, capture the params,
+        # resolve with the operator's decision on a later tick.
+        decision = {"action": "accept", "content": None, "_meta": None}
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        async def handler(params: dict[str, object]) -> dict[str, object]:
+            seen_params.append(params)
+            return await future
+
+        client.set_elicitation_handler(handler)
+        process.feed(
+            {
+                "id": "elic-2",
+                "method": "mcpServer/elicitation/request",
+                "params": {
+                    "server": "littrace",
+                    "tool": "search_papers",
+                    "arguments": {"topic": "MXene", "limit": 5},
+                },
+            }
+        )
+        # Let the reader loop dispatch the elicitation. The handler
+        # is now blocked on its future.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Sanity: nothing has been written back yet because the
+        # handler is awaiting the future.
+        assert all(
+            item.get("id") != "elic-2" for item in process.stdin.messages
+        ), "reader wrote a response before the handler resolved"
+        assert seen_params and seen_params[0]["tool"] == "search_papers"
+        # Operator presses Y. Unblock the handler.
+        future.set_result(decision)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        response = next(
+            item for item in process.stdin.messages if item.get("id") == "elic-2"
+        )
+        assert response["result"] == decision
+        await asyncio.wait_for(client.close(), timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_elicitation_handler_exception_falls_back_to_decline(monkeypatch) -> None:
+    """A raising handler must not hang the App Server — we always
+    send a decline envelope so codex can resume its turn."""
+    processes: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = _FakeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario() -> None:
+        client = AppServerClient(["codex", "app-server"])
+        await asyncio.wait_for(client.start(), timeout=2)
+        process = processes[0]
+        await asyncio.wait_for(
+            client.start_thread({"sandbox": "read-only"}), timeout=2
+        )
+
+        async def boom(params: dict[str, object]) -> dict[str, object]:
+            raise RuntimeError("UI blew up")
+
+        client.set_elicitation_handler(boom)
+        process.feed(
+            {
+                "id": "elic-3",
+                "method": "mcpServer/elicitation/request",
+                "params": {"server": "littrace", "tool": "search_papers"},
+            }
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        response = next(
+            item for item in process.stdin.messages if item.get("id") == "elic-3"
+        )
+        assert response["result"] == {
+            "action": "decline",
+            "content": None,
+            "_meta": None,
+        }
+        await asyncio.wait_for(client.close(), timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_elicitation_set_to_none_reverts_to_auto_decline(monkeypatch) -> None:
+    """``set_elicitation_handler(None)`` must restore the back-compat
+    auto-decline path so a previous chat's UI hook does not leak
+    into a subsequent headless chat on the same shared client."""
+    processes: list[_FakeProcess] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        process = _FakeProcess()
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    async def scenario() -> None:
+        client = AppServerClient(["codex", "app-server"])
+        await asyncio.wait_for(client.start(), timeout=2)
+        process = processes[0]
+        await asyncio.wait_for(
+            client.start_thread({"sandbox": "read-only"}), timeout=2
+        )
+
+        async def should_not_run(params: dict[str, object]) -> dict[str, object]:
+            raise AssertionError("handler should have been cleared")
+
+        client.set_elicitation_handler(should_not_run)
+        client.set_elicitation_handler(None)
+        process.feed(
+            {
+                "id": "elic-4",
+                "method": "mcpServer/elicitation/request",
+                "params": {"server": "littrace", "tool": "search_papers"},
+            }
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        response = next(
+            item for item in process.stdin.messages if item.get("id") == "elic-4"
+        )
+        assert response["result"]["action"] == "decline"
+        await asyncio.wait_for(client.close(), timeout=2)
+
+    asyncio.run(scenario())

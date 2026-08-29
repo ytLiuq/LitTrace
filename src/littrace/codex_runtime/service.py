@@ -154,6 +154,7 @@ class CodexAppServerChatService:
         *,
         cancellation: asyncio.Event | None = None,
         on_delta=None,
+        elicitation_handler=None,
     ) -> tuple[ChatResponse, LiteratureWorkspace]:
         scratch_dir = self._scratch_dir(session.session_id)
         scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +175,7 @@ class CodexAppServerChatService:
                         lambda client: self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
                             cancellation, recorder, on_delta,
+                            elicitation_handler,
                         )
                     )
                 elif self.client_factory is AppServerClient:
@@ -184,6 +186,7 @@ class CodexAppServerChatService:
                         lambda client: self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
                             cancellation, recorder, on_delta,
+                            elicitation_handler,
                         )
                     )
                 else:
@@ -199,6 +202,7 @@ class CodexAppServerChatService:
                         turn, latest_workspace = await self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
                             cancellation, recorder, on_delta,
+                            elicitation_handler,
                         )
         finally:
             # Close the recorder after the App Server has returned the
@@ -245,6 +249,7 @@ class CodexAppServerChatService:
         cancellation: asyncio.Event | None = None,
         recorder: RolloutRecorder | None = None,
         on_delta=None,
+        elicitation_handler=None,
     ):
         # Round 4 P1 step 7: bind the per-thread recorder. The
         # runtime_manager keeps one client across calls, so two
@@ -349,6 +354,13 @@ class CodexAppServerChatService:
                 thread_overrides=thread_overrides,
             )
         await self._require_mcp_connection(client, thread_id)
+        # Round 17: bind the per-chat elicitation handler. The
+        # ``runtime_manager`` keeps one client across chats on
+        # different sessions, so the previous handler (from
+        # another session's TUI instance) must NOT leak into
+        # this turn. ``set_elicitation_handler`` overwrites; we
+        # restore the prior value in the finally block.
+        client.set_elicitation_handler(elicitation_handler)
         try:
             turn = await client.run_turn(
                 thread_id,
@@ -375,6 +387,10 @@ class CodexAppServerChatService:
                     current_session.model_copy(update={"status": "systemError"})
                 )
             raise
+        finally:
+            # Clear the handler so a subsequent chat on this shared
+            # client does not inherit the previous operator's hook.
+            client.set_elicitation_handler(None)
         latest_workspace = self._latest_workspace(
             session.session_id,
             fallback=workspace,

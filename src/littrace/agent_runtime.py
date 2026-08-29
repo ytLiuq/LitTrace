@@ -35,6 +35,7 @@ async def handle_agent_chat(
     *,
     session: ChatSession,
     cancellation: asyncio.Event | None = None,
+    elicitation_handler=None,
 ) -> tuple[ChatResponse, LiteratureWorkspace]:
     """Route migrated capabilities to App Server and remaining mutations to legacy code."""
 
@@ -77,7 +78,9 @@ async def handle_agent_chat(
         )
     try:
         return await CodexAppServerChatService(config).chat(
-            request, workspace, session, cancellation=cancellation,
+            request, workspace, session,
+            cancellation=cancellation,
+            elicitation_handler=elicitation_handler,
         )
     except AppServerError as exc:
         if not config.agent_runtime.fallback_to_legacy:

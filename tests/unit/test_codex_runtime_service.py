@@ -146,6 +146,18 @@ class _FakeClient:
         else:
             self._rollout_recorders[thread_id] = recorder
 
+    def set_elicitation_handler(self, handler):  # type: ignore[no-untyped-def]
+        # Round 17 mirror. The production AppServerClient now exposes
+        # an opt-in hook for ``mcpServer/elicitation/request``. The
+        # fake records every set/clear so tests can assert the
+        # service bound the right value around run_turn and cleared
+        # it on exit.
+        self._elicitation_handler = handler
+        self._elicitation_history: list[object] = (
+            getattr(self, "_elicitation_history", [])
+        )
+        self._elicitation_history.append(handler)
+
     async def __aenter__(self):
         return self
 
@@ -581,3 +593,50 @@ def test_looks_like_refusal_ignores_normal_replies() -> None:
     )
     for reply in benign:
         assert not _looks_like_refusal(reply), f"false positive: {reply!r}"
+
+
+def test_service_binds_and_clears_elicitation_handler(monkeypatch, tmp_path) -> None:
+    """Round 17: ``chat()`` must install the caller's elicitation
+    handler on the AppServerClient around ``run_turn`` and clear it
+    on exit so a subsequent chat on the same shared client does
+    NOT inherit a stale UI hook."""
+    config = LitTraceConfig(
+        agent_runtime=LitTraceConfig.model_fields["agent_runtime"].default_factory(),
+    )
+    session = ChatSession.from_root(tmp_path / "session", "session-1", config=config)
+    store = _BindingStore()
+    from littrace.state_db import AgentThreadBindingRecord
+    store.binding = AgentThreadBindingRecord(
+        session_id=session.session_id,
+        codex_thread_id="thread-elic",
+    )
+    service = CodexAppServerChatService(
+        config, state_store=store, client_factory=_FakeClient,
+    )
+
+    async def noop(params):
+        return {"action": "decline", "content": None, "_meta": None}
+
+    asyncio.run(
+        service.chat(
+            ChatRequest(message="hi"),
+            LiteratureWorkspace(),
+            session,
+            elicitation_handler=noop,
+        )
+    )
+    # The fake client records every (set_elicitation_handler)
+    # call. The contract is: the caller's handler is installed
+    # BEFORE run_turn and cleared AFTER — even on the happy path.
+    client = _FakeClient.instances[-1]
+    assert noop in client._elicitation_history, (
+        "service.chat did not bind the caller's elicitation handler"
+    )
+    assert client._elicitation_history[-1] is None, (
+        "service.chat did not clear the elicitation handler on exit"
+    )
+    # And the caller's handler was bound exactly once (set + clear = 2).
+    handler_sets = [h for h in client._elicitation_history if h is not None]
+    assert handler_sets == [noop], (
+        f"handler was set/cleared extra times: {client._elicitation_history!r}"
+    )

@@ -157,6 +157,14 @@ class AppServerClient:
         # cache hit picks the right binding.
         self._active_review_turns: dict[str, str] = {}
         self._review_complete_callbacks: dict[str, Any] = {}
+        # Round 17: opt-in hook for ``mcpServer/elicitation/request``.
+        # The LitTrace TUI installs an async callback that surfaces
+        # an approval modal and resolves a Future with the operator's
+        # Y/N decision; headless callers leave it unset so the
+        # existing auto-decline path keeps the previous behaviour.
+        self._elicitation_handler: (
+            Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None
+        ) = None
 
     def set_rollout_recorder(
         self, thread_id: str, recorder: "RolloutRecorder | None"
@@ -197,6 +205,23 @@ class AppServerClient:
             self._review_complete_callbacks.pop(thread_id, None)
         else:
             self._review_complete_callbacks[thread_id] = callback
+
+    def set_elicitation_handler(
+        self,
+        handler: "Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None",
+    ) -> None:
+        """Bind (or clear) the ``mcpServer/elicitation/request`` hook.
+
+        Round 17: the LitTrace TUI installs an async callback that
+        surfaces a Y/N approval modal and resolves a Future with
+        the operator's decision; the callback's return value is
+        sent back as the JSON-RPC ``result`` for the elicitation.
+        Set to ``None`` to restore the previous auto-decline
+        behaviour. The handler is called from the reader loop, so
+        it shares the App Server process's asyncio loop and can
+        await on user-interface primitives.
+        """
+        self._elicitation_handler = handler
 
     def _review_complete_for(self, thread_id: str) -> Any:
         cb = self._review_complete_callbacks.get(thread_id)
@@ -947,12 +972,26 @@ class AppServerClient:
         if method == "mcpServer/elicitation/request":
             # Elicitation has a 3-state vocabulary (accept / decline
             # / cancel), distinct from the 6-word approval set.
-            await self._write(
-                {
-                    "id": request_id,
-                    "result": {"action": "decline", "content": None, "_meta": None},
-                }
-            )
+            # Round 17: if a UI installed an ``elicitation_handler``
+            # (the LitTrace TUI does this), let it decide; otherwise
+            # fall back to the previous auto-decline path so any
+            # caller that never opted in keeps its contract.
+            handler = self._elicitation_handler
+            response: dict[str, Any] | None = None
+            if handler is not None:
+                try:
+                    response = await handler(params)
+                except Exception as exc:  # pragma: no cover - defensive
+                    # The handler raised — surface a decline so the
+                    # App Server is never left hanging on a request.
+                    response = {"action": "decline", "content": None, "_meta": None}
+                    if hasattr(self, "_stderr_tail"):
+                        self._stderr_tail.append(
+                            f"elicitation_handler_raised: {exc.__class__.__name__}"
+                        )
+            if response is None:
+                response = {"action": "decline", "content": None, "_meta": None}
+            await self._write({"id": request_id, "result": response})
             return
         if method == "item/permissions/requestApproval":
             # Modern codex-harness folds network-policy amendment

@@ -15,7 +15,15 @@ class _AppServerService:
     def __init__(self, _config) -> None:
         pass
 
-    async def chat(self, _request, workspace, _session, *, cancellation=None):
+    async def chat(
+        self,
+        _request,
+        workspace,
+        _session,
+        *,
+        cancellation=None,
+        elicitation_handler=None,
+    ):
         return ChatResponse(reply="app-server", action="codex"), workspace
 
 
@@ -23,7 +31,15 @@ class _FailingAppServerService:
     def __init__(self, _config) -> None:
         pass
 
-    async def chat(self, _request, _workspace, _session, *, cancellation=None):
+    async def chat(
+        self,
+        _request,
+        _workspace,
+        _session,
+        *,
+        cancellation=None,
+        elicitation_handler=None,
+    ):
         from littrace.codex_runtime.errors import AppServerError, CodexErrorCode
         raise AppServerError(
             message="transport failed after tool commit",
