@@ -26,17 +26,23 @@ User / CLI / TUI / API / Window
   -> Answer / Job Status / Traceable Artifacts
 ```
 
-当前已完成的迁移切片：只读 evidence/RAG 工具、`search_papers`、
+当前已完成的迁移切片：所有领域写路径——`search_papers`、
 `set_download_selection`、`enqueue_download`、`enqueue_parse`、
-`enqueue_table_extraction` 及对应状态工具，以及带租约、重试、dead-letter 恢复的
-download/parse/table workers。命令的 workspace
-修订、审计、幂等回放记录和任务入队处于同一个 Postgres 事务；Codex 不直接下载或
-解析文件。Parse worker 从对象存储校验并物化 PDF，通过 worker lease + workspace
-CAS 将结果合并到最新状态；过期 PDF 结果不会覆盖新上下文。
+`enqueue_table_extraction`、`enqueue_storyline`、`enqueue_document`、
+`enqueue_autonomous_review` 及对应状态工具——以及带租约、重试、dead-letter 恢复的
+download/parse/table/storyline/document/autonomous_review workers。
+命令的 workspace 修订、审计、幂等回放记录和任务入队处于同一个 Postgres
+事务；Codex 不直接下载或解析文件。Parse worker 从对象存储校验并物化 PDF，
+通过 worker lease + workspace CAS 将结果合并到最新状态；过期 PDF
+结果不会覆盖新上下文。
 
-下一批迁移按同一模式推进：`storyline_job`、`document_job`、
-`autonomous_review_job`。在这些写路径全部迁移前，
-旧 Coordinator 只保留组合流程兼容，不再扩展新的业务逻辑。
+TUI 与 Window 是 Codex 唯一对话面——启动时强制 `mode=codex_app_server`、
+做 Codex binary + handshake preflight、mid-turn `AppServerError`
+渲染结构化错误气泡 / 模态、注册 `elicitation_handler`
+让 Codex 弹框真正呈现给用户而非 auto-decline。REPL shell 保留为低层级
+逃生通道（`mode=legacy`），启动 banner 含 deprecation 提示；
+`_LEGACY_DOMAIN_ACTIONS` 已收缩为空集合（除 composite / 多 action
+意图外不再有 legacy fallthrough）。
 
 ## LitTrace 领域内部结构图
 

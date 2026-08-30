@@ -89,15 +89,30 @@ chat window, keeps the literature context in a hideable side panel, and uses
 separate popups for context selection, OCR/text-layer choice, and login-gated
 download handoff. It is not a web app and does not require starting FastAPI.
 
+Both `littrace-tui` and `littrace-window` require the Codex App Server.
+At startup they force `agent_runtime.mode = codex_app_server`, run a
+lightweight handshake (`initialize` + `read_account`), and surface a
+structured error modal with remediation steps if the Codex binary is
+missing, the handshake times out, or `run_turn` fails mid-flight.
+The `LITTRACE_CODEX_STARTUP_TIMEOUT_SECONDS` env var (default 20s)
+overrides the cold-start timeout. Interactive chat in both surfaces
+routes exclusively through the Codex App Server + LitTrace MCP gateway;
+there is no silent fallback to the legacy Coordinator.
+
 If your Python build does not include Tk support, use a Python distribution
 with Tkinter enabled, then reinstall the editable package and run
 `littrace-window` again.
 
-For the lower-level command shell:
+For the lower-level command shell (legacy escape hatch):
 
 ```bash
 littrace
 ```
+
+The REPL shell calls `handle_chat` directly, bypassing the App Server
+facade. It is preserved for debugging and automation but is **not** the
+canonical interactive surface — the launch banner carries a deprecation
+hint pointing users at `littrace-tui` / `littrace-window`.
 
 Optional DeepSeek-compatible chat support is loaded from `.env.local`:
 

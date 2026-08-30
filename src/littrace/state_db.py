@@ -187,6 +187,8 @@ class AsyncTaskRecord(BaseModel):
         "parse_job",
         "table_job",
         "storyline_job",
+        "document_job",
+        "autonomous_review_job",
         "compaction_job",
     ]
     artifact_id: str = ""

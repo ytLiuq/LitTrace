@@ -328,6 +328,185 @@ def test_gateway_atomically_enqueues_table_extraction() -> None:
     assert jobs["jobs"][0]["paper_ids"] == ["paper-1"]
 
 
+def test_gateway_atomically_enqueues_document() -> None:
+    """Round 20: ``enqueue_document`` mirrors ``enqueue_table_extraction``.
+
+    Asserts CAS atomicity, idempotent replay, schema version, and that
+    ``get_document_jobs`` returns the queued task with paper_ids.
+    """
+    store = _GatewayStore()
+    workspace = LiteratureWorkspace.model_validate(store.state.workspace_json)
+    workspace.parsed_papers["paper-1"] = ParsedPaper(
+        title="One",
+        parsed=True,
+        sections=[{"name": "Results", "text": "Sensitivity 12.5 kPa-1"}],
+    )
+    store.state = store.state.model_copy(
+        update={"workspace_json": workspace.model_dump(mode="json")}
+    )
+    gateway = ReadOnlyToolGateway(LitTraceConfig(), store)
+    arguments = {
+        "paper_ids": ["paper-1"],
+        "expected_revision": 0,
+        "idempotency_key": "document-turn-1",
+    }
+
+    queued = asyncio.run(
+        gateway.call(
+            "enqueue_document",
+            arguments,
+            codex_thread_id="thread-1",
+        )
+    )
+    replay = asyncio.run(
+        gateway.call(
+            "enqueue_document",
+            arguments,
+            codex_thread_id="thread-1",
+        )
+    )
+    jobs = asyncio.run(
+        gateway.call("get_document_jobs", {}, codex_thread_id="thread-1")
+    )
+
+    assert queued["status"] == "queued"
+    assert replay["idempotency_reused"] is True
+    assert store.state.revision == 1
+    task = store.tasks[queued["task_id"]]
+    assert task.kind == "document_job"
+    assert task.result_json["schema_version"] == "littrace.document_job.v1"
+    assert len(task.result_json["command"]["source_sha256"]["paper-1"]) == 64
+    assert jobs["jobs"][0]["paper_ids"] == ["paper-1"]
+
+
+def test_gateway_rejects_unparsed_papers_for_document() -> None:
+    """Round 20: ``enqueue_document`` requires parsed papers."""
+    store = _GatewayStore()
+    gateway = ReadOnlyToolGateway(LitTraceConfig(), store)
+
+    with pytest.raises(
+        ValueError, match="Papers must be parsed before document generation"
+    ):
+        asyncio.run(
+            gateway.call(
+                "enqueue_document",
+                {
+                    "paper_ids": ["paper-1"],
+                    "expected_revision": 0,
+                    "idempotency_key": "document-unparsed",
+                },
+                codex_thread_id="thread-1",
+            )
+        )
+
+
+def test_gateway_get_document_jobs_returns_empty() -> None:
+    store = _GatewayStore()
+    gateway = ReadOnlyToolGateway(LitTraceConfig(), store)
+    result = asyncio.run(
+        gateway.call("get_document_jobs", {}, codex_thread_id="thread-1")
+    )
+    assert result["jobs"] == []
+
+
+def test_gateway_atomically_enqueues_autonomous_review() -> None:
+    """Round 20: ``enqueue_autonomous_review`` mirrors ``enqueue_document``.
+
+    Asserts CAS atomicity, idempotent replay, schema version,
+    ``auto_replan=True`` propagation, and that ``get_autonomous_review_jobs``
+    returns the queued task with paper_ids and auto_replan.
+    """
+    store = _GatewayStore()
+    workspace = LiteratureWorkspace.model_validate(store.state.workspace_json)
+    workspace.parsed_papers["paper-1"] = ParsedPaper(
+        title="One",
+        parsed=True,
+        sections=[{"name": "Results", "text": "Sensitivity 12.5 kPa-1"}],
+    )
+    store.state = store.state.model_copy(
+        update={"workspace_json": workspace.model_dump(mode="json")}
+    )
+    gateway = ReadOnlyToolGateway(LitTraceConfig(), store)
+    arguments = {
+        "paper_ids": ["paper-1"],
+        "auto_replan": True,
+        "expected_revision": 0,
+        "idempotency_key": "autoreview-turn-1",
+    }
+
+    queued = asyncio.run(
+        gateway.call(
+            "enqueue_autonomous_review",
+            arguments,
+            codex_thread_id="thread-1",
+        )
+    )
+    replay = asyncio.run(
+        gateway.call(
+            "enqueue_autonomous_review",
+            arguments,
+            codex_thread_id="thread-1",
+        )
+    )
+    jobs = asyncio.run(
+        gateway.call(
+            "get_autonomous_review_jobs", {}, codex_thread_id="thread-1"
+        )
+    )
+
+    assert queued["status"] == "queued"
+    assert queued["auto_replan"] is True
+    assert replay["idempotency_reused"] is True
+    assert store.state.revision == 1
+    task = store.tasks[queued["task_id"]]
+    assert task.kind == "autonomous_review_job"
+    assert task.result_json["schema_version"] == "littrace.autonomous_review_job.v1"
+    assert task.result_json["command"]["auto_replan"] is True
+    assert len(task.result_json["command"]["source_sha256"]["paper-1"]) == 64
+    assert jobs["jobs"][0]["paper_ids"] == ["paper-1"]
+    assert jobs["jobs"][0]["auto_replan"] is True
+
+
+def test_gateway_rejects_nonbool_auto_replan() -> None:
+    """Round 20: ``auto_replan`` must be a strict bool, not a string."""
+    store = _GatewayStore()
+    workspace = LiteratureWorkspace.model_validate(store.state.workspace_json)
+    workspace.parsed_papers["paper-1"] = ParsedPaper(
+        title="One",
+        parsed=True,
+        sections=[{"name": "Results", "text": "Sensitivity 12.5 kPa-1"}],
+    )
+    store.state = store.state.model_copy(
+        update={"workspace_json": workspace.model_dump(mode="json")}
+    )
+    gateway = ReadOnlyToolGateway(LitTraceConfig(), store)
+
+    with pytest.raises(TypeError, match="auto_replan must be a boolean"):
+        asyncio.run(
+            gateway.call(
+                "enqueue_autonomous_review",
+                {
+                    "paper_ids": ["paper-1"],
+                    "auto_replan": "yes",
+                    "expected_revision": 0,
+                    "idempotency_key": "autoreview-bad",
+                },
+                codex_thread_id="thread-1",
+            )
+        )
+
+
+def test_gateway_get_autonomous_review_jobs_returns_empty() -> None:
+    store = _GatewayStore()
+    gateway = ReadOnlyToolGateway(LitTraceConfig(), store)
+    result = asyncio.run(
+        gateway.call(
+            "get_autonomous_review_jobs", {}, codex_thread_id="thread-1"
+        )
+    )
+    assert result["jobs"] == []
+
+
 def test_gateway_rejects_stale_write_revision() -> None:
     store = _GatewayStore()
     store.state = store.state.model_copy(update={"revision": 3})

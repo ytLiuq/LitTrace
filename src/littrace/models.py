@@ -706,6 +706,10 @@ class ChatResponse(BaseModel):
     # API responses carry a bounded summary. The complete workspace remains
     # canonical in session_state and is passed internally between services.
     workspace: "WorkspaceSummary | None" = None
+    # Round 27: True when the user pressed the Stop button during
+    # streaming — the GUI renders the truncated text plus a
+    # "(已被用户中止)" annotation on the bubble.
+    truncated: bool = False
 
 
 class EvidenceSpan(BaseModel):

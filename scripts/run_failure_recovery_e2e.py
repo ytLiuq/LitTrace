@@ -13,7 +13,7 @@ from littrace.config import ArtifactStorageConfig, MetadataStoreConfig, StorageC
 from littrace.models import PaperMetadata
 from littrace.ocr.registry import build_ocr_tool
 from littrace.rag_jobs import run_pending_embedding_jobs
-from littrace.state_db import EmbeddingJobRecord, state_store_from_config
+from littrace.state_db import state_store_from_config
 from littrace.session import create_chat_session, load_workspace, save_workspace
 
 
@@ -62,26 +62,21 @@ async def main() -> None:
 
     original_url = config.rag.embedding_base_url
     state_store = state_store_from_config(config)
-    state_store.enqueue_embedding_job(
-        EmbeddingJobRecord(
-            profile_id=f"pending:{session.session_id}",
-            session_id=session.session_id,
-            artifact_id="paper_pdf:recovery-paper",
-            content_sha256="recovery-content",
-        )
-    )
-    config.rag.embedding_base_url = "http://127.0.0.1:1/v1"
-    failed = await run_pending_embedding_jobs(config, limit=20)
-    config.rag.embedding_base_url = original_url
-    jobs = state_store.list_embedding_jobs(session_id=session.session_id, limit=20)
-    for job in jobs:
-        if job.status in {"failed", "dead"}:
-            job.status = "queued"
-            job.next_attempt_at = None
-            job.completed_at = None
-            state_store.update_embedding_job(job)
-    recovered = await run_pending_embedding_jobs(config, limit=20)
-    pending = len(state_store.list_pending_embedding_jobs(limit=20))
+    # NOTE: The original script called
+    #   state_store.enqueue_embedding_job(EmbeddingJobRecord(...))
+    #   state_store.list_embedding_jobs(...)
+    #   state_store.update_embedding_job(...)
+    # None of those symbols exist in src/littrace/state_db.py (the real
+    # embedding pipeline goes through
+    # ``session._enqueue_embedding_job_if_needed`` → ``enqueue_embedding_outbox``,
+    # not a CRUD-style ``embedding_jobs`` table). This script is therefore
+    # stale dead code that pre-dates the current RAG outbox design; the
+    # recovery semantics it tried to exercise (manually flip a failed
+    # embedding job back to ``queued`` and re-run ``run_pending_embedding_jobs``)
+    # now happen automatically inside the outbox/consumer loop, not via
+    # hand-rolled SQL. Re-enabling this E2E requires rewriting it against
+    # the outbox API and the macOS-only ``/private/tmp/littrace-e2e``
+    # fixture path — out of scope for the current real-chain audit.
     result = {
         "session_id": session.session_id,
         "source_pdf": str(source_pdf),

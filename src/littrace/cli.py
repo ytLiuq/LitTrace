@@ -66,6 +66,18 @@ from littrace.parse_jobs import (
     run_parse_job_daemon,
     run_pending_parse_jobs,
 )
+from littrace.document_jobs import (
+    document_jobs_status,
+    requeue_dead_document_jobs,
+    run_document_job_daemon,
+    run_pending_document_jobs,
+)
+from littrace.autonomous_loop_jobs import (
+    autonomous_review_jobs_status,
+    requeue_dead_autonomous_review_jobs,
+    run_autonomous_review_job_daemon,
+    run_pending_autonomous_review_jobs,
+)
 from littrace.evaluation.pdf_benchmark import benchmark_pdf_parsing
 from littrace.publisher_connectors import build_publisher_search_plan
 from littrace.publisher_retrieval import (
@@ -448,9 +460,16 @@ async def _run_rag_command(config) -> None:
 
 
 async def _run_jobs_command(config) -> None:
-    if len(sys.argv) < 4 or sys.argv[2] not in {"download", "parse", "table"}:
+    if len(sys.argv) < 4 or sys.argv[2] not in {
+        "download",
+        "parse",
+        "table",
+        "storyline",
+        "document",
+        "autonomous_review",
+    }:
         print(
-            "用法：littrace jobs download|parse|table "
+            "用法：littrace jobs download|parse|table|storyline|document|autonomous_review "
             "run|daemon|status|requeue-dead [--session SESSION_ID] [--limit N]"
         )
         return
@@ -471,13 +490,38 @@ async def _run_jobs_command(config) -> None:
                 f"parse_failed: {report.parse_failed}\n"
                 f"stale: {report.stale}"
             )
-        else:
+        elif job_kind == "table":
             report = await run_pending_table_jobs(config, limit=limit)
             details = (
                 f"performance_cells: {report.performance_cells}\n"
                 f"structured_artifacts: {report.structured_artifacts}\n"
                 f"stale: {report.stale}"
             )
+        elif job_kind == "document":
+            report = await run_pending_document_jobs(config, limit=limit)
+            details = (
+                f"sections: {report.sections}\n"
+                f"citations: {report.citations}\n"
+                f"stale: {report.stale}"
+            )
+        elif job_kind == "autonomous_review":
+            report = await run_pending_autonomous_review_jobs(config, limit=limit)
+            details = (
+                f"rounds: {report.rounds}\n"
+                f"score: {report.score}\n"
+                f"passed: {report.passed}\n"
+                f"release_ready: {report.release_ready}\n"
+                f"stale: {report.stale}"
+            )
+        else:
+            # Round 20: storyline CLI hookup is intentionally deferred
+            # because the legacy worker path is being removed; use the
+            # Codex MCP tool ``get_storyline_jobs`` for progress.
+            print(
+                f"littrace jobs {job_kind} run is exposed via Codex MCP tool "
+                f"get_{job_kind}_jobs. No standalone CLI worker is wired."
+            )
+            return
         print(f"processed: {report.processed}")
         print(f"failed: {report.failed}")
         print(details)
@@ -507,12 +551,30 @@ async def _run_jobs_command(config) -> None:
                 interval_seconds=interval,
                 limit=limit,
             )
-        else:
+        elif job_kind == "table":
             await run_table_job_daemon(
                 config,
                 interval_seconds=interval,
                 limit=limit,
             )
+        elif job_kind == "document":
+            await run_document_job_daemon(
+                config,
+                interval_seconds=interval,
+                limit=limit,
+            )
+        elif job_kind == "autonomous_review":
+            await run_autonomous_review_job_daemon(
+                config,
+                interval_seconds=interval,
+                limit=limit,
+            )
+        else:
+            print(
+                f"littrace jobs {job_kind} daemon is exposed via Codex MCP tool "
+                f"get_{job_kind}_jobs. No standalone CLI worker is wired."
+            )
+            return
         return
     if action == "status":
         status_args = {
@@ -524,8 +586,18 @@ async def _run_jobs_command(config) -> None:
             queue, jobs = download_jobs_status(config, **status_args)
         elif job_kind == "parse":
             queue, jobs = parse_jobs_status(config, **status_args)
-        else:
+        elif job_kind == "table":
             queue, jobs = table_jobs_status(config, **status_args)
+        elif job_kind == "document":
+            queue, jobs = document_jobs_status(config, **status_args)
+        elif job_kind == "autonomous_review":
+            queue, jobs = autonomous_review_jobs_status(config, **status_args)
+        else:
+            print(
+                f"littrace jobs {job_kind} status is exposed via Codex MCP tool "
+                f"get_{job_kind}_jobs. No standalone CLI worker is wired."
+            )
+            return
         print(
             f"queued={queue.queued} running={queue.running} failed={queue.failed} "
             f"dead={queue.dead} completed={queue.completed} ready={queue.ready_to_claim}"
@@ -541,12 +613,22 @@ async def _run_jobs_command(config) -> None:
             count = requeue_dead_download_jobs(config, limit=limit)
         elif job_kind == "parse":
             count = requeue_dead_parse_jobs(config, limit=limit)
-        else:
+        elif job_kind == "table":
             count = requeue_dead_table_jobs(config, limit=limit)
+        elif job_kind == "document":
+            count = requeue_dead_document_jobs(config, limit=limit)
+        elif job_kind == "autonomous_review":
+            count = requeue_dead_autonomous_review_jobs(config, limit=limit)
+        else:
+            print(
+                f"littrace jobs {job_kind} requeue-dead is exposed via Codex MCP tool "
+                f"get_{job_kind}_jobs. No standalone CLI worker is wired."
+            )
+            return
         print(f"requeued: {count}")
         return
     print(
-        "用法：littrace jobs download|parse|table "
+        "用法：littrace jobs download|parse|table|storyline|document|autonomous_review "
         "run|daemon|status|requeue-dead [--session SESSION_ID] [--limit N]"
     )
 
@@ -892,7 +974,10 @@ async def run_shell() -> None:
         session_id=session.session_id,
         session_root=str(session.root),
     )
-    print("LitTrace agent shell")
+    print("LitTrace agent shell (low-level escape hatch; default mode = legacy)")
+    print(">> Migrated surfaces: littrace-tui, littrace-window. For the canonical")
+    print(">> interactive chat, run those instead. Legacy mode will be removed in")
+    print(">> a future release.")
     print(
         "输入研究任务开始。命令：/context /hide-context /show-context /papers "
         "/login N /browser-login N /attach N path.pdf /attach-si N path /full-text /publisher-retrieve family topic /check-downloads /resume-downloads /parse /table /storyline "

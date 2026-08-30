@@ -94,6 +94,8 @@ READ_ONLY_TOOL_NAMES = (
     "get_parse_jobs",
     "get_table_jobs",
     "get_storyline_jobs",
+    "get_document_jobs",
+    "get_autonomous_review_jobs",
     "search_workspace_rag",
     "get_paper_status",
     "get_evidence",
@@ -106,6 +108,8 @@ WRITE_TOOL_NAMES = (
     "enqueue_parse",
     "enqueue_table_extraction",
     "enqueue_storyline",
+    "enqueue_document",
+    "enqueue_autonomous_review",
 )
 APP_SERVER_TOOL_NAMES = READ_ONLY_TOOL_NAMES + WRITE_TOOL_NAMES
 
@@ -189,6 +193,46 @@ def read_only_tool_specs() -> list[dict[str, Any]]:
             "description": (
                 "Read recent durable evidence-grounded storyline jobs for the current "
                 "LitTrace session."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                    }
+                },
+                "additionalProperties": False,
+            },
+            "readOnlyHint": True,
+        },
+        {
+            "name": "get_document_jobs",
+            "description": (
+                "Read recent durable research-document generation jobs for the current "
+                "LitTrace session."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                    }
+                },
+                "additionalProperties": False,
+            },
+            "readOnlyHint": True,
+        },
+        {
+            "name": "get_autonomous_review_jobs",
+            "description": (
+                "Read recent durable autonomous-review jobs for the current LitTrace "
+                "session."
             ),
             "inputSchema": {
                 "type": "object",
@@ -441,6 +485,67 @@ def app_server_tool_specs() -> list[dict[str, Any]]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "enqueue_document",
+            "description": (
+                "Atomically enqueue a research-document generation job from parsed active "
+                "papers. The document composer produces an evidence-grounded Markdown "
+                "report (sections, citations, verification, release blockers). If paper_ids "
+                "is omitted, use all active parsed papers. Read get_workspace_context first, "
+                "pass its workspace revision, reuse one idempotency_key for retries, and use "
+                "get_document_jobs for progress."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "paper_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 100,
+                    },
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "idempotency_key": {
+                        "type": "string",
+                        "minLength": 8,
+                        "maxLength": 200,
+                    },
+                },
+                "required": ["expected_revision", "idempotency_key"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "enqueue_autonomous_review",
+            "description": (
+                "Atomically enqueue a bounded autonomous-review job for parsed active "
+                "papers. The reviewer loop runs mandatory quality gates plus an optional "
+                "bounded Reviewer and returns a ReviewLoopReport. If paper_ids is omitted, "
+                "use all active parsed papers. Set auto_replan=true to allow the reviewer "
+                "to apply bounded replan actions (parse, extract tables, rebuild storyline) "
+                "between rounds. Read get_workspace_context first, pass its workspace "
+                "revision, reuse one idempotency_key for retries, and use "
+                "get_autonomous_review_jobs for progress."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "paper_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 100,
+                    },
+                    "auto_replan": {"type": "boolean", "default": False},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "idempotency_key": {
+                        "type": "string",
+                        "minLength": 8,
+                        "maxLength": 200,
+                    },
+                },
+                "required": ["expected_revision", "idempotency_key"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
@@ -555,6 +660,10 @@ class LitTraceToolGateway:
             return self._enqueue_table_extraction(binding, workspace, args)
         if name == "enqueue_storyline":
             return self._enqueue_storyline(binding, workspace, args)
+        if name == "enqueue_document":
+            return self._enqueue_document(binding, workspace, args)
+        if name == "enqueue_autonomous_review":
+            return self._enqueue_autonomous_review(binding, workspace, args)
         if name == "get_workspace_context":
             return _workspace_context(binding, workspace)
         if name == "get_download_jobs":
@@ -596,6 +705,26 @@ class LitTraceToolGateway:
             return {
                 "session_id": binding.session_id,
                 "jobs": [_storyline_job_summary(job) for job in jobs],
+            }
+        if name == "get_document_jobs":
+            jobs = self.state_store.list_async_tasks(
+                session_id=binding.session_id,
+                kind="document_job",
+                limit=_bounded_int(args.get("limit"), default=20, minimum=1, maximum=100),
+            )
+            return {
+                "session_id": binding.session_id,
+                "jobs": [_document_job_summary(job) for job in jobs],
+            }
+        if name == "get_autonomous_review_jobs":
+            jobs = self.state_store.list_async_tasks(
+                session_id=binding.session_id,
+                kind="autonomous_review_job",
+                limit=_bounded_int(args.get("limit"), default=20, minimum=1, maximum=100),
+            )
+            return {
+                "session_id": binding.session_id,
+                "jobs": [_autonomous_review_job_summary(job) for job in jobs],
             }
         if name == "get_paper_status":
             return _paper_status(workspace, str(args.get("paper_id") or ""))
@@ -1211,6 +1340,247 @@ class LitTraceToolGateway:
             async_task=task,
         )
 
+    def _enqueue_document(
+        self,
+        binding: AgentThreadBindingRecord,
+        workspace: LiteratureWorkspace,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Round 20: durable research-document job.
+
+        Mirrors ``_enqueue_storyline``: validates ``expected_revision``
+        and ``idempotency_key``, resolves ``paper_ids`` against the
+        active parsed set, captures per-paper ``source_sha256`` so a
+        concurrent parse/table extraction cannot silently invalidate
+        the worker's view, then commits a ``document_job`` async task
+        and bumps ``workspace_revision``.
+        """
+        expected_revision = _strict_non_negative_int(
+            arguments.get("expected_revision"),
+            name="expected_revision",
+        )
+        idempotency_key = str(arguments.get("idempotency_key") or "").strip()
+        if not 8 <= len(idempotency_key) <= 200:
+            raise ValueError("idempotency_key must contain 8 to 200 characters")
+
+        raw_ids = arguments.get("paper_ids")
+        if raw_ids is None:
+            paper_ids = [
+                paper_id
+                for paper_id in workspace.context.active_papers
+                if coerce_parsed(workspace.parsed_papers.get(paper_id)).parsed
+            ]
+        elif isinstance(raw_ids, list):
+            paper_ids = list(
+                dict.fromkeys(str(item).strip() for item in raw_ids if str(item).strip())
+            )
+        else:
+            raise TypeError("paper_ids must be an array")
+        if not paper_ids:
+            raise ValueError("No parsed active papers were provided for document generation")
+        if len(paper_ids) > 100:
+            raise ValueError("paper_ids must contain at most 100 items")
+        active_ids = set(workspace.context.active_papers)
+        invalid = [paper_id for paper_id in paper_ids if paper_id not in active_ids]
+        if invalid:
+            raise ValueError(
+                "Only active workspace papers can be queued for document generation: "
+                + ", ".join(invalid[:10])
+            )
+        unparsed = [
+            paper_id
+            for paper_id in paper_ids
+            if not coerce_parsed(workspace.parsed_papers.get(paper_id)).parsed
+        ]
+        if unparsed:
+            raise ValueError(
+                "Papers must be parsed before document generation: "
+                + ", ".join(unparsed[:10])
+            )
+
+        source_sha256 = {
+            paper_id: _model_sha256(
+                {
+                    "paper": workspace.papers[paper_id].model_dump(mode="json"),
+                    "parsed": coerce_parsed(
+                        workspace.parsed_papers[paper_id]
+                    ).model_dump(mode="json"),
+                }
+            )
+            for paper_id in paper_ids
+        }
+        command = {
+            "paper_ids": paper_ids,
+            "expected_revision": expected_revision,
+        }
+        arguments_sha256 = _command_sha256(command)
+        task_digest = sha256(
+            f"{binding.session_id}\0enqueue_document\0{idempotency_key}".encode()
+        ).hexdigest()[:32]
+        task_id = f"document:{task_digest}"
+        task = AsyncTaskRecord(
+            task_id=task_id,
+            session_id=binding.session_id,
+            kind="document_job",
+            artifact_id=f"document_batch:{task_digest}",
+            event_type="document_requested",
+            source_revision=str(expected_revision),
+            content_sha256=arguments_sha256,
+            result_json={
+                "schema_version": "littrace.document_job.v1",
+                "command": {
+                    **command,
+                    "source_sha256": source_sha256,
+                },
+            },
+        )
+        updated = workspace.model_copy(deep=True)
+        updated.context.filters.workspace_revision = expected_revision + 1
+        result = {
+            "session_id": binding.session_id,
+            "tool": "enqueue_document",
+            "idempotency_key": idempotency_key,
+            "task_id": task_id,
+            "status": "queued",
+            "paper_ids": paper_ids,
+            "workspace_revision": expected_revision + 1,
+        }
+        return self._commit_workspace_tool(
+            binding=binding,
+            updated=updated,
+            tool_name="enqueue_document",
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+            command=command,
+            result=result,
+            async_task=task,
+        )
+
+    def _enqueue_autonomous_review(
+        self,
+        binding: AgentThreadBindingRecord,
+        workspace: LiteratureWorkspace,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Round 20: durable autonomous-review job.
+
+        Mirrors ``_enqueue_document`` and adds one extra field,
+        ``auto_replan``, which controls whether the reviewer is allowed
+        to mutate the workspace between rounds via bounded replan
+        actions (parse, extract tables, rebuild storyline). The default
+        is false so a Codex-driven turn never silently changes the
+        workspace mid-review.
+        """
+        expected_revision = _strict_non_negative_int(
+            arguments.get("expected_revision"),
+            name="expected_revision",
+        )
+        idempotency_key = str(arguments.get("idempotency_key") or "").strip()
+        if not 8 <= len(idempotency_key) <= 200:
+            raise ValueError("idempotency_key must contain 8 to 200 characters")
+
+        auto_replan_raw = arguments.get("auto_replan", False)
+        if not isinstance(auto_replan_raw, bool):
+            raise TypeError("auto_replan must be a boolean")
+        auto_replan = auto_replan_raw
+
+        raw_ids = arguments.get("paper_ids")
+        if raw_ids is None:
+            paper_ids = [
+                paper_id
+                for paper_id in workspace.context.active_papers
+                if coerce_parsed(workspace.parsed_papers.get(paper_id)).parsed
+            ]
+        elif isinstance(raw_ids, list):
+            paper_ids = list(
+                dict.fromkeys(str(item).strip() for item in raw_ids if str(item).strip())
+            )
+        else:
+            raise TypeError("paper_ids must be an array")
+        if not paper_ids:
+            raise ValueError(
+                "No parsed active papers were provided for autonomous review"
+            )
+        if len(paper_ids) > 100:
+            raise ValueError("paper_ids must contain at most 100 items")
+        active_ids = set(workspace.context.active_papers)
+        invalid = [paper_id for paper_id in paper_ids if paper_id not in active_ids]
+        if invalid:
+            raise ValueError(
+                "Only active workspace papers can be queued for autonomous review: "
+                + ", ".join(invalid[:10])
+            )
+        unparsed = [
+            paper_id
+            for paper_id in paper_ids
+            if not coerce_parsed(workspace.parsed_papers.get(paper_id)).parsed
+        ]
+        if unparsed:
+            raise ValueError(
+                "Papers must be parsed before autonomous review: "
+                + ", ".join(unparsed[:10])
+            )
+
+        source_sha256 = {
+            paper_id: _model_sha256(
+                {
+                    "paper": workspace.papers[paper_id].model_dump(mode="json"),
+                    "parsed": coerce_parsed(
+                        workspace.parsed_papers[paper_id]
+                    ).model_dump(mode="json"),
+                }
+            )
+            for paper_id in paper_ids
+        }
+        command = {
+            "paper_ids": paper_ids,
+            "auto_replan": auto_replan,
+            "expected_revision": expected_revision,
+        }
+        arguments_sha256 = _command_sha256(command)
+        task_digest = sha256(
+            f"{binding.session_id}\0enqueue_autonomous_review\0{idempotency_key}".encode()
+        ).hexdigest()[:32]
+        task_id = f"autonomous_review:{task_digest}"
+        task = AsyncTaskRecord(
+            task_id=task_id,
+            session_id=binding.session_id,
+            kind="autonomous_review_job",
+            artifact_id=f"autonomous_review_batch:{task_digest}",
+            event_type="autonomous_review_requested",
+            source_revision=str(expected_revision),
+            content_sha256=arguments_sha256,
+            result_json={
+                "schema_version": "littrace.autonomous_review_job.v1",
+                "command": {
+                    **command,
+                    "source_sha256": source_sha256,
+                },
+            },
+        )
+        updated = workspace.model_copy(deep=True)
+        updated.context.filters.workspace_revision = expected_revision + 1
+        result = {
+            "session_id": binding.session_id,
+            "tool": "enqueue_autonomous_review",
+            "idempotency_key": idempotency_key,
+            "task_id": task_id,
+            "status": "queued",
+            "paper_ids": paper_ids,
+            "auto_replan": auto_replan,
+            "workspace_revision": expected_revision + 1,
+        }
+        return self._commit_workspace_tool(
+            binding=binding,
+            updated=updated,
+            tool_name="enqueue_autonomous_review",
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+            command=command,
+            result=result,
+            async_task=task,
+        )
+
     def _commit_workspace_tool(
         self,
         *,
@@ -1440,6 +1810,66 @@ def _storyline_job_summary(job: AsyncTaskRecord) -> dict[str, object]:
         "paper_ids": list(command.get("paper_ids") or []),
         "storyline_claim_count": execution.get("storyline_claim_count"),
         "evidence_record_count": execution.get("evidence_record_count"),
+        "stale_paper_ids": list(execution.get("stale_paper_ids") or []),
+        "last_error": job.last_error,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "completed_at": job.completed_at,
+    }
+
+
+def _document_job_summary(job: AsyncTaskRecord) -> dict[str, object]:
+    """Round 20: summary helper for ``enqueue_document`` durable jobs.
+
+    Mirrors ``_storyline_job_summary`` but surfaces the document-specific
+    execution metrics (section_count, citation_count, release_ready)
+    so the model and the operator can see whether the report is
+    publishable from the ``get_document_jobs`` reply alone.
+    """
+    payload = job.result_json if isinstance(job.result_json, dict) else {}
+    command = payload.get("command")
+    execution = payload.get("execution")
+    command = command if isinstance(command, dict) else {}
+    execution = execution if isinstance(execution, dict) else {}
+    return {
+        "task_id": job.task_id,
+        "status": job.status,
+        "attempt_count": job.attempt_count,
+        "paper_ids": list(command.get("paper_ids") or []),
+        "section_count": execution.get("section_count"),
+        "citation_count": execution.get("citation_count"),
+        "release_ready": execution.get("release_ready"),
+        "stale_paper_ids": list(execution.get("stale_paper_ids") or []),
+        "last_error": job.last_error,
+        "created_at": job.created_at,
+        "updated_at": job.updated_at,
+        "completed_at": job.completed_at,
+    }
+
+
+def _autonomous_review_job_summary(job: AsyncTaskRecord) -> dict[str, object]:
+    """Round 20: summary helper for ``enqueue_autonomous_review`` jobs.
+
+    Surfaces the review-loop-specific execution metrics (rounds,
+    score, passed, release_ready) plus the ``auto_replan`` flag so the
+    model and the operator can see whether the worker was allowed to
+    mutate the workspace mid-review.
+    """
+    payload = job.result_json if isinstance(job.result_json, dict) else {}
+    command = payload.get("command")
+    execution = payload.get("execution")
+    command = command if isinstance(command, dict) else {}
+    execution = execution if isinstance(execution, dict) else {}
+    return {
+        "task_id": job.task_id,
+        "status": job.status,
+        "attempt_count": job.attempt_count,
+        "paper_ids": list(command.get("paper_ids") or []),
+        "auto_replan": command.get("auto_replan"),
+        "rounds": execution.get("rounds"),
+        "score": execution.get("score"),
+        "passed": execution.get("passed"),
+        "release_ready": execution.get("release_ready"),
         "stale_paper_ids": list(execution.get("stale_paper_ids") or []),
         "last_error": job.last_error,
         "created_at": job.created_at,

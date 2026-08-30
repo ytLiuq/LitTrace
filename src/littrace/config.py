@@ -281,6 +281,12 @@ class AgentRuntimeConfig(BaseModel):
     """
 
     mode: AgentRuntimeMode = AgentRuntimeMode.LEGACY
+    # ``chat_backend`` chooses which transport drives the GUI input box.
+    # ``app_server`` = the in-tree ``codex app-server`` JSON-RPC wrapper
+    # (default, fully wired to the littrace MCP gateway).
+    # ``codex_cli`` = the real ``codex`` CLI invoked as ``codex exec --json``;
+    # this is what the user wants when they say "把输入框接入到 codex cli".
+    chat_backend: str = "app_server"
     codex_command: list[str] = Field(default_factory=lambda: ["codex", "app-server"])
     codex_config_overrides: dict[str, str] = Field(default_factory=dict)
     codex_home_mode: CodexHomeMode = CodexHomeMode.ISOLATED

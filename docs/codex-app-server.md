@@ -31,9 +31,13 @@ history, turn execution, streaming, and tool orchestration.
   cells belonging to unrelated papers, replaces only the requested papers,
   and rejects results when their parsed source changed. Run it with
   `littrace jobs table run` or `littrace jobs table daemon`.
-- Search combined with download or later processing, storyline generation,
-  document generation, and autonomous review continue through the legacy
-  LitTrace coordinator.
+- Storyline generation, document generation, and autonomous review are
+  first-class App Server MCP commands (`enqueue_storyline`,
+  `enqueue_document`, `enqueue_autonomous_review`); each ships with its own
+  durable worker (`storyline_job` / `document_job` /
+  `autonomous_review_job`) and a `_jobs` companion reader. Status of all four
+  queues is reachable from the model via `get_storyline_jobs`,
+  `get_document_jobs`, and `get_autonomous_review_jobs`.
 - `session_state.workspace_json` in Postgres is canonical. A Codex thread is
   execution memory, not a second workspace database.
 - `agent_thread_bindings` maps one LitTrace session to one durable Codex thread.
@@ -45,12 +49,15 @@ history, turn execution, streaming, and tool orchestration.
   skills, threads, and Codex memories are not inherited.
 - App Server starts a required LitTrace MCP process. It exposes only:
   `get_workspace_context`, `get_download_jobs`, `get_parse_jobs`,
-  `get_table_jobs`, `search_workspace_rag`, `get_paper_status`, `get_evidence`,
-  `quality_report`, `set_download_selection`, `search_papers`,
-  `enqueue_download`, `enqueue_parse`, and `enqueue_table_extraction`.
+  `get_table_jobs`, `get_storyline_jobs`, `get_document_jobs`,
+  `get_autonomous_review_jobs`, `search_workspace_rag`, `get_paper_status`,
+  `get_evidence`, `quality_report`, `set_download_selection`,
+  `search_papers`, `enqueue_download`, `enqueue_parse`,
+  `enqueue_table_extraction`, `enqueue_storyline`, `enqueue_document`, and
+  `enqueue_autonomous_review`.
 - Every tool call resolves App Server's `_meta.threadId` back to the binding and
   reloads the current Postgres workspace. The gateway MCP process has no
-  module-level workspace; its five mutations can only commit through the
+  module-level workspace; its eight mutations can only commit through the
   Postgres CAS/idempotency transaction.
 - One App Server process is reused across sessions and across Desktop calls
   that each create a fresh asyncio loop. A dedicated daemon thread owns its
@@ -78,7 +85,8 @@ agent_runtime:
   codex_command: [codex, app-server]
   codex_home_mode: isolated
   codex_home: ./data/codex-home
-  fallback_to_legacy: true
+  startup_timeout_seconds: 20
+  fallback_to_legacy: false
 ```
 
 Equivalent environment flag:
@@ -86,6 +94,15 @@ Equivalent environment flag:
 ```text
 LITTRACE_AGENT_RUNTIME=codex_app_server
 ```
+
+For Windows cold starts, bump the startup handshake timeout via:
+
+```text
+LITTRACE_CODEX_STARTUP_TIMEOUT_SECONDS=60
+```
+
+This overrides `agent_runtime.startup_timeout_seconds` for the TUI/Window
+preflight handshake only. The HTTP route uses the configured value directly.
 
 The isolated home needs its own one-time Codex login. On PowerShell:
 
@@ -121,10 +138,15 @@ either the global Codex config or the managed home's `config.toml`.
 
 ## Failure behavior
 
-With `fallback_to_legacy: true`, process startup, protocol, MCP, binding, or
-configuration failures fall back to the existing coordinator and append a
-`codex_app_server_fallback` warning to the response. Set it to `false` while
-developing the integration to surface the original exception.
+`fallback_to_legacy: false` is the contract for the TUI and Window. The
+`littrace-tui` and `littrace-window` entry points force
+`fallback_to_legacy = False` regardless of what the user has in
+`config.yaml`; if the App Server cannot reach the user, the operator sees a
+structured `CodexStartupError` modal with remediation steps rather than a
+silent fall-through to legacy chat. The HTTP route and the `littrace` REPL
+shell still consult `fallback_to_legacy` for backward compatibility, but the
+REPL prints a deprecation banner that points operators at
+`littrace-tui`/`littrace-window` for the canonical experience.
 
 If the canonical workspace revision advanced before the failure, LitTrace does
 not replay the request through legacy code: an MCP mutation may already have
@@ -138,8 +160,6 @@ the full-duplex App Server connection.
 
 ## Deliberately deferred
 
-- Durable commands/workers for storyline, document generation, and autonomous
-  review.
 - Streaming App Server deltas into the current HTTP/Desktop UI. ✅ done in Round 6
   via `POST /chat/stream` (text/event-stream). See "Streaming chat"
   below for the SSE protocol contract.
@@ -151,6 +171,119 @@ the full-duplex App Server connection.
   state and RAG; the dedicated Codex home may retain thread execution context
   and Codex's own memory files, but LitTrace does not read them as canonical
   scientific state.
+
+## TUI/Window = strict Codex surface (Round 20)
+
+After Round 20 the `littrace-tui` and `littrace-window` entry points are
+canonical Codex surfaces — there is no longer any path through them that
+calls the legacy `handle_legacy_chat` coordinator.
+
+### Startup preflight
+
+Both surfaces run a one-shot handshake before they accept any input:
+
+1. `shutil.which` probes the configured `codex_command[0]` (default
+   `codex`). A missing binary raises `CodexStartupError("Codex CLI
+   not found: 'codex' is not on PATH")` carrying remediation
+   `["Install Codex CLI: npm install -g @openai/codex",
+   "Add the codex executable to your PATH"]`.
+2. A one-shot `AppServerClient.initialize()` + `read_account()` is
+   attempted with `startup_timeout_seconds` (default 20, overridable
+   via `LITTRACE_CODEX_STARTUP_TIMEOUT_SECONDS`). An `AppServerError`
+   is translated to `CodexStartupError` with the original reason
+   attached to the remediation list so the operator can copy-paste
+   the fix into a shell.
+3. The preflight runs BEFORE the Tk mainloop / Textual event loop
+   starts, so a missing Codex never appears as a mid-turn bubble.
+
+The TUI renders `_render_startup_error(screen, exc)` — full-screen
+modal listing the remediation steps. Window renders
+`_show_startup_error_modal(self, exc)` — `tk.Toplevel` with the same
+content. Both block until the operator presses OK, then return to
+the shell.
+
+### Mode hard-error
+
+If the user explicitly sets `LITTRACE_AGENT_RUNTIME=legacy` while
+launching `littrace-tui` or `littrace-window`, the entry points raise
+`SystemExit("littrace-tui requires the Codex App Server runtime;
+LITTRACE_AGENT_RUNTIME=legacy is not supported")` BEFORE the preflight.
+The legacy mode is still the default for the REPL shell, but the
+migrated surfaces refuse to start rather than silently fall through.
+
+A legacy `mode` in `config.yaml` is silently overwritten to
+`codex_app_server` and a one-line warning is printed to stderr so the
+operator knows their config was migrated.
+
+### Elicitation handler
+
+Codex's `mcpServer/elicitation/request` notifications carry the
+proposed tool call so the operator can approve/decline. Both TUI and
+Window register an `elicitation_handler` against the App Server
+client:
+
+- TUI: `_make_elicitation_handler(self)` builds a Textual modal
+  screen with Y/N/Esc buttons. The button callback uses
+  `_resolve_approval_future` which checks
+  `asyncio.get_running_loop()` — if the running loop is NOT the loop
+  the future was created on (the Tk thread has no running asyncio
+  loop), it routes through `fut_loop.call_soon_threadsafe(...)` so
+  the future resolves on the Codex reader loop without raising
+  `RuntimeError: ... attached to a different loop`.
+- Window: `_make_window_elicitation_handler(self)` does the same
+  thing with `tk.Toplevel` buttons. The Tk callback path mirrors
+  the TUI exactly; both are unit-tested with a real Tk root and a
+  long-lived event loop parked on a daemon thread.
+
+The modal title is `server.tool` (e.g. `littrace.search_papers`),
+the body is the `message` + the `tool_params` rendered verbatim, and
+the buttons are labelled 批准 / 拒绝 / 取消 (Y/N/Esc). Without this
+handler, Codex auto-declines every elicitation, so the operator
+never gets a chance to approve the model calling
+`search_papers` or `enqueue_document`.
+
+### Mid-turn `AppServerError`
+
+If the Codex transport dies mid-turn, the TUI renders a structured
+error bubble rather than the raw exception text:
+
+```
+Error: Codex App Server unavailable: <reason>
+
+修复步骤:
+- <step 1>
+- <step 2>
+```
+
+Window surfaces the same error as a `tk.Toplevel` modal via
+`_show_app_server_error_modal`. Either way the workspace state is
+unchanged — `codex_app_server_post_commit_failure` warnings remain
+on the response envelope if the App Server died after the MCP
+command committed but before the response stream finished.
+
+## REPL shell as low-level escape hatch (Round 20)
+
+The `littrace` REPL shell still defaults to `mode: legacy` so the
+operator has a known-good interactive surface even if Codex is
+uninstalled, broken, or in the middle of a credential rotation. The
+startup banner now prints:
+
+```
+LitTrace REPL shell (low-level escape hatch; default mode = legacy)
+>> Migrated surfaces: littrace-tui, littrace-window. For the canonical
+>> interactive chat, run those instead. Legacy mode will be removed in
+>> a future release.
+```
+
+The REPL keeps using `handle_chat` directly and never goes through
+`handle_agent_chat` / `CodexAppServerChatService`. That bypass is
+locked by `test_repl_shell_bypasses_agent_runtime` so the escape
+hatch cannot be removed by accident.
+
+`_LEGACY_DOMAIN_ACTIONS` is now an empty set; the legacy fallthrough
+predicate in `agent_runtime.py` consults `composite_search` and
+multi-action intent checks only. There is no longer any
+domain-specific legacy shortcut.
 
 ## Streaming chat (Round 6)
 
