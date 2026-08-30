@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 import shutil
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -20,13 +21,18 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 if TYPE_CHECKING:
     from littrace.codex_runtime.rollout import RolloutRecorder
 
-
-class AppServerError(RuntimeError):
-    """Base failure raised by the App Server transport."""
-
-
-class AppServerProtocolError(AppServerError):
-    """Malformed wire data or a JSON-RPC error response."""
+# ``AppServerError`` and ``AppServerProtocolError`` live in
+# ``littrace.codex_runtime.errors`` (Round 4 vocabulary). Importing
+# them here keeps the canonical kwargs-aware ``__init__`` so any
+# ``raise AppServerError(error_code=..., message=...)`` keeps working;
+# the previous inline duplicate in this module used the default
+# ``RuntimeError.__init__`` which rejects keyword args and surfaced
+# as ``TypeError: AppServerError() takes no keyword arguments`` from
+# ``service.py:218`` during real-chain E2E.
+from littrace.codex_runtime.errors import (  # noqa: E402
+    AppServerError,
+    AppServerProtocolError,
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,17 @@ class AppServerTurnResult:
     reply: str
     turn: dict[str, Any]
     usage: Usage = field(default_factory=Usage)
+    # Round 27: True when the user pressed the Stop button during
+    # streaming — the reply is whatever was streamed before the
+    # stop_event fired, not the canonical full text. GUI surfaces a
+    # "(已被用户中止)" annotation on the bubble.
+    truncated: bool = False
+    # Round 28 (Phase 6): tool events emitted by the Codex App
+    # Server during the turn. Each entry is a dict shaped like
+    # ``{"name": str, "status": str, "duration": float | None,
+    # "body": str}`` so test fixtures and probes can introspect the
+    # tool stream without re-reading the JSONL rollout.
+    tool_events: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -374,6 +391,8 @@ class AppServerClient:
         timeout: float = 300.0,
         cancellation: asyncio.Event | None = None,
         on_delta: "Callable[[str], Awaitable[None] | None] | None" = None,
+        on_tool: "Callable[[str, str, float | None, str], Awaitable[None] | None] | None" = None,
+        stop_event: "threading.Event | None" = None,
     ) -> AppServerTurnResult:
         queue = self._thread_queues.setdefault(thread_id, asyncio.Queue())
         self._turn_request_tasks.setdefault(thread_id, set())
@@ -395,6 +414,13 @@ class AppServerClient:
             )
         completed_messages: list[str] = []
         deltas: list[str] = []
+        # Round 28 (Phase 6): track tool call start times so we can
+        # emit ``on_tool`` events with a wall-clock duration when the
+        # tool completes. Keyed by the App Server's tool-call item id.
+        tool_events: list[dict[str, Any]] = []
+        tool_started_at: dict[str, float] = {}
+        tool_names: dict[str, str] = {}
+        tool_inputs: dict[str, str] = {}
 
         async def wait_for_completion() -> AppServerTurnResult:
             while True:
@@ -447,6 +473,28 @@ class AppServerClient:
                     continue
                 if method == "item/agentMessage/delta":
                     delta = params.get("delta")
+                    # Round 27: stop_event is a thread-safe flag the
+                    # GUI sets when the user clicks the Stop button.
+                    # Check it BEFORE forwarding the delta so the
+                    # last visible character is the one the user
+                    # actually saw. ``threading.Event.is_set()`` is
+                    # safe to call from the asyncio thread.
+                    if stop_event is not None and stop_event.is_set():
+                        try:
+                            await self.cancel_current_turn(
+                                thread_id, turn_id, grace_seconds=2.0,
+                            )
+                        except AppServerError:
+                            pass
+                        partial = "".join(deltas).strip()
+                        return AppServerTurnResult(
+                            thread_id=thread_id,
+                            turn_id=turn_id,
+                            status="interrupted",
+                            reply=partial,
+                            turn={"id": turn_id, "status": "interrupted"},
+                            truncated=True,
+                        )
                     if isinstance(delta, str):
                         deltas.append(delta)
                         # Stream hook: callers that need to forward
@@ -471,6 +519,49 @@ class AppServerClient:
                     item = params.get("item") or {}
                     if item.get("type") == "agentMessage" and isinstance(item.get("text"), str):
                         completed_messages.append(item["text"])
+                    # Round 28 (Phase 6): ``mcpToolCall`` items mark
+                    # the completion of an MCP tool invocation. We
+                    # emit a tool-card event with the tool name,
+                    # status, duration, and a JSON body for the
+                    # inline card. The GUI renders one collapsible
+                    # card per completed tool call.
+                    if item.get("type") == "mcpToolCall":
+                        item_id = str(item.get("id") or item.get("call_id") or "")
+                        name = str(
+                            item.get("name")
+                            or item.get("tool")
+                            or tool_names.get(item_id, "tool")
+                        )
+                        error = item.get("error")
+                        status = "failed" if error else "success"
+                        started_at = tool_started_at.pop(item_id, None)
+                        duration = (
+                            asyncio.get_event_loop().time() - started_at
+                            if started_at is not None
+                            else None
+                        )
+                        body = json.dumps(
+                            item.get("result")
+                            or item.get("output")
+                            or item.get("input")
+                            or tool_inputs.get(item_id, "")
+                            or "",
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        tool_events.append({
+                            "name": name,
+                            "status": status,
+                            "duration": duration,
+                            "body": body,
+                        })
+                        if on_tool is not None:
+                            try:
+                                result_cb = on_tool(name, status, duration, body)
+                                if asyncio.iscoroutine(result_cb):
+                                    await result_cb
+                            except Exception:
+                                pass
                     # Round 8 step 2: the review turn ends with
                     # ``enteredReviewMode`` and ``exitedReviewMode``
                     # items. We surface the completion via the
@@ -500,6 +591,21 @@ class AppServerClient:
                     item = params.get("item") or {}
                     if item.get("type") == "enteredReviewMode":
                         self._active_review_turns[thread_id] = turn_id
+                    # Round 28 (Phase 6): ``mcpToolCall`` items start
+                    # here. We capture the start timestamp so the
+                    # ``item/completed`` branch can compute a
+                    # wall-clock duration.
+                    if item.get("type") == "mcpToolCall":
+                        item_id = str(item.get("id") or item.get("call_id") or "")
+                        tool_started_at[item_id] = asyncio.get_event_loop().time()
+                        tool_names[item_id] = str(
+                            item.get("name") or item.get("tool") or "tool"
+                        )
+                        tool_inputs[item_id] = json.dumps(
+                            item.get("input") or item.get("arguments") or {},
+                            ensure_ascii=False,
+                            default=str,
+                        )
                 elif method == "turn/completed":
                     completed_turn = _required_object(params, "turn")
                     status = str(completed_turn.get("status") or "unknown")
@@ -528,6 +634,11 @@ class AppServerClient:
                         usage=Usage.from_turn_payload(
                             completed_turn.get("usage", {})
                         ),
+                        # Round 28 (Phase 6): tool events emitted
+                        # during the turn — exposed on the result so
+                        # test fixtures can introspect without
+                        # re-reading the JSONL rollout.
+                        tool_events=list(tool_events),
                     )
 
         try:

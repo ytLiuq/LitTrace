@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager, nullcontext
 from hashlib import sha256
@@ -41,7 +42,8 @@ canonical source of scientific truth; Codex thread history is execution memory o
 Use only tools on the `littrace` MCP server for facts and changes involving the active session.
 Never infer that a filesystem file is canonical. Do not mutate files or run shell commands.
 The currently supported domain mutations are `set_download_selection`, `search_papers`,
-`enqueue_download`, `enqueue_parse`, and `enqueue_table_extraction`.
+`enqueue_download`, `enqueue_parse`, `enqueue_table_extraction`, `enqueue_storyline`,
+`enqueue_document`, and `enqueue_autonomous_review`.
 
 WORKFLOW FOR A LITERATURE-DISCOVERY REQUEST:
 1. Call `search_papers` first with the topic + year_min + limit. Do NOT call
@@ -57,10 +59,12 @@ WORKFLOW FOR A LITERATURE-DISCOVERY REQUEST:
 WORKFLOW FOR ANY OTHER MUTATION:
 Call `get_workspace_context` first, pass the returned workspace revision, and
 use a stable idempotency key for retries of one intended change. Download, parse,
-and table extraction commands only submit durable work; explain that they are
-queued and use the matching job-status tool when the user asks for progress.
-Other mutations must be handled by the legacy LitTrace domain workflow. Keep
-evidence and paper identifiers in answers when available.
+table extraction, storyline, document, and autonomous_review commands only submit
+durable work; explain that they are queued and use the matching job-status tool
+when the user asks for progress.
+Other multi-action mutations (e.g. "search then select the first paper") still
+fall through to the legacy LitTrace domain workflow. Keep evidence and paper
+identifiers in answers when available.
 
 If a tool returns a successful 200 response, treat that as the authoritative
 result — do not reinterpret the reply as "rejected" or "denied" because the
@@ -130,6 +134,28 @@ def _looks_like_refusal(reply: str) -> bool:
     )
 
 
+def _emit_phase(callback, phase: str) -> None:
+    """Round 23: fire a phase hook if the caller installed one.
+
+    Phase strings are stable ids (``authenticated``, ``thread_started``,
+    ``thread_resumed``, ``mcp_ready``, ``model_thinking``,
+    ``turn_completed``). The TUI / GUI maps them to a localized status
+    string. Errors are swallowed because a broken UI hook must never
+    poison the transport -- the turn is the source of truth.
+    """
+    if callback is None:
+        return
+    try:
+        result = callback(phase)
+        if asyncio.iscoroutine(result):
+            # Phase hooks in the GUI / TUI are sync; the future is
+            # awaited implicitly via ``asyncio.ensure_future`` on the
+            # running loop. We do NOT block the turn on it.
+            asyncio.ensure_future(result)  # noqa: F821
+    except Exception:
+        pass
+
+
 class CodexAppServerChatService:
     """Bind one LitTrace session to one durable Codex thread."""
 
@@ -154,7 +180,10 @@ class CodexAppServerChatService:
         *,
         cancellation: asyncio.Event | None = None,
         on_delta=None,
+        on_phase=None,
         elicitation_handler=None,
+        on_tool=None,
+        stop_event: "threading.Event | None" = None,
     ) -> tuple[ChatResponse, LiteratureWorkspace]:
         scratch_dir = self._scratch_dir(session.session_id)
         scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -174,8 +203,8 @@ class CodexAppServerChatService:
                     turn, latest_workspace = await self.runtime_manager.use(
                         lambda client: self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
-                            cancellation, recorder, on_delta,
-                            elicitation_handler,
+                            cancellation, recorder, on_delta, on_phase,
+                            elicitation_handler, on_tool, stop_event,
                         )
                     )
                 elif self.client_factory is AppServerClient:
@@ -185,8 +214,8 @@ class CodexAppServerChatService:
                     turn, latest_workspace = await manager.use(
                         lambda client: self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
-                            cancellation, recorder, on_delta,
-                            elicitation_handler,
+                            cancellation, recorder, on_delta, on_phase,
+                            elicitation_handler, on_tool, stop_event,
                         )
                     )
                 else:
@@ -201,8 +230,8 @@ class CodexAppServerChatService:
                     async with client:
                         turn, latest_workspace = await self._chat_with_client(
                             client, request, workspace, session, scratch_dir,
-                            cancellation, recorder, on_delta,
-                            elicitation_handler,
+                            cancellation, recorder, on_delta, on_phase,
+                            elicitation_handler, on_tool, stop_event,
                         )
         finally:
             # Close the recorder after the App Server has returned the
@@ -235,6 +264,7 @@ class CodexAppServerChatService:
                 reply=reply,
                 action=action,
                 session_id=session.session_id,
+                truncated=turn.truncated,
             ),
             latest_workspace,
         )
@@ -249,7 +279,10 @@ class CodexAppServerChatService:
         cancellation: asyncio.Event | None = None,
         recorder: RolloutRecorder | None = None,
         on_delta=None,
+        on_phase=None,
         elicitation_handler=None,
+        on_tool=None,
+        stop_event: "threading.Event | None" = None,
     ):
         # Round 4 P1 step 7: bind the per-thread recorder. The
         # runtime_manager keeps one client across calls, so two
@@ -276,6 +309,11 @@ class CodexAppServerChatService:
             client.set_rollout_recorder(binding.codex_thread_id, recorder)
         runtime = self.config.agent_runtime
         await self._require_authentication(client)
+        # Round 23: surface coarse-grained phase events so the GUI can
+        # show a live status (e.g. "Codex 思考中..."). ``on_phase`` is
+        # always called with a stable string id; the GUI maps it to a
+        # localized message via a status callback.
+        _emit_phase(on_phase, "authenticated")
         thread_overrides = self._thread_overrides(scratch_dir)
         binding = self.state_store.get_agent_thread_binding(session.session_id)
         thread: dict[str, Any]
@@ -291,11 +329,13 @@ class CodexAppServerChatService:
                 binding.codex_thread_id,
                 thread_overrides,
             )
+            _emit_phase(on_phase, "thread_resumed")
         else:
             thread = await client.start_thread(thread_overrides)
             thread_id = str(thread.get("id") or "")
             if not thread_id:
                 raise BadRequestError("thread/start did not return a thread id")
+            _emit_phase(on_phase, "thread_started")
             binding = self.state_store.upsert_agent_thread_binding(
                 AgentThreadBindingRecord(
                     session_id=session.session_id,
@@ -354,6 +394,7 @@ class CodexAppServerChatService:
                 thread_overrides=thread_overrides,
             )
         await self._require_mcp_connection(client, thread_id)
+        _emit_phase(on_phase, "mcp_ready")
         # Round 17: bind the per-chat elicitation handler. The
         # ``runtime_manager`` keeps one client across chats on
         # different sessions, so the previous handler (from
@@ -361,6 +402,7 @@ class CodexAppServerChatService:
         # this turn. ``set_elicitation_handler`` overwrites; we
         # restore the prior value in the finally block.
         client.set_elicitation_handler(elicitation_handler)
+        _emit_phase(on_phase, "model_thinking")
         try:
             turn = await client.run_turn(
                 thread_id,
@@ -368,18 +410,34 @@ class CodexAppServerChatService:
                 timeout=runtime.turn_timeout_seconds,
                 cancellation=cancellation,
                 on_delta=on_delta,
+                on_tool=on_tool,
+                stop_event=stop_event,
             )
         except AppServerError as exc:
             # Any transport-level failure freezes the session in
             # systemError so an operator can inspect via the
             # session_state row rather than watching the chat path
             # auto-retry against a half-broken connection.
+            #
+            # ``error_code`` / ``additional_details`` are always set
+            # by ``AppServerError.__init__`` (defaults to ``OTHER``
+            # and ``{}``). The ``getattr`` fallbacks here are a
+            # defensive belt-and-braces measure for any future
+            # subclass that forgets to call ``super().__init__``
+            # (Round 18 E2E surfaced one such bug: a typed error
+            # raised by the timeout path bypassed the recorder's
+            # ``error_code.value`` access and crashed the turn).
             if recorder is not None:
+                code = getattr(
+                    exc, "error_code", CodexErrorCode.OTHER
+                )
                 recorder.append(
                     type_="system_error",
-                    error_code=exc.error_code.value,
+                    error_code=code.value,
                     message=str(exc),
-                    additional_details=exc.additional_details,
+                    additional_details=getattr(
+                        exc, "additional_details", {}
+                    ) or {},
                 )
             current_session = self.state_store.get_session_state(session.session_id)
             if current_session is not None:
@@ -391,6 +449,14 @@ class CodexAppServerChatService:
             # Clear the handler so a subsequent chat on this shared
             # client does not inherit the previous operator's hook.
             client.set_elicitation_handler(None)
+            # Round 23: ``run_turn`` does not expose a terminal-ack
+            # callback, so fire ``turn_completed`` from ``finally`` to
+            # guarantee the GUI can swap its streaming bubble for the
+            # final assistant message even if the turn ended via
+            # AppServerError or cancellation. The handler is restored
+            # AFTER the phase hook so the UI sees the terminal signal
+            # before it sees the next chat's handler binding.
+            _emit_phase(on_phase, "turn_completed")
         latest_workspace = self._latest_workspace(
             session.session_id,
             fallback=workspace,

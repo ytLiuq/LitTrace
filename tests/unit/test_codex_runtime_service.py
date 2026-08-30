@@ -189,7 +189,7 @@ class _FakeClient:
         type(self).compact_calls.append(thread_id)
         return {"ok": True, "thread_id": thread_id}
 
-    async def run_turn(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
+    async def run_turn(self, thread_id, text, *, timeout, cancellation=None, on_delta=None, on_tool=None, stop_event=None):
         if type(self).on_turn is not None:
             type(self).on_turn()
         # Mirror what AppServerClient.run_turn writes into the rollout
@@ -408,7 +408,7 @@ def test_service_chat_returns_interrupted_action(monkeypatch, tmp_path) -> None:
     )
     captured: list[dict[str, object]] = []
 
-    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None, on_tool=None, stop_event=None):
         captured.append({"cancellation": cancellation})
         return AppServerTurnResult(
             thread_id=thread_id, turn_id="turn-1",
@@ -442,7 +442,7 @@ def test_service_chat_returns_interrupted_failed_action(monkeypatch, tmp_path) -
         config, state_store=store, client_factory=_FakeClient,
     )
 
-    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None, on_tool=None, stop_event=None):
         return AppServerTurnResult(
             thread_id=thread_id, turn_id="turn-1",
             status="failed", reply="", turn={},
@@ -473,7 +473,7 @@ def test_service_writes_rollout_file_when_enabled(monkeypatch, tmp_path) -> None
         config, state_store=store, client_factory=_FakeClient,
     )
 
-    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None, on_tool=None, stop_event=None):
         # Mirror the real AppServerClient.run_turn surface that the
         # rollout recorder relies on so the service-level test
         # actually exercises the append path.
@@ -525,7 +525,7 @@ def test_service_skips_rollout_when_disabled(monkeypatch, tmp_path) -> None:
         config, state_store=store, client_factory=_FakeClient,
     )
 
-    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None):
+    async def fake_run(self, thread_id, text, *, timeout, cancellation=None, on_delta=None, on_tool=None, stop_event=None):
         return AppServerTurnResult(
             thread_id=thread_id, turn_id="turn-1",
             status="completed", reply="ok", turn={},
@@ -640,3 +640,26 @@ def test_service_binds_and_clears_elicitation_handler(monkeypatch, tmp_path) -> 
     assert handler_sets == [noop], (
         f"handler was set/cleared extra times: {client._elicitation_history!r}"
     )
+
+
+def test_developer_instructions_advertise_new_mcp_commands() -> None:
+    """Round 20 (Phase 6): the system prompt must list ``enqueue_document``
+    and ``enqueue_autonomous_review`` so the model knows to call them
+    when the user asks for document generation / autonomous review.
+
+    Without these names in the prompt, the model has no way to discover
+    the tools — the App Server allowlist only filters what the model can
+    call, it does not advertise what is available.
+    """
+    from littrace.codex_runtime.service import DEVELOPER_INSTRUCTIONS
+
+    for tool_name in (
+        "enqueue_document",
+        "enqueue_autonomous_review",
+        "enqueue_storyline",
+    ):
+        assert tool_name in DEVELOPER_INSTRUCTIONS, (
+            f"DEVELOPER_INSTRUCTIONS must mention {tool_name!r} so the "
+            "model can call it when the user asks for the corresponding "
+            "operation"
+        )
