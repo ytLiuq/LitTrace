@@ -112,7 +112,13 @@ class ShellController:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the controller's worker thread. Idempotent."""
+        """Start the controller's worker thread. Idempotent.
+
+        Also kicks off a background ``_prime_service()`` coroutine that
+        builds the CodexAppServerChatService and runs an empty thread so
+        the first ``codex app-server -c initialize`` handshake is paid
+        during window startup, not during the user's first message.
+        """
         if self._loop_thread is not None and self._loop_thread.is_alive():
             return
         self._loop_thread = threading.Thread(
@@ -123,6 +129,39 @@ class ShellController:
         # very first ``submit_user_message`` does not race with startup.
         while self._loop is None:
             threading.Event().wait(0.01)
+        # Warm the CodexAppServerChatService off the event loop so the
+        # spawn+initialize handshake happens while the window is still
+        # being painted, not after the user has already typed their
+        # first message. Failure here is non-fatal: the lazy
+        # ``_run_chat_turn`` path still works if priming fails (e.g. the
+        # codex binary is missing on $PATH).
+        try:
+            asyncio.run_coroutine_threadsafe(self._prime_service(), self._loop)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    async def _prime_service(self) -> None:
+        """Pre-build ``CodexAppServerChatService`` and force the runtime
+        manager to spin up its CodexAppServer subprocess + JSON-RPC
+        handshake. Called from ``start()`` so first-turn latency is just
+        the LLM round-trip instead of spawn + initialize + turn.
+        """
+        if not (
+            _HAS_CODEX_SERVICE
+            and self._config.agent_runtime.mode == "codex_app_server"
+        ):
+            return
+        with self._service_lock:
+            if self._service is None:
+                self._service = CodexAppServerChatService(self._config)
+        # Delegate to ``service.warmup()`` which builds the runtime
+        # manager and forces it to open the client. Best-effort: failure
+        # here leaves ``self._service`` set so the lazy chat path still
+        # works, just without the spawn cost amortised into startup.
+        try:
+            await self._service.warmup()
+        except Exception:
+            pass
 
     def stop(self) -> None:
         if self._loop is None:

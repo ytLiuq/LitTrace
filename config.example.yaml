@@ -169,7 +169,16 @@ agent_runtime:
   # Force the Codex App Server to talk to OpenAI directly instead of the
   # provider declared in ~/.codex/config.toml (which on internal machines
   # can be a corporate gateway that rejects ChatGPT OAuth access tokens
-  # with ``无效的令牌``). The value is a TOML literal string.
+  # with ``无效的令牌``).
+  #
+  # ``model`` is intentionally not overridden: the Codex CLI's ``-c model=``
+  # override is silently ignored when the active session authenticates
+  # via ChatGPT OAuth (it raises ``"The '<name>' model is not supported
+  # when using Codex with a ChatGPT account."``), and the user's
+  # ``~/.codex/config.toml`` default (``gpt-5.6-sol``) is already a
+  # ChatGPT-OAuth-compatible choice that the host's ChatGPT subscription
+  # supports. Service reuse (see ``ShellController._prime_service``)
+  # cuts subsequent turn latency from ~11 s cold start to ~6 s.
   codex_config_overrides:
     model_provider: '"openai"'
   # `isolated` keeps a private CODEX_HOME under ./data/codex-home so the

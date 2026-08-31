@@ -235,6 +235,30 @@ class CodexAppServerChatService:
             latest_workspace,
         )
 
+    async def warmup(self) -> bool:
+        """Pre-spawn the CodexAppServer subprocess and run the JSON-RPC
+        ``initialize`` handshake so the first user turn doesn't pay
+        ~5–7 s of cold-start cost. Returns ``True`` on success, ``False``
+        if priming was skipped or failed (the first chat turn will retry).
+
+        Safe to call concurrently — if the runtime manager is already
+        alive, this is a no-op.
+        """
+        try:
+            if self.runtime_manager is None:
+                # Build the manager through the same path the chat
+                # handler uses so the key derivation stays consistent.
+                self.runtime_manager = self._shared_runtime_manager()
+            # Force the manager to actually open the client (spawn +
+            # initialize) by calling ``.use`` once with a no-op op.
+            async def _noop(_operation):
+                return None
+
+            await self.runtime_manager.use(_noop)
+            return True
+        except Exception:
+            return False
+
     async def _chat_with_client(
         self,
         client: AppServerClient,

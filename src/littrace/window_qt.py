@@ -730,6 +730,34 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._wire_events()
         self._refresh_initial_state()
 
+    # ---- Cross-thread bridge for "运行今日管线" status ----------------
+
+    @QtCore.Slot(str)
+    def _set_rag_status_from_any_thread(self, text: str) -> None:
+        # Slot target for ``QMetaObject.invokeMethod``. ``QLabel.setText``
+        # is a plain Python method, not a registered Qt slot, so calling
+        # ``invokeMethod(label, "setText", ...)`` returns ``True`` but
+        # never actually fires. ``@Slot(str)`` registers this method in
+        # Qt's meta-object system so cross-thread
+        # ``invokeMethod(..., QueuedConnection, ...)`` posts the call onto
+        # the GUI event loop and the actual ``setText`` runs there.
+        self._rag_panel._status.setText(text)
+
+    def _post_status(self, text: str) -> None:
+        # Posted from a daemon worker thread (``_on_run_daily``). The
+        # ``@Slot(str)`` decorator on ``_set_rag_status_from_any_thread``
+        # lets ``QMetaObject.invokeMethod`` route this onto the GUI
+        # event loop. Earlier attempts that used
+        # ``QTimer.singleShot(0, ...)`` from the worker thread were
+        # silently dropped because the timer was bound to a thread
+        # with no Qt event loop.
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_set_rag_status_from_any_thread",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, text),
+        )
+
     # ---- UI construction -------------------------------------------------
 
     def _build_layout(self) -> None:
@@ -951,9 +979,6 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 self._post_status(f"今日管线失败: {type(exc).__name__}: {exc}")
 
         threading.Thread(target=_worker, daemon=True, name="littrace-daily").start()
-
-    def _post_status(self, text: str) -> None:
-        QtCore.QTimer.singleShot(0, lambda: self._rag_panel.set_status(text))
 
     # ---- Event wiring ----------------------------------------------------
 
