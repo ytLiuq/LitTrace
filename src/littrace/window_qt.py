@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -64,6 +65,40 @@ DESIGN = {
 
 
 logger = logging.getLogger("littrace.window_qt")
+
+
+def _littrace_cmd(*args: str) -> tuple[list[str], dict[str, str], str]:
+    """Resolve the ``littrace`` console-script entry point and the
+    working-directory / environment needed to invoke it.
+
+    Hard-coding ``["littrace", ...]`` broke when the shell was launched
+    via PyInstaller/py2app or any environment where the ``$PATH`` did
+    not include the venv bin directory: ``subprocess.run`` raised
+    ``FileNotFoundError`` and the user clicked "运行今日管线" only to
+    see the status bar silently stay on "运行中…" forever. A second,
+    subtler bug surfaced once that was fixed: ``python -m littrace.cli``
+    resolves ``config.yaml`` relative to the *child's* cwd (not the
+    LitTrace repository root), so the fallback path raised another
+    ``FileNotFoundError`` from ``load_config``. Anchor both paths to
+    the project root so the subprocess always sees the right
+    ``config.yaml`` regardless of how ``littrace-qt`` was launched.
+    """
+    project_root = Path(__file__).resolve().parent.parent.parent  # src/littrace/window_qt.py -> repo root
+    # Prefer the installed console script. If that fails (e.g. frozen
+    # distribution where the entry wasn't generated) fall back to
+    # ``python -m littrace.cli`` but still anchor cwd + config.
+    exe = shutil.which("littrace")
+    if exe:
+        cmd = [exe, *args]
+    else:
+        cmd = [sys.executable, "-m", "littrace.cli", *args]
+    env = {
+        "LITTRACE_CONFIG": str(project_root / "config.yaml"),
+        "PYTHONPATH": str(project_root / "src"),
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+    }
+    return cmd, env, str(project_root)
 
 
 # ---------------------------------------------------------------------------
@@ -359,18 +394,26 @@ class ChatPanel(QtWidgets.QFrame):
         input_row.addWidget(self._send)
 
         # Slash-command autocomplete popup, lazily shown beneath the
-        # input box when the user types a leading "/".
+        # input box when the user types a leading "/". Pre-create every
+        # catalog entry so the first keystroke never pays a 500 ms
+        # ``addItem x 30 + show()`` cost (measured on this machine; see
+        # commit message for trace). Filtering is done by toggling
+        # ``setHidden`` on the existing items, which is O(N) Qt flag work
+        # and stays single-digit-ms even for the full catalog.
         self._popup = QtWidgets.QListWidget()
         self._popup.setObjectName("command_popup")
         self._popup.setWindowFlags(QtCore.Qt.WindowType.Popup)
         self._popup.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self._popup.itemActivated.connect(self._commit_popup_item)
         self._popup.itemClicked.connect(self._commit_popup_item)
-        self._popup.hide()
+        self._popup.setFixedWidth(420)
+        self._popup.setMinimumHeight(220)
+        self._popup.setUniformItemSizes(True)
         for name, desc, _ctx in COMMAND_CATALOG:
             item = QtWidgets.QListWidgetItem(f"/{name}    — {desc}")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
             self._popup.addItem(item)
+        self._popup.hide()
 
         self._popup_index = 0
 
@@ -419,26 +462,34 @@ class ChatPanel(QtWidgets.QFrame):
             self._popup.hide()
             return
         query = text[1:].lower()
-        # Filter items whose name (without leading /) starts with query.
-        self._popup_index = 0
-        self._popup.clear()
-        matched = 0
-        for name, desc, _ctx in COMMAND_CATALOG:
-            if query and not name.lower().startswith(query):
-                continue
-            item = QtWidgets.QListWidgetItem(f"/{name}    — {desc}")
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
-            self._popup.addItem(item)
-            matched += 1
-        if matched == 0:
+        # Toggle ``setHidden`` on the pre-populated items instead of
+        # ``clear()`` + ``addItem`` per keystroke. ``clear/addItem`` paid
+        # ~500 ms on the very first keystroke because Qt had to allocate
+        # every item, lay it out, and then position+show the popup window;
+        # toggling the hidden flag is flag-bit work on existing items.
+        visible_rows: list[int] = []
+        for row in range(self._popup.count()):
+            item = self._popup.item(row)
+            name = item.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+            match = not query or name.lower().startswith(query)
+            item.setHidden(not match)
+            if match:
+                visible_rows.append(row)
+        if not visible_rows:
             self._popup.hide()
             return
-        self._popup.setCurrentRow(0)
-        # Position popup beneath the input line edit.
-        anchor = self._input.mapToGlobal(QtCore.QPoint(0, self._input.height()))
-        self._popup.move(anchor)
-        self._popup.setFixedWidth(max(self._input.width(), 360))
-        self._popup.show()
+        # Preserve current selection if it still matches; otherwise jump
+        # to the first visible row so ↑/↓ stays predictable.
+        current = self._popup.currentRow()
+        if current < 0 or self._popup.item(current).isHidden():
+            self._popup.setCurrentRow(visible_rows[0])
+        self._popup_index = self._popup.currentRow()
+        # Position popup beneath the input line edit (cached while
+        # visible so repeated keystrokes don't re-query the screen).
+        if not self._popup.isVisible():
+            anchor = self._input.mapToGlobal(QtCore.QPoint(0, self._input.height()))
+            self._popup.move(anchor)
+            self._popup.show()
 
     def _navigate_popup(self, delta: int) -> None:
         count = self._popup.count()
@@ -812,18 +863,28 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._status_bar.showMessage(f"解析模式：{self._parse_strategy_btn.text()}", 3000)
 
     def _on_setup_browser(self) -> None:
-        self._run_subprocess_action(
-            ["littrace", "setup-browser"],
-            "Chrome 配置完成",
-        )
+        cmd, env, cwd = _littrace_cmd("setup-browser")
+        self._run_subprocess_action(cmd, env, cwd, "Chrome 配置完成")
 
     def _on_doctor(self) -> None:
-        self._run_subprocess_action(["littrace", "doctor"], None)
+        cmd, env, cwd = _littrace_cmd("doctor")
+        self._run_subprocess_action(cmd, env, cwd, None)
 
-    def _run_subprocess_action(self, cmd: list[str], success_label: str | None) -> None:
+    def _run_subprocess_action(
+        self,
+        cmd: list[str],
+        env: dict[str, str],
+        cwd: str,
+        success_label: str | None,
+    ) -> None:
         try:
             completed = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=20,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                cwd=cwd,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             self._status_bar.showMessage(f"{' '.join(cmd)} 超时", 5000)
@@ -870,21 +931,20 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
 
         def _worker():
             try:
+                cmd, env, cwd = _littrace_cmd("sentinel", "run", "--watchlist", "mxene_sensor")
                 completed = subprocess.run(
-                    [
-                        "littrace",
-                        "sentinel",
-                        "run",
-                        "--watchlist",
-                        "mxene_sensor",
-                    ],
+                    cmd,
                     capture_output=True,
                     text=True,
                     timeout=600,
+                    cwd=cwd,
+                    env=env,
                 )
                 msg = (completed.stdout or "").strip().splitlines()
                 tail = " · ".join(msg[-3:]) if msg else ""
-                self._post_status(f"今日管线完成（exit={completed.returncode}） · {tail}")
+                self._post_status(
+                    f"今日管线完成（exit={completed.returncode}） · {tail}"
+                )
             except subprocess.TimeoutExpired:
                 self._post_status("今日管线超时（10 分钟）")
             except Exception as exc:  # pragma: no cover - defensive
