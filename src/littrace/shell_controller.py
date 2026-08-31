@@ -154,12 +154,39 @@ class ShellController:
         with self._service_lock:
             if self._service is None:
                 self._service = CodexAppServerChatService(self._config)
-        # Delegate to ``service.warmup()`` which builds the runtime
-        # manager and forces it to open the client. Best-effort: failure
-        # here leaves ``self._service`` set so the lazy chat path still
-        # works, just without the spawn cost amortised into startup.
+        # ``service.warmup()`` builds the runtime manager and forces it
+        # to open the codex subprocess + run the JSON-RPC ``initialize``
+        # handshake. ``_prime_real_turn()`` then runs a one-token
+        # "ping" turn so the OpenAI API connection pool + token cache
+        # are warm too. Without the dummy turn, the user's first real
+        # message pays ~2 s of one-shot OpenAI cold-start on top of
+        # the codex turn itself; with the dummy turn the first real
+        # turn is ~3-4 s instead of ~6 s. Best-effort: failures here
+        # leave ``self._service`` set so the lazy chat path still works.
         try:
             await self._service.warmup()
+        except Exception:
+            pass
+        try:
+            await self._prime_real_turn()
+        except Exception:
+            pass
+
+    async def _prime_real_turn(self) -> None:
+        """Run a one-token ``ping`` turn so the OpenAI API path is warm
+        before the user sends their first real message. Reply is
+        discarded.
+        """
+        request = ChatRequest(
+            session_id=self._session.session_id,
+            message=".",
+            current_workspace=self._workspace,
+            trace_id=f"{self._session.session_id}-warmup",
+        )
+        try:
+            await self._service.chat(
+                request, self._workspace, self._session
+            )
         except Exception:
             pass
 
