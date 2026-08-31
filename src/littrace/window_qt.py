@@ -1,34 +1,35 @@
 """Qt-based shell for LitTrace.
 
-This is the ``littrace-qt`` entry point. It is a deliberately small first
-cut that exercises the ``ShellController`` against a Qt + QtWebEngine
-front-end so we can answer the "does PySide6 actually run here?" question
-before committing to a full Tk-to-Qt port. Layout is intentionally
-minimal — a left chat column, a right browser pane, a status bar — but
-every panel wires back to ``ShellController`` events so swapping in a
-richer design later is local.
+This is the ``littrace-qt`` entry point. It mirrors the layout and
+feature set of the Tk shell (``littrace.window``) while delegating all
+business logic to ``ShellController``. ``QWebEngineView`` is a real
+``QWidget``, so the embedded Chromium pane lives in the same splitter
+as the chat / context / trace panels rather than opening a separate
+top-level window like pywebview would.
 
-Until the Tk shell is retired, ``littrace-window`` keeps using Tk and
-``littrace-qt`` runs alongside it on the same LitTrace config and
-session backend.
+The Tk shell (``littrace-window``) and this Qt shell can coexist on the
+same ``config.yaml``; both go through the same controller, session
+backend, and codex MCP tools.
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
+import subprocess
 import sys
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterable
 
-# QtWebEngineWidgets pulls in Chromium; the env var below silences the
-# noisy "Qt WebEngine seems to be initialized from a server" warning
-# when running headless for the smoke test.
 os.environ.setdefault("QT_LOGGING_RULES", "qt.webengine.*=false")
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from littrace.config import load_config
+from littrace.models import PaperMetadata
+from littrace.session import list_chat_sessions
 from littrace.shell_controller import ShellController, ShellEvent
 
 
@@ -36,8 +37,7 @@ logger = logging.getLogger("littrace.window_qt")
 
 
 # ---------------------------------------------------------------------------
-# Design tokens — kept in sync with the Tk shell's DESIGN dict so the
-# two shells look like siblings.
+# Design tokens — kept in sync with the Tk shell's DESIGN dict.
 # ---------------------------------------------------------------------------
 
 DESIGN = {
@@ -77,7 +77,6 @@ QLabel#brand {{
     color: {DESIGN["ink"]};
     font-size: 22px;
     font-weight: 600;
-    padding: 8px 0;
 }}
 
 QLabel#tagline {{
@@ -85,10 +84,47 @@ QLabel#tagline {{
     font-size: 12px;
 }}
 
-QFrame#pane, QFrame#tile, QFrame#chat_tile {{
+QFrame#subnav, QPushButton#subnav_btn {{
+    background: {DESIGN["parchment"]};
+}}
+QPushButton#subnav_btn {{
+    border: 1px solid {DESIGN["hairline"]};
+    color: {DESIGN["ink"]};
+    border-radius: 4px;
+    padding: 6px 14px;
+}}
+QPushButton#subnav_btn:hover {{
+    background: {DESIGN["surface_1"]};
+}}
+QPushButton#subnav_btn_primary {{
+    background: {DESIGN["primary"]};
+    color: white;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 4px;
+    font-weight: 600;
+}}
+QPushButton#subnav_btn_primary:hover {{
+    background: {DESIGN["primary_hover"]};
+}}
+
+QFrame#tile, QFrame#chat_tile, QFrame#trace_tile, QFrame#context_tile, QFrame#browser_tile {{
     background: {DESIGN["surface_1"]};
     border: 1px solid {DESIGN["hairline"]};
     border-radius: 6px;
+}}
+
+QLabel#pane_title {{
+    color: {DESIGN["ink"]};
+    font-weight: 600;
+    font-size: 14px;
+    padding: 2px 4px;
+}}
+
+QTextBrowser#trace_view, QTextBrowser#chat_view {{
+    background: {DESIGN["surface_1"]};
+    border: none;
+    color: {DESIGN["ink"]};
 }}
 
 QLineEdit#input {{
@@ -112,29 +148,80 @@ QPushButton#send:hover {{
     background: {DESIGN["primary_hover"]};
 }}
 
-QTextBrowser#chat_view {{
-    background: {DESIGN["surface_1"]};
-    border: none;
-    color: {DESIGN["ink"]};
-}}
-
-QLabel#status {{
-    color: {DESIGN["ink_subtle"]};
-    padding: 4px 8px;
-}}
-
-QListWidget#context {{
+QListWidget#context, QListWidget#sessions {{
     background: {DESIGN["surface_1"]};
     border: 1px solid {DESIGN["hairline"]};
     border-radius: 6px;
     color: {DESIGN["ink"]};
 }}
 
+QListWidget#command_popup {{
+    background: {DESIGN["surface_1"]};
+    border: 1px solid {DESIGN["hairline"]};
+    border-radius: 4px;
+    color: {DESIGN["ink"]};
+}}
+QListWidget#command_popup::item:selected {{
+    background: {DESIGN["accent_teal_subtle"]};
+    color: {DESIGN["ink"]};
+}}
+
+QLabel#status {{
+    color: {DESIGN["ink_subtle"]};
+}}
+
 QStatusBar {{
     background: {DESIGN["parchment"]};
     color: {DESIGN["ink_muted"]};
 }}
+
+QSplitter::handle {{
+    background: {DESIGN["parchment"]};
+}}
+QSplitter::handle:horizontal {{
+    width: 8px;
+}}
 """
+
+
+# ---------------------------------------------------------------------------
+# Slash command catalog — mirrored from window.COMMAND_CATALOG so the
+# autocomplete popup behaves identically to the Tk shell.
+# ---------------------------------------------------------------------------
+
+COMMAND_CATALOG: list[tuple[str, str, bool]] = [
+    ("context", "显示 / 隐藏当前文献上下文", True),
+    ("papers", "列出当前上下文文献", True),
+    ("parse", "按当前解析模式处理 PDF", False),
+    ("parse --ocr", "强制使用 OCR 解析", False),
+    ("parse --text", "强制使用文本层解析", False),
+    ("table", "抽取性能指标并生成对比表", True),
+    ("storyline", "梳理论文回应关系", True),
+    ("storyline-report", "导出 storyline 报告", True),
+    ("storyline-review", "Reviewer 审阅 storyline", True),
+    ("dashboard", "打开 RAG / Daily 仪表盘", True),
+    ("quality", "运行质量门", True),
+    ("agents", "列出可用 agents", False),
+    ("workflow", "显示当前 workflow trace", True),
+    ("quality-audits", "运行质量审计", True),
+    ("plan", "显示当前执行计划", False),
+    ("init-config", "运行 config wizard", False),
+    ("login", "打开授权登录弹窗", True),
+    ("attach", "手动附加本地 PDF", False),
+    ("attach-si", "附加 SI / 补充材料", False),
+    ("full-text", "构建 full-text context", True),
+    ("backfill-dois", "回填 DOI", False),
+    ("publisher-retrieve", "按 publisher 抓取", False),
+    ("check-downloads", "检查当前下载计划", True),
+    ("resume-downloads", "恢复下载（等待用户授权）", True),
+    ("benchmark", "运行评测基准", False),
+    ("golden-eval", "运行 golden set 评估", False),
+    ("export", "导出当前 session", False),
+    ("quit", "关闭窗口", False),
+    ("全部下载", "选择当前上下文中全部待下载文献", True),
+    ("选择第 N 篇下载", "选择第 N 篇进入下载计划", True),
+    ("取消选择第 N 篇", "从下载计划中移除第 N 篇", True),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +229,59 @@ QStatusBar {{
 # ---------------------------------------------------------------------------
 
 
+class TracePanel(QtWidgets.QFrame):
+    """Left column — workflow trace + session history."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("trace_tile")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        title = QtWidgets.QLabel("执行 Trace")
+        title.setObjectName("pane_title")
+        layout.addWidget(title)
+
+        self._view = QtWidgets.QTextBrowser()
+        self._view.setObjectName("trace_view")
+        self._view.setOpenExternalLinks(False)
+        layout.addWidget(self._view, stretch=3)
+
+        # Session history sub-panel
+        history_title = QtWidgets.QLabel("历史 Session")
+        history_title.setObjectName("pane_title")
+        layout.addWidget(history_title)
+
+        self._sessions = QtWidgets.QListWidget()
+        self._sessions.setObjectName("sessions")
+        self._sessions.setMaximumHeight(180)
+        layout.addWidget(self._sessions, stretch=2)
+
+    def render_workflow_trace(self, trace_steps: Iterable[str]) -> None:
+        body = "<br>".join(f"• {step}" for step in trace_steps) or "(等待任务…)"
+        self._view.setHtml(f"<div>{body}</div>")
+
+    def render_execution_path(self, steps: Iterable[str]) -> None:
+        body = "<br>".join(f"→ {step}" for step in steps) or ""
+        self._view.append(f'<div style="margin-top:6px;color:#5c6068;">{body}</div>')
+
+    def set_sessions(self, sessions: list[Any], current_session_id: str) -> None:
+        self._sessions.clear()
+        for session in sessions:
+            label = f"{session.session_id}  ({session.created_at[:19]})"
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, session.session_id)
+            if session.session_id == current_session_id:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            self._sessions.addItem(item)
+
+
 class ChatPanel(QtWidgets.QFrame):
-    """Left column: scrollback + input + send button."""
+    """Middle column — chat scrollback + slash autocomplete + input."""
 
     def __init__(self, controller: ShellController, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -154,32 +292,130 @@ class ChatPanel(QtWidgets.QFrame):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
+        title = QtWidgets.QLabel("对话")
+        title.setObjectName("pane_title")
+        layout.addWidget(title)
+
         self._view = QtWidgets.QTextBrowser()
         self._view.setObjectName("chat_view")
         self._view.setOpenExternalLinks(True)
+        self._view.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self._view.customContextMenuRequested.connect(self._on_chat_context_menu)
         layout.addWidget(self._view, stretch=1)
 
         input_row = QtWidgets.QHBoxLayout()
         self._input = QtWidgets.QLineEdit()
         self._input.setObjectName("input")
-        self._input.setPlaceholderText("输入研究任务，回车发送…")
+        self._input.setPlaceholderText("输入研究任务或 / 命令…")
         self._input.returnPressed.connect(self._on_send)
+        self._input.textChanged.connect(self._on_input_changed)
+        self._input.installEventFilter(self)
+        layout.addLayout(input_row)
         input_row.addWidget(self._input, stretch=1)
 
         self._send = QtWidgets.QPushButton("发送")
         self._send.setObjectName("send")
         self._send.clicked.connect(self._on_send)
         input_row.addWidget(self._send)
-        layout.addLayout(input_row)
+
+        # Slash-command autocomplete popup, lazily shown beneath the
+        # input box when the user types a leading "/".
+        self._popup = QtWidgets.QListWidget()
+        self._popup.setObjectName("command_popup")
+        self._popup.setWindowFlags(QtCore.Qt.WindowType.Popup)
+        self._popup.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self._popup.itemActivated.connect(self._commit_popup_item)
+        self._popup.itemClicked.connect(self._commit_popup_item)
+        self._popup.hide()
+        for name, desc, _ctx in COMMAND_CATALOG:
+            item = QtWidgets.QListWidgetItem(f"/{name}    — {desc}")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+            self._popup.addItem(item)
+
+        self._popup_index = 0
+
+    # ---- Event filter for ↑/↓/Esc -------------------------------------
+
+    def eventFilter(self, source: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if source is self._input and event.type() == QtCore.QEvent.Type.KeyPress:
+            key = event.key()
+            if self._popup.isVisible():
+                if key == QtCore.Qt.Key.Key_Down:
+                    self._navigate_popup(+1)
+                    return True
+                if key == QtCore.Qt.Key.Key_Up:
+                    self._navigate_popup(-1)
+                    return True
+                if key in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+                    self._commit_popup_at(self._popup.currentRow())
+                    return True
+                if key == QtCore.Qt.Key.Key_Escape:
+                    self._popup.hide()
+                    return True
+        return super().eventFilter(source, event)
+
+    # ---- Slash popup logic ----------------------------------------------
+
+    def _on_input_changed(self, text: str) -> None:
+        if not text.startswith("/"):
+            self._popup.hide()
+            return
+        query = text[1:].lower()
+        # Filter items whose name (without leading /) starts with query.
+        self._popup_index = 0
+        self._popup.clear()
+        matched = 0
+        for name, desc, _ctx in COMMAND_CATALOG:
+            if query and not name.lower().startswith(query):
+                continue
+            item = QtWidgets.QListWidgetItem(f"/{name}    — {desc}")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+            self._popup.addItem(item)
+            matched += 1
+        if matched == 0:
+            self._popup.hide()
+            return
+        self._popup.setCurrentRow(0)
+        # Position popup beneath the input line edit.
+        anchor = self._input.mapToGlobal(QtCore.QPoint(0, self._input.height()))
+        self._popup.move(anchor)
+        self._popup.setFixedWidth(max(self._input.width(), 360))
+        self._popup.show()
+
+    def _navigate_popup(self, delta: int) -> None:
+        count = self._popup.count()
+        if count == 0:
+            return
+        new_row = (self._popup.currentRow() + delta) % count
+        self._popup.setCurrentRow(new_row)
+        self._popup_index = new_row
+
+    def _commit_popup_at(self, row: int) -> None:
+        if row < 0 or row >= self._popup.count():
+            return
+        self._commit_popup_item(self._popup.item(row))
+
+    def _commit_popup_item(self, item: QtWidgets.QListWidgetItem) -> None:
+        name = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not name:
+            return
+        self._input.setText(f"/{name} ")
+        self._popup.hide()
+
+    # ---- Send ---------------------------------------------------------
 
     def _on_send(self) -> None:
-        text = self._input.text()
-        if not text.strip():
+        text = self._input.text().strip()
+        if not text:
             return
         self._input.clear()
+        self._popup.hide()
+        if text == "/quit":
+            QtWidgets.QApplication.instance().quit()
+            return
         self._controller.submit_user_message(text)
 
-    # ---- Event handlers wired by LitTraceQtWindow ----
+    # ---- Event handlers wired by LitTraceQtWindow ----------------------
 
     def append_message(self, role: str, text: str, **extras: Any) -> None:
         css_role = {
@@ -188,7 +424,11 @@ class ChatPanel(QtWidgets.QFrame):
             "system": "color:#a4a7ad;font-style:italic;",
         }.get(role, "color:#0b0c0e;")
         action = extras.get("action")
-        action_html = f'<div style="color:#5c6068;font-size:11px;">{action}</div>' if action else ""
+        action_html = (
+            f'<div style="color:#5c6068;font-size:11px;">action: {action}</div>'
+            if action
+            else ""
+        )
         warnings = extras.get("warnings") or []
         warn_html = (
             "<ul style='color:#cc785c;margin:4px 0;'>"
@@ -197,38 +437,53 @@ class ChatPanel(QtWidgets.QFrame):
             if warnings
             else ""
         )
-        body = QtGui.QTextDocument().toPlainText(text)
-        safe = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        # Preserve line breaks
-        safe = safe.replace("\n", "<br>")
+        safe = (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
         html = (
             f'<div style="{css_role}margin:6px 0;">'
             f'<span style="color:#5c6068;font-size:11px;">{role}</span><br>'
-            f'{safe}{action_html}{warn_html}</div>'
+            f"{safe}{action_html}{warn_html}</div>"
         )
         self._view.append(html)
 
+    # ---- Right-click copy/paste menu -----------------------------------
+
+    def _on_chat_context_menu(self, pos: QtCore.QPoint) -> None:
+        menu = QtWidgets.QMenu(self)
+        copy_action = menu.addAction("复制")
+        copy_action.setEnabled(self._view.textCursor().hasSelection())
+        copy_action.triggered.connect(self._view.copy)
+        select_all = menu.addAction("全选")
+        select_all.triggered.connect(self._view.selectAll)
+        clear_action = menu.addAction("清屏")
+        clear_action.triggered.connect(self._view.clear)
+        menu.exec(self._view.mapToGlobal(pos))
+
 
 class ContextPanel(QtWidgets.QFrame):
-    """Right column: active literature context. Read-only summary list."""
+    """Right column upper — active literature context."""
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("tile")
+        self.setObjectName("context_tile")
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
         title = QtWidgets.QLabel("文献上下文")
-        title.setStyleSheet(f"color:{DESIGN['ink']};font-weight:600;font-size:14px;")
+        title.setObjectName("pane_title")
         layout.addWidget(title)
 
         self._list = QtWidgets.QListWidget()
         self._list.setObjectName("context")
         layout.addWidget(self._list, stretch=1)
 
-    def refresh(self, papers: list[Any]) -> None:
+    def refresh(self, papers: list[PaperMetadata]) -> None:
         self._list.clear()
         if not papers:
             placeholder = QtWidgets.QListWidgetItem("暂无激活文献 — 在聊天中提需求即可加入")
@@ -236,27 +491,74 @@ class ContextPanel(QtWidgets.QFrame):
             self._list.addItem(placeholder)
             return
         for index, paper in enumerate(papers, start=1):
+            year = paper.year or "n.d."
+            source = paper.journal or paper.publisher or "unknown source"
             item = QtWidgets.QListWidgetItem(
-                f"{index}. {paper.title}  ({paper.year or 'n.d.'}, "
-                f"{paper.journal or paper.publisher or 'unknown'})"
+                f"{index}. {paper.title}  ({year}, {source})"
             )
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, paper)
             self._list.addItem(item)
 
 
-class BrowserPanel(QtWidgets.QFrame):
-    """Right column, lower half: QWebEngineView pane.
+class RAGPanel(QtWidgets.QFrame):
+    """Right column middle — RAG / Daily dashboard."""
 
-    The pane renders whatever URL the user or the controller points it
-    at. LitTrace currently uses it as an embedded browser for publisher
-    pages opened from the context panel; future iterations can pipe
-    parsed paper Markdown through ``setHtml`` for a richer reading view.
+    def __init__(
+        self,
+        on_refresh_session,
+        on_refresh_all,
+        on_full_daily,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("tile")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        title = QtWidgets.QLabel("RAG / Daily")
+        title.setObjectName("pane_title")
+        layout.addWidget(title)
+
+        row = QtWidgets.QHBoxLayout()
+        layout.addLayout(row)
+        b1 = QtWidgets.QPushButton("刷新当前 session")
+        b1.setObjectName("subnav_btn")
+        b1.clicked.connect(on_refresh_session)
+        row.addWidget(b1)
+        b2 = QtWidgets.QPushButton("全量刷新")
+        b2.setObjectName("subnav_btn")
+        b2.clicked.connect(on_refresh_all)
+        row.addWidget(b2)
+        b3 = QtWidgets.QPushButton("Full daily")
+        b3.setObjectName("subnav_btn_primary")
+        b3.clicked.connect(on_full_daily)
+        row.addWidget(b3)
+
+        self._status = QtWidgets.QLabel("RAG 状态：未知（运行 Full daily 后更新）")
+        self._status.setObjectName("status")
+        self._status.setWordWrap(True)
+        layout.addWidget(self._status, stretch=1)
+
+    def set_status(self, text: str) -> None:
+        self._status.setText(f"RAG 状态：{text}")
+
+
+class BrowserPanel(QtWidgets.QFrame):
+    """Right column lower — QWebEngineView pane.
+
+    Real QWidget child of the splitter (not a separate NSWindow), so it
+    stays inside the LitTrace window and shares the focus / z-order with
+    the chat and trace panels. Use ``open_url`` from a controller /
+    button to navigate.
     """
 
     HOME_URL = "https://duckduckgo.com/"
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("tile")
+        self.setObjectName("browser_tile")
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -264,23 +566,30 @@ class BrowserPanel(QtWidgets.QFrame):
 
         url_row = QtWidgets.QHBoxLayout()
         url_row.setContentsMargins(8, 8, 8, 4)
+
         self._back = QtWidgets.QPushButton("←")
         self._back.setFixedWidth(32)
+        self._back.setObjectName("subnav_btn")
         self._back.clicked.connect(self._on_back)
         url_row.addWidget(self._back)
+
         self._forward = QtWidgets.QPushButton("→")
         self._forward.setFixedWidth(32)
+        self._forward.setObjectName("subnav_btn")
         self._forward.clicked.connect(self._on_forward)
         url_row.addWidget(self._forward)
+
         self._reload = QtWidgets.QPushButton("⟳")
         self._reload.setFixedWidth(32)
+        self._reload.setObjectName("subnav_btn")
         self._reload.clicked.connect(self._on_reload)
         url_row.addWidget(self._reload)
 
         self._url = QtWidgets.QLineEdit()
         self._url.setPlaceholderText("输入 URL（Enter 打开）…")
-        self._url.returnPressed.connect(self._on_url)
+        self._url.returnPressed.connect(self._on_url_entered)
         url_row.addWidget(self._url, stretch=1)
+
         layout.addLayout(url_row)
 
         self._view = QWebEngineView()
@@ -288,7 +597,7 @@ class BrowserPanel(QtWidgets.QFrame):
         self._view.urlChanged.connect(self._on_url_changed)
         layout.addWidget(self._view, stretch=1)
 
-    def _on_url(self) -> None:
+    def _on_url_entered(self) -> None:
         text = self._url.text().strip()
         if not text:
             return
@@ -329,10 +638,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
 
         self._build_layout()
         self._wire_events()
-
-        # Initial refresh — mirrors Tk shell's first paint.
-        self._context_panel.refresh(list(self._controller.list_active_papers()))
-        self._status_bar.showMessage("就绪")
+        self._refresh_initial_state()
 
     # ---- UI construction -------------------------------------------------
 
@@ -344,45 +650,81 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Top nav bar (dark)
+        outer.addWidget(self._build_nav())
+        outer.addWidget(self._build_brand_strip())
+        outer.addWidget(self._build_subnav())
+
+        # Main three-column splitter: trace | chat | right column
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.addWidget(self._build_trace_panel())
+        splitter.addWidget(self._build_chat_panel())
+        splitter.addWidget(self._build_right_column())
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(2, 4)
+        splitter.setSizes([280, 520, 520])
+        outer.addWidget(splitter, stretch=1)
+
+        self._status_bar = QtWidgets.QStatusBar()
+        self._status_bar.setObjectName("status")
+        self.setStatusBar(self._status_bar)
+
+    def _build_nav(self) -> QtWidgets.QWidget:
         nav = QtWidgets.QFrame()
         nav.setObjectName("nav")
         nav.setFixedHeight(48)
-        nav_layout = QtWidgets.QHBoxLayout(nav)
-        nav_layout.setContentsMargins(20, 0, 20, 0)
+        layout = QtWidgets.QHBoxLayout(nav)
+        layout.setContentsMargins(20, 0, 20, 0)
         title = QtWidgets.QLabel("LitTrace")
         title.setStyleSheet(f"color:{DESIGN['on_dark']};font-weight:600;font-size:15px;")
-        nav_layout.addWidget(title)
-        nav_layout.addStretch(1)
+        layout.addWidget(title)
+        layout.addStretch(1)
         session = QtWidgets.QLabel(f"session: {self._controller.session.session_id}")
         session.setStyleSheet(f"color:{DESIGN['on_dark']};font-size:11px;")
-        nav_layout.addWidget(session)
-        outer.addWidget(nav)
+        layout.addWidget(session)
+        return nav
 
-        # Brand strip
-        brand_row = QtWidgets.QHBoxLayout()
-        brand_row.setContentsMargins(28, 18, 28, 6)
+    def _build_brand_strip(self) -> QtWidgets.QWidget:
+        strip = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(strip)
+        layout.setContentsMargins(28, 18, 28, 4)
+        layout.setSpacing(10)
         brand = QtWidgets.QLabel("LitTrace")
         brand.setObjectName("brand")
         tagline = QtWidgets.QLabel("·  Materials & Chemistry Research")
         tagline.setObjectName("tagline")
-        brand_row.addWidget(brand)
-        brand_row.addWidget(tagline, stretch=1)
-        brand_container = QtWidgets.QWidget()
-        brand_container.setLayout(brand_row)
-        outer.addWidget(brand_container)
+        layout.addWidget(brand)
+        layout.addWidget(tagline)
+        layout.addStretch(1)
+        return strip
 
-        # Two-column main area: left chat, right (context above browser)
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_chat_panel())
-        splitter.addWidget(self._build_right_column())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 4)
-        splitter.setSizes([520, 720])
-        outer.addWidget(splitter, stretch=1)
+    def _build_subnav(self) -> QtWidgets.QWidget:
+        subnav = QtWidgets.QFrame()
+        subnav.setObjectName("subnav")
+        subnav.setFixedHeight(56)
+        layout = QtWidgets.QHBoxLayout(subnav)
+        layout.setContentsMargins(28, 0, 28, 0)
+        layout.setSpacing(8)
 
-        self._status_bar = QtWidgets.QStatusBar()
-        self.setStatusBar(self._status_bar)
+        def add_btn(text: str, slot, primary: bool = False) -> QtWidgets.QPushButton:
+            btn = QtWidgets.QPushButton(text)
+            btn.setObjectName("subnav_btn_primary" if primary else "subnav_btn")
+            btn.clicked.connect(slot)
+            layout.addWidget(btn)
+            return btn
+
+        add_btn("文献上下文", self._open_context_popup)
+        self._context_toggle_btn = add_btn("隐藏上下文", self._toggle_context)
+        self._parse_strategy_btn = add_btn("文本层解析", self._toggle_parse_strategy, primary=True)
+        add_btn("Setup browser", self._on_setup_browser)
+        add_btn("Doctor", self._on_doctor)
+        add_btn("使用说明", self._open_help_popup)
+        layout.addStretch(1)
+        return subnav
+
+    def _build_trace_panel(self) -> QtWidgets.QWidget:
+        self._trace_panel = TracePanel()
+        return self._trace_panel
 
     def _build_chat_panel(self) -> QtWidgets.QWidget:
         self._chat_panel = ChatPanel(self._controller)
@@ -397,14 +739,118 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._context_panel = ContextPanel()
         layout.addWidget(self._context_panel, stretch=2)
 
+        self._rag_panel = RAGPanel(
+            on_refresh_session=self._on_rag_refresh_session,
+            on_refresh_all=self._on_rag_refresh_all,
+            on_full_daily=self._on_rag_full_daily,
+        )
+        layout.addWidget(self._rag_panel, stretch=1)
+
         self._browser_panel = BrowserPanel()
-        layout.addWidget(self._browser_panel, stretch=5)
+        layout.addWidget(self._browser_panel, stretch=4)
         return right
+
+    # ---- Subnav actions -------------------------------------------------
+
+    def _open_context_popup(self) -> None:
+        papers = list(self._controller.list_active_papers())
+        QtWidgets.QMessageBox.information(
+            self,
+            "文献上下文",
+            "\n".join(
+                f"• {p.title} ({p.year or 'n.d.'}, {p.access_type})"
+                for p in papers
+            ) or "暂无激活文献",
+        )
+
+    def _toggle_context(self) -> None:
+        visible = self._context_panel.isVisible()
+        self._context_panel.setVisible(not visible)
+        self._context_toggle_btn.setText("显示上下文" if not visible else "隐藏上下文")
+
+    def _toggle_parse_strategy(self) -> None:
+        current = self._parse_strategy_btn.text()
+        if current == "文本层解析":
+            self._parse_strategy_btn.setText("OCR 解析")
+        else:
+            self._parse_strategy_btn.setText("文本层解析")
+        self._status_bar.showMessage(f"解析模式：{self._parse_strategy_btn.text()}", 3000)
+
+    def _on_setup_browser(self) -> None:
+        self._run_subprocess_action(
+            ["littrace", "setup-browser"],
+            "Chrome 配置完成",
+        )
+
+    def _on_doctor(self) -> None:
+        self._run_subprocess_action(["littrace", "doctor"], None)
+
+    def _run_subprocess_action(self, cmd: list[str], success_label: str | None) -> None:
+        try:
+            completed = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            self._status_bar.showMessage(f"{' '.join(cmd)} 超时", 5000)
+            return
+        except Exception as exc:
+            self._status_bar.showMessage(f"{' '.join(cmd)} 失败: {exc}", 5000)
+            return
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(" ".join(cmd))
+        dialog.resize(720, 480)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        view = QtWidgets.QPlainTextEdit()
+        view.setPlainText((completed.stdout or "") + (completed.stderr or ""))
+        view.setReadOnly(True)
+        layout.addWidget(view)
+        if success_label:
+            layout.addWidget(QtWidgets.QLabel(success_label))
+        dialog.exec()
+        self._status_bar.showMessage(f"{' '.join(cmd)} 完成", 3000)
+
+    def _open_help_popup(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "使用说明",
+            "LitTrace Qt shell\n"
+            "\n"
+            "• 左侧：执行 Trace + 历史 Session（点击切换）\n"
+            "• 中间：对话窗口，输入 / 触发 slash 命令自动完成\n"
+            "• 右上：文献上下文 / RAG / Daily 操作\n"
+            "• 右下：嵌入式 Chromium 浏览器（用于 publisher 页面）\n"
+            "\n"
+            "Slash 命令示例： /papers  /parse  /table  /storyline  /quit\n"
+            "右键 chat 区域可复制 / 全选 / 清屏。",
+        )
+
+    def _on_rag_refresh_session(self) -> None:
+        self._status_bar.showMessage("RAG refresh 任务已加入队列…", 3000)
+        self._rag_panel.set_status("已入队（请看 jobs status）")
+
+    def _on_rag_refresh_all(self) -> None:
+        self._status_bar.showMessage("全量 RAG refresh 已入队…", 3000)
+        self._rag_panel.set_status("全量 refresh 已入队")
+
+    def _on_rag_full_daily(self) -> None:
+        self._status_bar.showMessage("Full daily 已入队（需要时会触发 codex turn）", 3000)
+        self._rag_panel.set_status("full_daily 已入队")
 
     # ---- Event wiring ----------------------------------------------------
 
     def _wire_events(self) -> None:
         controller = self._controller
+
+        # Qt widgets must only be touched from the GUI thread, but the
+        # controller emits events on its asyncio worker thread. Post each
+        # event back to the main loop with ``QTimer.singleShot(0, ...)`` so
+        # ``QTextDocument`` and friends are constructed on the right thread.
+        # The headless-smoke subscribers are exceptions — they only print
+        # and call ``app.quit`` which is thread-safe.
+        def post_to_gui(handler):
+            def _wrapper(event: ShellEvent) -> None:
+                QtCore.QTimer.singleShot(0, lambda e=event: handler(e))
+            return _wrapper
 
         def on_message(event: ShellEvent) -> None:
             if event.kind == controller.EVENT_MESSAGE_APPENDED:
@@ -425,6 +871,13 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         def on_workspace(event: ShellEvent) -> None:
             if event.kind == controller.EVENT_WORKSPACE_REFRESHED:
                 self._context_panel.refresh(list(self._controller.list_active_papers()))
+                self._trace_panel.render_workflow_trace(
+                    ["工作区刷新"]
+                    + [
+                        f"{i + 1}. {p.title}"
+                        for i, p in enumerate(self._controller.list_active_papers())
+                    ]
+                )
 
         def on_error(event: ShellEvent) -> None:
             if event.kind == controller.EVENT_ERROR:
@@ -432,10 +885,24 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                     "system", f"⚠️ {event.payload.get('message', 'error')}"
                 )
 
-        controller.bus.subscribe(on_message)
-        controller.bus.subscribe(on_status)
-        controller.bus.subscribe(on_workspace)
-        controller.bus.subscribe(on_error)
+        controller.bus.subscribe(post_to_gui(on_message))
+        controller.bus.subscribe(post_to_gui(on_status))
+        controller.bus.subscribe(post_to_gui(on_workspace))
+        controller.bus.subscribe(post_to_gui(on_error))
+
+    # ---- Initial state ---------------------------------------------------
+
+    def _refresh_initial_state(self) -> None:
+        self._context_panel.refresh(list(self._controller.list_active_papers()))
+        self._trace_panel.render_workflow_trace(["等待任务…"])
+        try:
+            sessions = list_chat_sessions(self._controller.config)
+            self._trace_panel.set_sessions(
+                sessions, current_session_id=self._controller.session.session_id
+            )
+        except Exception:
+            pass
+        self._status_bar.showMessage("就绪")
 
 
 # ---------------------------------------------------------------------------
@@ -461,10 +928,49 @@ def _parse_argv(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--headless-smoke",
         action="store_true",
-        help="Build the window, schedule a ping chat turn, then exit cleanly. "
-        "Used by CI to confirm QtWebEngine + ShellController work without a display.",
+        help="Build the window, fire a chat turn, wait for the reply, then "
+        "exit cleanly. Used by CI to confirm QtWebEngine + ShellController "
+        "work without a display.",
     )
     return parser.parse_args(argv)
+
+
+def _await_status_idle(
+    controller: ShellController,
+    app: QtWidgets.QApplication,
+    state: dict[str, bool],
+    timeout_ms: int = 45000,
+) -> None:
+    """Quit ``app`` once the controller emits status='就绪' *and* we have
+    seen an assistant message. Falls back to ``timeout_ms`` if the chat
+    turn never completes.
+    """
+
+    def _on_message(event: ShellEvent) -> None:
+        if event.kind == controller.EVENT_MESSAGE_APPENDED and event.payload.get("role") == "assistant":
+            state["got_reply"] = True
+            print(
+                f"[smoke] reply action={event.payload.get('action')!r} "
+                f"text={event.payload.get('text', '')[:120]!r}",
+                flush=True,
+            )
+
+    def _on_status(event: ShellEvent) -> None:
+        if event.kind == controller.EVENT_STATUS_CHANGED and state["got_reply"]:
+            if event.payload.get("text") == "就绪":
+                state["done"] = True
+                app.quit()
+
+    def _on_error(event: ShellEvent) -> None:
+        if event.kind == controller.EVENT_ERROR:
+            print(f"[smoke] ERROR: {event.payload}", flush=True)
+            state["done"] = True
+            app.quit()
+
+    controller.bus.subscribe(_on_message)
+    controller.bus.subscribe(_on_status)
+    controller.bus.subscribe(_on_error)
+    QtCore.QTimer.singleShot(timeout_ms, app.quit)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -488,46 +994,14 @@ def main(argv: list[str] | None = None) -> int:
         window._browser_panel.open_url(args.url)
 
     if args.headless_smoke:
-        # Pump one chat turn, then quit only after the controller reports
-        # status back to idle. Without the idle wait the event loop tears
-        # down an in-flight asyncio.Task that the Codex App Server is
-        # still driving (visible as ``Task was destroyed but it is
-        # pending!`` on shutdown).
-        state = {"got_reply": False, "done": False}
-
-        def _on_message(event: ShellEvent) -> None:
-            if event.kind == controller.EVENT_MESSAGE_APPENDED and event.payload.get("role") == "assistant":
-                state["got_reply"] = True
-                # Print the reply so CI can grep for it.
-                print(
-                    f"[smoke] reply action={event.payload.get('action')!r} "
-                    f"text={event.payload.get('text', '')[:120]!r}",
-                    flush=True,
-                )
-
-        def _on_status(event: ShellEvent) -> None:
-            if event.kind == controller.EVENT_STATUS_CHANGED and state["got_reply"]:
-                if event.payload.get("text") == "就绪":
-                    state["done"] = True
-                    app.quit()
-
-        def _on_error(event: ShellEvent) -> None:
-            if event.kind == controller.EVENT_ERROR:
-                print(f"[smoke] ERROR: {event.payload}", flush=True)
-                state["done"] = True
-                app.quit()
-
-        controller.bus.subscribe(_on_message)
-        controller.bus.subscribe(_on_status)
-        controller.bus.subscribe(_on_error)
-        # Hard ceiling so a stuck turn does not hang CI forever.
-        QtCore.QTimer.singleShot(45000, app.quit)
+        state: dict[str, bool] = {"got_reply": False, "done": False}
+        _await_status_idle(controller, app, state)
         window.show()
         controller.submit_user_message("ping")
         rc = app.exec()
         controller.stop()
         if not state["got_reply"]:
-            print("[smoke] FAIL: no assistant reply within 45s", flush=True)
+            print("[smoke] FAIL: no assistant reply within timeout", flush=True)
             return 1
         print("[smoke] OK", flush=True)
         return rc
