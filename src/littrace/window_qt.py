@@ -516,38 +516,42 @@ QSplitter::handle:horizontal {{
 # autocomplete popup behaves identically to the Tk shell.
 # ---------------------------------------------------------------------------
 
-COMMAND_CATALOG: list[tuple[str, str, bool]] = [
-    ("context", "显示 / 隐藏当前文献上下文", True),
-    ("papers", "列出当前上下文文献", True),
-    ("parse", "按当前解析模式处理 PDF", False),
-    ("parse --ocr", "强制使用 OCR 解析", False),
-    ("parse --text", "强制使用文本层解析", False),
-    ("table", "抽取性能指标并生成对比表", True),
-    ("storyline", "梳理论文回应关系", True),
-    ("storyline-report", "导出 storyline 报告", True),
-    ("storyline-review", "Reviewer 审阅 storyline", True),
-    ("dashboard", "打开 RAG / Daily 仪表盘", True),
-    ("quality", "运行质量门", True),
-    ("agents", "列出可用 agents", False),
-    ("workflow", "显示当前 workflow trace", True),
-    ("quality-audits", "运行质量审计", True),
-    ("plan", "显示当前执行计划", False),
-    ("init-config", "运行 config wizard", False),
-    ("login", "打开授权登录弹窗", True),
-    ("attach", "手动附加本地 PDF", False),
-    ("attach-si", "附加 SI / 补充材料", False),
-    ("full-text", "构建 full-text context", True),
-    ("backfill-dois", "回填 DOI", False),
-    ("publisher-retrieve", "按 publisher 抓取", False),
-    ("check-downloads", "检查当前下载计划", True),
-    ("resume-downloads", "恢复下载（等待用户授权）", True),
-    ("benchmark", "运行评测基准", False),
-    ("golden-eval", "运行 golden set 评估", False),
-    ("export", "导出当前 session", False),
-    ("quit", "关闭窗口", False),
-    ("全部下载", "选择当前上下文中全部待下载文献", True),
-    ("选择第 N 篇下载", "选择第 N 篇进入下载计划", True),
-    ("取消选择第 N 篇", "从下载计划中移除第 N 篇", True),
+COMMAND_CATALOG: list[tuple[str, str, bool, str]] = [
+    # Group: 论文库
+    ("context", "显示 / 隐藏当前文献上下文", True, "论文库"),
+    ("papers", "列出当前上下文文献", True, "论文库"),
+    ("全部下载", "选择当前上下文中全部待下载文献", True, "论文库"),
+    ("选择第 N 篇下载", "选择第 N 篇进入下载计划", True, "论文库"),
+    ("取消选择第 N 篇", "从下载计划中移除第 N 篇", True, "论文库"),
+    ("check-downloads", "检查当前下载计划", True, "论文库"),
+    ("resume-downloads", "恢复下载（等待用户授权）", True, "论文库"),
+    # Group: 解析与抽取
+    ("parse", "按当前解析模式处理 PDF", False, "解析"),
+    ("parse --ocr", "强制使用 OCR 解析", False, "解析"),
+    ("parse --text", "强制使用文本层解析", False, "解析"),
+    ("table", "抽取性能指标并生成对比表", True, "解析"),
+    ("storyline", "梳理论文回应关系", True, "解析"),
+    ("storyline-report", "导出 storyline 报告", True, "解析"),
+    ("storyline-review", "Reviewer 审阅 storyline", True, "解析"),
+    # Group: 工具
+    ("dashboard", "打开 RAG / Daily 仪表盘", True, "工具"),
+    ("quality", "运行质量门", True, "工具"),
+    ("agents", "列出可用 agents", False, "工具"),
+    ("workflow", "显示当前 workflow trace", True, "工具"),
+    ("quality-audits", "运行质量审计", True, "工具"),
+    ("plan", "显示当前执行计划", False, "工具"),
+    ("init-config", "运行 config wizard", False, "工具"),
+    ("login", "打开授权登录弹窗", True, "工具"),
+    ("attach", "手动附加本地 PDF", False, "工具"),
+    ("attach-si", "附加 SI / 补充材料", False, "工具"),
+    ("full-text", "构建 full-text context", True, "工具"),
+    ("backfill-dois", "回填 DOI", False, "工具"),
+    ("publisher-retrieve", "按 publisher 抓取", False, "工具"),
+    ("benchmark", "运行评测基准", False, "工具"),
+    ("golden-eval", "运行 golden set 评估", False, "工具"),
+    ("export", "导出当前 session", False, "工具"),
+    ("quit", "关闭窗口", False, "工具"),
+    ("取消选择第 N 篇", "从下载计划中移除第 N 篇", True, "论文库"),
 ]
 
 
@@ -742,7 +746,28 @@ class ChatPanel(QtWidgets.QFrame):
         self._popup.setFixedWidth(420)
         self._popup.setMinimumHeight(220)
         self._popup.setUniformItemSizes(True)
-        for name, desc, _ctx in COMMAND_CATALOG:
+        # Build the popup with one separator row per group so the user
+        # can scan the available commands by category. The
+        # ``_is_separator`` flag on each item tells the filter logic
+        # to hide separators when a query is non-empty.
+        self._popup_meta: dict[int, str] = {}  # row -> "separator:<group>"
+        last_group: str | None = None
+        for name, desc, _ctx, group in COMMAND_CATALOG:
+            if group != last_group:
+                sep = QtWidgets.QListWidgetItem(group)
+                sep.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                sep.setData(QtCore.Qt.ItemDataRole.UserRole, None)
+                sep.setBackground(QtGui.QColor("#f5f6f6"))
+                sep.setForeground(QtGui.QColor("#a4a7ad"))
+                font = sep.font()
+                font.setBold(True)
+                font.setPointSize(font.pointSize() - 1)
+                sep.setFont(font)
+                self._popup.addItem(sep)
+                self._popup_meta[self._popup.count() - 1] = (
+                    f"separator:{group}"
+                )
+                last_group = group
             item = QtWidgets.QListWidgetItem(f"/{name}    — {desc}")
             item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
             self._popup.addItem(item)
@@ -799,6 +824,20 @@ class ChatPanel(QtWidgets.QFrame):
 
     # ---- Slash popup logic ----------------------------------------------
 
+    def _next_command_matches(self, separator_row: int) -> bool:
+        """Return True if the next non-separator row after
+        ``separator_row`` is visible under the current filter. Used by
+        the per-row visibility logic to decide whether a separator
+        should stay on screen.
+        """
+        for row in range(separator_row + 1, self._popup.count()):
+            item = self._popup.item(row)
+            if self._popup_meta.get(row, "").startswith("separator:"):
+                return False
+            if not item.isHidden():
+                return True
+        return False
+
     def _on_input_text_changed(self) -> None:
         text = self._input.toPlainText()
         # Keep the send button in sync with whether the user has
@@ -814,14 +853,37 @@ class ChatPanel(QtWidgets.QFrame):
         # ~500 ms on the very first keystroke because Qt had to allocate
         # every item, lay it out, and then position+show the popup window;
         # toggling the hidden flag is flag-bit work on existing items.
+        # With a non-empty query we also hide the group separator rows
+        # so the filtered list reads as a single flat menu.
+        hide_separators = bool(query)
         visible_rows: list[int] = []
         for row in range(self._popup.count()):
             item = self._popup.item(row)
+            meta = self._popup_meta.get(row, "")
+            is_separator = meta.startswith("separator:")
+            if is_separator and hide_separators:
+                item.setHidden(True)
+                continue
             name = item.data(QtCore.Qt.ItemDataRole.UserRole) or ""
-            match = not query or name.lower().startswith(query)
-            item.setHidden(not match)
-            if match:
-                visible_rows.append(row)
+            # Fuzzy: command name or description contains the query as a
+            # substring. ``startswith`` is too strict — ``/par`` would
+            # miss ``parse --ocr``.
+            text_match = (
+                not query
+                or name.lower().find(query) >= 0
+                or item.text().lower().find(query) >= 0
+            )
+            if is_separator:
+                # A separator stays visible only if the next command
+                # in the catalog is a match (so groups don't appear
+                # empty once their entries are filtered out).
+                item.setHidden(not self._next_command_matches(row))
+                if not item.isHidden():
+                    visible_rows.append(row)
+            else:
+                item.setHidden(not text_match)
+                if text_match:
+                    visible_rows.append(row)
         if not visible_rows:
             self._popup.hide()
             return
