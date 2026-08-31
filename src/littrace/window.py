@@ -9,6 +9,7 @@ from littrace.agent_runtime import handle_agent_chat
 from littrace.auto_resume import auto_resume_downloaded_pdfs
 from littrace.config import load_config
 from littrace.intent import parse_chat_intent
+from littrace.shell_controller import ShellController, ShellEvent
 from littrace.access_layer import (
     browser_login_session_for_paper,
     fetch_authorized_pdf_after_user_auth,
@@ -110,9 +111,21 @@ class LitTraceWindow:
     def __init__(self) -> None:
         self.tk, self.ttk = _load_tk()
         self.config = load_config()
-        self.session = create_chat_session(self.config)
-        _scope_storage_to_session(self.config, self.session)
-        self.workspace = LiteratureWorkspace()
+        # Route chat through ``ShellController`` so service reuse and
+        # the same event payload that powers ``littrace-qt`` work here
+        # too. The previous direct ``handle_agent_chat`` background
+        # thread called ``self.root.after(0, apply_response)`` from the
+        # worker thread, which Tk rejects with ``RuntimeError: main
+        # thread is not in main loop`` -- so the assistant reply never
+        # made it to the chat widget. ``ShellController`` keeps the
+        # asyncio worker on its own thread, and the bus handlers below
+        # re-post every event onto the Tk main loop via ``root.after``.
+
+        self.controller = ShellController(self.config)
+        self.controller.start()
+        self._wire_controller_to_widgets()
+        self.session = self.controller.session
+        self.workspace = self.controller.workspace
         self.context_visible = True
         self.last_download_plan: DownloadPlan | None = None
         self.parse_strategy = "text_only"
@@ -134,6 +147,8 @@ class LitTraceWindow:
         self.root.geometry("1280x820")
         self.root.minsize(900, 600)
         self.root.configure(background=DESIGN["parchment"])
+        # Start the cross-thread event pump now that ``self.root`` exists.
+        self._start_controller_pump()
 
         self._configure_styles()
         self._build_layout()
@@ -637,47 +652,114 @@ class LitTraceWindow:
         if message in {"/quit", "/exit"}:
             self.root.destroy()
             return
-        self._append_message("user", message)
-        self._show_execution_path(message)
-        threading.Thread(target=self._handle_message_thread, args=(message,), daemon=True).start()
+        # Hand off to ``ShellController``; the reply comes back through
+        # ``ShellController`` emits ``message_appended`` for the user
+        # role as well; the bus handler below is what actually writes
+        # it into the chat widget. Doing it here too would duplicate
+        # the message; using the bus as the single source of truth
+        # keeps the writer in exactly one place.
+        self.controller.submit_user_message(message)
+
+    def _wire_controller_to_widgets(self) -> None:
+        # Bridge every controller event onto the Tk main loop.
+        # ``ShellEventBus`` emits on the controller's asyncio worker
+        # thread. ``self.root.after(0, callable)`` from a non-main
+        # thread turns out to be unreliable — the idle handler is
+        # dropped during the cross-thread call in this test setup
+        # (``update()`` does not always flush after-events posted from
+        # another thread). Use a Python ``queue.Queue`` and have the
+        # Tk main thread ``after()`` itself poll it: the call to
+        # ``self.root.after(100, _drain)`` *is* made from the Tk
+        # constructor so it lands on the right thread, and each
+        # iteration reads whatever the worker posted in the meantime.
+        import queue as _queue
+
+        self._event_queue: _queue.Queue = _queue.Queue()
+
+        def _drain() -> None:
+            while True:
+                try:
+                    callable_, args = self._event_queue.get_nowait()
+                except Exception:
+                    break
+                try:
+                    callable_(*args)
+                except Exception:
+                    # Single event failures must not stop the pump.
+                    pass
+            self.root.after(100, _drain)
+
+        def post(callable_):
+            def _wrapper(event: ShellEvent) -> None:
+                self._event_queue.put((callable_, (event,)))
+
+            return _wrapper
+
+        controller = self.controller
+
+        def on_message(event: ShellEvent) -> None:
+            if event.kind == controller.EVENT_MESSAGE_APPENDED:
+                role = event.payload.get("role", "system")
+                text = event.payload.get("text", "")
+                self._append_message(role, text)
+                if role == "assistant":
+                    action = event.payload.get("action", "")
+                    if action:
+                        self.status_var.set(
+                            f"Action: {action} | Session: {self.session.session_id}"
+                        )
+
+        def on_status(event: ShellEvent) -> None:
+            if event.kind == controller.EVENT_STATUS_CHANGED:
+                self.status_var.set(event.payload.get("text", ""))
+
+        def on_workspace(event: ShellEvent) -> None:
+            if event.kind == controller.EVENT_WORKSPACE_REFRESHED:
+                try:
+                    self._refresh_context()
+                    self._refresh_ocr_buttons()
+                    self._refresh_context_popup()
+                    self._refresh_session_history()
+                    self._refresh_rag_panel()
+                except Exception:
+                    pass
+
+        def on_error(event: ShellEvent) -> None:
+            if event.kind == controller.EVENT_ERROR:
+                self._append_message("system", f"⚠️ {event.payload.get('message', 'error')}")
+                self.status_var.set("错误")
+
+        controller.bus.subscribe(post(on_message))
+        controller.bus.subscribe(post(on_status))
+        controller.bus.subscribe(post(on_workspace))
+        controller.bus.subscribe(post(on_error))
+
+        # The drain loop itself is started by ``_start_controller_pump``
+        # once ``self.root`` exists.
+
+    def _start_controller_pump(self) -> None:
+        # Called from ``__init__`` after ``self.root = self.tk.Tk()`` so
+        # the idle task is scheduled on the Tk main thread.
+        def _drain() -> None:
+            while True:
+                try:
+                    callable_, args = self._event_queue.get_nowait()
+                except Exception:
+                    break
+                try:
+                    callable_(*args)
+                except Exception:
+                    pass
+            self.root.after(100, _drain)
+
+        self.root.after(100, _drain)
 
     def _handle_message_thread(self, message: str) -> None:
-        try:
-            response, workspace = asyncio.run(
-                handle_agent_chat(
-                    ChatRequest(message=message, session_id=self.session.session_id),
-                    self.workspace,
-                    self.config,
-                    session=self.session,
-                )
-            )
-        except Exception as exc:
-            error_text = f"{exc.__class__.__name__}: {exc}"
-            self.root.after(0, lambda: self._append_message("system", error_text))
-            self.root.after(0, lambda: self.status_var.set("错误"))
-            return
-
-        def apply_response() -> None:
-            self.workspace = workspace
-            self.context_visible = workspace.context.visible_to_user
-            save_workspace(self.session, self.workspace, config=self.config)
-            append_message(self.session, "user", message)
-            append_message(self.session, "assistant", response)
-            if _is_user_effective_reply(response.reply):
-                self._append_message("assistant", response.reply)
-            if response.warnings:
-                self._append_message("system", "；".join(response.warnings[:4]))
-            self.last_download_plan = response.download_plan
-            if response.research_result and response.research_result.workflow_trace:
-                self._render_workflow_trace(response.research_result.workflow_trace)
-            self.status_var.set(f"Action: {response.action} | Session: {self.session.session_id}")
-            self._refresh_context()
-            self._refresh_ocr_buttons()
-            self._refresh_context_popup()
-            self._refresh_session_history()
-            self._refresh_rag_panel()
-
-        self.root.after(0, apply_response)
+        # Legacy background-thread chat handler kept only for source
+        # compatibility with subclasses that override ``_send`` and
+        # call into here directly. ``_send`` itself no longer uses
+        # this path — it hands the message to ``ShellController``.
+        return None
 
     def _send_from_event(self, event) -> str:
         if event.state & 0x0001:

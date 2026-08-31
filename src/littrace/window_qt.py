@@ -67,6 +67,35 @@ DESIGN = {
 logger = logging.getLogger("littrace.window_qt")
 
 
+def _summarise_sentinel_output(stdout: str) -> str:
+    """Pick the user-facing one-liner out of a ``littrace sentinel run``
+    stdout stream.
+
+    Sentinel prints ``run_id:`` / ``new_candidates:`` / ``downloaded:`` /
+    ``parsed:`` / ``access_tasks:`` lines near the top of its run summary
+    block, followed by a closing ``warnings:`` blob whose individual
+    items ("Dataset is missing for all rows; comparison may be unfair.")
+    are useful to the parse pipeline but pure noise on a status badge.
+    Extract just the run_id + the four counter lines.
+    """
+    keys = ("run_id:", "new_candidates:", "downloaded:", "parsed:", "access_tasks:")
+    picked: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for key in keys:
+            if line.startswith(key):
+                picked.append(line)
+                break
+    if not picked:
+        # Fall back to a short tail when the run did not match the
+        # expected format (older codex output, broken upgrade, …).
+        tail_lines = [line.strip() for line in stdout.strip().splitlines() if line.strip()]
+        return " · ".join(tail_lines[-2:])
+    return " · ".join(picked)
+
+
 def _littrace_cmd(*args: str) -> tuple[list[str], dict[str, str], str]:
     """Resolve the ``littrace`` console-script entry point and the
     working-directory / environment needed to invoke it.
@@ -968,10 +997,18 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                     cwd=cwd,
                     env=env,
                 )
-                msg = (completed.stdout or "").strip().splitlines()
-                tail = " · ".join(msg[-3:]) if msg else ""
+                # Parse sentinel stdout and surface only a clean one-line
+                # summary. The previous implementation dumped ``msg[-3:]``
+                # which almost always picked up the closing
+                # ``Dataset is missing for all rows; comparison may be
+                # unfair.`` warnings — useful for the parse pipeline
+                # itself but noise for the user who just wants to know
+                # whether the run finished.
+                summary = _summarise_sentinel_output(
+                    completed.stdout or ""
+                )
                 self._post_status(
-                    f"今日管线完成（exit={completed.returncode}） · {tail}"
+                    f"今日管线完成（exit={completed.returncode}） · {summary}"
                 )
             except subprocess.TimeoutExpired:
                 self._post_status("今日管线超时（10 分钟）")
