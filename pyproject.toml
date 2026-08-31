@@ -35,6 +35,14 @@ rag = [
 storage = [
   "boto3>=1.34",
 ]
+gui-qt = [
+  # PySide6 ships with QtWebEngine (Chromium) on macOS/Windows and Linux
+  # x86_64. The Qt wheels are universal2 on macOS, so the same pip
+  # command covers Apple Silicon and Intel. See
+  # https://doc.qt.io/qt-6/qtwebengine-platform-notes.html for platform
+  # requirements.
+  "PySide6>=6.7",
+]
 dev = [
   "pytest>=8.2",
   "ruff>=0.6",
@@ -48,6 +56,7 @@ where = ["src"]
 littrace = "littrace.cli:main"
 littrace-tui = "littrace.tui:main"
 littrace-window = "littrace.window:main"
+littrace-qt = "littrace.window_qt:main"
 littrace-mcp = "littrace.mcp_server:main"
 
 # Plugin entry-point group. Third-party packages may declare a
