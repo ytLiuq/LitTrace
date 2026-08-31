@@ -1748,8 +1748,20 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             rounds_done = 0
             last_summary = ""
             for round_idx, q in enumerate(queries, start=1):
+                round_start = time.monotonic()
                 self._post_status(
                     f"第 {round_idx}/{MAX_ROUNDS} 轮检索 · query='{q}'"
+                )
+                # Sentinel does not emit mid-run progress lines, so
+                # ``subprocess.run`` blocks silently for ~2 min. Park a
+                # background timer that re-posts the same status with
+                # the elapsed time appended so the user sees the run is
+                # alive. The timer is cancelled as soon as the round
+                # finishes (see ``_stop_progress_timer`` below).
+                progress_state = {"stop": False}
+                _stop_progress_timer = lambda: progress_state.update(stop=True)
+                self._start_progress_timer(
+                    round_idx, MAX_ROUNDS, q, round_start, progress_state
                 )
                 try:
                     cmd, env, cwd = _littrace_cmd(
@@ -1757,6 +1769,17 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                         "--watchlist", topic,
                         "--topic", q,
                     )
+                    completed = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=PER_ROUND_TIMEOUT,
+                        cwd=cwd,
+                        env=env,
+                    )
+                finally:
+                    progress_state["stop"] = True
+                try:
                     completed = subprocess.run(
                         cmd,
                         capture_output=True,
@@ -1810,6 +1833,32 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             self._post_status(headline)
 
         threading.Thread(target=_worker, daemon=True, name="littrace-daily").start()
+
+    def _start_progress_timer(
+        self,
+        round_idx: int,
+        max_rounds: int,
+        query: str,
+        start_monotonic: float,
+        state: dict,
+    ) -> None:
+        """Update the RAG status line every 10 s while a sentinel round
+        is running, appending the elapsed time so the user can see the
+        run is alive (sentinel does not emit any mid-run progress on
+        its own). ``state["stop"]`` is set by the caller when the
+        round finishes; the timer exits as soon as it notices.
+        """
+        def _tick():
+            if state.get("stop"):
+                return
+            elapsed = int(time.monotonic() - start_monotonic)
+            self._post_status(
+                f"第 {round_idx}/{max_rounds} 轮检索中 · 已跑 {elapsed} 秒 · "
+                f"query='{query}'"
+            )
+            QtCore.QTimer.singleShot(10000, _tick)
+
+        QtCore.QTimer.singleShot(10000, _tick)
 
     def _launch_publisher_login_browser(self) -> None:
         # ``littrace setup-browser --launch`` boots the LitTrace-private
