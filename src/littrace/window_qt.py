@@ -611,12 +611,9 @@ class ChatPanel(QtWidgets.QFrame):
 
         # Left slot — placeholder for an "attach file" button (future
         # work). For now it's a thin visual anchor.
-        self._attach_btn = QtWidgets.QPushButton("+")
-        self._attach_btn.setObjectName("input_attach")
-        self._attach_btn.setFixedSize(32, 32)
-        self._attach_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self._attach_btn.setToolTip("附加文件（待实现）")
-        input_layout.addWidget(self._attach_btn)
+        # No left-side button — the previous "+" attachment slot was
+        # unused and made the bar look busy. The input starts directly
+        # at the rounded container's left edge.
 
         # Multi-line text input (was a single-line QLineEdit; Codex App
         # wraps on Enter when Shift isn't held and inserts a literal
@@ -819,40 +816,61 @@ class ChatPanel(QtWidgets.QFrame):
     # ---- Event handlers wired by LitTraceQtWindow ----------------------
 
     def append_message(self, role: str, text: str, **extras: Any) -> None:
-        # Codex replies come back as plain text that happens to use
-        # Markdown conventions (bold with **...**, code with `...`, list
-        # items with "- ", headings with "# ", blockquotes with "> ").
-        # Convert to HTML and render as a styled bubble so the user
-        # actually sees formatting. QTextBrowser's ``append`` accepts an
-        # HTML fragment, so the body is wrapped in a per-role ``<div>``.
-        # We escape the input first, then apply markdown rules against
-        # the escaped text — that way any literal ``<``/``>`` in the
-        # reply never opens a tag the browser will interpret.
-        bubble_color = {
-            "user": "#e6efee",
-            "assistant": "#ffffff",
-            "system": "#f7f8f8",
-        }.get(role, "#ffffff")
-        bubble_radius = {"user": "12px 12px 4px 12px", "assistant": "12px 12px 12px 4px"}.get(
-            role, "8px"
+        # Render a Codex reply as a left/right chat bubble. ChatGPT
+        # Codex App shows user on the right, assistant on the left, with
+        # no per-message name label (the visual side is the speaker
+        # marker). Markdown is rendered by ``_render_message_html``;
+        # any leading Codex internal-narration sentence is stripped.
+        body = _strip_leading_narration(_render_message_html(text))
+        if role == "user":
+            bubble_color = DESIGN["primary"]
+            text_color = "#ffffff"
+            align = "right"
+            wrap = "12px 12px 4px 12px"  # tail bottom-right
+            max_width = "78%"
+        elif role == "system":
+            bubble_color = DESIGN["surface_2"]
+            text_color = DESIGN["ink_muted"]
+            align = "left"
+            wrap = "8px"
+            max_width = "78%"
+        else:  # assistant
+            bubble_color = "#ffffff"
+            text_color = DESIGN["ink"]
+            align = "left"
+            wrap = "12px 12px 12px 4px"  # tail bottom-left
+            max_width = "78%"
+        from PySide6.QtGui import QTextBlockFormat
+
+        cursor = self._view.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+
+        # Set the block format on a new block (so the previous bubble's
+        # alignment doesn't bleed in) then ``insertHtml`` the bubble.
+        # ``<p align="...">`` in HTML was silently coerced to right by
+        # QTextBrowser's HTML parser, so we have to set the alignment
+        # via the block format instead.
+        block_fmt = QTextBlockFormat()
+        block_fmt.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+            if align == "right"
+            else QtCore.Qt.AlignmentFlag.AlignLeft
         )
-        body = _render_message_html(text)
-        # The first two sentences of the first line show up in lots of
-        # codex replies that begin with internal notes the user does
-        # not want to see ("这里只需要确认当前助手身份，不会改动
-        # LitTrace 会话。"). Hide a leading narration sentence so the
-        # answer starts with the substantive reply.
-        body = _strip_leading_narration(body)
-        html = (
-            f'<div style="background:{bubble_color};border:1px solid {DESIGN["hairline"]};'
-            f'border-radius:{bubble_radius};padding:8px 12px;margin:6px 0;'
-            f'color:{DESIGN["ink"]};">'
-            f'<div style="color:{DESIGN["ink_muted"]};font-size:11px;'
-            f'font-weight:600;margin-bottom:4px;">{"你" if role == "user" else "Codex"}</div>'
+        block_fmt.setTopMargin(8)
+        block_fmt.setBottomMargin(8)
+        cursor.insertBlock(block_fmt)
+        cursor.insertHtml(
+            f'<span style="display:inline-block;max-width:{max_width};'
+            f"background:{bubble_color};color:{text_color};"
+            f"border:1px solid {DESIGN['hairline']};"
+            f"border-radius:{wrap};padding:8px 12px;"
+            f"line-height:1.4;"
+            f'">'
             f"{body}"
-            f"</div>"
+            f"</span>"
         )
-        self._view.append(html)
+        self._view.setTextCursor(cursor)
+        self._view.ensureCursorVisible()
 
     def _on_chat_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
@@ -948,7 +966,7 @@ class RAGPanel(QtWidgets.QFrame):
         helper.setWordWrap(True)
         layout.addWidget(helper)
 
-        run_btn = QtWidgets.QPushButton("运行今日管线")
+        run_btn = QtWidgets.QPushButton("🔍 检索并补全文献")
         run_btn.setObjectName("subnav_btn_primary")
         run_btn.clicked.connect(on_run_daily)
         layout.addWidget(run_btn)
@@ -1411,7 +1429,9 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         dialog = DailyConfigDialog(
             self,
             default_topic=existing_topic,
-            default_year_min=getattr(self.config.literature_context, "default_year_min", 2023),
+            default_year_min=getattr(
+                self._controller.config.literature_context, "default_year_min", 2023
+            ),
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
