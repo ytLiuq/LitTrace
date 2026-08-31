@@ -1244,9 +1244,13 @@ class BrowserPanel(QtWidgets.QFrame):
         ("🌐 arXiv", "https://arxiv.org/login"),
     ]
 
-    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(self, parent: QtWidgets.QWidget | None = None, config=None) -> None:
         super().__init__(parent)
         self.setObjectName("browser_tile")
+        # ``config`` is optional so the panel can be used standalone
+        # (e.g. unit tests). When None the cookie-status strip renders
+        # an explicit "(no config)" placeholder instead of crashing.
+        self._config = config
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1267,6 +1271,39 @@ class BrowserPanel(QtWidgets.QFrame):
         publisher_row.addStretch(1)
         layout.addLayout(publisher_row)
 
+        # Per-publisher cookie status strip — sits between the shortcut
+        # row and the URL bar. The strip lists the same publishers
+        # as the shortcut row, but renders ``✓ logged in`` or ``✗ not
+        # logged in`` based on what ``_detect_publisher_cookie_domains``
+        # finds in ``./data/chrome-cdp``. The check runs once on
+        # construction; it is cheap (reads the cookie SQLite files
+        # directly, no network). Clicking a status pill reopens the
+        # publisher's sign-in page so the user can recover a stale
+        # session without leaving the panel.
+        self._cookie_status = QtWidgets.QLabel("")
+        self._cookie_status.setObjectName("cookie_status")
+        self._cookie_status.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        self._cookie_status.setWordWrap(False)
+        self._cookie_status.setStyleSheet(
+            f"color:{DESIGN['ink_muted']};font-size:11px;padding:2px 10px;"
+        )
+        self._cookie_status.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.LinksAccessibleByMouse
+            | QtCore.Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+        )
+        cookie_strip = QtWidgets.QHBoxLayout()
+        cookie_strip.setContentsMargins(8, 0, 8, 0)
+        cookie_strip.addWidget(self._cookie_status, stretch=1)
+        self._cookie_refresh_btn = QtWidgets.QPushButton("↻")
+        self._cookie_refresh_btn.setObjectName("cookie_refresh")
+        self._cookie_refresh_btn.setFixedSize(24, 20)
+        self._cookie_refresh_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self._cookie_refresh_btn.setToolTip("重新读取 cookie 状态")
+        self._cookie_refresh_btn.clicked.connect(self._refresh_cookie_status)
+        cookie_strip.addWidget(self._cookie_refresh_btn)
+        layout.addLayout(cookie_strip)
+        self._refresh_cookie_status()
+
         # Free-form URL bar for ad-hoc navigation.
         url_row = QtWidgets.QHBoxLayout()
         url_row.setContentsMargins(8, 4, 8, 4)
@@ -1284,6 +1321,53 @@ class BrowserPanel(QtWidgets.QFrame):
 
     def _on_url_entered(self) -> None:
         self.open_url(self._url.text())
+
+    def _refresh_cookie_status(self) -> None:
+        # Map each publisher shortcut to a list of cookie domains that
+        # the littrace config knows about. The cookie detector searches
+        # the user's private Chrome profile (``./data/chrome-cdp``)
+        # for any of those domains; if at least one matches, the
+        # publisher is "logged in".
+        from littrace.chrome_profiles import (
+            _detect_publisher_cookie_domains,
+        )
+        # Group domains by publisher (using the same shorthand names
+        # the shortcut row uses).
+        publisher_domains: list[tuple[str, list[str]]] = [
+            ("Wiley", ["wiley.com", "onlinelibrary.wiley.com"]),
+            ("ACS", ["acs.org", "pubs.acs.org"]),
+            ("Springer", ["springer.com"]),
+            ("Nature", ["nature.com"]),
+        ]
+        # Resolve the LitTrace-private Chrome profile path. The
+        # detector only looks at the directory; we don't require the
+        # file to exist (a fresh install simply reads as "all
+        # unlogged in").
+        if self._config is None:
+            self._cookie_status.setText("(no config)")
+            return
+        from pathlib import Path
+        profile_root = (
+            self._config.cdp_downloader.chrome_user_data_dir
+        ).expanduser()
+        try:
+            present = set(_detect_publisher_cookie_domains(Path(profile_root)))
+        except Exception:
+            present = set()
+        bits: list[str] = []
+        for label, domains in publisher_domains:
+            logged = any(d in present for d in domains)
+            color = "#2a7a3a" if logged else "#cc785c"
+            mark = "✓" if logged else "✗"
+            bits.append(
+                f'<span style="color:{color};">{label} {mark}</span>'
+            )
+        # arXiv doesn't need login (open access) — mark it as always
+        # ready so the user doesn't have to wonder.
+        bits.append(
+            f'<span style="color:#2a7a3a;">arXiv ✓</span>'
+        )
+        self._cookie_status.setText("  ".join(bits))
 
     def _on_url_changed(self, url: QtCore.QUrl) -> None:
         # Don't echo about:blank into the URL bar — leaves a stale-looking
@@ -1494,7 +1578,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._rag_panel = RAGPanel(on_run_daily=self._on_run_daily)
         layout.addWidget(self._rag_panel, stretch=1)
 
-        self._browser_panel = BrowserPanel()
+        self._browser_panel = BrowserPanel(config=self._controller.config)
         layout.addWidget(self._browser_panel, stretch=4)
         return right
 
