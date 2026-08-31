@@ -939,15 +939,19 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
 
     # ---- Cross-thread bridge for "运行今日管线" status ----------------
 
-    @QtCore.Slot(str)
+    @QtCore.Slot("QString")
     def _set_rag_status_from_any_thread(self, text: str) -> None:
         # Slot target for ``QMetaObject.invokeMethod``. ``QLabel.setText``
         # is a plain Python method, not a registered Qt slot, so calling
         # ``invokeMethod(label, "setText", ...)`` returns ``True`` but
-        # never actually fires. ``@Slot(str)`` registers this method in
-        # Qt's meta-object system so cross-thread
+        # never actually fires. ``@Slot("QString")`` registers this
+        # method in Qt's meta-object system so cross-thread
         # ``invokeMethod(..., QueuedConnection, ...)`` posts the call onto
         # the GUI event loop and the actual ``setText`` runs there.
+        # Use ``QString`` (not the bare ``str``) — PySide6's invokeMethod
+        # matches a Qt string Q_ARG against ``@Slot("QString")`` but
+        # silently drops the call against a bare ``@Slot(str)``, so the
+        # status label never updates.
         self._rag_panel._status.setText(text)
 
     def _post_status(self, text: str) -> None:
