@@ -106,6 +106,13 @@ class ShellController:
         # use so the controller's main-thread constructor stays light.
         self._service: Any = None
         self._service_lock = threading.Lock()
+        # Set when ``_prime_service`` finishes (or skips because the
+        # mode / ``_HAS_CODEX_SERVICE`` flag vetoed the warm-up).
+        # ``_run_chat_turn`` waits up to 30 s for this before falling
+        # through, so a user turn that races the background warm-up
+        # never lands on a not-yet-ready service and silently
+        # downgrades to the legacy ``handle_agent_chat`` path.
+        self._service_ready = threading.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -150,25 +157,26 @@ class ShellController:
             _HAS_CODEX_SERVICE
             and self._config.agent_runtime.mode == "codex_app_server"
         ):
+            self._service_ready.set()
             return
         with self._service_lock:
             if self._service is None:
                 self._service = CodexAppServerChatService(self._config)
         # ``service.warmup()`` builds the runtime manager and forces it
         # to open the codex subprocess + run the JSON-RPC ``initialize``
-        # handshake. ``_prime_real_turn()`` then runs a one-token
-        # "ping" turn so the OpenAI API connection pool + token cache
-        # are warm too. Without the dummy turn, the user's first real
-        # message pays ~2 s of one-shot OpenAI cold-start on top of
-        # the codex turn itself; with the dummy turn the first real
-        # turn is ~3-4 s instead of ~6 s. Best-effort: failures here
-        # leave ``self._service`` set so the lazy chat path still works.
+        # handshake. A previous version awaited the warmup here, but
+        # the runtime_manager's lock serialised the warmup's no-op
+        # turn against the user's first real turn, so the chat
+        # thread waited the full ``service_ready.wait`` timeout (30 s)
+        # for nothing. The warmup now runs in the background; the
+        # first user turn pays the spawn cost (5-10 s) once and then
+        # every subsequent turn reuses the warm client.
+        asyncio.create_task(self._run_warmup())
+        self._service_ready.set()
+
+    async def _run_warmup(self) -> None:
         try:
             await self._service.warmup()
-        except Exception:
-            pass
-        try:
-            await self._prime_real_turn()
         except Exception:
             pass
 
@@ -178,8 +186,21 @@ class ShellController:
         suppresses the ``message_appended`` event so the dummy "**.**"
         answer does not pollute the user's chat scrollback.
         """
+        # Call ``service.chat`` directly — going through
+        # ``_run_chat_turn`` would deadlock because that path waits
+        # on ``_service_ready`` which is the event we are *about* to
+        # set at the bottom of ``_prime_service``. The dummy reply is
+        # discarded.
         try:
-            await self._run_chat_turn(".", silent=True)
+            request = ChatRequest(
+                session_id=self._session.session_id,
+                message=".",
+                current_workspace=self._workspace,
+                trace_id=f"{self._session.session_id}-warmup",
+            )
+            await self._service.chat(
+                request, self._workspace, self._session,
+            )
         except Exception:
             pass
 
@@ -244,6 +265,19 @@ class ShellController:
         )
 
     async def _run_chat_turn(self, text: str, *, silent: bool = False) -> None:
+        # Wait for ``_prime_service`` to finish (or skip) before
+        # touching the service — otherwise a user turn that races
+        # the background warm-up can land on a not-yet-ready client
+        # and silently downgrades to the legacy ``handle_agent_chat``
+        # path (which doesn't take ``on_delta`` and therefore never
+        # streams). The wait is bounded so a hung warm-up never
+        # freezes the chat thread.
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._service_ready.wait, 30.0,
+            )
+        except Exception:
+            pass
         request = ChatRequest(
             session_id=self._session.session_id,
             message=text,
