@@ -1284,6 +1284,11 @@ class BrowserPanel(QtWidgets.QFrame):
         self._cookie_status.setObjectName("cookie_status")
         self._cookie_status.setTextFormat(QtCore.Qt.TextFormat.RichText)
         self._cookie_status.setWordWrap(False)
+        # Treat the ✗ markers as in-label links so clicking them jumps
+        # the embedded Chromium to the publisher's sign-in page. The
+        # full HTML string is re-set on every refresh; the slot only
+        # needs to be connected once.
+        self._cookie_status.linkActivated.connect(self.open_url)
         self._cookie_status.setStyleSheet(
             f"color:{DESIGN['ink_muted']};font-size:11px;padding:2px 10px;"
         )
@@ -1355,13 +1360,31 @@ class BrowserPanel(QtWidgets.QFrame):
         except Exception:
             present = set()
         bits: list[str] = []
+        # Map the short label back to the publisher sign-in URL so the
+        # ✗ marker becomes a clickable shortcut: clicking ✗ fires
+        # ``BrowserPanel.open_url`` for that publisher, which is the
+        # exact behaviour the user asked for ("主动弹出来就可以了").
         for label, domains in publisher_domains:
             logged = any(d in present for d in domains)
-            color = "#2a7a3a" if logged else "#cc785c"
-            mark = "✓" if logged else "✗"
-            bits.append(
-                f'<span style="color:{color};">{label} {mark}</span>'
+            signin_url = next(
+                (u for btn_label, u in self.PUBLISHER_LINKS if btn_label.endswith(label)),
+                None,
             )
+            if logged:
+                color = "#2a7a3a"
+                mark = "✓"
+                bits.append(
+                    f'<span style="color:{color};">{label} {mark}</span>'
+                )
+            else:
+                # ✗ is a clickable shortcut: the click fires
+                # ``open_url(signin_url)`` so the embedded Chromium
+                # navigates straight to the publisher's sign-in page.
+                bits.append(
+                    f'<a href="{signin_url}" '
+                    f'style="color:#cc785c;text-decoration:none;">'
+                    f"{label} ✗</a>"
+                )
         # arXiv doesn't need login (open access) — mark it as always
         # ready so the user doesn't have to wonder.
         bits.append(
