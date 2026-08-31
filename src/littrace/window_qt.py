@@ -1201,7 +1201,37 @@ class BrowserPanel(QtWidgets.QFrame):
     decision and only adds the publisher row.
     """
 
-    HOME_URL = "about:blank"
+    # The embedded Chromium starts on a small data-URL welcome page
+    # so the user sees actionable guidance instead of a blank
+    # ``about:blank``. The data URL carries the same publisher
+    # shortcut rail as the toolbar below it, plus a one-line note
+    # about ``auto_launch_chrome`` having just brought the private
+    # Chrome up for them.
+    HOME_URL = (
+        "data:text/html;charset=utf-8,"
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>LitTrace Publisher Browser</title>"
+        "<style>"
+        "  body { font-family: -apple-system, 'Helvetica Neue', sans-serif;"
+        "         margin: 24px; color: #0b0c0e; background: #fbfbfc; }"
+        "  h1 { font-size: 18px; margin: 0 0 12px; }"
+        "  p { color: #5c6068; line-height: 1.55; margin: 8px 0; }"
+        "  code { background: #f7f8f8; padding: 1px 6px; border-radius: 3px;"
+        "         font-family: Menlo, Consolas, monospace; font-size: 12px; }"
+        "  a { color: #3a8a8c; text-decoration: none; }"
+        "  .ok { color: #2a7a3a; }"
+        "</style></head><body>"
+        "<h1>LitTrace Publisher Browser</h1>"
+        "<p class='ok'>✓ LitTrace private Chrome is up on "
+        "<code>http://127.0.0.1:19222</code>.</p>"
+        "<p>Pick a publisher above to open its sign-in page here. Once "
+        "you sign in, the session cookie is stored in LitTrace's "
+        "private profile so the next <em>检索并补全文献</em> run can "
+        "reach the gated PDFs.</p>"
+        "<p>Need a publisher that's not on the row? Paste its URL in "
+        "the bar above to navigate manually.</p>"
+        "</body></html>"
+    )
 
     # Sign-in URLs for the publishers LitTrace is wired to handle. These
     # land the user on whichever page surfaces a "Sign in" link near
@@ -1303,6 +1333,32 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._build_layout()
         self._wire_events()
         self._refresh_initial_state()
+        # ``auto_launch_chrome`` is true by default but no caller in the
+        # project actually invokes ``launch_chrome_for_cdp`` — so the
+        # private Chromium on ``./data/chrome-cdp`` only came up when
+        # the user clicked "🌐 打开 publisher 登录" in the daily dialog.
+        # Do it here too, in a background thread, so the embedded
+        # BrowserPanel's publisher buttons actually work the first time
+        # the user opens one. The thread is daemon, the work is gated
+        # by ``check_cdp_status`` (no-op if Chrome is already up), and
+        # failures are swallowed so an auto-launch miss never blocks
+        # the chat thread.
+        if getattr(self._controller.config.cdp_downloader, "auto_launch_chrome", False):
+            self._auto_launch_chrome()
+
+    def _auto_launch_chrome(self) -> None:
+        import threading
+        from littrace.chrome_profiles import launch_chrome_for_cdp
+
+        def _worker():
+            try:
+                result = launch_chrome_for_cdp(self._controller.config)
+                if result.launched:
+                    self._post_status("publisher Chrome 已启动（CDP 19222）")
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True, name="littrace-auto-chrome").start()
 
     # ---- Cross-thread bridge for "运行今日管线" status ----------------
 
