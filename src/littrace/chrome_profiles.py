@@ -145,7 +145,7 @@ def launch_chrome_for_cdp(
             error="Could not build a Chrome launch command.",
         )
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             plan.command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -158,6 +158,20 @@ def launch_chrome_for_cdp(
             cdp_status=status,
             command=plan.command,
             error=f"{exc.__class__.__name__}: {exc}",
+        )
+    # Chrome on macOS will exit immediately if its user-data-dir is already
+    # held by another Chrome instance (it prints "正在现有的浏览器会话中打开。"
+    # and quits). Without this poll the launcher just reports "CDP endpoint
+    # did not become available" with no hint about the real cause — leaving
+    # users to debug it themselves.
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        return ChromeLaunchResult(
+            attempted=True,
+            launched=False,
+            cdp_status=status,
+            command=plan.command,
+            error=_explain_chrome_early_exit(plan, proc.returncode),
         )
     deadline = time.monotonic() + max(wait_seconds, 0.0)
     latest_status = status
@@ -177,6 +191,39 @@ def launch_chrome_for_cdp(
         cdp_status=latest_status,
         command=plan.command,
         error="Chrome was launched, but the CDP endpoint did not become available in time.",
+    )
+
+
+def _explain_chrome_early_exit(plan: ChromeLaunchPlan, returncode: int | None) -> str:
+    """Return a user-actionable error when the launched Chrome process exited
+    before the CDP endpoint could come up. The common case on macOS is that
+    another Chrome instance is already using the same user-data-dir — Chrome
+    refuses to start a second one and exits immediately. Without this hint
+    users see only the generic ``CDP endpoint did not become available``
+    error and cannot diagnose the problem.
+    """
+    user_data_dir = Path(plan.user_data_dir)
+    profile_dir = user_data_dir / plan.profile_name
+    lock_candidates = [
+        user_data_dir / "SingletonLock",
+        user_data_dir / "Singleton",
+        profile_dir / "LOCK",
+    ]
+    conflicting_lock = next(
+        (lock for lock in lock_candidates if lock.exists()), None
+    )
+    if conflicting_lock is not None:
+        return (
+            f"Chrome exited immediately (returncode={returncode}). The user-data-dir "
+            f"{user_data_dir!s} appears to be in use by another Chrome instance "
+            f"(lock file: {conflicting_lock.name}). Quit the existing Google Chrome "
+            f"window and re-run `littrace setup-browser --launch`, or set "
+            f"cdp_downloader.chrome_user_data_dir in config.yaml to a fresh directory."
+        )
+    return (
+        f"Chrome exited immediately (returncode={returncode}) before the CDP "
+        f"endpoint could bind. No conflicting user-data-dir lock was detected; "
+        f"check the launch command above for unsupported flags."
     )
 
 
