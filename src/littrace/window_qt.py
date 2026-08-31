@@ -2126,6 +2126,104 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._status_bar.showMessage("就绪")
+        # Drop a one-shot onboarding banner the first time the user
+        # opens LitTrace. The flag file lives next to the LitTrace
+        # config so it survives across sessions; closing the dialog
+        # is the user's explicit acknowledgement. This is the answer to
+        # the "no onboarding, new users don't know what to do" pain
+        # point — three explicit steps in plain Chinese, with a
+        # pointer to the right panel for each.
+        from pathlib import Path
+        marker = Path.home() / ".littrace_welcomed"
+        if not marker.exists():
+            QtCore.QTimer.singleShot(
+                400, lambda: self._show_welcome_banner(marker)
+            )
+
+    def _show_welcome_banner(self, marker_path: "Path") -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("欢迎使用 LitTrace")
+        dialog.setModal(True)
+        dialog.resize(540, 380)
+
+        outer = QtWidgets.QVBoxLayout(dialog)
+        outer.setContentsMargins(24, 20, 24, 20)
+        outer.setSpacing(14)
+
+        title = QtWidgets.QLabel("欢迎使用 LitTrace")
+        title.setStyleSheet(
+            f"font-size:18px;font-weight:600;color:{DESIGN['ink']};"
+        )
+        outer.addWidget(title)
+
+        subtitle = QtWidgets.QLabel(
+            "3 步把 LitTrace 用起来："
+        )
+        subtitle.setStyleSheet(
+            f"font-size:13px;color:{DESIGN['ink_muted']};"
+        )
+        outer.addWidget(subtitle)
+
+        steps = [
+            (
+                "1. 在右下角点登录 publisher",
+                "首次检索时需要 Wiley/ACS/Springer/Nature 的访问权限。"
+                "Cookie 状态显示在浏览器面板顶部，"
+                "点 ✗ 一键跳到登录页。",
+            ),
+            (
+                "2. 点 \"🔍 搜索研究主题\"",
+                "弹窗里填主题 / 关键词 / 年份区间 / 最少下载数。"
+                "Sentinel 会按主题检索并解析 PDF。",
+            ),
+            (
+                "3. 在中间对话框里对话",
+                "输 / 弹 slash 命令；assistant 边生成边显示。"
+                "聊天记录自动保存到 session。",
+            ),
+        ]
+        for heading, body in steps:
+            step_label = QtWidgets.QLabel(f"<b>{heading}</b>")
+            step_label.setStyleSheet(
+                f"font-size:13px;color:{DESIGN['ink']};"
+            )
+            body_label = QtWidgets.QLabel(body)
+            body_label.setWordWrap(True)
+            body_label.setStyleSheet(
+                f"font-size:12px;color:{DESIGN['ink_muted']};"
+            )
+            outer.addWidget(step_label)
+            outer.addWidget(body_label)
+
+        outer.addStretch(1)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.setSpacing(8)
+        button_row.addStretch(1)
+        ok_btn = QtWidgets.QPushButton("明白了，不再显示")
+        ok_btn.setObjectName("subnav_btn_primary")
+        ok_btn.setDefault(True)
+
+        def _on_close() -> None:
+            try:
+                marker_path.parent.mkdir(parents=True, exist_ok=True)
+                marker_path.touch()
+            except OSError as exc:
+                print(f"[littrace] warning: failed to write {marker_path}: {exc}")
+            # ``close()`` only hides a modeless dialog; the widget stays
+            # in the ``QApplication``'s top-level list. ``deleteLater()``
+            # is what actually tears it down so the next-start check
+            # (``Path.exists``) sees no stale dialog.
+            dialog.close()
+            dialog.deleteLater()
+
+        ok_btn.clicked.connect(_on_close)
+        button_row.addWidget(ok_btn)
+        outer.addLayout(button_row)
+
+        # Show non-blocking so the controller's ``singleShot`` timer
+        # callback can return and the main loop can keep spinning.
+        dialog.show()
 
 
 # ---------------------------------------------------------------------------
