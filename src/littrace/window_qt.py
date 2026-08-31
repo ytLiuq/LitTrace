@@ -1564,44 +1564,87 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         import threading
 
         def _worker():
-            try:
-                cmd, env, cwd = _littrace_cmd(
-                    "sentinel", "run",
-                    "--watchlist", topic,
-                    "--topic", keywords or topic,
+            # Multi-round retrieval. The user's "最少检索数目" is a
+            # target, not a hard cap. Each round queries sentinel with
+            # a different topic variation so the underlying API
+            # returns fresh candidates. Sentinel dedupes on paper id
+            # (DOI), so the cumulative ``downloaded`` counter across
+            # rounds is what really matters. We cap at ``MAX_ROUNDS``
+            # and use a per-round ``timeout`` because a single sentinel
+            # run can take ~2 min on a cold OpenAlex cache; three
+            # rounds would otherwise blow past the user wait budget.
+            MAX_ROUNDS = 2
+            PER_ROUND_TIMEOUT = 180
+            base_keywords = keywords or topic
+            queries = [
+                base_keywords,
+                f"{base_keywords} review",
+            ]
+            cumulative_downloaded = 0
+            cumulative_candidates = 0
+            rounds_done = 0
+            last_summary = ""
+            for round_idx, q in enumerate(queries, start=1):
+                self._post_status(
+                    f"第 {round_idx}/{MAX_ROUNDS} 轮检索 · query='{q}'"
                 )
-                completed = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                    cwd=cwd,
-                    env=env,
-                )
-                summary = _summarise_sentinel_output(
-                    completed.stdout or ""
-                )
+                try:
+                    cmd, env, cwd = _littrace_cmd(
+                        "sentinel", "run",
+                        "--watchlist", topic,
+                        "--topic", q,
+                    )
+                    completed = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=PER_ROUND_TIMEOUT,
+                        cwd=cwd,
+                        env=env,
+                    )
+                except subprocess.TimeoutExpired:
+                    self._post_status(
+                        f"第 {round_idx} 轮超时（{PER_ROUND_TIMEOUT // 60} 分钟），跳过"
+                    )
+                    continue
+                except Exception as exc:  # pragma: no cover - defensive
+                    self._post_status(
+                        f"第 {round_idx} 轮失败: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                rounds_done += 1
+                summary = _summarise_sentinel_output(completed.stdout or "")
+                last_summary = summary
                 downloaded = _summary_value(summary, "downloaded:")
                 candidates = _summary_value(summary, "new_candidates:")
-                headline = (
-                    f"检索完成（exit={completed.returncode}）· {summary}"
+                if downloaded is not None:
+                    cumulative_downloaded += downloaded
+                if candidates is not None:
+                    cumulative_candidates += candidates
+                # Stop early once we have enough downloads. Sentinel
+                # dedupes by DOI so accumulated downloaded is the
+                # real "we found N new papers" count.
+                if cumulative_downloaded >= min_papers:
+                    break
+            headline = (
+                f"检索完成（{rounds_done} 轮）· {last_summary}"
+            )
+            shortfall = []
+            if (
+                cumulative_downloaded is not None
+                and cumulative_downloaded < min_papers
+            ):
+                shortfall.append(
+                    f"{rounds_done} 轮累计下了 {cumulative_downloaded} 篇，"
+                    f"少于目标 {min_papers} 篇"
                 )
-                shortfall = []
-                if downloaded is not None and downloaded < min_papers:
-                    shortfall.append(
-                        f"只下了 {downloaded} 篇，少于目标 {min_papers} 篇"
-                    )
-                if candidates is not None and candidates < 3:
-                    shortfall.append(
-                        f"只检索到 {candidates} 个候选——考虑扩大关键词或时间区间"
-                    )
-                if shortfall:
-                    headline += " · ⚠️ " + "；".join(shortfall)
-                self._post_status(headline)
-            except subprocess.TimeoutExpired:
-                self._post_status("检索超时（10 分钟）")
-            except Exception as exc:  # pragma: no cover - defensive
-                self._post_status(f"检索失败: {type(exc).__name__}: {exc}")
+            if cumulative_candidates is not None and cumulative_candidates < 5:
+                shortfall.append(
+                    f"累计检索到 {cumulative_candidates} 个候选"
+                )
+            if shortfall:
+                headline += " · ⚠️ " + "；".join(shortfall)
+            self._post_status(headline)
 
         threading.Thread(target=_worker, daemon=True, name="littrace-daily").start()
 
