@@ -1354,6 +1354,26 @@ def _print_doctor(config) -> None:
         print(f"chrome: {setup.discovery.executable}")
     if setup.discovery.user_data_dir:
         print(f"user data dir: {setup.discovery.user_data_dir}")
+        # Surface whether LitTrace is sharing Chrome with the user's
+        # day-to-day browser (collision risk) or running in a private
+        # profile (the default).
+        from pathlib import Path as _Path
+        resolved = _Path(setup.discovery.user_data_dir).expanduser()
+        is_private = not (
+            resolved.resolve() == _Path.home() / "Library/Application Support/Google/Chrome"
+            or resolved.resolve() == _Path.home() / ".config/google-chrome"
+        )
+        if is_private:
+            print(
+                "profile mode: private (LitTrace's Chrome is isolated from your "
+                "day-to-day browser; sign in to each publisher once)"
+            )
+        else:
+            print(
+                "profile mode: shared (LitTrace is reusing your day-to-day Chrome "
+                "profile — quit Chrome before launching LitTrace, or set "
+                "cdp_downloader.chrome_user_data_dir to a fresh path)"
+            )
     if setup.selected_profile:
         cookies = ", ".join(setup.selected_profile.publisher_cookie_domains) or "none detected"
         print(

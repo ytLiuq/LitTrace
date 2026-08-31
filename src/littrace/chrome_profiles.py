@@ -77,9 +77,18 @@ def discover_chrome_profiles(config: LitTraceConfig) -> ChromeDiscoveryResult:
     profiles: list[ChromeProfileInfo] = []
     if user_data_dir is None:
         warnings.append("Could not infer Chrome user data directory for this platform.")
-    elif not user_data_dir.exists():
-        warnings.append(f"Chrome user data directory was not found: {user_data_dir}")
     else:
+        # The default LitTrace chrome_user_data_dir lives under ./data and
+        # is created lazily on first launch. Treat a missing directory as
+        # "not yet provisioned" rather than a configuration error so the
+        # first-time setup flow is not flagged as broken.
+        if not user_data_dir.exists():
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            warnings.append(
+                f"Initialized empty Chrome user-data-dir at {user_data_dir}. "
+                "Open the LitTrace Chrome once and sign in to each publisher "
+                "you want full-text access to."
+            )
         profiles = _read_profiles(user_data_dir)
         if not profiles:
             warnings.append(f"No Chrome profiles were found under {user_data_dir}.")
@@ -144,6 +153,12 @@ def launch_chrome_for_cdp(
             cdp_status=status,
             error="Could not build a Chrome launch command.",
         )
+    # LitTrace defaults chrome_user_data_dir to a private directory under
+    # the repo so its Chrome process never collides with the user's
+    # day-to-day browser. Ensure that directory exists before Chrome
+    # starts — without it, Chrome refuses to launch with --user-data-dir.
+    user_data_dir = Path(plan.user_data_dir)
+    user_data_dir.mkdir(parents=True, exist_ok=True)
     try:
         proc = subprocess.Popen(
             plan.command,

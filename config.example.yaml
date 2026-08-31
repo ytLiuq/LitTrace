@@ -70,10 +70,21 @@ api:
 cdp_downloader:
   cdp_url: "http://127.0.0.1:19222"
   chrome_executable: null
-  chrome_user_data_dir: null
+  # LitTrace uses a private Chrome profile under ./data/chrome-cdp so it
+  # never collides with the user's day-to-day Chrome instance (whose
+  # user-data-dir is locked while it is running). Set to null to fall
+  # back to the platform default Chrome user-data-dir (only safe when
+  # your normal Chrome is not running). The first time the profile is
+  # created LitTrace prints a one-off instruction to sign in to each
+  # publisher you want full-text access to.
+  chrome_user_data_dir: "./data/chrome-cdp"
   chrome_profile_name: "Default"
   remote_debugging_port: 19222
-  auto_launch_chrome: false
+  # When true, LitTrace launches its private Chrome on demand so the
+  # user does not need to run `littrace setup-browser --launch` before
+  # every session. Disable here (or set LITTRACE_AUTO_LAUNCH_CHROME=false)
+  # to opt out.
+  auto_launch_chrome: true
   cloudflare_wait_seconds: 60
   user_action_wait_seconds: 30
   command_timeout_seconds: 60

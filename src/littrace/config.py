@@ -204,10 +204,21 @@ class CDPDownloaderConfig(BaseModel):
     cdp_url: str = "http://127.0.0.1:19222"
     default_output_dir: Path | None = None
     chrome_executable: Path | None = None
-    chrome_user_data_dir: Path | None = None
+    # LitTrace ships with a private Chrome profile under ./data/chrome-cdp
+    # so it never collides with the user's day-to-day Chrome instance
+    # (whose user-data-dir is locked while it is running). On the first
+    # ``setup-browser`` launch LitTrace creates this directory and points
+    # Chrome at it via --user-data-dir; the user must sign in to each
+    # publisher they want full-text access to, once. Set to null to fall
+    # back to the platform default Chrome user-data-dir (only safe when
+    # your normal Chrome is not running).
+    chrome_user_data_dir: Path | None = Path("./data/chrome-cdp")
     chrome_profile_name: str = "Default"
     remote_debugging_port: int = 19222
-    auto_launch_chrome: bool = False
+    # LitTrace launches its private Chrome on demand so the user does
+    # not need to run ``setup-browser --launch`` before every session.
+    # Disable here (or set LITTRACE_AUTO_LAUNCH_CHROME=false) to opt out.
+    auto_launch_chrome: bool = True
     cloudflare_wait_seconds: float = 60.0
     user_action_wait_seconds: float = 30.0
     command_timeout_seconds: float = 60.0
@@ -633,6 +644,11 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
             config.cdp_downloader.cdp_url = (
                 f"http://127.0.0.1:{config.cdp_downloader.remote_debugging_port}"
             )
+    auto_launch = os.environ.get("LITTRACE_AUTO_LAUNCH_CHROME")
+    if auto_launch is not None:
+        config.cdp_downloader.auto_launch_chrome = auto_launch.lower() not in {
+            "0", "false", "no", "off"
+        }
     fallback_models = os.environ.get("LITTRACE_LLM_FALLBACK_MODELS")
     if fallback_models:
         config.llm.fallback_models = [
