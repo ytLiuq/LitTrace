@@ -20,6 +20,17 @@ from littrace.config import LitTraceConfig
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
 from littrace.session import ChatSession, create_chat_session, load_workspace
 
+try:
+    # Hold a long-lived CodexAppServerChatService so the Codex CLI subprocess
+    # and JSON-RPC handshake are reused across turns. Without this every chat
+    # turn pays the ~7s spawn+initialize tax; with it a follow-up turn is
+    # typically <2s of pure LLM round-trip latency.
+    from littrace.codex_runtime.service import CodexAppServerChatService
+
+    _HAS_CODEX_SERVICE = True
+except Exception:  # pragma: no cover - defensive
+    _HAS_CODEX_SERVICE = False
+
 
 @dataclass(frozen=True)
 class ShellEvent:
@@ -74,6 +85,7 @@ class ShellController:
 
     EVENT_MESSAGE_APPENDED = "message_appended"
     EVENT_STATUS_CHANGED = "status_changed"
+    EVENT_THINKING = "thinking"
     EVENT_WORKSPACE_REFRESHED = "workspace_refreshed"
     EVENT_RAG_PANEL_REFRESHED = "rag_panel_refreshed"
     EVENT_OCR_BUTTONS_REFRESHED = "ocr_buttons_refreshed"
@@ -88,6 +100,12 @@ class ShellController:
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
+        # Reuse a single CodexAppServerChatService across turns so we
+        # don't pay the codex-app-server spawn + JSON-RPC initialize cost
+        # on every chat turn. Built lazily on the worker thread on first
+        # use so the controller's main-thread constructor stays light.
+        self._service: Any = None
+        self._service_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -157,6 +175,7 @@ class ShellController:
         if not text.strip():
             return
         self._emit(self.EVENT_STATUS_CHANGED, text="处理中…")
+        self._emit(self.EVENT_THINKING, active=True, label="正在理解任务…")
         self._emit(self.EVENT_MESSAGE_APPENDED, role="user", text=text)
         if self._loop is None:
             self._emit(self.EVENT_ERROR, message="controller event loop not ready")
@@ -172,15 +191,43 @@ class ShellController:
             current_workspace=self._workspace,
             trace_id=f"{self._session.session_id}",
         )
+        # Use the long-lived CodexAppServerChatService when in codex_app_server
+        # mode so the App Server subprocess + JSON-RPC handshake are reused
+        # across turns. Falls back to the legacy top-level dispatcher for
+        # other modes or if the service import failed at module load.
+        service = None
+        if (
+            _HAS_CODEX_SERVICE
+            and self._config.agent_runtime.mode == "codex_app_server"
+        ):
+            with self._service_lock:
+                if self._service is None:
+                    self._service = CodexAppServerChatService(self._config)
+                service = self._service
+
+        async def _thinking(label: str) -> None:
+            self._emit(self.EVENT_THINKING, active=True, label=label)
+
+        # Surface the early pipeline steps to the UI so the user sees the
+        # model is moving instead of staring at a frozen chat input.
+        await _thinking("正在解析任务意图…")
+
         try:
-            response, workspace = await handle_agent_chat(
-                request,
-                self._workspace,
-                self._config,
-                session=self._session,
-            )
+            self._emit(self.EVENT_THINKING, active=True, label="调用 Codex / 模型…")
+            if service is not None:
+                response, workspace = await service.chat(
+                    request, self._workspace, self._session
+                )
+            else:
+                response, workspace = await handle_agent_chat(
+                    request,
+                    self._workspace,
+                    self._config,
+                    session=self._session,
+                )
         except Exception as exc:
             self._emit(self.EVENT_ERROR, message=f"{type(exc).__name__}: {exc}")
+            self._emit(self.EVENT_THINKING, active=False)
             self._emit(self.EVENT_STATUS_CHANGED, text="错误")
             return
         with self._lock:
@@ -193,6 +240,7 @@ class ShellController:
             warnings=response.warnings,
         )
         self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        self._emit(self.EVENT_THINKING, active=False)
         self._emit(self.EVENT_STATUS_CHANGED, text="就绪")
 
     # ------------------------------------------------------------------

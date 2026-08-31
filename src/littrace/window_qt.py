@@ -33,7 +33,10 @@ from littrace.session import list_chat_sessions
 from littrace.shell_controller import ShellController, ShellEvent
 
 
-logger = logging.getLogger("littrace.window_qt")
+# Animated "thinking" dots used in the chat-panel status strip. Cycles
+# through 1..3 dots so the user gets a clear heartbeat while a Codex
+# turn is in flight — the previous static "处理中…" looked frozen.
+_THINKING_FRAMES = ("·  ·  ·", "·· ··", "·····")
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +62,13 @@ DESIGN = {
     "accent_teal_subtle": "#e6efee",
 }
 
+
+logger = logging.getLogger("littrace.window_qt")
+
+
+# ---------------------------------------------------------------------------
+# Design tokens — kept in sync with the Tk shell's DESIGN dict.
+# ---------------------------------------------------------------------------
 
 WINDOW_QSS = f"""
 QMainWindow, QWidget#root {{
@@ -173,6 +183,18 @@ QLabel#status {{
 QStatusBar {{
     background: {DESIGN["parchment"]};
     color: {DESIGN["ink_muted"]};
+}}
+
+QLabel#thinking_strip {{
+    color: {DESIGN["ink_muted"]};
+    background: {DESIGN["surface_2"]};
+    border: 1px solid {DESIGN["hairline"]};
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-style: italic;
+}}
+QLabel#thinking_strip[active="true"] {{
+    color: {DESIGN["primary"]};
 }}
 
 QSplitter::handle {{
@@ -303,6 +325,24 @@ class ChatPanel(QtWidgets.QFrame):
         self._view.customContextMenuRequested.connect(self._on_chat_context_menu)
         layout.addWidget(self._view, stretch=1)
 
+        # Thinking strip — sits between the chat scrollback and the input
+        # box, mirroring ChatGPT Codex App's "thinking / researching" row.
+        # Animated dots + the current pipeline label so the user can see
+        # the controller is alive while a turn is in flight.
+        self._thinking = QtWidgets.QLabel("")
+        self._thinking.setObjectName("thinking_strip")
+        self._thinking.setMinimumHeight(22)
+        self._thinking.setStyleSheet(
+            f"color:{DESIGN['ink_muted']};padding:2px 6px;font-style:italic;"
+        )
+        self._thinking.hide()
+        layout.addWidget(self._thinking)
+        self._thinking_frame = 0
+        self._thinking_timer = QtCore.QTimer(self)
+        self._thinking_timer.setInterval(450)
+        self._thinking_timer.timeout.connect(self._tick_thinking)
+        self._thinking_label = ""
+
         input_row = QtWidgets.QHBoxLayout()
         self._input = QtWidgets.QLineEdit()
         self._input.setObjectName("input")
@@ -353,6 +393,24 @@ class ChatPanel(QtWidgets.QFrame):
                     self._popup.hide()
                     return True
         return super().eventFilter(source, event)
+
+    # ---- Thinking strip --------------------------------------------------
+
+    def _tick_thinking(self) -> None:
+        self._thinking_frame = (self._thinking_frame + 1) % len(_THINKING_FRAMES)
+        dots = _THINKING_FRAMES[self._thinking_frame]
+        self._thinking.setText(f"{self._thinking_label}  {dots}")
+
+    def set_thinking(self, active: bool, label: str = "") -> None:
+        if active:
+            self._thinking_label = label or "思考中"
+            self._thinking.show()
+            self._tick_thinking()
+            self._thinking_timer.start()
+        else:
+            self._thinking_timer.stop()
+            self._thinking.hide()
+            self._thinking_label = ""
 
     # ---- Slash popup logic ----------------------------------------------
 
@@ -501,13 +559,18 @@ class ContextPanel(QtWidgets.QFrame):
 
 
 class RAGPanel(QtWidgets.QFrame):
-    """Right column middle — RAG / Daily dashboard."""
+    """Right column middle — single Daily run entry point.
+
+    The original shell exposed three buttons ("刷新当前 session", "全量刷新",
+    "Full daily") whose semantics were unclear without reading the parser
+    code. Collapse them into one explicit action: **"运行今日管线"** runs
+    the daily retrieval + parse + RAG refresh against all sessions, and
+    the panel shows the result of the most recent run.
+    """
 
     def __init__(
         self,
-        on_refresh_session,
-        on_refresh_all,
-        on_full_daily,
+        on_run_daily,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -517,44 +580,42 @@ class RAGPanel(QtWidgets.QFrame):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
-        title = QtWidgets.QLabel("RAG / Daily")
+        title = QtWidgets.QLabel("今日管线")
         title.setObjectName("pane_title")
         layout.addWidget(title)
 
-        row = QtWidgets.QHBoxLayout()
-        layout.addLayout(row)
-        b1 = QtWidgets.QPushButton("刷新当前 session")
-        b1.setObjectName("subnav_btn")
-        b1.clicked.connect(on_refresh_session)
-        row.addWidget(b1)
-        b2 = QtWidgets.QPushButton("全量刷新")
-        b2.setObjectName("subnav_btn")
-        b2.clicked.connect(on_refresh_all)
-        row.addWidget(b2)
-        b3 = QtWidgets.QPushButton("Full daily")
-        b3.setObjectName("subnav_btn_primary")
-        b3.clicked.connect(on_full_daily)
-        row.addWidget(b3)
+        helper = QtWidgets.QLabel(
+            "检索最新文献 → 下载开放访问 PDF → 用 docling 解析 → 写入 RAG 索引。"
+        )
+        helper.setObjectName("status")
+        helper.setWordWrap(True)
+        layout.addWidget(helper)
 
-        self._status = QtWidgets.QLabel("RAG 状态：未知（运行 Full daily 后更新）")
+        run_btn = QtWidgets.QPushButton("运行今日管线")
+        run_btn.setObjectName("subnav_btn_primary")
+        run_btn.clicked.connect(on_run_daily)
+        layout.addWidget(run_btn)
+
+        self._status = QtWidgets.QLabel("未运行")
         self._status.setObjectName("status")
         self._status.setWordWrap(True)
         layout.addWidget(self._status, stretch=1)
 
     def set_status(self, text: str) -> None:
-        self._status.setText(f"RAG 状态：{text}")
+        self._status.setText(text)
 
 
 class BrowserPanel(QtWidgets.QFrame):
-    """Right column lower — QWebEngineView pane.
+    """Right column lower — QWebEngineView pane for publisher pages.
 
-    Real QWidget child of the splitter (not a separate NSWindow), so it
-    stays inside the LitTrace window and shares the focus / z-order with
-    the chat and trace panels. Use ``open_url`` from a controller /
-    button to navigate.
+    Three back/forward/reload buttons used to sit above the URL bar.
+    None of them are worth their weight — the URL bar already accepts any
+    input, and when LitTrace opens a publisher page automatically the
+    user has no reason to navigate away. Keep just a single URL line so
+    the panel stays out of the way.
     """
 
-    HOME_URL = "https://duckduckgo.com/"
+    HOME_URL = "about:blank"
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -566,30 +627,11 @@ class BrowserPanel(QtWidgets.QFrame):
 
         url_row = QtWidgets.QHBoxLayout()
         url_row.setContentsMargins(8, 8, 8, 4)
-
-        self._back = QtWidgets.QPushButton("←")
-        self._back.setFixedWidth(32)
-        self._back.setObjectName("subnav_btn")
-        self._back.clicked.connect(self._on_back)
-        url_row.addWidget(self._back)
-
-        self._forward = QtWidgets.QPushButton("→")
-        self._forward.setFixedWidth(32)
-        self._forward.setObjectName("subnav_btn")
-        self._forward.clicked.connect(self._on_forward)
-        url_row.addWidget(self._forward)
-
-        self._reload = QtWidgets.QPushButton("⟳")
-        self._reload.setFixedWidth(32)
-        self._reload.setObjectName("subnav_btn")
-        self._reload.clicked.connect(self._on_reload)
-        url_row.addWidget(self._reload)
-
+        url_row.addWidget(QtWidgets.QLabel("URL"))
         self._url = QtWidgets.QLineEdit()
-        self._url.setPlaceholderText("输入 URL（Enter 打开）…")
+        self._url.setPlaceholderText("粘贴 publisher 链接（Enter 打开）…")
         self._url.returnPressed.connect(self._on_url_entered)
         url_row.addWidget(self._url, stretch=1)
-
         layout.addLayout(url_row)
 
         self._view = QWebEngineView()
@@ -605,17 +647,14 @@ class BrowserPanel(QtWidgets.QFrame):
             text = "https://" + text
         self._view.setUrl(QtCore.QUrl(text))
 
-    def _on_back(self) -> None:
-        self._view.back()
-
-    def _on_forward(self) -> None:
-        self._view.forward()
-
-    def _on_reload(self) -> None:
-        self._view.reload()
-
     def _on_url_changed(self, url: QtCore.QUrl) -> None:
-        self._url.setText(url.toString())
+        # Don't echo about:blank into the URL bar — leaves a stale-looking
+        # field on startup.
+        text = url.toString()
+        if text == "about:blank":
+            self._url.clear()
+        else:
+            self._url.setText(text)
 
     def open_url(self, url: str) -> None:
         self._view.setUrl(QtCore.QUrl(url))
@@ -739,11 +778,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._context_panel = ContextPanel()
         layout.addWidget(self._context_panel, stretch=2)
 
-        self._rag_panel = RAGPanel(
-            on_refresh_session=self._on_rag_refresh_session,
-            on_refresh_all=self._on_rag_refresh_all,
-            on_full_daily=self._on_rag_full_daily,
-        )
+        self._rag_panel = RAGPanel(on_run_daily=self._on_run_daily)
         layout.addWidget(self._rag_panel, stretch=1)
 
         self._browser_panel = BrowserPanel()
@@ -824,17 +859,41 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             "右键 chat 区域可复制 / 全选 / 清屏。",
         )
 
-    def _on_rag_refresh_session(self) -> None:
-        self._status_bar.showMessage("RAG refresh 任务已加入队列…", 3000)
-        self._rag_panel.set_status("已入队（请看 jobs status）")
+    def _on_run_daily(self) -> None:
+        # Single Daily run entry point. The button hands off to
+        # ``littrace sentinel run --watchlist ...`` in a background thread
+        # so the chat thread stays responsive. The status line is updated
+        # when the run completes via a controller event.
+        self._status_bar.showMessage("今日管线启动中…", 3000)
+        self._rag_panel.set_status("运行中…")
+        import threading
 
-    def _on_rag_refresh_all(self) -> None:
-        self._status_bar.showMessage("全量 RAG refresh 已入队…", 3000)
-        self._rag_panel.set_status("全量 refresh 已入队")
+        def _worker():
+            try:
+                completed = subprocess.run(
+                    [
+                        "littrace",
+                        "sentinel",
+                        "run",
+                        "--watchlist",
+                        "mxene_sensor",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                msg = (completed.stdout or "").strip().splitlines()
+                tail = " · ".join(msg[-3:]) if msg else ""
+                self._post_status(f"今日管线完成（exit={completed.returncode}） · {tail}")
+            except subprocess.TimeoutExpired:
+                self._post_status("今日管线超时（10 分钟）")
+            except Exception as exc:  # pragma: no cover - defensive
+                self._post_status(f"今日管线失败: {type(exc).__name__}: {exc}")
 
-    def _on_rag_full_daily(self) -> None:
-        self._status_bar.showMessage("Full daily 已入队（需要时会触发 codex turn）", 3000)
-        self._rag_panel.set_status("full_daily 已入队")
+        threading.Thread(target=_worker, daemon=True, name="littrace-daily").start()
+
+    def _post_status(self, text: str) -> None:
+        QtCore.QTimer.singleShot(0, lambda: self._rag_panel.set_status(text))
 
     # ---- Event wiring ----------------------------------------------------
 
@@ -868,6 +927,13 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             if event.kind == controller.EVENT_STATUS_CHANGED:
                 self._status_bar.showMessage(event.payload.get("text", ""))
 
+        def on_thinking(event: ShellEvent) -> None:
+            if event.kind == controller.EVENT_THINKING:
+                self._chat_panel.set_thinking(
+                    active=bool(event.payload.get("active")),
+                    label=str(event.payload.get("label", "思考中")),
+                )
+
         def on_workspace(event: ShellEvent) -> None:
             if event.kind == controller.EVENT_WORKSPACE_REFRESHED:
                 self._context_panel.refresh(list(self._controller.list_active_papers()))
@@ -887,6 +953,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
 
         controller.bus.subscribe(post_to_gui(on_message))
         controller.bus.subscribe(post_to_gui(on_status))
+        controller.bus.subscribe(post_to_gui(on_thinking))
         controller.bus.subscribe(post_to_gui(on_workspace))
         controller.bus.subscribe(post_to_gui(on_error))
 
