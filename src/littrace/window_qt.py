@@ -1186,14 +1186,33 @@ class DailyConfigDialog(QtWidgets.QDialog):
 class BrowserPanel(QtWidgets.QFrame):
     """Right column lower — QWebEngineView pane for publisher pages.
 
-    Three back/forward/reload buttons used to sit above the URL bar.
-    None of them are worth their weight — the URL bar already accepts any
-    input, and when LitTrace opens a publisher page automatically the
-    user has no reason to navigate away. Keep just a single URL line so
-    the panel stays out of the way.
+    The panel exposes two shortcuts that come up often when the user
+    wants LitTrace to be able to pull gated PDFs:
+
+      * A row of one-click publisher login buttons (Wiley / ACS /
+        Springer / Nature / arXiv) right above the URL bar. Each opens
+        that publisher's sign-in page in the embedded Chromium, so the
+        user can sign in once and the session cookies live in
+        ``./data/chrome-cdp`` for the next ``sentinel run`` to use.
+      * A free-form URL line for ad-hoc navigation.
+
+    The previous round removed the back/forward/reload arrows because
+    the URL bar already accepts any input; this round keeps that
+    decision and only adds the publisher row.
     """
 
     HOME_URL = "about:blank"
+
+    # Sign-in URLs for the publishers LitTrace is wired to handle. These
+    # land the user on whichever page surfaces a "Sign in" link near
+    # the top-right after the federated SSO redirects land.
+    PUBLISHER_LINKS: list[tuple[str, str]] = [
+        ("🌐 Wiley", "https://onlinelibrary.wiley.com/action/login"),
+        ("🌐 ACS", "https://pubs.acs.org/action/showLogin"),
+        ("🌐 Springer", "https://link.springer.com/signup-login"),
+        ("🌐 Nature", "https://idp.nature.com/authorize?response_type=cookie"),
+        ("🌐 arXiv", "https://arxiv.org/login"),
+    ]
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1203,8 +1222,24 @@ class BrowserPanel(QtWidgets.QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # Publisher shortcut row — small text buttons so the row stays
+        # compact even with five entries.
+        publisher_row = QtWidgets.QHBoxLayout()
+        publisher_row.setContentsMargins(8, 8, 8, 0)
+        publisher_row.setSpacing(4)
+        for label, url in self.PUBLISHER_LINKS:
+            btn = QtWidgets.QPushButton(label)
+            btn.setObjectName("publisher_btn")
+            btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(url)
+            btn.clicked.connect(lambda _checked=False, u=url: self.open_url(u))
+            publisher_row.addWidget(btn)
+        publisher_row.addStretch(1)
+        layout.addLayout(publisher_row)
+
+        # Free-form URL bar for ad-hoc navigation.
         url_row = QtWidgets.QHBoxLayout()
-        url_row.setContentsMargins(8, 8, 8, 4)
+        url_row.setContentsMargins(8, 4, 8, 4)
         url_row.addWidget(QtWidgets.QLabel("URL"))
         self._url = QtWidgets.QLineEdit()
         self._url.setPlaceholderText("粘贴 publisher 链接（Enter 打开）…")
@@ -1218,16 +1253,28 @@ class BrowserPanel(QtWidgets.QFrame):
         layout.addWidget(self._view, stretch=1)
 
     def _on_url_entered(self) -> None:
-        text = self._url.text().strip()
+        self.open_url(self._url.text())
+
+    def _on_url_changed(self, url: QtCore.QUrl) -> None:
+        # Don't echo about:blank into the URL bar — leaves a stale-looking
+        # field on startup.
+        text = url.toString()
+        if text == "about:blank":
+            self._url.clear()
+        else:
+            self._url.setText(text)
+
+    def open_url(self, url: str) -> None:
+        """Load ``url`` in the embedded Chromium. Normalises bare hosts
+        (``example.com``) to ``https://example.com``) and tolerates
+        missing scheme prefixes; safe to call from any caller.
+        """
+        text = (url or "").strip()
         if not text:
             return
         if not text.startswith(("http://", "https://")):
             text = "https://" + text
         self._view.setUrl(QtCore.QUrl(text))
-
-    def _on_url_changed(self, url: QtCore.QUrl) -> None:
-        # Don't echo about:blank into the URL bar — leaves a stale-looking
-        # field on startup.
         text = url.toString()
         if text == "about:blank":
             self._url.clear()
