@@ -86,6 +86,16 @@ class ShellController:
     EVENT_MESSAGE_APPENDED = "message_appended"
     EVENT_STATUS_CHANGED = "status_changed"
     EVENT_THINKING = "thinking"
+    # Streaming token events — emitted by codex as the model writes
+    # text. Subscribers (the Qt chat bubble, in particular) update
+    # the visible reply as it arrives instead of waiting for the
+    # full assistant message.
+    EVENT_ASSISTANT_DELTA = "assistant_delta"
+    # Emitted once the full assistant reply is in, after the
+    # streaming deltas have finished. Chat panels should *replace*
+    # the streaming placeholder with this payload, not append a
+    # second bubble.
+    EVENT_ASSISTANT_FINAL = "assistant_final"
     EVENT_WORKSPACE_REFRESHED = "workspace_refreshed"
     EVENT_RAG_PANEL_REFRESHED = "rag_panel_refreshed"
     EVENT_OCR_BUTTONS_REFRESHED = "ocr_buttons_refreshed"
@@ -274,8 +284,22 @@ class ShellController:
         try:
             self._emit(self.EVENT_THINKING, active=True, label="调用 Codex / 模型…")
             if service is not None:
+                # Forward each streaming delta to the controller bus
+                # so the chat panel can update the visible reply as
+                # text arrives instead of waiting for the full
+                # message. ``on_delta`` may be sync or async;
+                # ``AppServerClient.run_turn`` awaits the coroutine.
+                def _on_delta(delta: str) -> None:
+                    self._emit(
+                        self.EVENT_ASSISTANT_DELTA,
+                        delta=delta,
+                    )
+
                 response, workspace = await service.chat(
-                    request, self._workspace, self._session
+                    request,
+                    self._workspace,
+                    self._session,
+                    on_delta=_on_delta,
                 )
             else:
                 response, workspace = await handle_agent_chat(
@@ -292,9 +316,13 @@ class ShellController:
         with self._lock:
             self._workspace = workspace
         if not silent:
+            # When streaming was active the chat panel already
+            # rendered the reply token-by-token; emitting the regular
+            # ``message_appended`` would create a duplicate bubble.
+            # ``assistant_final`` is a coalesced signal that says
+            # "the streaming bubble should be replaced with this".
             self._emit(
-                self.EVENT_MESSAGE_APPENDED,
-                role="assistant",
+                self.EVENT_ASSISTANT_FINAL,
                 text=response.reply,
                 action=response.action,
                 warnings=response.warnings,

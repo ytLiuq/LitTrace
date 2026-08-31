@@ -1001,6 +1001,125 @@ class ChatPanel(QtWidgets.QFrame):
         sb = self._view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
+    def append_delta(self, delta: str) -> None:
+        # Append a streaming token to the in-progress assistant
+        # block. The first ``delta`` after an assistant message is
+        # emitted creates the block; subsequent deltas just append
+        # text to its end. We intentionally do not route the delta
+        # through ``_render_message_html`` — partial tokens would
+        # otherwise get half-applied markdown rules (e.g. ``**``
+        # without a closing pair). The block is filled in plain
+        # until the final ``assistant_final`` arrives, at which
+        # point ``finalize_streaming`` swaps the whole block out
+        # for the rendered Markdown.
+        if not delta:
+            return
+        if not getattr(self, "_streaming_bubble_active", False):
+            self._open_streaming_bubble()
+        # ``End`` would push us to the bottom of the document — and
+        # the user message bubble (and the cursor's normal resting
+        # place after the assistant reply is finalised) usually sit
+        # *below* the streaming block by the time we get the later
+        # deltas. Re-pin the cursor to the end of the streaming
+        # block before every insert so user/assistant messages do
+        # not absorb the partial tokens.
+        cursor = self._view.textCursor()
+        cursor.setPosition(self._streaming_bubble_start)
+        for _ in range(200):
+            end = cursor.block().position() + cursor.block().length() - 1
+            if end <= self._streaming_bubble_start:
+                cursor.movePosition(QtGui.QTextCursor.MoveOperation.StartOfBlock)
+                continue
+            cursor.setPosition(end)
+            break
+        cursor.insertText(delta)
+        # Snapshot for ``finalize_streaming`` so it can select from
+        # the start of the streaming block to the cursor's new
+        # position (the end of the just-inserted delta) without
+        # bleeding past the streaming text into the next block.
+        self._streaming_bubble_end = cursor.position()
+        self._view.setTextCursor(cursor)
+        sb = self._view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _open_streaming_bubble(self) -> None:
+        # Build a single empty block for the streaming ``delta``s to
+        # land in. The block is styled as a "draft" bubble while the
+        # model is still writing — the styling gets swapped for the
+        # final rendered bubble in ``finalize_streaming`` so the
+        # Markdown layout is applied in one shot at the end.
+        from PySide6.QtGui import QTextBlockFormat, QTextCursor
+        cursor = self._view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        block_fmt = QTextBlockFormat()
+        block_fmt.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        block_fmt.setTopMargin(8)
+        block_fmt.setBottomMargin(8)
+        # Light-grey background marks the block as "still streaming"
+        # — the user can see tokens landing in real time.
+        block_fmt.setBackground(QtGui.QColor("#f5f6f6"))
+        cursor.insertBlock(block_fmt)
+        # Remember the block's start so the finalize step can
+        # select the whole streaming run and replace it with the
+        # rendered final block in one shot.
+        self._streaming_bubble_start = cursor.block().position()
+        self._streaming_bubble_active = True
+
+    def finalize_streaming(self, full_text: str) -> None:
+        # Replace the streaming draft block with the final rendered
+        # Markdown block. The streaming block was just a single
+        # paragraph with no inline HTML; selecting from its start
+        # to the current cursor (end-of-document) covers the whole
+        # partial reply and lets us overwrite it in one shot.
+        if not getattr(self, "_streaming_bubble_active", False):
+            return
+        from PySide6.QtGui import QTextCursor
+
+        # Select exactly the streaming block: from its start to
+        # the position the cursor was at right after the last
+        # ``append_delta`` ran. We use the snapshot rather than
+        # ``movePosition(EndOfBlock)`` because the cursor has
+        # already been moved past the block by previous delta
+        # insertions and we want to delete the *trailing newline*
+        # so the next block (the user message) does not get
+        # collapsed into our replacement.
+        cursor = self._view.textCursor()
+        cursor.setPosition(self._streaming_bubble_start)
+        cursor.setPosition(
+            self._streaming_bubble_end,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        cursor.removeSelectedText()
+        # Now write the final block in the same place. The
+        # background colour drops back to white (vs the draft grey
+        # the streaming block had), the inline span carries the
+        # rounded corners, and the rendered Markdown HTML lands
+        # inside.
+        from PySide6.QtGui import QTextBlockFormat
+
+        cleaned = _strip_trailing_narration(
+            _strip_leading_narration(_render_message_html(full_text))
+        )
+        block_fmt = QTextBlockFormat()
+        block_fmt.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        block_fmt.setTopMargin(8)
+        block_fmt.setBottomMargin(8)
+        cursor.insertBlock(block_fmt)
+        cursor.insertHtml(
+            '<span style="display:inline-block;max-width:78%;'
+            "background:#ffffff;color:#0b0c0e;"
+            f"border:1px solid {DESIGN['hairline']};"
+            "border-radius:12px 12px 12px 4px;padding:8px 12px;"
+            "line-height:1.4;text-align:left;"
+            '">'
+            f"{cleaned}"
+            "</span>"
+        )
+        self._view.setTextCursor(cursor)
+        self._streaming_bubble_active = False
+        sb = self._view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
     def _on_chat_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
         copy_action = menu.addAction("复制")
@@ -2048,6 +2167,8 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             return _wrapper
 
         controller.bus.subscribe(post("_qt_on_message_event"))
+        controller.bus.subscribe(post("_qt_on_assistant_delta_event"))
+        controller.bus.subscribe(post("_qt_on_assistant_final_event"))
         controller.bus.subscribe(post("_qt_on_status_event"))
         controller.bus.subscribe(post("_qt_on_thinking_event"))
         controller.bus.subscribe(post("_qt_on_workspace_event"))
@@ -2112,6 +2233,30 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._chat_panel.append_message(
             "system", f"⚠️ {body.get('message', 'error')}"
         )
+
+    @QtCore.Slot(str)
+    def _qt_on_assistant_delta_event(self, payload: str) -> None:
+        # Streaming reply: codex fires a delta for every token the
+        # model writes. The controller hands each one off via
+        # ``EVENT_ASSISTANT_DELTA``; we forward it to the chat panel
+        # which appends it to the in-progress assistant bubble so the
+        # user sees the reply as it streams rather than waiting for
+        # the full message.
+        kind, body = self._decode_event(payload)
+        if kind != self._controller.EVENT_ASSISTANT_DELTA:
+            return
+        self._chat_panel.append_delta(body.get("delta", ""))
+
+    @QtCore.Slot(str)
+    def _qt_on_assistant_final_event(self, payload: str) -> None:
+        # Final streaming payload — the chat panel swaps the live
+        # bubble (which has been accumulating the partial deltas) for
+        # a fully-rendered Markdown bubble using the same renderer
+        # ``append_message`` uses for one-shot replies.
+        kind, body = self._decode_event(payload)
+        if kind != self._controller.EVENT_ASSISTANT_FINAL:
+            return
+        self._chat_panel.finalize_streaming(body.get("text", ""))
 
     # ---- Initial state ---------------------------------------------------
 
