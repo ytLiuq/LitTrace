@@ -248,29 +248,61 @@ def _render_message_html(text: str) -> str:
     return body
 
 
-# Codex 0.149 alpha frequently prepends a sentence of internal narration
-# to its replies ("I'll keep it to two concise comparison bullets.",
-# "这里只需要确认当前助手身份，不会改动 LitTrace 会话。"). These are
-# useful for the model's own bookkeeping but useless — and sometimes
-# confusing — to the human reader. Strip one or two such leading
-# sentences so the user sees the substantive answer immediately.
+# Codex 0.149 alpha frequently leaks sentences of internal narration
+# into its replies. Some are prepended ("I'll keep it to two concise
+# comparison bullets.", "我会按 Codex/OpenAI 产品说明来回答；这里只
+# 需要确认当前助手身份，不会改动 LitTrace 会话。"), but a common new
+# pattern is the *trailing* sentence the model uses to "tidy up":
+# "用户不关注的信息不用说", "I'll keep the rest concise.", "The rest
+# is internal.". Strip both at the start of the reply and immediately
+# before the first block-level tag so the user's eyes land on the
+# substantive answer, not a line of model bookkeeping.
+
 _NARRATION_PATTERNS = [
-    r"^我.{0,80}(?:确认|只需|只.{0,8}需要|会.{0,8}改动|会.{0,8}修改|会.{0,8}影响|不.{0,4}会).{0,40}[。.]\s*",
-    r"^I['’]?ll.{0,80}(?:keep|just|only).{0,80}[.!?]\s*",
-    r"^Sure[,!.].{0,120}[.!?]\s*",
-    r"^Here'?s.{0,120}[.!?]\s*",
+    # Each pattern matches ONE leading sentence up to its first ``。``
+    # so we never bleed past the narration into the real answer.
+    r"^我[^。]*?(?:确认|只需|只.{0,8}需要|会.{0,8}改动|会.{0,8}修改|会.{0,8}影响|不.{0,4}会)[^。]*?[。.]\s*",
+    r"^I['’]?ll[^.!?]*?(?:keep|just|only)[^.!?]*?[.!?]\s*",
+    r"^Sure[,!.][^.!?]*?[.!?]\s*",
+    r"^Here'?s[^.!?]*?[.!?]\s*",
+    r"^当然[,，.][^。]*?[。.]\s*",
+]
+# Trailing sentences: Codex often tacks a directive-style line at
+# the end ("用户不关注的信息不用说", "I'll keep the rest concise.",
+# "The rest is internal."). These are stripped before the closing
+# block boundary so the chat scrollback ends on the substantive
+# content.
+_TRAILING_NARRATION_PATTERNS = [
+    r"[\s\S]*?(?:用户不关注.{0,30}|用户不需要.{0,30}|不.{0,4}直接展示给用户|不.{0,4}展示给用户|不.{0,8}说给用户|不.{0,8}用.{0,4}看)[。.]?\s*$",
+    r"[\s\S]*?(?:I['’]?ll keep the rest concise\.?|Keep the rest concise\.?|I['’]?ll be concise\.?|I'll skip the rest\.?)\s*$",
+    r"[\s\S]*?(?:I['’]?ll skip the internal details\.?|Skipping internal details\.?)\s*$",
+    r"[\s\S]*?(?:The rest is internal\.?|Internal notes removed\.?)\s*$",
 ]
 
 
 def _strip_leading_narration(html: str) -> str:
-    """Drop one or two leading sentences that match common Codex
-    internal-narration templates. Operates on the already-rendered
-    HTML fragment by stripping a leading text-run before any block tag.
+    """Drop leading sentences that match common Codex internal-
+    narration templates. Operates on the already-rendered HTML
+    fragment by stripping a leading text-run before any block tag.
     """
     for pattern in _NARRATION_PATTERNS:
         m = re.match(pattern, html, re.DOTALL)
         if m:
             return html[m.end():].lstrip()
+    return html
+
+
+def _strip_trailing_narration(html: str) -> str:
+    """Drop a trailing internal-narration sentence from the end of the
+    reply, just before the closing block boundary. The patterns match
+    Codex's common "tidy up" lines ("用户不关注的信息不用说",
+    "I'll keep the rest concise.", etc.) — these leak the model's
+    own bookkeeping into the visible chat.
+    """
+    for pattern in _TRAILING_NARRATION_PATTERNS:
+        m = re.search(pattern, html)
+        if m:
+            return html[: m.start()].rstrip()
     return html
 
 
@@ -822,6 +854,7 @@ class ChatPanel(QtWidgets.QFrame):
         # marker). Markdown is rendered by ``_render_message_html``;
         # any leading Codex internal-narration sentence is stripped.
         body = _strip_leading_narration(_render_message_html(text))
+        body = _strip_trailing_narration(body)
         if role == "user":
             bubble_color = DESIGN["primary"]
             text_color = "#ffffff"
@@ -982,12 +1015,18 @@ class RAGPanel(QtWidgets.QFrame):
 
 class DailyConfigDialog(QtWidgets.QDialog):
     """Collect the parameters that drive ``littrace sentinel run`` from
-    the user before the daily pipeline kicks off. The sentinel CLI
-    only takes ``--watchlist`` and ``--topic``; everything else
-    (year filter, target download count, etc.) is applied client-side
-    on top of the resulting stdout, so the dialog tracks what the user
-    actually asked for and surfaces a follow-up warning when the run
-    came up short.
+    the user before the daily pipeline kicks off. Four fields:
+
+      * 研究主题 (used as sentinel watchlist id, required)
+      * 开始 / 结束年份 (year range for retrieval)
+      * 最少检索数目 (target count; warns if the run comes up short)
+
+    When the user wants publisher-only papers (not just open-access
+    ones), they tick the **「打开 publisher 登录」** button after the
+    dialog closes — that fires ``chromium --remote-debugging-port=19222``
+    on LitTrace's private profile (``./data/chrome-cdp``) and the user
+    signs in to each publisher in turn. The next ``sentinel run`` then
+    has access to the gated PDFs.
     """
 
     def __init__(
@@ -996,24 +1035,27 @@ class DailyConfigDialog(QtWidgets.QDialog):
         *,
         default_topic: str = "mxene_sensor",
         default_year_min: int = 2023,
+        default_year_max: int = 2026,
+        default_min_papers: int = 10,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("今日管线配置")
+        self.setWindowTitle("检索并补全文献 · 配置")
         self.setModal(True)
-        self.resize(520, 360)
+        self.resize(540, 380)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
 
-        title = QtWidgets.QLabel("今日管线")
+        title = QtWidgets.QLabel("检索并补全文献")
         title.setStyleSheet(
             f"font-size:18px;font-weight:600;color:{DESIGN['ink']};"
         )
         layout.addWidget(title)
 
         subtitle = QtWidgets.QLabel(
-            "指定研究主题和指标，sentinel 会按主题检索开放访问论文、下载并解析。"
+            "告诉 sentinel 要研究什么主题、什么年份区间、最少要几篇。"
+            "只检索开放访问论文；要看 publisher 内的论文，先点下面的「打开 publisher 登录」。"
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(
@@ -1027,36 +1069,36 @@ class DailyConfigDialog(QtWidgets.QDialog):
 
         # 主题（watchlist id，必填）
         self._topic_input = QtWidgets.QLineEdit(default_topic)
-        self._topic_input.setPlaceholderText("e.g. mxene_sensor, perovskite_solar, ... ")
+        self._topic_input.setPlaceholderText("e.g. mxene_sensor, perovskite_solar, mof_co2")
         self._topic_input.selectAll()
         form.addRow("研究主题 *", self._topic_input)
 
-        # 关键词（--topic，可选）
+        # 关键词
         self._keywords_input = QtWidgets.QLineEdit()
-        self._keywords_input.setPlaceholderText(
-            "可选：更精确的检索词（多个用空格分隔）"
-        )
+        self._keywords_input.setPlaceholderText("可选：更精确的检索词（多个用空格分隔）")
         form.addRow("关键词", self._keywords_input)
 
-        # 起始年份
-        self._year_input = QtWidgets.QSpinBox()
-        self._year_input.setRange(1990, 2030)
-        self._year_input.setValue(default_year_min)
-        form.addRow("起始年份", self._year_input)
+        # 年份范围
+        year_row = QtWidgets.QHBoxLayout()
+        year_row.setSpacing(6)
+        self._year_min_input = QtWidgets.QSpinBox()
+        self._year_min_input.setRange(1990, 2030)
+        self._year_min_input.setValue(default_year_min)
+        year_row.addWidget(self._year_min_input)
+        year_row.addWidget(QtWidgets.QLabel("至"))
+        self._year_max_input = QtWidgets.QSpinBox()
+        self._year_max_input.setRange(1990, 2030)
+        self._year_max_input.setValue(default_year_max)
+        year_row.addWidget(self._year_max_input)
+        year_row.addStretch(1)
+        form.addRow("年份区间", year_row)
 
-        # 目标下载数
-        self._target_input = QtWidgets.QSpinBox()
-        self._target_input.setRange(1, 50)
-        self._target_input.setValue(5)
-        self._target_input.setSuffix(" 篇")
-        form.addRow("最少下载数", self._target_input)
-
-        # 截止月份
-        self._months_input = QtWidgets.QSpinBox()
-        self._months_input.setRange(1, 24)
-        self._months_input.setValue(6)
-        self._months_input.setSuffix(" 个月")
-        form.addRow("回看时长", self._months_input)
+        # 最少检索数
+        self._min_papers_input = QtWidgets.QSpinBox()
+        self._min_papers_input.setRange(1, 200)
+        self._min_papers_input.setValue(default_min_papers)
+        self._min_papers_input.setSuffix(" 篇")
+        form.addRow("最少检索数目", self._min_papers_input)
 
         layout.addLayout(form)
         layout.addStretch(1)
@@ -1072,12 +1114,20 @@ class DailyConfigDialog(QtWidgets.QDialog):
         # 按钮
         button_row = QtWidgets.QHBoxLayout()
         button_row.setSpacing(8)
+        login_btn = QtWidgets.QPushButton("🌐 打开 publisher 登录")
+        login_btn.setObjectName("subnav_btn")
+        login_btn.setToolTip(
+            "启动 LitTrace 自己的 Chrome（独立 profile，避开你日常 Chrome 的 user-data-dir 锁），"
+            "在打开的浏览器里登录各 publisher。登录态会保留，下次 sentinel run 可访问 gated PDF。"
+        )
+        login_btn.clicked.connect(self._open_publisher_login)
+        button_row.addWidget(login_btn)
         button_row.addStretch(1)
         cancel_btn = QtWidgets.QPushButton("取消")
         cancel_btn.setObjectName("subnav_btn")
         cancel_btn.clicked.connect(self.reject)
         button_row.addWidget(cancel_btn)
-        run_btn = QtWidgets.QPushButton("运行")
+        run_btn = QtWidgets.QPushButton("开始检索")
         run_btn.setObjectName("subnav_btn_primary")
         run_btn.setDefault(True)
         run_btn.clicked.connect(self._validate_and_accept)
@@ -1085,6 +1135,18 @@ class DailyConfigDialog(QtWidgets.QDialog):
         layout.addLayout(button_row)
 
         self._topic_input.returnPressed.connect(self._validate_and_accept)
+
+    def _open_publisher_login(self) -> None:
+        # Persist the dialog's settings before opening the browser so
+        # when the user returns and clicks "开始检索" they keep what
+        # they typed. We do that by accepting the dialog and storing
+        # the chosen values back through the parent (``_on_run_daily``
+        # reads them). The parent then launches the browser.
+        self._validate_and_accept()
+        if self.result() == QtWidgets.QDialog.DialogCode.Accepted:
+            # Mark "open publisher login" intent on the parent so it
+            # knows to launch the browser after the dialog returns.
+            self._open_login_after = True
 
     def _validate_and_accept(self) -> None:
         topic = self._topic_input.text().strip()
@@ -1096,7 +1158,13 @@ class DailyConfigDialog(QtWidgets.QDialog):
                 "主题只能是字母数字 + _ + -（用作 watchlist id 文件名）"
             )
             return
+        if self._year_min_input.value() > self._year_max_input.value():
+            self._error_label.setText("开始年份不能晚于结束年份")
+            return
         self.accept()
+
+    def open_login_after(self) -> bool:
+        return getattr(self, "_open_login_after", False)
 
     # Accessors
     def topic(self) -> str:
@@ -1106,13 +1174,13 @@ class DailyConfigDialog(QtWidgets.QDialog):
         return self._keywords_input.text().strip()
 
     def year_min(self) -> int:
-        return self._year_input.value()
+        return self._year_min_input.value()
 
-    def target_papers(self) -> int:
-        return self._target_input.value()
+    def year_max(self) -> int:
+        return self._year_max_input.value()
 
-    def months_lookback(self) -> int:
-        return self._months_input.value()
+    def min_papers(self) -> int:
+        return self._min_papers_input.value()
 
 
 class BrowserPanel(QtWidgets.QFrame):
@@ -1412,25 +1480,20 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         )
 
     def _on_run_daily(self) -> None:
-        # Single Daily run entry point. The button used to dispatch
-        # straight to a hard-coded ``--watchlist mxene_sensor``; that was
-        # wrong because the user has no way to know which topic the
-        # pipeline is about. Now the button opens ``DailyConfigDialog``
-        # first so the user picks a topic, keywords, year filter, and
-        # target download count. ``DailyConfigDialog.exec`` is modal so
-        # the chat thread is paused until the user either accepts or
+        # The button opens ``DailyConfigDialog`` first. The dialog
+        # blocks the chat thread until the user either accepts or
         # cancels; both branches return immediately, this method just
-        # kicks off the worker once we have a config.
+        # kicks off the worker (or the browser, if the user picked
+        # "🌐 打开 publisher 登录") once we have a config.
         existing_topic = "mxene_sensor"
-        # Try to inherit the topic from the current chat session if it
-        # has been mentioned before. Cheap heuristic: any token starting
-        # with an alpha character is fine, but for now we default to a
-        # safe placeholder.
         dialog = DailyConfigDialog(
             self,
             default_topic=existing_topic,
             default_year_min=getattr(
                 self._controller.config.literature_context, "default_year_min", 2023
+            ),
+            default_year_max=getattr(
+                self._controller.config.literature_context, "default_recent_year_min", 2026
             ),
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
@@ -1438,10 +1501,19 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         topic = dialog.topic()
         keywords = dialog.keywords()
         year_min = dialog.year_min()
-        target = dialog.target_papers()
-        months = dialog.months_lookback()
-        self._status_bar.showMessage(f"今日管线启动中…主题：{topic}", 3000)
-        self._rag_panel.set_status("运行中…")
+        year_max = dialog.year_max()
+        min_papers = dialog.min_papers()
+        open_login = dialog.open_login_after()
+
+        if open_login:
+            self._launch_publisher_login_browser()
+            return
+
+        self._status_bar.showMessage(
+            f"检索启动中…主题：{topic}（{year_min}-{year_max}，≥{min_papers} 篇）",
+            3000,
+        )
+        self._rag_panel.set_status(f"运行中…主题 {topic}")
         import threading
 
         def _worker():
@@ -1462,25 +1534,68 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 summary = _summarise_sentinel_output(
                     completed.stdout or ""
                 )
-                # Parse counters out of the summary so we can flag
-                # short-falls (the user's ``target_papers`` is the
-                # contract they signed up to).
                 downloaded = _summary_value(summary, "downloaded:")
+                candidates = _summary_value(summary, "new_candidates:")
                 headline = (
-                    f"今日管线完成（exit={completed.returncode}）· {summary}"
+                    f"检索完成（exit={completed.returncode}）· {summary}"
                 )
-                if downloaded is not None and downloaded < target:
-                    headline += (
-                        f" · ⚠️ 只下了 {downloaded} 篇，"
-                        f"少于目标 {target} 篇"
+                shortfall = []
+                if downloaded is not None and downloaded < min_papers:
+                    shortfall.append(
+                        f"只下了 {downloaded} 篇，少于目标 {min_papers} 篇"
                     )
+                if candidates is not None and candidates < 3:
+                    shortfall.append(
+                        f"只检索到 {candidates} 个候选——考虑扩大关键词或时间区间"
+                    )
+                if shortfall:
+                    headline += " · ⚠️ " + "；".join(shortfall)
                 self._post_status(headline)
             except subprocess.TimeoutExpired:
-                self._post_status("今日管线超时（10 分钟）")
+                self._post_status("检索超时（10 分钟）")
             except Exception as exc:  # pragma: no cover - defensive
-                self._post_status(f"今日管线失败: {type(exc).__name__}: {exc}")
+                self._post_status(f"检索失败: {type(exc).__name__}: {exc}")
 
         threading.Thread(target=_worker, daemon=True, name="littrace-daily").start()
+
+    def _launch_publisher_login_browser(self) -> None:
+        # ``littrace setup-browser --launch`` boots the LitTrace-private
+        # Chromium with ``--remote-debugging-port=19222`` against
+        # ``./data/chrome-cdp`` (independent of the user's day-to-day
+        # Chrome). Once the browser is up, the embedded BrowserPanel
+        # can be pointed at each publisher's sign-in page so the user
+        # can authenticate; the next sentinel run then has access to
+        # gated PDFs.
+        self._status_bar.showMessage("启动 publisher 登录浏览器…", 3000)
+        self._rag_panel.set_status("等待 publisher 登录…")
+        import threading
+
+        def _worker():
+            try:
+                cmd, env, cwd = _littrace_cmd("setup-browser", "--launch")
+                completed = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    cwd=cwd,
+                    env=env,
+                )
+                if completed.returncode == 0:
+                    self._post_status("publisher 浏览器已就绪（CDP 19222）")
+                else:
+                    tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-1]
+                    self._post_status(
+                        f"启动 publisher 浏览器失败（exit={completed.returncode}）：{tail}"
+                    )
+            except subprocess.TimeoutExpired:
+                self._post_status("启动 publisher 浏览器超时（30 秒）")
+            except Exception as exc:  # pragma: no cover - defensive
+                self._post_status(
+                    f"启动 publisher 浏览器失败: {type(exc).__name__}: {exc}"
+                )
+
+        threading.Thread(target=_worker, daemon=True, name="littrace-setup-browser").start()
 
     # ---- Event wiring ----------------------------------------------------
 
