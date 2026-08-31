@@ -930,7 +930,14 @@ class ChatPanel(QtWidgets.QFrame):
             f"</span>"
         )
         self._view.setTextCursor(cursor)
-        self._view.ensureCursorVisible()
+        # ``ensureCursorVisible`` is not reliable enough on
+        # ``QTextBrowser`` once the cursor is at the very end (the
+        # last paragraph can be the same height as the viewport and
+        # nothing scrolls). Set the vertical scroll bar to its
+        # maximum directly so the new bubble always appears at the
+        # bottom of the scrollback.
+        sb = self._view.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _on_chat_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
@@ -1391,6 +1398,7 @@ class BrowserPanel(QtWidgets.QFrame):
         # ✗ marker becomes a clickable shortcut: clicking ✗ fires
         # ``BrowserPanel.open_url`` for that publisher, which is the
         # exact behaviour the user asked for ("主动弹出来就可以了").
+        any_unlogged = False
         for label, domains in publisher_domains:
             logged = any(d in present for d in domains)
             signin_url = next(
@@ -1404,6 +1412,7 @@ class BrowserPanel(QtWidgets.QFrame):
                     f'<span style="color:{color};">{label} {mark}</span>'
                 )
             else:
+                any_unlogged = True
                 # ✗ is a clickable shortcut: the click fires
                 # ``open_url(signin_url)`` so the embedded Chromium
                 # navigates straight to the publisher's sign-in page.
@@ -1417,6 +1426,14 @@ class BrowserPanel(QtWidgets.QFrame):
         bits.append(
             f'<span style="color:#2a7a3a;">arXiv ✓</span>'
         )
+        # The first time the user opens the panel, the strip is a wall
+        # of red ✗ and they have no idea what to do. Drop a tiny hint
+        # so they know the ✗ markers are clickable sign-in shortcuts.
+        if any_unlogged:
+            bits.append(
+                '<span style="color:#a4a7ad;font-size:11px;">'
+                "&nbsp;· 点 ✗ 一键登录</span>"
+            )
         self._cookie_status.setText("  ".join(bits))
 
     def _on_url_changed(self, url: QtCore.QUrl) -> None:
