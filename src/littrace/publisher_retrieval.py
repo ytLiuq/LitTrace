@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, HttpUrl
 from littrace.cache import cache_key, read_cached_text, write_text_cache
 from littrace.config import LitTraceConfig
 from littrace.context import add_papers
-from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata
+from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata, model_validator, _coerce_http_url_fields
 from littrace.publisher_connectors import PublisherSearchPlan
 
 
@@ -19,6 +19,11 @@ class PublisherRetrievalResult(BaseModel):
     papers: list[PaperMetadata] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_field(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["query_url"])
+
 
 class BrowserRetrievalPlan(BaseModel):
     publisher_family: str
@@ -26,6 +31,11 @@ class BrowserRetrievalPlan(BaseModel):
     steps: list[str]
     extract_selectors: list[str]
     requires_user_login: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_field(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["query_url"])
 
 
 class PublisherEnrichment(BaseModel):
@@ -35,6 +45,11 @@ class PublisherEnrichment(BaseModel):
     article_type: str | None = None
     supplementary_links: list[HttpUrl] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_field(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["supplementary_links"])
 
 
 def build_browser_retrieval_plan(plan: PublisherSearchPlan) -> BrowserRetrievalPlan:

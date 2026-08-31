@@ -10,6 +10,37 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
 
+def _coerce_str_to_http_url(value: object) -> object:
+    """Coerce ``str`` → ``HttpUrl`` so upstream API responses (Crossref /
+    OpenAlex / Unpaywall) that hand back plain strings no longer trigger
+    ``PydanticSerializationUnexpectedValue`` warnings during model_dump.
+
+    Non-string values pass through unchanged so existing HttpUrl instances
+    are not double-wrapped.
+    """
+    if isinstance(value, str):
+        try:
+            return HttpUrl(value)
+        except Exception:
+            return value
+    return value
+
+
+def _coerce_http_url_fields(data: object, field_names: list[str]) -> object:
+    """Apply :func:`_coerce_str_to_http_url` to ``field_names`` inside
+    ``data`` (dict or pydantic-incompatible raw input). Tolerant of bad
+    inputs (returns ``data`` unchanged if it is not a dict)."""
+    if not isinstance(data, dict):
+        return data
+    for field_name in field_names:
+        if field_name in data:
+            data[field_name] = _coerce_str_to_http_url(data[field_name])
+        nested = data.get(field_name)
+        if isinstance(nested, list):
+            data[field_name] = [_coerce_str_to_http_url(item) for item in nested]
+    return data
+
+
 class AccessType(StrEnum):
     OPEN_ACCESS = "open_access"
     REQUIRES_LOGIN = "requires_login"
@@ -277,6 +308,18 @@ class PaperMetadata(BaseModel):
     relevance_score: float | None = None
     recency_score: float | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_fields(cls, data: object) -> object:
+        # Upstream APIs (Crossref / OpenAlex / Unpaywall) hand back plain
+        # string URLs. Without this coercion, Pydantic emits
+        # PydanticSerializationUnexpectedValue warnings on every model_dump
+        # round-trip during the sentinel run. Coercion preserves the
+        # HttpUrl type for downstream consumers.
+        return _coerce_http_url_fields(
+            data, ["source_urls", "pdf_url"]
+        )
+
 
 class SourceRecord(BaseModel):
     source_record_id: str
@@ -336,6 +379,11 @@ class FullTextCandidate(BaseModel):
     checked_content_type: str | None = None
     note: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_field(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["url"])
+
 
 class FullTextResolutionReport(BaseModel):
     paper_id: str
@@ -344,6 +392,13 @@ class FullTextResolutionReport(BaseModel):
     best_pdf_url: HttpUrl | None = None
     best_landing_url: HttpUrl | None = None
     open_access_candidate_count: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_fields(cls, data: object) -> object:
+        return _coerce_http_url_fields(
+            data, ["best_pdf_url", "best_landing_url"]
+        )
     login_required_candidate_count: int = 0
     verified_candidate_count: int = 0
     warnings: list[str] = Field(default_factory=list)
@@ -552,6 +607,11 @@ class DownloadExecutionItem(BaseModel):
     login_instructions: list[str] = Field(default_factory=list)
     error: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_field(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["login_url"])
+
 
 class DownloadExecutionResult(BaseModel):
     items: list[DownloadExecutionItem]
@@ -578,6 +638,11 @@ class CitationRecord(BaseModel):
     link_status: LinkStatus = LinkStatus.UNCHECKED
     doi: str | None = None
     checked_url: HttpUrl | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_fields(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["access_url", "checked_url"])
     status_code: int | None = None
     requires_login: bool = False
     error: str | None = None

@@ -150,15 +150,25 @@ eval:
 # `codex_app_server` to route synthesis/Q&A and the first controlled mutation
 # (`set_download_selection`) through Codex. Other domain writes remain legacy.
 agent_runtime:
-  mode: "legacy"  # legacy | codex_app_server
-  codex_command: ["codex", "app-server"]
+  mode: "codex_app_server"  # legacy | codex_app_server
+  codex_command:
+    - "/Applications/ChatGPT.app/Contents/Resources/codex"
+    - "app-server"
   # Raw TOML values passed as repeated `codex app-server -c key=value`.
-  # Example compatibility override: {service_tier: '"fast"'}
-  codex_config_overrides: {}
-  # `isolated` prevents global Codex MCP servers, skills, threads, and memory
-  # from entering LitTrace. Authenticate this home once with `codex login`.
-  # `shared` is a temporary migration escape hatch.
-  codex_home_mode: "isolated"  # isolated | shared
+  # Force the Codex App Server to talk to OpenAI directly instead of the
+  # provider declared in ~/.codex/config.toml (which on internal machines
+  # can be a corporate gateway that rejects ChatGPT OAuth access tokens
+  # with ``无效的令牌``). The value is a TOML literal string.
+  codex_config_overrides:
+    model_provider: '"openai"'
+  # `isolated` keeps a private CODEX_HOME under ./data/codex-home so the
+  # project's Codex state, threads, and MCP servers stay isolated from
+  # the user's default ~/.codex. Authenticate this home once with
+  # `CODEX_HOME=./data/codex-home codex login`.
+  # `shared` reuses ~/.codex (ChatGPT OAuth tokens written by
+  # ``codex login`` are honoured). Required on codex 0.149.x where the
+  # app-server does not yet read OAuth tokens from an isolated home.
+  codex_home_mode: "shared"  # isolated | shared
   codex_home: "./data/codex-home"
   scratch_root: "./data/codex-runtime"
   startup_timeout_seconds: 20

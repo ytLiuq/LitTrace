@@ -110,10 +110,21 @@ class ShellState:
 def main() -> None:
     # A second positional arg that is not a recognised subcommand should
     # fail loud (exit 1) instead of silently dropping into the REPL shell.
-    if len(sys.argv) > 1 and sys.argv[1].startswith("-"):
+    #
+    # The shell collapses unquoted words into one argv token (e.g.
+    # ``littrace sentinel status`` arrives as ``sys.argv[1] == "sentinel status"``).
+    # Split sys.argv[1] on whitespace and rewrite sys.argv so the per-subcommand
+    # handlers can keep using ``sys.argv[2]`` for the action and ``sys.argv[2:]``
+    # for the rest. After this rewrite, ``sys.argv == ["littrace", "sentinel",
+    # "status", ...]`` regardless of how the user quoted the command.
+    if len(sys.argv) > 1:
+        head, *rest = sys.argv[1].split()
+        sys.argv = [sys.argv[0], head, *rest, *sys.argv[2:]]
+    first_token = sys.argv[1] if len(sys.argv) > 1 else ""
+    if first_token.startswith("-"):
         # Flag-like argv (e.g. --help) goes to the REPL shell.
         pass
-    elif len(sys.argv) > 1 and sys.argv[1] not in {
+    elif first_token and first_token not in {
         "sentinel",
         "rag",
         "doctor",
@@ -126,7 +137,7 @@ def main() -> None:
         "plugin",
     }:
         print(
-            f"Unknown subcommand: {sys.argv[1]!r}. "
+            f"Unknown subcommand: {first_token!r}. "
             "Run `littrace` with no args for the interactive shell, or pass "
             "one of: sentinel, rag, jobs, doctor, metrics, setup-browser, publisher-e2e.",
             file=sys.stderr,
@@ -1356,6 +1367,86 @@ def _print_doctor(config) -> None:
         print("browser setup:")
         for instruction in setup.instructions:
             print(f"- {instruction}")
+    _print_parser_diagnostics(config)
+    _print_codex_auth_diagnostics(config)
+
+
+def _print_parser_diagnostics(config) -> None:
+    """Probe every parser backend declared in ``config.parsing.preferred_engines``
+    plus the configured default, and report which heavy dependencies are
+    actually importable. The original ``littrace doctor`` only checked CDP /
+    Chrome and silently treated paddleocr as available even when the
+    ``[parsers]`` extra was not installed — leaving every /parse call to fail
+    with ``PaddleOCR is not installed`` at runtime.
+    """
+    import importlib
+
+    declared = [config.parsing.default_parser, *config.parsing.preferred_engines]
+    declared = [name for name in dict.fromkeys(declared) if name]
+    deps_for = {
+        "paddleocr": ("paddleocr", "pypdfium2"),
+        "docling": ("docling", "pypdfium2"),
+        "marker": ("marker_pdf",),
+        "grobid": ("grobid_client",),
+    }
+    print("\nparsers:")
+    for name in declared:
+        deps = deps_for.get(name, ())
+        missing = [dep for dep in deps if not _safe_import(importlib, dep)]
+        if not missing:
+            print(f"  {name}: ok")
+        else:
+            print(f"  {name}: missing deps {', '.join(missing)}")
+
+
+def _safe_import(importlib, module: str) -> bool:
+    try:
+        importlib.import_module(module)
+        return True
+    except Exception:
+        return False
+
+
+def _print_codex_auth_diagnostics(config) -> None:
+    """Show whether the configured codex app-server command is reachable and
+    whether the active ``CODEX_HOME`` looks authenticated. The original
+    doctor never surfaced this, so users only learned that codex calls
+    failed with ``401 Unauthorized`` after pressing Enter in the chat box.
+    """
+    cmd = config.agent_runtime.codex_command
+    binary = cmd[0] if cmd else ""
+    from pathlib import Path
+
+    binary_ok = False
+    if binary:
+        binary_path = Path(binary)
+        binary_ok = binary_path.exists() or bool(__import__("shutil").which(binary))
+    print("\ncodex:")
+    print(f"  command: {' '.join(cmd) or '(empty)'}")
+    print(f"  binary: {'ok' if binary_ok else 'missing'}")
+    if config.agent_runtime.codex_home_mode.value == "shared":
+        home = Path.home() / ".codex"
+        home_raw = "~/.codex"
+    else:
+        raw = Path(config.agent_runtime.codex_home).expanduser()
+        # Resolve relative paths against the config.yaml directory so the
+        # reported location stays stable regardless of the cwd the user
+        # launched from (Finder, IDE, parent directory, …).
+        if not raw.is_absolute():
+            base = Path(getattr(config, "_config_path", "").parent or Path.cwd())
+            home = (base / raw).resolve()
+            home_raw = f"{raw} (resolved from {base})"
+        else:
+            home = raw.resolve()
+            home_raw = str(home)
+    auth = home / "auth.json"
+    print(f"  codex_home: {home_raw} (mode={config.agent_runtime.codex_home_mode.value})")
+    print(f"  codex_home resolved: {home}")
+    print(f"  auth.json: {'present' if auth.exists() else 'missing'}")
+    if binary_ok:
+        print("  tip: littrace-window uses codex for chat. If chat fails with 401,")
+        print("       check that auth.json above points to a valid OpenAI API key,")
+        print("       or set LITTRACE_CODEX_HOME_MODE=shared to use the default ~/.codex.")
 
 
 def _print_browser_setup(config, profile_name: str | None, launch: bool) -> None:

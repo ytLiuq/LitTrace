@@ -22,7 +22,7 @@ from littrace.access_layer.browser import (
 )
 from littrace.access_layer.paths import target_pdf_path
 from littrace.config import LitTraceConfig
-from littrace.models import DownloadExecutionItem, FullTextResolutionReport, PaperMetadata
+from littrace.models import DownloadExecutionItem, FullTextResolutionReport, PaperMetadata, model_validator, _coerce_http_url_fields
 from littrace.retry import retry_async, RetryConfig, BackoffStrategy
 
 
@@ -38,6 +38,11 @@ class LoginLaunchResult(BaseModel):
     target_path: str | None = None
     instructions: list[str] = Field(default_factory=list)
     error: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_field(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["login_url"])
 
 
 class BrowserLoginSessionPlan(BaseModel):
@@ -55,6 +60,11 @@ class BrowserLoginSessionPlan(BaseModel):
     instructions: list[str] = Field(default_factory=list)
     requires_user_login: bool = True
     error: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_field(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["login_url"])
 
 
 class BrowserLoginOpenResult(BaseModel):

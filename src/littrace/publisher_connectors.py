@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, HttpUrl
 
 from littrace.citations import best_access_url
-from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata
+from littrace.models import AccessType, LiteratureWorkspace, PaperMetadata, model_validator, _coerce_http_url_fields
 
 
 class PublisherAccessRoute(BaseModel):
@@ -14,6 +14,11 @@ class PublisherAccessRoute(BaseModel):
     requires_login: bool = False
     confidence: float = 0.0
     notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_fields(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["landing_url", "pdf_url"])
 
 
 class PublisherRouteReport(BaseModel):
@@ -27,6 +32,11 @@ class PublisherSearchPlan(BaseModel):
     purpose: str
     requires_browser: bool = False
     notes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_url_field(cls, data: object) -> object:
+        return _coerce_http_url_fields(data, ["query_url"])
 
 
 class PublisherSearchPlanReport(BaseModel):

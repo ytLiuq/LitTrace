@@ -20,13 +20,15 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Self
 if TYPE_CHECKING:
     from littrace.codex_runtime.rollout import RolloutRecorder
 
-
-class AppServerError(RuntimeError):
-    """Base failure raised by the App Server transport."""
-
-
-class AppServerProtocolError(AppServerError):
-    """Malformed wire data or a JSON-RPC error response."""
+# Re-export the canonical App Server errors. Defined in ``errors`` to keep
+# the structured ``error_code`` / ``additional_details`` vocabulary in one
+# place — re-defining simplified ``RuntimeError`` subclasses here used to
+# silently strip those attributes, which made ``service._chat_with_client``
+# crash on every transport failure (it accesses ``exc.error_code.value``).
+from littrace.codex_runtime.errors import (  # noqa: E402,F401
+    AppServerError,
+    AppServerProtocolError,
+)
 
 
 @dataclass(frozen=True)

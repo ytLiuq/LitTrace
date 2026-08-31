@@ -437,15 +437,104 @@ class LitTraceConfig(BaseModel):
         self.artifact_storage = value
 
 
-def load_config(path: str | Path = "config.yaml") -> LitTraceConfig:
+def load_config(path: str | Path | None = None) -> LitTraceConfig:
+    """Load LitTrace configuration.
+
+    Resolution order:
+      1. ``LITTRACE_CONFIG`` environment variable (explicit override).
+      2. ``path`` argument if provided.
+      3. ``./config.yaml`` (relative to the current working directory).
+
+    Raises ``FileNotFoundError`` when no config file is reachable instead
+    of silently falling back to Pydantic defaults — the previous silent
+    fallback made every CLI invocation run with the wrong ``mode``,
+    ``rag.enabled`` and ``codex_command`` whenever the user launched
+    littrace from outside the repository root (e.g. Finder, IDE).
+    """
     _load_env_file(Path(".env.local"))
-    config_path = Path(path)
-    if not config_path.exists():
-        return _with_env_overrides(LitTraceConfig())
+    env_override = os.environ.get("LITTRACE_CONFIG")
+    candidates: list[Path] = []
+    if env_override:
+        candidates.append(Path(env_override))
+    if path is not None:
+        candidates.append(Path(path))
+    candidates.append(Path("config.yaml"))
+
+    for candidate in candidates:
+        if candidate.exists():
+            config_path = candidate
+            break
+    else:
+        tried = ", ".join(str(c) for c in candidates)
+        cwd = Path.cwd()
+        raise FileNotFoundError(
+            f"Could not locate LitTrace config (tried: {tried}). "
+            f"cwd={cwd}. Run littrace commands from the repository root, "
+            f"or set LITTRACE_CONFIG=/path/to/config.yaml."
+        )
 
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
-    return _with_env_overrides(LitTraceConfig.model_validate(raw))
+    config = _with_env_overrides(LitTraceConfig.model_validate(raw))
+    # Remember the config.yaml location so other components (notably
+    # ``littrace doctor`` and the codex_home resolver) can interpret
+    # relative paths against the same directory the user actually picked,
+    # regardless of the cwd they happened to launch from.
+    config._config_path = config_path
+    # Re-anchor every relative Path declared in config.yaml to the config
+    # directory. Without this, a user launching ``littrace-window`` from
+    # Finder or a parent directory ends up with paper_library_dir pointing
+    # at ``./data/papers`` relative to the wrong cwd — and silent ``parsed=0``
+    # failures in sentinel because there are no PDFs to parse.
+    config = _reanchor_relative_paths(config, config_path.parent)
+    return config
+
+
+def _reanchor_relative_paths(
+    config: LitTraceConfig, base_dir: Path
+) -> LitTraceConfig:
+    """Return a copy of ``config`` whose relative ``Path`` fields are
+    resolved against ``base_dir`` instead of the process cwd.
+    """
+    storage = config.storage
+    new_storage = storage.model_copy(
+        update={
+            "paper_library_dir": _reanchor(storage.paper_library_dir, base_dir),
+            "metadata_dir": _reanchor(storage.metadata_dir, base_dir),
+            "cache_dir": _reanchor(storage.cache_dir, base_dir),
+            "sessions_dir": _reanchor(storage.sessions_dir, base_dir),
+        }
+    )
+    artifact = config.artifact_storage
+    new_artifact = artifact.model_copy(
+        update={
+            "local_root": _reanchor(artifact.local_root, base_dir),
+        }
+    )
+    runtime = config.agent_runtime
+    new_runtime = runtime.model_copy(
+        update={
+            "codex_home": _reanchor(runtime.codex_home, base_dir),
+        }
+    )
+    return config.model_copy(
+        update={
+            "storage": new_storage,
+            "artifact_storage": new_artifact,
+            "agent_runtime": new_runtime,
+        }
+    )
+
+
+def _reanchor(path: Path, base_dir: Path) -> Path:
+    """Return ``path`` as an absolute Path anchored at ``base_dir`` when
+    it is relative. Absolute paths pass through unchanged. ``Path(...)``
+    constructors in LitTraceConfig default to strings like ``./data/papers``,
+    so a typical call resolves to ``base_dir/data/papers``.
+    """
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
 
 
 def _load_env_file(path: Path) -> None:
