@@ -680,7 +680,7 @@ class ChatPanel(QtWidgets.QFrame):
         # context).
         self._input = QtWidgets.QTextEdit()
         self._input.setObjectName("input")
-        self._input.setPlaceholderText("Message LitTrace…  (Enter 发送 / Shift+Enter 换行)")
+        self._input.setPlaceholderText("输入研究问题，Enter 发送，Shift+Enter 换行…")
         self._input.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._input.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._input.setAcceptRichText(False)
@@ -1026,12 +1026,12 @@ class RAGPanel(QtWidgets.QFrame):
         helper.setWordWrap(True)
         layout.addWidget(helper)
 
-        run_btn = QtWidgets.QPushButton("🔍 检索并补全文献")
+        run_btn = QtWidgets.QPushButton("🔍 搜索研究主题")
         run_btn.setObjectName("subnav_btn_primary")
         run_btn.clicked.connect(on_run_daily)
         layout.addWidget(run_btn)
 
-        self._status = QtWidgets.QLabel("未运行")
+        self._status = QtWidgets.QLabel("尚未启动")
         self._status.setObjectName("status")
         self._status.setWordWrap(True)
         layout.addWidget(self._status, stretch=1)
@@ -1599,12 +1599,12 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             layout.addWidget(btn)
             return btn
 
-        add_btn("文献上下文", self._open_context_popup)
-        self._context_toggle_btn = add_btn("隐藏上下文", self._toggle_context)
-        self._parse_strategy_btn = add_btn("文本层解析", self._toggle_parse_strategy, primary=True)
-        add_btn("Setup browser", self._on_setup_browser)
-        add_btn("Doctor", self._on_doctor)
-        add_btn("使用说明", self._open_help_popup)
+        add_btn("论文库", self._open_context_popup)
+        self._context_toggle_btn = add_btn("隐藏论文库", self._toggle_context)
+        self._parse_strategy_btn = add_btn("解析：文本层", self._toggle_parse_strategy, primary=True)
+        add_btn("设置浏览器", self._on_setup_browser)
+        add_btn("诊断", self._on_doctor)
+        add_btn("帮助", self._open_help_popup)
         layout.addStretch(1)
         return subnav
 
