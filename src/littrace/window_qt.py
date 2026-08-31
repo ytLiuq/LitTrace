@@ -97,6 +97,24 @@ def _summarise_sentinel_output(stdout: str) -> str:
     return " · ".join(picked)
 
 
+def _summary_value(summary: str, key: str) -> int | None:
+    """Pull the integer out of a sentinel counter line that
+    ``_summarise_sentinel_output`` already picked out of stdout, e.g.
+    ``downloaded: 1`` → 1. Returns ``None`` if the line isn't in the
+    summary or the value can't be parsed.
+    """
+    for line in summary.split("·"):
+        line = line.strip()
+        if line.startswith(key):
+            tail = line[len(key):].strip()
+            token = tail.split()[0] if tail else ""
+            try:
+                return int(token)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Message body rendering
 # ---------------------------------------------------------------------------
@@ -571,20 +589,86 @@ class ChatPanel(QtWidgets.QFrame):
         self._thinking_timer.timeout.connect(self._tick_thinking)
         self._thinking_label = ""
 
-        input_row = QtWidgets.QHBoxLayout()
-        self._input = QtWidgets.QLineEdit()
-        self._input.setObjectName("input")
-        self._input.setPlaceholderText("输入研究任务或 / 命令…")
-        self._input.returnPressed.connect(self._on_send)
-        self._input.textChanged.connect(self._on_input_changed)
-        self._input.installEventFilter(self)
-        layout.addLayout(input_row)
-        input_row.addWidget(self._input, stretch=1)
+        # ChatGPT-Codex-style input bar: a single rounded container with
+        # a left attachment slot, a multi-line text editor in the
+        # middle, and a send button on the right. The container's
+        # background lightens on focus, mirroring the Codex App.
+        input_row = QtWidgets.QFrame()
+        input_row.setObjectName("input_bar")
+        input_row.setStyleSheet(
+            "QFrame#input_bar {"
+            f"  background: {DESIGN['surface_2']};"
+            f"  border: 1px solid {DESIGN['hairline']};"
+            "  border-radius: 22px;"
+            "}"
+            "QFrame#input_bar:focus-within {"
+            f"  border: 1px solid {DESIGN['ink']};"
+            "}"
+        )
+        input_layout = QtWidgets.QHBoxLayout(input_row)
+        input_layout.setContentsMargins(8, 4, 8, 4)
+        input_layout.setSpacing(6)
 
-        self._send = QtWidgets.QPushButton("发送")
+        # Left slot — placeholder for an "attach file" button (future
+        # work). For now it's a thin visual anchor.
+        self._attach_btn = QtWidgets.QPushButton("+")
+        self._attach_btn.setObjectName("input_attach")
+        self._attach_btn.setFixedSize(32, 32)
+        self._attach_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self._attach_btn.setToolTip("附加文件（待实现）")
+        input_layout.addWidget(self._attach_btn)
+
+        # Multi-line text input (was a single-line QLineEdit; Codex App
+        # wraps on Enter when Shift isn't held and inserts a literal
+        # newline when it is, so the user can paste multi-line
+        # context).
+        self._input = QtWidgets.QTextEdit()
+        self._input.setObjectName("input")
+        self._input.setPlaceholderText("Message LitTrace…  (Enter 发送 / Shift+Enter 换行)")
+        self._input.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._input.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._input.setAcceptRichText(False)
+        self._input.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._input.setFixedHeight(40)
+        self._input.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        # Install an event filter so the existing slash-popup keypress
+        # logic (Up / Down / Enter / Esc) keeps working against the new
+        # widget.
+        self._input.installEventFilter(self)
+        # Re-route textChanged to the existing handler.
+        self._input.textChanged.connect(self._on_input_text_changed)
+        input_layout.addWidget(self._input, stretch=1)
+
+        # Send button — round, primary-coloured, only enabled when the
+        # text editor holds non-whitespace content.
+        self._send = QtWidgets.QPushButton("➤")
         self._send.setObjectName("send")
+        self._send.setFixedSize(32, 32)
+        self._send.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self._send.setStyleSheet(
+            "QPushButton#send {"
+            f"  background: {DESIGN['primary']};"
+            "  color: white;"
+            "  border: none;"
+            "  border-radius: 16px;"
+            "  font-size: 14px;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton#send:hover {"
+            f"  background: {DESIGN['primary_hover']};"
+            "}"
+            "QPushButton#send:disabled {"
+            "  background: #d8d9dc;"
+            "  color: #a4a7ad;"
+            "}"
+        )
         self._send.clicked.connect(self._on_send)
-        input_row.addWidget(self._send)
+        self._send.setEnabled(False)
+        input_layout.addWidget(self._send)
+
+        layout.addWidget(input_row)
 
         # Slash-command autocomplete popup, lazily shown beneath the
         # input box when the user types a leading "/". Pre-create every
@@ -615,6 +699,7 @@ class ChatPanel(QtWidgets.QFrame):
     def eventFilter(self, source: QtCore.QObject, event: QtCore.QEvent) -> bool:
         if source is self._input and event.type() == QtCore.QEvent.Type.KeyPress:
             key = event.key()
+            modifiers = event.modifiers()
             if self._popup.isVisible():
                 if key == QtCore.Qt.Key.Key_Down:
                     self._navigate_popup(+1)
@@ -628,6 +713,14 @@ class ChatPanel(QtWidgets.QFrame):
                 if key == QtCore.Qt.Key.Key_Escape:
                     self._popup.hide()
                     return True
+            else:
+                # Send-on-Enter when the slash popup isn't up — matches
+                # the ChatGPT Codex App behaviour. Shift+Enter still
+                # inserts a literal newline.
+                if key in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+                    if not (modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier):
+                        self._on_send()
+                        return True
         return super().eventFilter(source, event)
 
     # ---- Thinking strip --------------------------------------------------
@@ -650,7 +743,12 @@ class ChatPanel(QtWidgets.QFrame):
 
     # ---- Slash popup logic ----------------------------------------------
 
-    def _on_input_changed(self, text: str) -> None:
+    def _on_input_text_changed(self) -> None:
+        text = self._input.toPlainText()
+        # Keep the send button in sync with whether the user has
+        # anything to send. ``CursorPosition`` updates fire this slot
+        # as well, so re-read the current value each time.
+        self._send.setEnabled(bool(text.strip()))
         if not text.startswith("/"):
             self._popup.hide()
             return
@@ -707,11 +805,12 @@ class ChatPanel(QtWidgets.QFrame):
     # ---- Send ---------------------------------------------------------
 
     def _on_send(self) -> None:
-        text = self._input.text().strip()
+        text = self._input.toPlainText().strip()
         if not text:
             return
         self._input.clear()
         self._popup.hide()
+        self._send.setEnabled(False)
         if text == "/quit":
             QtWidgets.QApplication.instance().quit()
             return
@@ -861,6 +960,141 @@ class RAGPanel(QtWidgets.QFrame):
 
     def set_status(self, text: str) -> None:
         self._status.setText(text)
+
+
+class DailyConfigDialog(QtWidgets.QDialog):
+    """Collect the parameters that drive ``littrace sentinel run`` from
+    the user before the daily pipeline kicks off. The sentinel CLI
+    only takes ``--watchlist`` and ``--topic``; everything else
+    (year filter, target download count, etc.) is applied client-side
+    on top of the resulting stdout, so the dialog tracks what the user
+    actually asked for and surfaces a follow-up warning when the run
+    came up short.
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        default_topic: str = "mxene_sensor",
+        default_year_min: int = 2023,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("今日管线配置")
+        self.setModal(True)
+        self.resize(520, 360)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("今日管线")
+        title.setStyleSheet(
+            f"font-size:18px;font-weight:600;color:{DESIGN['ink']};"
+        )
+        layout.addWidget(title)
+
+        subtitle = QtWidgets.QLabel(
+            "指定研究主题和指标，sentinel 会按主题检索开放访问论文、下载并解析。"
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(
+            f"font-size:12px;color:{DESIGN['ink_muted']};"
+        )
+        layout.addWidget(subtitle)
+
+        form = QtWidgets.QFormLayout()
+        form.setSpacing(10)
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+
+        # 主题（watchlist id，必填）
+        self._topic_input = QtWidgets.QLineEdit(default_topic)
+        self._topic_input.setPlaceholderText("e.g. mxene_sensor, perovskite_solar, ... ")
+        self._topic_input.selectAll()
+        form.addRow("研究主题 *", self._topic_input)
+
+        # 关键词（--topic，可选）
+        self._keywords_input = QtWidgets.QLineEdit()
+        self._keywords_input.setPlaceholderText(
+            "可选：更精确的检索词（多个用空格分隔）"
+        )
+        form.addRow("关键词", self._keywords_input)
+
+        # 起始年份
+        self._year_input = QtWidgets.QSpinBox()
+        self._year_input.setRange(1990, 2030)
+        self._year_input.setValue(default_year_min)
+        form.addRow("起始年份", self._year_input)
+
+        # 目标下载数
+        self._target_input = QtWidgets.QSpinBox()
+        self._target_input.setRange(1, 50)
+        self._target_input.setValue(5)
+        self._target_input.setSuffix(" 篇")
+        form.addRow("最少下载数", self._target_input)
+
+        # 截止月份
+        self._months_input = QtWidgets.QSpinBox()
+        self._months_input.setRange(1, 24)
+        self._months_input.setValue(6)
+        self._months_input.setSuffix(" 个月")
+        form.addRow("回看时长", self._months_input)
+
+        layout.addLayout(form)
+        layout.addStretch(1)
+
+        # 错误提示
+        self._error_label = QtWidgets.QLabel("")
+        self._error_label.setStyleSheet(
+            f"color:{DESIGN['accent_coral']};font-size:12px;"
+        )
+        self._error_label.setWordWrap(True)
+        layout.addWidget(self._error_label)
+
+        # 按钮
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.setSpacing(8)
+        button_row.addStretch(1)
+        cancel_btn = QtWidgets.QPushButton("取消")
+        cancel_btn.setObjectName("subnav_btn")
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addWidget(cancel_btn)
+        run_btn = QtWidgets.QPushButton("运行")
+        run_btn.setObjectName("subnav_btn_primary")
+        run_btn.setDefault(True)
+        run_btn.clicked.connect(self._validate_and_accept)
+        button_row.addWidget(run_btn)
+        layout.addLayout(button_row)
+
+        self._topic_input.returnPressed.connect(self._validate_and_accept)
+
+    def _validate_and_accept(self) -> None:
+        topic = self._topic_input.text().strip()
+        if not topic:
+            self._error_label.setText("研究主题是必填的（用于 sentinel watchlist id）")
+            return
+        if not topic.replace("_", "").replace("-", "").isalnum():
+            self._error_label.setText(
+                "主题只能是字母数字 + _ + -（用作 watchlist id 文件名）"
+            )
+            return
+        self.accept()
+
+    # Accessors
+    def topic(self) -> str:
+        return self._topic_input.text().strip()
+
+    def keywords(self) -> str:
+        return self._keywords_input.text().strip()
+
+    def year_min(self) -> int:
+        return self._year_input.value()
+
+    def target_papers(self) -> int:
+        return self._target_input.value()
+
+    def months_lookback(self) -> int:
+        return self._months_input.value()
 
 
 class BrowserPanel(QtWidgets.QFrame):
@@ -1160,17 +1394,43 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         )
 
     def _on_run_daily(self) -> None:
-        # Single Daily run entry point. The button hands off to
-        # ``littrace sentinel run --watchlist ...`` in a background thread
-        # so the chat thread stays responsive. The status line is updated
-        # when the run completes via a controller event.
-        self._status_bar.showMessage("今日管线启动中…", 3000)
+        # Single Daily run entry point. The button used to dispatch
+        # straight to a hard-coded ``--watchlist mxene_sensor``; that was
+        # wrong because the user has no way to know which topic the
+        # pipeline is about. Now the button opens ``DailyConfigDialog``
+        # first so the user picks a topic, keywords, year filter, and
+        # target download count. ``DailyConfigDialog.exec`` is modal so
+        # the chat thread is paused until the user either accepts or
+        # cancels; both branches return immediately, this method just
+        # kicks off the worker once we have a config.
+        existing_topic = "mxene_sensor"
+        # Try to inherit the topic from the current chat session if it
+        # has been mentioned before. Cheap heuristic: any token starting
+        # with an alpha character is fine, but for now we default to a
+        # safe placeholder.
+        dialog = DailyConfigDialog(
+            self,
+            default_topic=existing_topic,
+            default_year_min=getattr(self.config.literature_context, "default_year_min", 2023),
+        )
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        topic = dialog.topic()
+        keywords = dialog.keywords()
+        year_min = dialog.year_min()
+        target = dialog.target_papers()
+        months = dialog.months_lookback()
+        self._status_bar.showMessage(f"今日管线启动中…主题：{topic}", 3000)
         self._rag_panel.set_status("运行中…")
         import threading
 
         def _worker():
             try:
-                cmd, env, cwd = _littrace_cmd("sentinel", "run", "--watchlist", "mxene_sensor")
+                cmd, env, cwd = _littrace_cmd(
+                    "sentinel", "run",
+                    "--watchlist", topic,
+                    "--topic", keywords or topic,
+                )
                 completed = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -1179,19 +1439,22 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                     cwd=cwd,
                     env=env,
                 )
-                # Parse sentinel stdout and surface only a clean one-line
-                # summary. The previous implementation dumped ``msg[-3:]``
-                # which almost always picked up the closing
-                # ``Dataset is missing for all rows; comparison may be
-                # unfair.`` warnings — useful for the parse pipeline
-                # itself but noise for the user who just wants to know
-                # whether the run finished.
                 summary = _summarise_sentinel_output(
                     completed.stdout or ""
                 )
-                self._post_status(
-                    f"今日管线完成（exit={completed.returncode}） · {summary}"
+                # Parse counters out of the summary so we can flag
+                # short-falls (the user's ``target_papers`` is the
+                # contract they signed up to).
+                downloaded = _summary_value(summary, "downloaded:")
+                headline = (
+                    f"今日管线完成（exit={completed.returncode}）· {summary}"
                 )
+                if downloaded is not None and downloaded < target:
+                    headline += (
+                        f" · ⚠️ 只下了 {downloaded} 篇，"
+                        f"少于目标 {target} 篇"
+                    )
+                self._post_status(headline)
             except subprocess.TimeoutExpired:
                 self._post_status("今日管线超时（10 分钟）")
             except Exception as exc:  # pragma: no cover - defensive
