@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import json
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -228,15 +229,15 @@ def _render_message_html(text: str) -> str:
     body = re.sub(r"`([^`\n]+)`", code, body)
     body = re.sub(r"\*\*([^*\n]+)\*\*", bold, body)
     body = re.sub(r"(?<![*\w])\*([^*\n]+)\*(?!\w)", italic, body)
-    body = re.sub(r"^###### (.+)$", heading("6"), body, flags=re.MULTILINE)
-    body = re.sub(r"^##### (.+)$", heading("5"), body, flags=re.MULTILINE)
-    body = re.sub(r"^#### (.+)$", heading("5"), body, flags=re.MULTILINE)
-    body = re.sub(r"^### (.+)$", heading("4"), body, flags=re.MULTILINE)
-    body = re.sub(r"^## (.+)$", heading("4"), body, flags=re.MULTILINE)
-    body = re.sub(r"^# (.+)$", heading("3"), body, flags=re.MULTILINE)
-    body = re.sub(r"^> (.+)$", bq, body, flags=re.MULTILINE)
-    body = re.sub(r"^(?:[-*] )(.+)$", li_dash, body, flags=re.MULTILINE)
-    body = re.sub(r"^\d+\. (.+)$", li_num, body, flags=re.MULTILINE)
+    body = re.sub(r"^###### ([^\n]+)$", heading("6"), body, flags=re.MULTILINE)
+    body = re.sub(r"^##### ([^\n]+)$", heading("5"), body, flags=re.MULTILINE)
+    body = re.sub(r"^#### ([^\n]+)$", heading("5"), body, flags=re.MULTILINE)
+    body = re.sub(r"^### ([^\n]+)$", heading("4"), body, flags=re.MULTILINE)
+    body = re.sub(r"^## ([^\n]+)$", heading("4"), body, flags=re.MULTILINE)
+    body = re.sub(r"^# ([^\n]+)$", heading("3"), body, flags=re.MULTILINE)
+    body = re.sub(r"^> ([^\n]+)$", bq, body, flags=re.MULTILINE)
+    body = re.sub(r"^(?:[-*] )([^\n]+)$", li_dash, body, flags=re.MULTILINE)
+    body = re.sub(r"^\d+\. ([^\n]+)$", li_num, body, flags=re.MULTILINE)
     # Escape anything left over so a literal ``<`` or ``&`` in the
     # user's reply can't open a tag.
     body = _xml_escape(body)
@@ -272,11 +273,30 @@ _NARRATION_PATTERNS = [
 # "The rest is internal."). These are stripped before the closing
 # block boundary so the chat scrollback ends on the substantive
 # content.
+#
+# Each entry is matched as a ``re.search`` with a single trailing
+# pattern (no leading ``[\s\S]*?``) so a greedy quantifier on the
+# prefix doesn't eat the whole reply. The pattern is anchored to the
+# end of the string with ``$`` (with ``re.DOTALL`` so the optional
+# whitespace can span line breaks). If the last match is at position
+# 0 the entire reply would have been narration and we drop it; in
+# practice codex only emits the trailing sentence once the rest of
+# the answer is already on the page, so position 0 is unusual.
 _TRAILING_NARRATION_PATTERNS = [
-    r"[\s\S]*?(?:用户不关注.{0,30}|用户不需要.{0,30}|不.{0,4}直接展示给用户|不.{0,4}展示给用户|不.{0,8}说给用户|不.{0,8}用.{0,4}看)[。.]?\s*$",
-    r"[\s\S]*?(?:I['’]?ll keep the rest concise\.?|Keep the rest concise\.?|I['’]?ll be concise\.?|I'll skip the rest\.?)\s*$",
-    r"[\s\S]*?(?:I['’]?ll skip the internal details\.?|Skipping internal details\.?)\s*$",
-    r"[\s\S]*?(?:The rest is internal\.?|Internal notes removed\.?)\s*$",
+    r"用户不关注[^。]{0,80}\s*$",
+    r"用户不需要[^。]{0,80}\s*$",
+    r"不.{0,4}直接展示给用户\s*$",
+    r"不.{0,4}展示给用户\s*$",
+    r"不.{0,8}说给用户\s*$",
+    r"不.{0,8}用.{0,4}看\s*$",
+    r"I['’]?ll keep the rest concise\.?\s*$",
+    r"Keep the rest concise\.?\s*$",
+    r"I['’]?ll be concise\.?\s*$",
+    r"I'll skip the rest\.?\s*$",
+    r"I['’]?ll skip the internal details\.?\s*$",
+    r"Skipping internal details\.?\s*$",
+    r"The rest is internal\.?\s*$",
+    r"Internal notes removed\.?\s*$",
 ]
 
 
@@ -298,11 +318,18 @@ def _strip_trailing_narration(html: str) -> str:
     Codex's common "tidy up" lines ("用户不关注的信息不用说",
     "I'll keep the rest concise.", etc.) — these leak the model's
     own bookkeeping into the visible chat.
+
+    Implementation note: ``re.search`` + a leading ``[\\s\\S]*?`` is
+    wrong — the lazy quantifier still expands to cover the whole
+    prefix and the match consumes the entire reply. ``re.finditer``
+    enumerates all matches in left-to-right order; the **last** match
+    is the one that touches the trailing sentence, so the start of
+    that last match is the right cut point.
     """
     for pattern in _TRAILING_NARRATION_PATTERNS:
-        m = re.search(pattern, html)
-        if m:
-            return html[: m.start()].rstrip()
+        matches = list(re.finditer(pattern, html))
+        if matches:
+            return html[: matches[-1].start()].rstrip()
     return html
 
 
@@ -1919,12 +1946,24 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         # silently dropped by ``invokeMethod`` even with
         # ``QueuedConnection``.
         def post(handler_name: str) -> "callable":
+            # ``QMetaObject.invokeMethod`` with ``Q_ARG("QVariant", ...)``
+            # serialises Python objects through Qt's meta-system, which
+            # has no idea what a ``ShellEvent`` is and ends up handing
+            # the slot a bare ``str`` (its ``repr()``). ``Q_ARG(str, ...)``
+            # with a JSON payload + ``@Slot(str)`` is the documented
+            # cross-thread path: the slot receives a real Python string
+            # that ``json.loads`` can rebuild into the dict shape the
+            # handler expects.
             def _wrapper(event: ShellEvent) -> None:
+                payload = json.dumps(
+                    {"kind": event.kind, "payload": event.payload},
+                    ensure_ascii=False,
+                )
                 QtCore.QMetaObject.invokeMethod(
                     self,
                     handler_name,
                     QtCore.Qt.ConnectionType.QueuedConnection,
-                    QtCore.Q_ARG("QVariant", event),
+                    QtCore.Q_ARG(str, payload),
                 )
 
             return _wrapper
@@ -1935,33 +1974,47 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         controller.bus.subscribe(post("_qt_on_workspace_event"))
         controller.bus.subscribe(post("_qt_on_error_event"))
 
-    @QtCore.Slot("QVariant")
-    def _qt_on_message_event(self, event: ShellEvent) -> None:
-        if event.kind != self._controller.EVENT_MESSAGE_APPENDED:
+    def _decode_event(self, payload: str) -> tuple[str, dict]:
+        """Restore a ``(kind, payload_dict)`` pair from the JSON string
+        the ``post()`` trampoline passes across threads.
+        """
+        try:
+            data = json.loads(payload)
+        except (TypeError, ValueError):
+            return "", {}
+        return data.get("kind", ""), data.get("payload", {}) or {}
+
+    @QtCore.Slot(str)
+    def _qt_on_message_event(self, payload: str) -> None:
+        kind, body = self._decode_event(payload)
+        if kind != self._controller.EVENT_MESSAGE_APPENDED:
             return
-        role = event.payload.get("role", "system")
-        text = event.payload.get("text", "")
-        extras = {k: v for k, v in event.payload.items() if k in ("action", "warnings")}
+        role = body.get("role", "system")
+        text = body.get("text", "")
+        extras = {k: v for k, v in body.items() if k in ("action", "warnings")}
         self._chat_panel.append_message(role, text, **extras)
 
-    @QtCore.Slot("QVariant")
-    def _qt_on_status_event(self, event: ShellEvent) -> None:
-        if event.kind != self._controller.EVENT_STATUS_CHANGED:
+    @QtCore.Slot(str)
+    def _qt_on_status_event(self, payload: str) -> None:
+        kind, body = self._decode_event(payload)
+        if kind != self._controller.EVENT_STATUS_CHANGED:
             return
-        self._status_bar.showMessage(event.payload.get("text", ""))
+        self._status_bar.showMessage(body.get("text", ""))
 
-    @QtCore.Slot("QVariant")
-    def _qt_on_thinking_event(self, event: ShellEvent) -> None:
-        if event.kind != self._controller.EVENT_THINKING:
+    @QtCore.Slot(str)
+    def _qt_on_thinking_event(self, payload: str) -> None:
+        kind, body = self._decode_event(payload)
+        if kind != self._controller.EVENT_THINKING:
             return
         self._chat_panel.set_thinking(
-            active=bool(event.payload.get("active")),
-            label=str(event.payload.get("label", "思考中")),
+            active=bool(body.get("active")),
+            label=str(body.get("label", "思考中")),
         )
 
-    @QtCore.Slot("QVariant")
-    def _qt_on_workspace_event(self, event: ShellEvent) -> None:
-        if event.kind != self._controller.EVENT_WORKSPACE_REFRESHED:
+    @QtCore.Slot(str)
+    def _qt_on_workspace_event(self, payload: str) -> None:
+        kind, body = self._decode_event(payload)
+        if kind != self._controller.EVENT_WORKSPACE_REFRESHED:
             return
         self._context_panel.refresh(list(self._controller.list_active_papers()))
         self._trace_panel.render_workflow_trace(
@@ -1972,12 +2025,13 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             ]
         )
 
-    @QtCore.Slot("QVariant")
-    def _qt_on_error_event(self, event: ShellEvent) -> None:
-        if event.kind != self._controller.EVENT_ERROR:
+    @QtCore.Slot(str)
+    def _qt_on_error_event(self, payload: str) -> None:
+        kind, body = self._decode_event(payload)
+        if kind != self._controller.EVENT_ERROR:
             return
         self._chat_panel.append_message(
-            "system", f"⚠️ {event.payload.get('message', 'error')}"
+            "system", f"⚠️ {body.get('message', 'error')}"
         )
 
     # ---- Initial state ---------------------------------------------------
