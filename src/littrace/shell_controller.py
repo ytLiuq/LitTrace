@@ -173,20 +173,13 @@ class ShellController:
             pass
 
     async def _prime_real_turn(self) -> None:
-        """Run a one-token ``ping`` turn so the OpenAI API path is warm
-        before the user sends their first real message. Reply is
-        discarded.
+        """Run a one-token ``.`` turn so the OpenAI API path is warm
+        before the user sends their first real message. ``silent=True``
+        suppresses the ``message_appended`` event so the dummy "**.**"
+        answer does not pollute the user's chat scrollback.
         """
-        request = ChatRequest(
-            session_id=self._session.session_id,
-            message=".",
-            current_workspace=self._workspace,
-            trace_id=f"{self._session.session_id}-warmup",
-        )
         try:
-            await self._service.chat(
-                request, self._workspace, self._session
-            )
+            await self._run_chat_turn(".", silent=True)
         except Exception:
             pass
 
@@ -247,10 +240,10 @@ class ShellController:
             self._emit(self.EVENT_ERROR, message="controller event loop not ready")
             return
         asyncio.run_coroutine_threadsafe(
-            self._run_chat_turn(text), self._loop
+            self._run_chat_turn(text, silent=False), self._loop
         )
 
-    async def _run_chat_turn(self, text: str) -> None:
+    async def _run_chat_turn(self, text: str, *, silent: bool = False) -> None:
         request = ChatRequest(
             session_id=self._session.session_id,
             message=text,
@@ -298,16 +291,17 @@ class ShellController:
             return
         with self._lock:
             self._workspace = workspace
-        self._emit(
-            self.EVENT_MESSAGE_APPENDED,
-            role="assistant",
-            text=response.reply,
-            action=response.action,
-            warnings=response.warnings,
-        )
-        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        if not silent:
+            self._emit(
+                self.EVENT_MESSAGE_APPENDED,
+                role="assistant",
+                text=response.reply,
+                action=response.action,
+                warnings=response.warnings,
+            )
+            self._emit(self.EVENT_WORKSPACE_REFRESHED)
         self._emit(self.EVENT_THINKING, active=False)
-        self._emit(self.EVENT_STATUS_CHANGED, text="就绪")
+        self._emit(self.EVENT_STATUS_CHANGED, text="就绪" if not silent else "已就绪")
 
     # ------------------------------------------------------------------
     # Refresh hooks (mirrors Tk shell's refresh_* methods)

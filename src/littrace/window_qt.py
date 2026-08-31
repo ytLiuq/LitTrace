@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -94,6 +95,169 @@ def _summarise_sentinel_output(stdout: str) -> str:
         tail_lines = [line.strip() for line in stdout.strip().splitlines() if line.strip()]
         return " · ".join(tail_lines[-2:])
     return " · ".join(picked)
+
+
+# ---------------------------------------------------------------------------
+# Message body rendering
+# ---------------------------------------------------------------------------
+#
+# Codex replies come back as plain text that happens to use Markdown
+# conventions: bold with **...**, inline code with `...`, code fences
+# with ```...```, headings with ``#``/``##``, list items with ``- ``,
+# and block quotes with ``> ``. ``QTextBrowser.append`` accepts an HTML
+# fragment, so we convert Markdown to a small whitelist of HTML tags
+# here and inject the result. We escape the input first, then run
+# Markdown rules against the escaped text — that way any literal
+# ``<``/``>`` in the reply never opens a tag the browser interprets.
+# No external Markdown dependency; the rule set is intentionally
+# minimal (whatever Codex 0.149 emits today, not CommonMark).
+
+
+def _xml_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _render_message_html(text: str) -> str:
+    """Render a Codex reply as the small HTML subset Qt's text browser
+    understands. ``text`` is treated as Markdown; the rules above cover
+    the cases Codex 0.149 actually emits (bold / code / fenced code /
+    headings / lists / block quotes).
+
+    Implementation note: escape-then-rewrite would re-escape the ``<b>``
+    / ``<code>`` / ``<pre>`` we just inserted when a later rule (e.g.
+    the list rule) sees those tags inside its match group. So we do
+    three passes:
+
+      1. Run the markdown rules on the raw text. Each rule's callback
+         emits the *final* HTML for its match (escaping the captured
+         text group itself), so the result is already valid HTML.
+      2. ``_xml_escape`` the whole string once. That escapes any
+         literal ``<``/``>``/``&`` in the reply that was outside the
+         markdown patterns, but leaves the already-emitted HTML tags
+         (we swapped them for sentinels just before escaping so they
+         pass through untouched).
+      3. Swap the sentinels back to their final ``<b>``/``<code>``/etc.
+    """
+    sentinel_map = {
+        "@@LT_B@@": "<b>",
+        "@@RT_B@@": "</b>",
+        "@@LT_I@@": "<i>",
+        "@@RT_I@@": "</i>",
+        "@@LT_CODE@@": (
+            "<code style='background:" + DESIGN["surface_2"]
+            + ";padding:1px 4px;border-radius:3px;"
+            + "font-family:Menlo,Consolas,monospace;font-size:12px;'>"
+        ),
+        "@@RT_CODE@@": "</code>",
+        "@@LT_PRE@@": (
+            "<pre style='background:" + DESIGN["surface_2"]
+            + ";padding:6px 8px;border-radius:4px;"
+            + "white-space:pre-wrap;font-family:Menlo,Consolas,monospace;"
+            + "font-size:12px;'>"
+        ),
+        "@@RT_PRE@@": "</pre>",
+        "@@LT_H3@@": "<h3 style='margin:6px 0;'>",
+        "@@RT_H3@@": "</h3>",
+        "@@LT_H4@@": "<h4>",
+        "@@RT_H4@@": "</h4>",
+        "@@LT_H5@@": "<h5>",
+        "@@RT_H5@@": "</h5>",
+        "@@LT_H6@@": "<h6>",
+        "@@RT_H6@@": "</h6>",
+        "@@LT_BQ@@": (
+            "<blockquote style='margin:4px 0;padding:2px 8px;"
+            + "border-left:3px solid " + DESIGN["hairline"] + ";"
+            + "color:" + DESIGN["ink_muted"] + ";'>"
+        ),
+        "@@RT_BQ@@": "</blockquote>",
+        "@@LI_START@@": (
+            "<div style='margin-left:12px;'>"
+        ),
+        "@@LI_END@@": "</div>",
+    }
+
+    def fence(m):
+        return "@@LT_PRE@@" + _xml_escape(m.group(1).strip()) + "@@RT_PRE@@"
+
+    def code(m):
+        return "@@LT_CODE@@" + _xml_escape(m.group(1)) + "@@RT_CODE@@"
+
+    def bold(m):
+        return "@@LT_B@@" + _xml_escape(m.group(1)) + "@@RT_B@@"
+
+    def italic(m):
+        return "@@LT_I@@" + _xml_escape(m.group(1)) + "@@RT_I@@"
+
+    def heading(level: str):
+        return lambda m: f"@@LT_H{level}@@" + _xml_escape(m.group(1)) + f"@@RT_H{level}@@"
+
+    def bq(m):
+        return "@@LT_BQ@@" + _xml_escape(m.group(1)) + "@@RT_BQ@@"
+
+    def li_dash(m):
+        return "@@LI_START@@• " + _xml_escape(m.group(1)) + "@@LI_END@@"
+
+    def li_num(m):
+        return "@@LI_START@@" + m.group(0) + "@@LI_END@@"
+
+    body = text
+    body = re.sub(r"```([\s\S]*?)```", fence, body)
+    body = re.sub(r"`([^`\n]+)`", code, body)
+    body = re.sub(r"\*\*([^*\n]+)\*\*", bold, body)
+    body = re.sub(r"(?<![*\w])\*([^*\n]+)\*(?!\w)", italic, body)
+    body = re.sub(r"^###### (.+)$", heading("6"), body, flags=re.MULTILINE)
+    body = re.sub(r"^##### (.+)$", heading("5"), body, flags=re.MULTILINE)
+    body = re.sub(r"^#### (.+)$", heading("5"), body, flags=re.MULTILINE)
+    body = re.sub(r"^### (.+)$", heading("4"), body, flags=re.MULTILINE)
+    body = re.sub(r"^## (.+)$", heading("4"), body, flags=re.MULTILINE)
+    body = re.sub(r"^# (.+)$", heading("3"), body, flags=re.MULTILINE)
+    body = re.sub(r"^> (.+)$", bq, body, flags=re.MULTILINE)
+    body = re.sub(r"^(?:[-*] )(.+)$", li_dash, body, flags=re.MULTILINE)
+    body = re.sub(r"^\d+\. (.+)$", li_num, body, flags=re.MULTILINE)
+    # Escape anything left over so a literal ``<`` or ``&`` in the
+    # user's reply can't open a tag.
+    body = _xml_escape(body)
+    # Re-emit the previously-substituted HTML tags. Order doesn't
+    # matter because the sentinels are unique placeholder strings.
+    for sentinel, html in sentinel_map.items():
+        body = body.replace(sentinel, html)
+    body = body.replace("\n", "<br>")
+    return body
+
+
+# Codex 0.149 alpha frequently prepends a sentence of internal narration
+# to its replies ("I'll keep it to two concise comparison bullets.",
+# "这里只需要确认当前助手身份，不会改动 LitTrace 会话。"). These are
+# useful for the model's own bookkeeping but useless — and sometimes
+# confusing — to the human reader. Strip one or two such leading
+# sentences so the user sees the substantive answer immediately.
+_NARRATION_PATTERNS = [
+    r"^我.{0,80}(?:确认|只需|只.{0,8}需要|会.{0,8}改动|会.{0,8}修改|会.{0,8}影响|不.{0,4}会).{0,40}[。.]\s*",
+    r"^I['’]?ll.{0,80}(?:keep|just|only).{0,80}[.!?]\s*",
+    r"^Sure[,!.].{0,120}[.!?]\s*",
+    r"^Here'?s.{0,120}[.!?]\s*",
+]
+
+
+def _strip_leading_narration(html: str) -> str:
+    """Drop one or two leading sentences that match common Codex
+    internal-narration templates. Operates on the already-rendered
+    HTML fragment by stripping a leading text-run before any block tag.
+    """
+    for pattern in _NARRATION_PATTERNS:
+        m = re.match(pattern, html, re.DOTALL)
+        if m:
+            return html[m.end():].lstrip()
+    return html
+
+
+# Late import kept out of the top of the file on purpose; ``re`` is
+# already imported above near the standard-library block.
 
 
 def _littrace_cmd(*args: str) -> tuple[list[str], dict[str, str], str]:
@@ -556,37 +720,51 @@ class ChatPanel(QtWidgets.QFrame):
     # ---- Event handlers wired by LitTraceQtWindow ----------------------
 
     def append_message(self, role: str, text: str, **extras: Any) -> None:
-        css_role = {
-            "user": "color:#0b0c0e;font-weight:600;",
-            "assistant": "color:#0b0c0e;",
-            "system": "color:#a4a7ad;font-style:italic;",
-        }.get(role, "color:#0b0c0e;")
-        action = extras.get("action")
-        action_html = (
-            f'<div style="color:#5c6068;font-size:11px;">action: {action}</div>'
-            if action
-            else ""
+        # Codex replies come back as plain text that happens to use
+        # Markdown conventions (bold with **...**, code with `...`, list
+        # items with "- ", headings with "# ", blockquotes with "> ").
+        # Convert to HTML and render as a styled bubble so the user
+        # actually sees formatting. QTextBrowser's ``append`` accepts an
+        # HTML fragment, so the body is wrapped in a per-role ``<div>``.
+        # We escape the input first, then apply markdown rules against
+        # the escaped text — that way any literal ``<``/``>`` in the
+        # reply never opens a tag the browser will interpret.
+        bubble_color = {
+            "user": "#e6efee",
+            "assistant": "#ffffff",
+            "system": "#f7f8f8",
+        }.get(role, "#ffffff")
+        bubble_radius = {"user": "12px 12px 4px 12px", "assistant": "12px 12px 12px 4px"}.get(
+            role, "8px"
         )
-        warnings = extras.get("warnings") or []
-        warn_html = (
-            "<ul style='color:#cc785c;margin:4px 0;'>"
-            + "".join(f"<li>{w}</li>" for w in warnings)
-            + "</ul>"
-            if warnings
-            else ""
-        )
-        safe = (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace("\n", "<br>")
-        )
+        body = _render_message_html(text)
+        # The first two sentences of the first line show up in lots of
+        # codex replies that begin with internal notes the user does
+        # not want to see ("这里只需要确认当前助手身份，不会改动
+        # LitTrace 会话。"). Hide a leading narration sentence so the
+        # answer starts with the substantive reply.
+        body = _strip_leading_narration(body)
         html = (
-            f'<div style="{css_role}margin:6px 0;">'
-            f'<span style="color:#5c6068;font-size:11px;">{role}</span><br>'
-            f"{safe}{action_html}{warn_html}</div>"
+            f'<div style="background:{bubble_color};border:1px solid {DESIGN["hairline"]};'
+            f'border-radius:{bubble_radius};padding:8px 12px;margin:6px 0;'
+            f'color:{DESIGN["ink"]};">'
+            f'<div style="color:{DESIGN["ink_muted"]};font-size:11px;'
+            f'font-weight:600;margin-bottom:4px;">{"你" if role == "user" else "Codex"}</div>'
+            f"{body}"
+            f"</div>"
         )
         self._view.append(html)
+
+    def _on_chat_context_menu(self, pos: QtCore.QPoint) -> None:
+        menu = QtWidgets.QMenu(self)
+        copy_action = menu.addAction("复制")
+        copy_action.setEnabled(self._view.textCursor().hasSelection())
+        copy_action.triggered.connect(self._view.copy)
+        select_all = menu.addAction("全选")
+        select_all.triggered.connect(self._view.selectAll)
+        clear_action = menu.addAction("清屏")
+        clear_action.triggered.connect(self._view.clear)
+        menu.exec(self._view.mapToGlobal(pos))
 
     # ---- Right-click copy/paste menu -----------------------------------
 
