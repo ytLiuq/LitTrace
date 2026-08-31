@@ -1023,61 +1023,80 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         controller = self._controller
 
         # Qt widgets must only be touched from the GUI thread, but the
-        # controller emits events on its asyncio worker thread. Post each
-        # event back to the main loop with ``QTimer.singleShot(0, ...)`` so
-        # ``QTextDocument`` and friends are constructed on the right thread.
-        # The headless-smoke subscribers are exceptions — they only print
-        # and call ``app.quit`` which is thread-safe.
-        def post_to_gui(handler):
+        # controller emits events on its asyncio worker thread. Earlier
+        # iterations tried ``QTimer.singleShot(0, lambda)`` from the
+        # worker thread — that bound the timer to a thread with no Qt
+        # event loop, so the lambda never fired. The current bridge
+        # declares ``@Slot``-decorated methods on ``self`` (so they live
+        # in the Qt meta-object system) and then dispatches every event
+        # via ``QMetaObject.invokeMethod(self, "...", QueuedConnection,
+        # ...)`` from the worker thread. ``QueuedConnection`` posts the
+        # call onto the receiver's thread (the GUI thread), where the
+        # actual widget mutation runs. The ``@Slot`` registration is
+        # what makes the method invokable — plain Python methods are
+        # silently dropped by ``invokeMethod`` even with
+        # ``QueuedConnection``.
+        def post(handler_name: str) -> "callable":
             def _wrapper(event: ShellEvent) -> None:
-                QtCore.QTimer.singleShot(0, lambda e=event: handler(e))
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    handler_name,
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG("QVariant", event),
+                )
+
             return _wrapper
 
-        def on_message(event: ShellEvent) -> None:
-            if event.kind == controller.EVENT_MESSAGE_APPENDED:
-                self._chat_panel.append_message(
-                    event.payload.get("role", "system"),
-                    event.payload.get("text", ""),
-                    **{
-                        k: v
-                        for k, v in event.payload.items()
-                        if k in ("action", "warnings")
-                    },
-                )
+        controller.bus.subscribe(post("_qt_on_message_event"))
+        controller.bus.subscribe(post("_qt_on_status_event"))
+        controller.bus.subscribe(post("_qt_on_thinking_event"))
+        controller.bus.subscribe(post("_qt_on_workspace_event"))
+        controller.bus.subscribe(post("_qt_on_error_event"))
 
-        def on_status(event: ShellEvent) -> None:
-            if event.kind == controller.EVENT_STATUS_CHANGED:
-                self._status_bar.showMessage(event.payload.get("text", ""))
+    @QtCore.Slot("QVariant")
+    def _qt_on_message_event(self, event: ShellEvent) -> None:
+        if event.kind != self._controller.EVENT_MESSAGE_APPENDED:
+            return
+        role = event.payload.get("role", "system")
+        text = event.payload.get("text", "")
+        extras = {k: v for k, v in event.payload.items() if k in ("action", "warnings")}
+        self._chat_panel.append_message(role, text, **extras)
 
-        def on_thinking(event: ShellEvent) -> None:
-            if event.kind == controller.EVENT_THINKING:
-                self._chat_panel.set_thinking(
-                    active=bool(event.payload.get("active")),
-                    label=str(event.payload.get("label", "思考中")),
-                )
+    @QtCore.Slot("QVariant")
+    def _qt_on_status_event(self, event: ShellEvent) -> None:
+        if event.kind != self._controller.EVENT_STATUS_CHANGED:
+            return
+        self._status_bar.showMessage(event.payload.get("text", ""))
 
-        def on_workspace(event: ShellEvent) -> None:
-            if event.kind == controller.EVENT_WORKSPACE_REFRESHED:
-                self._context_panel.refresh(list(self._controller.list_active_papers()))
-                self._trace_panel.render_workflow_trace(
-                    ["工作区刷新"]
-                    + [
-                        f"{i + 1}. {p.title}"
-                        for i, p in enumerate(self._controller.list_active_papers())
-                    ]
-                )
+    @QtCore.Slot("QVariant")
+    def _qt_on_thinking_event(self, event: ShellEvent) -> None:
+        if event.kind != self._controller.EVENT_THINKING:
+            return
+        self._chat_panel.set_thinking(
+            active=bool(event.payload.get("active")),
+            label=str(event.payload.get("label", "思考中")),
+        )
 
-        def on_error(event: ShellEvent) -> None:
-            if event.kind == controller.EVENT_ERROR:
-                self._chat_panel.append_message(
-                    "system", f"⚠️ {event.payload.get('message', 'error')}"
-                )
+    @QtCore.Slot("QVariant")
+    def _qt_on_workspace_event(self, event: ShellEvent) -> None:
+        if event.kind != self._controller.EVENT_WORKSPACE_REFRESHED:
+            return
+        self._context_panel.refresh(list(self._controller.list_active_papers()))
+        self._trace_panel.render_workflow_trace(
+            ["工作区刷新"]
+            + [
+                f"{i + 1}. {p.title}"
+                for i, p in enumerate(self._controller.list_active_papers())
+            ]
+        )
 
-        controller.bus.subscribe(post_to_gui(on_message))
-        controller.bus.subscribe(post_to_gui(on_status))
-        controller.bus.subscribe(post_to_gui(on_thinking))
-        controller.bus.subscribe(post_to_gui(on_workspace))
-        controller.bus.subscribe(post_to_gui(on_error))
+    @QtCore.Slot("QVariant")
+    def _qt_on_error_event(self, event: ShellEvent) -> None:
+        if event.kind != self._controller.EVENT_ERROR:
+            return
+        self._chat_panel.append_message(
+            "system", f"⚠️ {event.payload.get('message', 'error')}"
+        )
 
     # ---- Initial state ---------------------------------------------------
 
