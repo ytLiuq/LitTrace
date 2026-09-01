@@ -538,6 +538,11 @@ class LiteratureContext(BaseModel):
     active_papers: list[str] = Field(default_factory=list)
     excluded_papers: list[str] = Field(default_factory=list)
     pinned_papers: list[str] = Field(default_factory=list)
+    # Round 19: per-paper importance (1 = normal, 2 = important,
+    # 3 = critical). The GUI renders a 🔥 / ⭐ marker so the user
+    # can spot core papers at a glance when the active list grows
+    # past ~10 entries.
+    importance_levels: dict[str, int] = Field(default_factory=dict)
     selected_for_download: list[str] = Field(default_factory=list)
     filters: WorkspaceFilters = Field(default_factory=WorkspaceFilters)
 

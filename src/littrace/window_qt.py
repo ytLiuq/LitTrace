@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -32,6 +33,10 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from littrace.config import load_config
 from littrace.models import PaperMetadata
+from littrace.publisher_catalog import (
+    PUBLISHERS as PUBLISHER_CATALOG,
+    sign_in_shortlinks,
+)
 from littrace.session import list_chat_sessions
 from littrace.shell_controller import ShellController, ShellEvent
 
@@ -583,7 +588,16 @@ COMMAND_CATALOG: list[tuple[str, str, bool, str]] = [
 
 
 class TracePanel(QtWidgets.QFrame):
-    """Left column — workflow trace + session history."""
+    """Left column — workflow trace + session history.
+
+    Round 19: each section is a collapsible group (tool-button
+    header + an expandable body widget). Default state is expanded;
+    users collapse the workflow trace when they're not actively
+    debugging a run, or collapse the session list when they only
+    have one session. The QSettings key ``trace/group:<name>``
+    remembers the per-section state across launches so the panel
+    re-opens the way the user left it.
+    """
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -593,19 +607,34 @@ class TracePanel(QtWidgets.QFrame):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
-        title = QtWidgets.QLabel("执行 Trace")
-        title.setObjectName("pane_title")
-        layout.addWidget(title)
+        # Round 19: QSettings-backed per-group collapse persistence.
+        # We keep it scoped to the same org/app as ``DailyConfigDialog``
+        # so a single ``~/.config/LitTrace/littrace-qt.conf`` file
+        # owns all GUI prefs.
+        self._settings = QtCore.QSettings("LitTrace", "littrace-qt")
+
+        # Section 1: workflow trace.
+        self._workflow_toggle, self._workflow_body = self._build_collapsible(
+            layout,
+            title="执行 Trace",
+            settings_key="trace/group:workflow",
+            default_expanded=True,
+            stretch=3,
+        )
 
         self._view = QtWidgets.QTextBrowser()
         self._view.setObjectName("trace_view")
         self._view.setOpenExternalLinks(False)
-        layout.addWidget(self._view, stretch=3)
+        self._workflow_body.layout().addWidget(self._view)
 
-        # Session history sub-panel
-        history_title = QtWidgets.QLabel("历史 Session（点击切换）")
-        history_title.setObjectName("pane_title")
-        layout.addWidget(history_title)
+        # Section 2: session history.
+        self._sessions_toggle, self._sessions_body = self._build_collapsible(
+            layout,
+            title="历史 Session（点击切换）",
+            settings_key="trace/group:sessions",
+            default_expanded=True,
+            stretch=2,
+        )
 
         self._sessions = QtWidgets.QListWidget()
         self._sessions.setObjectName("sessions")
@@ -618,7 +647,67 @@ class TracePanel(QtWidgets.QFrame):
         # consistent regardless of input method.
         self._sessions.itemClicked.connect(self._on_session_clicked)
         self._sessions.itemActivated.connect(self._on_session_clicked)
-        layout.addWidget(self._sessions, stretch=2)
+        self._sessions_body.layout().addWidget(self._sessions)
+
+    def _build_collapsible(
+        self,
+        parent_layout: QtWidgets.QVBoxLayout,
+        *,
+        title: str,
+        settings_key: str,
+        default_expanded: bool,
+        stretch: int,
+    ) -> tuple[QtWidgets.QToolButton, QtWidgets.QWidget]:
+        """Create a header tool-button + a body container that
+        toggles visibility together. Returns ``(toggle, body)`` so
+        the caller can populate the body with whatever widget(s) it
+        needs.
+
+        ``settings_key`` (if provided) makes the state survive
+        across launches — the user collapses the workflow trace on
+        day 1, reopens the app on day 2, and the trace stays
+        collapsed. ``default_expanded`` is used only when the key
+        is missing (first launch).
+        """
+        toggle = QtWidgets.QToolButton()
+        toggle.setObjectName("group_toggle")
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toggle.setStyleSheet(
+            "QToolButton#group_toggle{"
+            f"font-size:13px;font-weight:600;color:{DESIGN['ink']};"
+            "border:none;background:transparent;text-align:left;"
+            "padding:4px 0;}"
+            "QToolButton#group_toggle:hover{color:#3a8a8c;}"
+        )
+        body = QtWidgets.QWidget()
+        body_layout = QtWidgets.QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 4, 0, 0)
+        body_layout.setSpacing(4)
+
+        def _apply(expanded: bool) -> None:
+            toggle.setChecked(expanded)
+            toggle.setArrowType(
+                QtCore.Qt.ArrowType.DownArrow
+                if expanded
+                else QtCore.Qt.ArrowType.RightArrow
+            )
+            body.setVisible(expanded)
+
+        # Restore previous state, or fall back to default.
+        stored = self._settings.value(settings_key, default_expanded, type=bool)
+        _apply(bool(stored))
+
+        def _on_toggled(checked: bool) -> None:
+            _apply(checked)
+            self._settings.setValue(settings_key, checked)
+
+        toggle.toggled.connect(_on_toggled)
+
+        parent_layout.addWidget(toggle)
+        parent_layout.addWidget(body, stretch=stretch)
+        return toggle, body
 
     def render_workflow_trace(self, trace_steps: Iterable[str]) -> None:
         body = "<br>".join(f"• {step}" for step in trace_steps) or "(等待任务…)"
@@ -709,6 +798,39 @@ class TracePanel(QtWidgets.QFrame):
             self._status_bar.showMessage(
                 f"该 paper 不在激活列表中：{paper.title[:40]}",
                 3000,
+            )
+
+    def _on_paper_pin_toggle_requested(self, paper_id: str) -> None:
+        # Round 19: ``ContextPanel`` hands the right-click "Pin" /
+        # "取消 pin" action here. ``controller.toggle_paper_pin``
+        # flips the pin state and emits ``EVENT_WORKSPACE_REFRESHED``
+        # so the panel re-renders against the new pinned list. The
+        # status bar lets the user know whether they pinned or
+        # unpinned.
+        new_state = self._controller.toggle_paper_pin(paper_id)
+        action = "已 pin" if new_state else "已取消 pin"
+        self._status_bar.showMessage(
+            f"{action} · {paper_id}", 3000,
+        )
+
+    def _on_paper_importance_requested(
+        self, paper_id: str, level: int
+    ) -> None:
+        # Round 19: ``ContextPanel`` hands the importance submenu
+        # (普通 / 重要 / 核心 / 清除) here. Level=0 clears the
+        # marker; 2 = important; 3 = critical. ``EVENT_WORKSPACE_REFRESHED``
+        # re-renders the panel so the marker flips.
+        ok = self._controller.set_paper_importance(paper_id, level)
+        if ok:
+            label = {
+                0: "已清除重要性标记",
+                2: "已标记为 ⭐ 重要",
+                3: "已标记为 🔥 核心",
+            }.get(level, "重要性已更新")
+            self._status_bar.showMessage(f"{label} · {paper_id}", 3000)
+        else:
+            self._status_bar.showMessage(
+                f"该 paper 不在激活列表中：{paper_id}", 3000,
             )
 
 
@@ -869,7 +991,14 @@ class ChatPanel(QtWidgets.QFrame):
         # can scan the available commands by category. The
         # ``_is_separator`` flag on each item tells the filter logic
         # to hide separators when a query is non-empty.
+        #
+        # Round 19: ``_popup_base_text`` stores the ``"/<name>    — <desc>"``
+        # form for each command row so ``_refresh_popup_counters``
+        # can rebuild the displayed text with a fresh counter (e.g.
+        # ``/papers    — 列出当前上下文文献    · 3 篇``) every time
+        # the popup becomes visible.
         self._popup_meta: dict[int, str] = {}  # row -> "separator:<group>"
+        self._popup_base_text: dict[int, str] = {}  # row -> base "/<name> — <desc>"
         last_group: str | None = None
         for name, desc, _ctx, group in COMMAND_CATALOG:
             if group != last_group:
@@ -887,9 +1016,11 @@ class ChatPanel(QtWidgets.QFrame):
                     f"separator:{group}"
                 )
                 last_group = group
-            item = QtWidgets.QListWidgetItem(f"/{name}    — {desc}")
+            base = f"/{name}    — {desc}"
+            item = QtWidgets.QListWidgetItem(base)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
             self._popup.addItem(item)
+            self._popup_base_text[self._popup.count() - 1] = base
         self._popup.hide()
 
         self._popup_index = 0
@@ -982,6 +1113,63 @@ class ChatPanel(QtWidgets.QFrame):
                 return True
         return False
 
+    def _popup_counter_for(self, name: str) -> str:
+        """Return a short live counter string for ``name`` (e.g.
+        ``"3 篇"`` or ``"RAG 2h 前 · 1.2k chunks"``) to append after
+        the slash-command description. Empty string means "no
+        counter — render the row as before".
+
+        The user sees this every time they type ``/`` and the popup
+        opens, so the counter doubles as a glanceable workspace
+        status — they don't have to open the context panel to know
+        how many papers are active.
+        """
+        try:
+            workspace = self._controller.workspace
+            active = list(getattr(workspace.context, "active_papers", []))
+        except Exception:
+            return ""
+        # Group "论文库" commands — show the same active-paper count
+        # next to whichever command the user is hovering over. Cheap
+        # to recompute (it's a ``len()``), so we don't cache.
+        if name in {"context", "papers", "全部下载", "check-downloads", "resume-downloads"}:
+            n = len(active)
+            return f"{n} 篇"
+        # ``dashboard`` surfaces RAG freshness — use the controller's
+        # refresh tracker (also read by the RAG panel) so the popup
+        # agrees with whatever the user last saw in the right column.
+        if name == "dashboard":
+            try:
+                status = self._controller.get_rag_refresh_status()
+            except Exception:
+                return ""
+            ts = status.get("timestamp")
+            chunks = int(status.get("indexed_chunks") or 0)
+            if not ts:
+                return "RAG 未刷新"
+            age = max(0, int(time.time() - float(ts)))
+            age_text = _fmt_age(age)
+            chunk_text = f"{chunks / 1000:.1f}k" if chunks >= 1000 else str(chunks)
+            return f"RAG {age_text}前 · {chunk_text} 块"
+        return ""
+
+    def _refresh_popup_counters(self) -> None:
+        """Rewrite each command row's display text with the latest
+        ``_popup_counter_for(name)`` value. Called from
+        ``_on_input_text_changed`` so the counter is fresh every
+        keystroke (not just the first ``/``).
+        """
+        for row, base in self._popup_base_text.items():
+            item = self._popup.item(row)
+            if item is None:
+                continue
+            name = item.data(QtCore.Qt.ItemDataRole.UserRole) or ""
+            counter = self._popup_counter_for(name)
+            if counter:
+                item.setText(f"{base}    · {counter}")
+            else:
+                item.setText(base)
+
     def _on_input_text_changed(self) -> None:
         text = self._input.toPlainText()
         # Keep the send button in sync with whether the user has
@@ -991,6 +1179,11 @@ class ChatPanel(QtWidgets.QFrame):
         if not text.startswith("/"):
             self._popup.hide()
             return
+        # Round 19: refresh the live counters (active-paper count,
+        # RAG age, etc.) on every keystroke so the popup never
+        # shows stale numbers. Cheap — each counter is a single
+        # attribute read on the controller's workspace.
+        self._refresh_popup_counters()
         query = text[1:].lower()
         # Toggle ``setHidden`` on the pre-populated items instead of
         # ``clear()`` + ``addItem`` per keystroke. ``clear/addItem`` paid
@@ -1075,6 +1268,20 @@ class ChatPanel(QtWidgets.QFrame):
         self._send.setEnabled(False)
         if text == "/quit":
             QtWidgets.QApplication.instance().quit()
+            return
+        # Round 19: route slash commands through the controller's local
+        # dispatch table instead of forwarding them to Codex (which has
+        # no idea what ``/parse`` means in LitTrace context). Slash
+        # commands without arguments go straight to the dispatch table;
+        # ``/foo bar baz`` becomes ``name="foo", args="bar baz"``.
+        if text.startswith("/"):
+            stripped = text[1:].strip()
+            if not stripped:
+                return
+            parts = stripped.split(maxsplit=1)
+            name = parts[0]
+            args = parts[1] if len(parts) > 1 else ""
+            self._controller.submit_slash_command(name, args)
             return
         self._controller.submit_user_message(text)
 
@@ -1335,7 +1542,25 @@ class ChatPanel(QtWidgets.QFrame):
 
 
 class ContextPanel(QtWidgets.QFrame):
-    """Right column upper — active literature context."""
+    """Right column upper — active literature context.
+
+    Round 19: the original panel exposed only a flat list and a
+    right-click "取消激活" action. With sessions routinely
+    accumulating 30+ active papers, users had no way to (a) search
+    for a specific paper, (b) mark the most relevant ones, or
+    (c) inspect a single paper's full metadata. This rewrite adds:
+
+    * A search box that filters by title / DOI / author substring.
+    * A "只看 pinned" toggle so core papers stay visible when the
+      list is long.
+    * Per-item markers: 📌 for pinned, ⭐ for importance=2, 🔥 for
+      importance=3. The visual hierarchy lets the user spot core
+      papers without scrolling.
+    * Double-click → modal detail dialog with the full metadata
+      table (DOI, authors, abstract, access, citation, local PDF).
+    * Expanded right-click menu: pin/unpin, importance menu
+      (普通 / 重要 / 核心 / 清除), deactivate, view detail.
+    """
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1349,18 +1574,45 @@ class ContextPanel(QtWidgets.QFrame):
         title.setObjectName("pane_title")
         layout.addWidget(title)
 
-        # Round 17: one-line hint so the user knows the right-click
-        # menu exists. Without it the only way to discover the
-        # "取消激活" action was trial and error.
-        hint = QtWidgets.QLabel("右键单条可取消激活")
+        # Search row
+        search_row = QtWidgets.QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(6)
+        self._search = QtWidgets.QLineEdit()
+        self._search.setObjectName("context_search")
+        self._search.setPlaceholderText("搜索标题 / 作者 / DOI…")
+        self._search.setClearButtonEnabled(True)
+        self._search.textChanged.connect(self._refresh_visible)
+        search_row.addWidget(self._search, stretch=1)
+        self._pinned_only = QtWidgets.QCheckBox("只看 pinned")
+        self._pinned_only.setObjectName("pinned_only")
+        self._pinned_only.toggled.connect(self._refresh_visible)
+        search_row.addWidget(self._pinned_only)
+        layout.addLayout(search_row)
+
+        # Hint line — short so the panel doesn't waste a row on it.
+        hint = QtWidgets.QLabel(
+            "双击查看详情 · Ctrl/Shift 多选后点 [🔍 比较选中] · 右键菜单可 pin / 标重要性"
+        )
         hint.setObjectName("status")
         hint.setStyleSheet(
             f"color:{DESIGN['ink_subtle']};font-size:11px;"
         )
+        hint.setWordWrap(True)
         layout.addWidget(hint)
 
         self._list = QtWidgets.QListWidget()
         self._list.setObjectName("context")
+        # Round 19: allow Ctrl / Shift multi-select so the user can
+        # pick 2+ papers and click "🔍 比较选中" to ask Codex for a
+        # side-by-side comparison without typing the paper list by
+        # hand. ``ExtendedSelection`` is the standard pattern (macOS
+        # Cmd+click on Linux/Win; plain click clears the selection
+        # first so the user doesn't accidentally drag along old
+        # picks).
+        self._list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         # Right-click context menu for the per-paper actions
         # ("取消激活" / "查看详情"). Custom menu policy keeps the
         # menu off when the user clicks empty space.
@@ -1368,50 +1620,142 @@ class ContextPanel(QtWidgets.QFrame):
         self._list.customContextMenuRequested.connect(
             self._on_context_menu
         )
+        # Double-click opens the detail dialog. The single-click
+        # selection stays as-is so the user can still right-click
+        # without immediately invoking the modal.
+        self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        # React to selection changes so the "🔍 比较选中" button
+        # enables / disables on the fly.
+        self._list.itemSelectionChanged.connect(self._refresh_compare_button)
         layout.addWidget(self._list, stretch=1)
 
+        # Compare button row — only enabled when 2+ papers are
+        # selected. We don't pin this to a global keyboard shortcut
+        # (those would collide with the chat panel's text editor);
+        # the click affordance is enough for the day-to-day flow.
+        compare_row = QtWidgets.QHBoxLayout()
+        compare_row.setContentsMargins(0, 0, 0, 0)
+        compare_row.setSpacing(6)
+        self._compare_btn = QtWidgets.QPushButton("🔍 比较选中")
+        self._compare_btn.setObjectName("compare_btn")
+        self._compare_btn.setToolTip(
+            "把当前选中的文献交给 Codex，要求给出方法 / 结果 / 局限的对比。"
+            "需要 ≥2 篇才生效。"
+        )
+        self._compare_btn.setEnabled(False)
+        self._compare_btn.clicked.connect(self._on_compare_clicked)
+        compare_row.addWidget(self._compare_btn)
+        self._compare_count = QtWidgets.QLabel("未选中")
+        self._compare_count.setObjectName("compare_count")
+        self._compare_count.setStyleSheet(
+            f"color:{DESIGN['ink_subtle']};font-size:11px;"
+        )
+        compare_row.addWidget(self._compare_count)
+        compare_row.addStretch(1)
+        layout.addLayout(compare_row)
+
+        # Cached so the search box can re-filter without going back
+        # to the controller on every keystroke. Refreshed by
+        # ``refresh()``.
+        self._cached_papers: list[PaperMetadata] = []
+        self._cached_pinned: list[str] = []
+        self._cached_importance: dict[str, int] = {}
+
     def refresh(self, papers: list[PaperMetadata]) -> None:
+        # Read the pin/importance state directly from the
+        # controller's workspace so this panel doesn't need a
+        # controller reference of its own — the parent window
+        # pushes fresh workspace data via ``refresh()``.
+        window = self.window()
+        pinned: list[str] = []
+        importance: dict[str, int] = {}
+        if window is not None and hasattr(window, "_controller"):
+            ctx = window._controller.workspace.context
+            pinned = list(ctx.pinned_papers)
+            importance = dict(ctx.importance_levels)
+        self._cached_papers = list(papers)
+        self._cached_pinned = pinned
+        self._cached_importance = importance
+        self._render_list()
+
+    def _refresh_visible(self) -> None:
+        self._render_list()
+
+    def _render_list(self) -> None:
+        query = self._search.text().strip().lower()
+        pinned_only = self._pinned_only.isChecked()
         self._list.clear()
+        papers = self._cached_papers
         if not papers:
             placeholder = QtWidgets.QListWidgetItem("暂无激活文献 — 在聊天中提需求即可加入")
             placeholder.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
             self._list.addItem(placeholder)
             return
-        for index, paper in enumerate(papers, start=1):
+        pinned_set = set(self._cached_pinned)
+        visible_index = 0
+        for paper in papers:
+            paper_id = getattr(paper, "paper_id", None)
+            if pinned_only and paper_id not in pinned_set:
+                continue
+            if query and not self._paper_matches(paper, query):
+                continue
+            visible_index += 1
+            importance = self._cached_importance.get(paper_id, 1) if paper_id else 1
+            pin_mark = "📌 " if paper_id in pinned_set else ""
+            if importance >= 3:
+                imp_mark = "🔥 "
+            elif importance >= 2:
+                imp_mark = "⭐ "
+            else:
+                imp_mark = ""
             year = paper.year or "n.d."
             source = paper.journal or paper.publisher or "unknown source"
             item = QtWidgets.QListWidgetItem(
-                f"{index}. {paper.title}  ({year}, {source})"
+                f"{pin_mark}{imp_mark}{visible_index}. {paper.title}  "
+                f"({year}, {source})"
             )
             item.setData(QtCore.Qt.ItemDataRole.UserRole, paper)
-            # Round 17: hover tooltip surfaces the metadata that
-            # doesn't fit on the list row (DOI, full author list,
-            # access type, citation count). The 5-line wrap is
-            # enough for typical paper metadata; longer
-            # abstracts / methods would need a separate dialog
-            # but the user can grep the digest for those.
-            tooltip_parts = [
-                f"标题：{paper.title}",
-                f"年份：{year}",
-                f"来源：{source}",
-            ]
-            if getattr(paper, "doi", None):
-                tooltip_parts.append(f"DOI：{paper.doi}")
-            if getattr(paper, "authors", None):
-                authors = paper.authors or []
-                if authors:
-                    shown = "、".join(authors[:3])
-                    if len(authors) > 3:
-                        shown += f" 等 {len(authors)} 位"
-                    tooltip_parts.append(f"作者：{shown}")
-            if getattr(paper, "access_type", None):
-                tooltip_parts.append(
-                    f"访问类型：{paper.access_type.value if hasattr(paper.access_type, 'value') else paper.access_type}"
-                )
-            if getattr(paper, "citation_count", None):
-                tooltip_parts.append(f"引用数：{paper.citation_count}")
-            item.setToolTip("\n".join(tooltip_parts))
+            item.setToolTip(self._format_tooltip(paper))
             self._list.addItem(item)
+
+    def _paper_matches(self, paper: Any, query: str) -> bool:
+        """Substring match across title / DOI / first author. The
+        search is intentionally permissive — better to show a few
+        extra results than to silently hide the one the user wants.
+        """
+        if query in (paper.title or "").lower():
+            return True
+        if query in (getattr(paper, "doi", None) or "").lower():
+            return True
+        authors = getattr(paper, "authors", None) or []
+        for author in authors[:5]:
+            if query in author.lower():
+                return True
+        return False
+
+    def _format_tooltip(self, paper: Any) -> str:
+        year = paper.year or "n.d."
+        source = paper.journal or paper.publisher or "unknown source"
+        tooltip_parts = [
+            f"标题：{paper.title}",
+            f"年份：{year}",
+            f"来源：{source}",
+        ]
+        if getattr(paper, "doi", None):
+            tooltip_parts.append(f"DOI：{paper.doi}")
+        authors = getattr(paper, "authors", None) or []
+        if authors:
+            shown = "、".join(authors[:3])
+            if len(authors) > 3:
+                shown += f" 等 {len(authors)} 位"
+            tooltip_parts.append(f"作者：{shown}")
+        if getattr(paper, "access_type", None):
+            at = paper.access_type
+            at_str = at.value if hasattr(at, "value") else str(at)
+            tooltip_parts.append(f"访问类型：{at_str}")
+        if getattr(paper, "citation_count", None):
+            tooltip_parts.append(f"引用数：{paper.citation_count}")
+        return "\n".join(tooltip_parts)
 
     def _on_context_menu(self, pos: QtCore.QPoint) -> None:
         item = self._list.itemAt(pos)
@@ -1421,11 +1765,66 @@ class ContextPanel(QtWidgets.QFrame):
         if paper is None:
             return
         menu = QtWidgets.QMenu(self)
+        window = self.window()
+        ctrl = getattr(window, "_controller", None)
+        paper_id = getattr(paper, "paper_id", None)
+        # Pin toggle — label depends on current state.
+        if paper_id in set(self._cached_pinned):
+            pin_label = "取消 pin"
+        else:
+            pin_label = "📌 Pin"
+        pin_action = menu.addAction(pin_label)
+        pin_action.triggered.connect(
+            lambda _checked=False, pid=paper_id: self._request_toggle_pin(pid)
+        )
+        # Importance submenu
+        imp_menu = menu.addMenu("标记重要性")
+        for level, label in (
+            (2, "⭐ 重要"),
+            (3, "🔥 核心"),
+            (0, "清除标记"),
+        ):
+            act = imp_menu.addAction(label)
+            act.triggered.connect(
+                lambda _checked=False, lvl=level, pid=paper_id:
+                    self._request_set_importance(pid, lvl)
+            )
+        menu.addSeparator()
+        detail_action = menu.addAction("📄 查看详情")
+        detail_action.triggered.connect(
+            lambda _checked=False, p=paper: self._show_detail(p)
+        )
         deactivate = menu.addAction("取消激活")
         deactivate.triggered.connect(
             lambda: self._request_deactivate(paper)
         )
         menu.exec(self._list.mapToGlobal(pos))
+
+    def _on_item_double_clicked(self, item: QtWidgets.QListWidgetItem) -> None:
+        paper = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if paper is None:
+            return
+        self._show_detail(paper)
+
+    def _show_detail(self, paper: Any) -> None:
+        """Open a non-modal detail dialog for ``paper``. The dialog
+        is parented to the main window so closing the window cleans
+        it up; multiple detail dialogs can co-exist (one per paper)
+        without blocking the rest of the GUI.
+        """
+        window = self.window()
+        dlg = PaperDetailDialog(paper, self._cached_importance, parent=window)
+        dlg.show()
+
+    def _request_toggle_pin(self, paper_id: str) -> None:
+        window = self.window()
+        if window is not None and hasattr(window, "_on_paper_pin_toggle_requested"):
+            window._on_paper_pin_toggle_requested(paper_id)
+
+    def _request_set_importance(self, paper_id: str, level: int) -> None:
+        window = self.window()
+        if window is not None and hasattr(window, "_on_paper_importance_requested"):
+            window._on_paper_importance_requested(paper_id, level)
 
     def _request_deactivate(self, paper: Any) -> None:
         # Delegate to the parent LitTraceQtWindow which owns the
@@ -1437,16 +1836,229 @@ class ContextPanel(QtWidgets.QFrame):
         if window is not None and hasattr(window, "_on_paper_deactivate_requested"):
             window._on_paper_deactivate_requested(paper)
 
+    def _refresh_compare_button(self) -> None:
+        """Toggle the compare button + label based on the current
+        selection count. Wired to ``itemSelectionChanged`` so it
+        fires every time the user adds / removes a row.
+        """
+        n = len(self._list.selectedItems())
+        if n == 0:
+            self._compare_btn.setEnabled(False)
+            self._compare_count.setText("未选中")
+        elif n == 1:
+            self._compare_btn.setEnabled(False)
+            self._compare_count.setText("已选 1 篇（需要 ≥2 篇）")
+        else:
+            self._compare_btn.setEnabled(True)
+            self._compare_count.setText(f"已选 {n} 篇")
+
+    def _on_compare_clicked(self) -> None:
+        """Round 19: build a Codex comparison prompt from the
+        currently selected papers and submit it through the
+        controller. Format: ``"比较这 N 篇文献：1. <title>…2. <title>…"``
+        — the numbering matches what the user sees in the panel so
+        they can verify each pick landed in the right slot.
+        """
+        items = self._list.selectedItems()
+        if len(items) < 2:
+            return
+        picked: list[tuple[int, str]] = []
+        for item in items:
+            paper = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            if paper is None:
+                continue
+            # Re-use the visible numbering so the user can double-check
+            # "yes, paper 3 is the one I meant" before Codex answers.
+            label = item.text().strip()
+            # Strip the leading pin/importance glyphs + leading number
+            # so the comparison list starts at the bare title.
+            cleaned = label.lstrip("📌⭐🔥 ").lstrip()
+            if cleaned and cleaned[0].isdigit():
+                # Drop "<num>. " prefix.
+                idx = cleaned.find(". ")
+                if idx >= 0:
+                    cleaned = cleaned[idx + 2:]
+            picked.append((len(picked) + 1, cleaned or "(no title)"))
+        if not picked:
+            return
+        bullet_lines = "\n".join(f"{i}. {title}" for i, title in picked)
+        message = (
+            f"请比较这 {len(picked)} 篇文献，给出方法 / 结果 / 局限性的对比表：\n"
+            f"{bullet_lines}"
+        )
+        window = self.window()
+        if window is None:
+            return
+        # Hand the message to the controller via the same path the
+        # chat panel's send button uses, so the user sees the bubble
+        # land in the chat scrollback and Codex actually answers.
+        # We don't expose ``submit_user_message`` directly because
+        # the chat panel keeps an internal ``_input`` widget we'd
+        # like to mirror (the user might want to edit the prompt
+        # before pressing Enter).
+        if hasattr(window, "_controller"):
+            try:
+                window._controller.submit_user_message(message)
+            except Exception:
+                pass
+        # Clear the selection so the user can immediately pick a
+        # new comparison set without having to Ctrl+click each
+        # previous pick.
+        self._list.clearSelection()
+        self._refresh_compare_button()
+
+
+class PaperDetailDialog(QtWidgets.QDialog):
+    """Read-only detail dialog for a single paper.
+
+    Shown when the user double-clicks an entry in ``ContextPanel``.
+    Renders every metadata field the GUI knows about (DOI, authors,
+    abstract, access, citation, local PDF path if any) in a single
+    table so the user can confirm they have the right paper before
+    triggering ``/parse`` or ``/table``.
+    """
+
+    def __init__(
+        self,
+        paper: Any,
+        importance: dict[str, int],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._paper = paper
+        self.setWindowTitle(f"文献详情 · {paper.title[:60]}")
+        # Non-modal so the user can keep interacting with the
+        # main window while reading.
+        self.setModal(False)
+        self.resize(520, 480)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(12)
+
+        # Title — bold, larger than other rows.
+        title = QtWidgets.QLabel(paper.title)
+        title.setWordWrap(True)
+        title.setStyleSheet(
+            f"font-size:15px;font-weight:600;color:{DESIGN['ink']};"
+        )
+        layout.addWidget(title)
+
+        # Importance indicator + action row
+        paper_id = getattr(paper, "paper_id", None)
+        level = importance.get(paper_id, 1)
+        imp_label = QtWidgets.QLabel()
+        imp_label.setObjectName("status")
+        if level >= 3:
+            imp_label.setText("🔥 核心")
+        elif level >= 2:
+            imp_label.setText("⭐ 重要")
+        else:
+            imp_label.setText("普通")
+        layout.addWidget(imp_label)
+
+        # Field grid
+        grid = QtWidgets.QFormLayout()
+        grid.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
+
+        def _add_field(label_text: str, value_text: str) -> None:
+            if not value_text:
+                return
+            lab = QtWidgets.QLabel(label_text)
+            lab.setStyleSheet(
+                f"color:{DESIGN['ink_muted']};font-size:12px;"
+            )
+            val = QtWidgets.QLabel(value_text)
+            val.setWordWrap(True)
+            val.setTextInteractionFlags(
+                QtCore.Qt.TextInteractionFlag.TextSelectable
+            )
+            val.setStyleSheet(
+                f"color:{DESIGN['ink']};font-size:12px;"
+            )
+            grid.addRow(lab, val)
+
+        _add_field("paper_id", paper_id or "")
+        _add_field("DOI", getattr(paper, "doi", None) or "")
+        authors = getattr(paper, "authors", None) or []
+        if authors:
+            _add_field("作者", "、".join(authors))
+        _add_field("年份", str(paper.year) if paper.year else "")
+        _add_field(
+            "期刊 / 出版商",
+            paper.journal or paper.publisher or "",
+        )
+        at = getattr(paper, "access_type", None)
+        at_str = at.value if at and hasattr(at, "value") else (str(at) if at else "")
+        _add_field("访问类型", at_str)
+        cc = getattr(paper, "citation_count", None)
+        if cc is not None:
+            _add_field("引用数", str(cc))
+        abstract = getattr(paper, "abstract", None) or ""
+        if abstract:
+            _add_field("摘要", abstract[:500] + ("…" if len(abstract) > 500 else ""))
+
+        # Local PDF path (if LitTrace has parsed it).
+        window = self.parent()
+        if window is not None and hasattr(window, "_controller"):
+            local_pdf = self._resolve_local_pdf(window._controller, paper_id)
+            if local_pdf:
+                _add_field("本地 PDF", local_pdf)
+
+        layout.addLayout(grid)
+        layout.addStretch(1)
+
+        # Close button — keep it cheap (no Save button: the
+        # metadata is read-only and the workspace is the source
+        # of truth).
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        close_btn = QtWidgets.QPushButton("关闭")
+        close_btn.setObjectName("subnav_btn")
+        close_btn.clicked.connect(self.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+    def _resolve_local_pdf(self, controller: Any, paper_id: str | None) -> str | None:
+        if not paper_id:
+            return None
+        # ``parsed_papers`` is a dict[paper_id, ParsedPaper]. If
+        # the paper has been parsed we know where the PDF lives.
+        parsed = getattr(controller.workspace, "parsed_papers", {}) or {}
+        entry = parsed.get(paper_id)
+        if entry is None:
+            return None
+        # ``ParsedPaper`` may store the source PDF path under
+        # several attributes depending on parser backend; probe
+        # each in turn.
+        for attr in ("pdf_path", "source_pdf", "path"):
+            value = getattr(entry, attr, None)
+            if value:
+                return str(value)
+        return None
+
 
 class RAGPanel(QtWidgets.QFrame):
-    """Right column middle — single Daily run entry point.
+    """Right column middle — single Daily run entry point + RAG status.
 
-    The original shell exposed three buttons ("刷新当前 session", "全量刷新",
-    "Full daily") whose semantics were unclear without reading the parser
-    code. Collapse them into one explicit action: **"运行今日管线"** runs
-    the daily retrieval + parse + RAG refresh against all sessions, and
-    the panel shows the result of the most recent run.
+    Round 19: the original panel only showed a transient
+    "运行中…/尚未启动" label. After a daily run the user couldn't
+    tell when the index was last refreshed or whether it had gone
+    stale. The new layout adds:
+
+    * A persistent "上次 refresh" line with timestamp + chunk
+      count, fetched from the controller.
+    * A staleness badge — turns red when the timestamp is > 24 h
+      old, orange when > 12 h, hidden when fresh.
+    * A quick "立即 refresh" button that re-uses the same
+      ``on_run_daily`` slot (so QA / refresh-on-demand flow into
+      the same code path).
     """
+
+    STALE_THRESHOLD_SECONDS = 12 * 3600
+    VERY_STALE_THRESHOLD_SECONDS = 24 * 3600
 
     def __init__(
         self,
@@ -1455,12 +2067,13 @@ class RAGPanel(QtWidgets.QFrame):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("tile")
+        self._on_run_daily = on_run_daily
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
-        title = QtWidgets.QLabel("今日管线")
+        title = QtWidgets.QLabel("今日管线 / RAG")
         title.setObjectName("pane_title")
         layout.addWidget(title)
 
@@ -1476,13 +2089,107 @@ class RAGPanel(QtWidgets.QFrame):
         run_btn.clicked.connect(on_run_daily)
         layout.addWidget(run_btn)
 
-        self._status = QtWidgets.QLabel("尚未启动")
+        refresh_btn = QtWidgets.QPushButton("⟳ 立即 refresh")
+        refresh_btn.setObjectName("subnav_btn")
+        refresh_btn.setToolTip(
+            "复用「搜索研究主题」流程：re-fetch → re-parse → 写 RAG"
+        )
+        refresh_btn.clicked.connect(on_run_daily)
+        layout.addWidget(refresh_btn)
+
+        # Staleness badge — re-rendered every time the panel is
+        # refreshed. Hidden when the controller has no record of a
+        # refresh yet.
+        self._staleness = QtWidgets.QLabel("")
+        self._staleness.setObjectName("staleness")
+        self._staleness.setWordWrap(True)
+        layout.addWidget(self._staleness)
+
+        # Last-refresh line — same content as the staleness badge
+        # plus chunk count. Stays visible at all times so the user can
+        # see when it was.
+        self._last_refresh = QtWidgets.QLabel("尚未记录 refresh")
+        self._last_refresh.setObjectName("last_refresh")
+        self._last_refresh.setWordWrap(True)
+        self._last_refresh.setStyleSheet(
+            f"color:{DESIGN['ink_muted']};font-size:11px;"
+        )
+        layout.addWidget(self._last_refresh)
+
+        # Transient status — kept for backwards compatibility with
+        # ``set_status()`` callers that flip text during a run.
+        self._status = QtWidgets.QLabel("")
         self._status.setObjectName("status")
         self._status.setWordWrap(True)
         layout.addWidget(self._status, stretch=1)
 
+        # Initial render — picks up any timestamp the controller
+        # already had (e.g. if this panel is constructed mid-run).
+        self.refresh_status()
+
     def set_status(self, text: str) -> None:
         self._status.setText(text)
+
+    def refresh_status(self) -> None:
+        """Re-render the staleness badge + last-refresh line from
+        the controller's stored timestamp. Safe to call any time —
+        e.g. after a daily run completes.
+        """
+        status: dict[str, Any] = {}
+        window = self.window()
+        if window is not None and hasattr(window, "_controller"):
+            try:
+                status = window._controller.get_rag_refresh_status()
+            except Exception:
+                status = {}
+        ts = status.get("timestamp")
+        chunks = status.get("indexed_chunks", 0) or 0
+        if not ts:
+            self._last_refresh.setText("尚未记录 refresh")
+            self._staleness.hide()
+            return
+        # Round to the minute so the text doesn't flicker every
+        # second while the timer ticks.
+        import time as _t
+        age = max(0, int(_t.time() - ts))
+        ago_text = _fmt_age(age)
+        self._last_refresh.setText(
+            f"上次 refresh：{ago_text}前 · 索引 {chunks} chunks"
+        )
+        if age >= self.VERY_STALE_THRESHOLD_SECONDS:
+            self._staleness.setText(
+                f"⚠️ 索引已过期 >{int(self.VERY_STALE_THRESHOLD_SECONDS // 3600)}h，"
+                "建议立即 refresh"
+            )
+            self._staleness.setStyleSheet(
+                f"color:#b53939;font-size:11px;font-weight:600;"
+            )
+            self._staleness.show()
+        elif age >= self.STALE_THRESHOLD_SECONDS:
+            self._staleness.setText(
+                f"⏰ 索引超过 {int(self.STALE_THRESHOLD_SECONDS // 3600)}h，可考虑 refresh"
+            )
+            self._staleness.setStyleSheet(
+                f"color:#b07a17;font-size:11px;"
+            )
+            self._staleness.show()
+        else:
+            self._staleness.hide()
+
+
+def _fmt_age(seconds: int) -> str:
+    """Format a small duration in human terms. Used by ``RAGPanel``
+    so the staleness line reads naturally in both Chinese and
+    English-shaped labels. Above 24 h the formatter collapses to
+    hours so the panel line stays one row.
+    """
+    if seconds < 60:
+        return f"{seconds} 秒"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时"
+    return f"{seconds // 86400} 天"
 
 
 class DailyConfigDialog(QtWidgets.QDialog):
@@ -1492,6 +2199,13 @@ class DailyConfigDialog(QtWidgets.QDialog):
       * 研究主题 (used as sentinel watchlist id, required)
       * 开始 / 结束年份 (year range for retrieval)
       * 最少检索数目 (target count; warns if the run comes up short)
+
+    Round 19: the dialog is non-modal (``setModal(False)``) so the
+    user can still browse the context panel, switch sessions, or
+    check the chat scrollback while it's open. ``_on_run_daily``
+    listens for ``accepted`` / ``rejected`` signals instead of
+    blocking on ``exec()`` — closing the dialog (via the X button,
+    Esc, or the explicit "取消" button) rejects the run.
 
     When the user wants publisher-only papers (not just open-access
     ones), they tick the **「打开 publisher 登录」** button after the
@@ -1512,8 +2226,18 @@ class DailyConfigDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("检索并补全文献 · 配置")
-        self.setModal(True)
+        # Round 19: non-modal so the user can keep poking at the
+        # rest of the window while they tweak the parameters.
+        # Closing the dialog (X button, Esc, "取消") rejects the run.
+        self.setModal(False)
         self.resize(540, 380)
+
+        # Round 19: the dialog now remembers the last accepted values
+        # across sessions via ``QSettings`` so the user doesn't have
+        # to retype the same topic every time. Falls back to the
+        # ``default_*`` parameters (or config defaults the caller
+        # passes) on first run.
+        self._settings = QtCore.QSettings("LitTrace", "littrace-qt")
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -1540,13 +2264,17 @@ class DailyConfigDialog(QtWidgets.QDialog):
         form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
 
         # 主题（watchlist id，必填）
-        self._topic_input = QtWidgets.QLineEdit(default_topic)
+        self._topic_input = QtWidgets.QLineEdit(
+            self._settings.value("daily/topic", default_topic, type=str)
+        )
         self._topic_input.setPlaceholderText("e.g. mxene_sensor, perovskite_solar, mof_co2")
         self._topic_input.selectAll()
         form.addRow("研究主题 *", self._topic_input)
 
         # 关键词
-        self._keywords_input = QtWidgets.QLineEdit()
+        self._keywords_input = QtWidgets.QLineEdit(
+            self._settings.value("daily/keywords", "", type=str)
+        )
         self._keywords_input.setPlaceholderText("可选：更精确的检索词（多个用空格分隔）")
         form.addRow("关键词", self._keywords_input)
 
@@ -1555,12 +2283,16 @@ class DailyConfigDialog(QtWidgets.QDialog):
         year_row.setSpacing(6)
         self._year_min_input = QtWidgets.QSpinBox()
         self._year_min_input.setRange(1990, 2030)
-        self._year_min_input.setValue(default_year_min)
+        self._year_min_input.setValue(int(
+            self._settings.value("daily/year_min", default_year_min)
+        ))
         year_row.addWidget(self._year_min_input)
         year_row.addWidget(QtWidgets.QLabel("至"))
         self._year_max_input = QtWidgets.QSpinBox()
         self._year_max_input.setRange(1990, 2030)
-        self._year_max_input.setValue(default_year_max)
+        self._year_max_input.setValue(int(
+            self._settings.value("daily/year_max", default_year_max)
+        ))
         year_row.addWidget(self._year_max_input)
         year_row.addStretch(1)
         form.addRow("年份区间", year_row)
@@ -1568,7 +2300,9 @@ class DailyConfigDialog(QtWidgets.QDialog):
         # 最少检索数
         self._min_papers_input = QtWidgets.QSpinBox()
         self._min_papers_input.setRange(1, 200)
-        self._min_papers_input.setValue(default_min_papers)
+        self._min_papers_input.setValue(int(
+            self._settings.value("daily/min_papers", default_min_papers)
+        ))
         self._min_papers_input.setSuffix(" 篇")
         form.addRow("最少检索数目", self._min_papers_input)
 
@@ -1633,6 +2367,16 @@ class DailyConfigDialog(QtWidgets.QDialog):
         if self._year_min_input.value() > self._year_max_input.value():
             self._error_label.setText("开始年份不能晚于结束年份")
             return
+        # Round 19: persist the user's current choices so the next
+        # dialog open pre-fills with the same values. ``sync()``
+        # flushes the in-memory cache to disk immediately so a
+        # crash doesn't lose the just-accepted values.
+        self._settings.setValue("daily/topic", topic)
+        self._settings.setValue("daily/keywords", self._keywords_input.text().strip())
+        self._settings.setValue("daily/year_min", self._year_min_input.value())
+        self._settings.setValue("daily/year_max", self._year_max_input.value())
+        self._settings.setValue("daily/min_papers", self._min_papers_input.value())
+        self._settings.sync()
         self.accept()
 
     def open_login_after(self) -> bool:
@@ -1655,6 +2399,193 @@ class DailyConfigDialog(QtWidgets.QDialog):
         return self._min_papers_input.value()
 
 
+class DailyResultDialog(QtWidgets.QDialog):
+    """Round 19: surface the daily-run summary in a structured dialog
+    so the user can review what was retrieved before the headline
+    disappears from the status bar.
+
+    The dialog is non-modal (``setModal(False)``) so the user can
+    click through to the context panel and pin/unpin papers while
+    it's still open. It is *not* a confirmation step — by the time
+    the dialog opens, sentinel has already written its results to
+    the workspace. The intent is purely visibility: a one-shot
+    "this is what landed in your library" prompt that disappears
+    when the user dismisses it.
+    """
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None,
+        *,
+        topic: str,
+        keywords: str,
+        year_min: int,
+        year_max: int,
+        target_papers: int,
+        rounds_done: int,
+        cumulative_downloaded: int,
+        cumulative_candidates: int,
+        warnings: list[str],
+        summary_lines: list[str],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("daily 检索结果")
+        self.setModal(False)
+        self.resize(560, 380)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("✅ 检索完成")
+        title.setStyleSheet(
+            f"font-size:18px;font-weight:600;color:{DESIGN['ink']};"
+        )
+        layout.addWidget(title)
+
+        # Configuration block (so the user remembers what they asked for).
+        cfg_box = QtWidgets.QGroupBox("检索配置")
+        cfg_box.setStyleSheet(
+            f"QGroupBox{{font-size:12px;color:{DESIGN['ink_muted']};"
+            f"border:1px solid #e3e5e8;border-radius:6px;margin-top:8px;}}"
+            f"QGroupBox::title{{subcontrol-origin:margin;left:8px;padding:0 4px;}}"
+        )
+        cfg_layout = QtWidgets.QFormLayout(cfg_box)
+        cfg_layout.setSpacing(4)
+        cfg_layout.addRow("主题", QtWidgets.QLabel(topic or "—"))
+        cfg_layout.addRow("关键词", QtWidgets.QLabel(keywords or "(用主题作为关键词)"))
+        cfg_layout.addRow(
+            "年份区间",
+            QtWidgets.QLabel(f"{year_min} – {year_max}"),
+        )
+        cfg_layout.addRow("目标篇数", QtWidgets.QLabel(f"≥ {target_papers} 篇"))
+        layout.addWidget(cfg_box)
+
+        # Counters — three big numbers the user can scan in one glance.
+        counter_row = QtWidgets.QHBoxLayout()
+        counter_row.setSpacing(12)
+        counter_row.addWidget(self._make_counter(
+            "完成轮数", str(rounds_done), "#3a8a8c"
+        ))
+        counter_row.addWidget(self._make_counter(
+            "新增下载", str(cumulative_downloaded),
+            "#2a7a3a" if cumulative_downloaded >= target_papers else "#cc785c",
+        ))
+        counter_row.addWidget(self._make_counter(
+            "候选论文", str(cumulative_candidates), "#5c6068",
+        ))
+        layout.addLayout(counter_row)
+
+        # Shortfall warnings — explicit because they were silently
+        # dropped before. Color-coded so the user notices if the
+        # count fell short.
+        if cumulative_downloaded < target_papers:
+            warn = QtWidgets.QLabel(
+                f"⚠️ 累计下载 {cumulative_downloaded} 篇，少于目标 "
+                f"{target_papers} 篇。可以再跑一轮或放宽关键词。"
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet(
+                f"color:{DESIGN['accent_coral']};font-size:12px;"
+            )
+            layout.addWidget(warn)
+        if cumulative_candidates < 5:
+            warn = QtWidgets.QLabel(
+                f"⚠️ 仅检索到 {cumulative_candidates} 个候选，"
+                f"主题可能过于冷门或过新。"
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet(
+                f"color:{DESIGN['accent_coral']};font-size:12px;"
+            )
+            layout.addWidget(warn)
+
+        # Raw summary line — the same string the status bar would
+        # show, so the user has it for copy/paste.
+        if summary_lines:
+            details = QtWidgets.QTextBrowser()
+            details.setOpenExternalLinks(False)
+            details.setMaximumHeight(120)
+            details.setStyleSheet(
+                f"font-family:Menlo,Consolas,monospace;font-size:11px;"
+                f"color:{DESIGN['ink_muted']};"
+            )
+            details.setPlainText("\n".join(summary_lines))
+            layout.addWidget(details)
+
+        if warnings:
+            warn_box = QtWidgets.QLabel(
+                "⚠️ " + "；".join(warnings)
+            )
+            warn_box.setWordWrap(True)
+            warn_box.setStyleSheet(
+                f"color:{DESIGN['accent_coral']};font-size:12px;"
+            )
+            layout.addWidget(warn_box)
+
+        layout.addStretch(1)
+
+        # Button row.
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.setSpacing(8)
+        open_btn = QtWidgets.QPushButton("↗ 打开上下文")
+        open_btn.setObjectName("subnav_btn")
+        open_btn.setToolTip(
+            "把右侧上下文面板设为焦点，方便你立刻 pin / 取消某篇论文"
+        )
+        open_btn.clicked.connect(self._on_open_context)
+        button_row.addWidget(open_btn)
+        button_row.addStretch(1)
+        ok_btn = QtWidgets.QPushButton("知道了")
+        ok_btn.setObjectName("subnav_btn_primary")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.accept)
+        button_row.addWidget(ok_btn)
+        layout.addLayout(button_row)
+
+        # Cache the topic so the open-context handler can highlight it.
+        self._topic = topic
+
+    def _make_counter(self, label: str, value: str, color: str) -> QtWidgets.QFrame:
+        """One of the three big-number tiles in the dialog header."""
+        frame = QtWidgets.QFrame()
+        frame.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        frame.setStyleSheet(
+            "QFrame{background:#fbfbfc;border:1px solid #e3e5e8;"
+            "border-radius:8px;}"
+        )
+        v = QtWidgets.QVBoxLayout(frame)
+        v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(2)
+        big = QtWidgets.QLabel(value)
+        big.setStyleSheet(
+            f"font-size:22px;font-weight:700;color:{color};"
+        )
+        big.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(big)
+        small = QtWidgets.QLabel(label)
+        small.setStyleSheet(
+            f"font-size:11px;color:{DESIGN['ink_muted']};"
+        )
+        small.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(small)
+        return frame
+
+    def _on_open_context(self) -> None:
+        """Round 19: jump the user to the context panel so they can
+        immediately pin/unpin the new papers without hunting for the
+        tab. The context panel is the right-column upper widget in
+        the main splitter; we give it focus and accept the dialog so
+        it doesn't keep blocking the view."""
+        win = self.window()
+        if win is not None and hasattr(win, "_context_panel"):
+            try:
+                win._context_panel.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+            except Exception:
+                pass
+        self.accept()
+
+
 class BrowserPanel(QtWidgets.QFrame):
     """Right column lower — QWebEngineView pane for publisher pages.
 
@@ -1668,6 +2599,15 @@ class BrowserPanel(QtWidgets.QFrame):
         ``./data/chrome-cdp`` for the next ``sentinel run`` to use.
       * A free-form URL line for ad-hoc navigation.
 
+    Round 18: the embedded view is the **only** login surface now.
+    ``main()`` redirects QtWebEngine's default profile storage to
+    ``data/chrome-cdp`` (the same on-disk profile sentinel reads via
+    CDP), so cookies written here are immediately reusable. The
+    external ``chrome.exe`` is launched lazily only when sentinel needs
+    CDP — see ``LitTraceQtWindow._acquire_external_chrome_for_sentinel``
+    — and torn down again before this panel re-shows the URL the user
+    was on.
+
     The previous round removed the back/forward/reload arrows because
     the URL bar already accepts any input; this round keeps that
     decision and only adds the publisher row.
@@ -1675,10 +2615,10 @@ class BrowserPanel(QtWidgets.QFrame):
 
     # The embedded Chromium starts on a small data-URL welcome page
     # so the user sees actionable guidance instead of a blank
-    # ``about:blank``. The data URL carries the same publisher
-    # shortcut rail as the toolbar below it, plus a one-line note
-    # about ``auto_launch_chrome`` having just brought the private
-    # Chrome up for them.
+    # ``about:blank``. Round 18: drop the misleading "CDP 19222 is up"
+    # line — there is no external chrome anymore at this point, and
+    # logging in here is the actual mechanism that flows into
+    # sentinel's gated-PDF fetcher.
     HOME_URL = (
         "data:text/html;charset=utf-8,"
         "<!doctype html><html><head><meta charset='utf-8'>"
@@ -1694,8 +2634,8 @@ class BrowserPanel(QtWidgets.QFrame):
         "  .ok { color: #2a7a3a; }"
         "</style></head><body>"
         "<h1>LitTrace Publisher Browser</h1>"
-        "<p class='ok'>✓ LitTrace private Chrome is up on "
-        "<code>http://127.0.0.1:19222</code>.</p>"
+        "<p class='ok'>✓ 登录后 cookie 自动写入 <code>data/chrome-cdp</code>，"
+        "下次 sentinel 检索可直接复用。</p>"
         "<p>Pick a publisher above to open its sign-in page here. Once "
         "you sign in, the session cookie is stored in LitTrace's "
         "private profile so the next <em>检索并补全文献</em> run can "
@@ -1708,13 +2648,17 @@ class BrowserPanel(QtWidgets.QFrame):
     # Sign-in URLs for the publishers LitTrace is wired to handle. These
     # land the user on whichever page surfaces a "Sign in" link near
     # the top-right after the federated SSO redirects land.
-    PUBLISHER_LINKS: list[tuple[str, str]] = [
-        ("🌐 Wiley", "https://onlinelibrary.wiley.com/action/login"),
-        ("🌐 ACS", "https://pubs.acs.org/action/showLogin"),
-        ("🌐 Springer", "https://link.springer.com/signup-login"),
-        ("🌐 Nature", "https://idp.nature.com/authorize?response_type=cookie"),
-        ("🌐 arXiv", "https://arxiv.org/login"),
-    ]
+    #
+    # Round 18: clicking a shortcut loads the sign-in page in the
+    # embedded QWebEngineView. The cookie it writes lands in
+    # ``data/chrome-cdp`` and is immediately visible to sentinel's
+    # next gated-PDF fetch.
+    #
+    # Round 19: derived from the unified ``PUBLISHERS`` catalog so
+    # the GUI shortcut row, the cookie strip, and the
+    # ``chrome_profiles`` detector stay in lock-step. ``arXiv`` is
+    # excluded from shortcuts (``requires_login=False``).
+    PUBLISHER_LINKS: list[tuple[str, str]] = list(sign_in_shortlinks())
 
     def __init__(self, parent: QtWidgets.QWidget | None = None, config=None) -> None:
         super().__init__(parent)
@@ -1725,8 +2669,47 @@ class BrowserPanel(QtWidgets.QFrame):
         self._config = config
 
         layout = QtWidgets.QVBoxLayout(self)
+        # Round 18: store a reference so ``resume_after_external_chrome``
+        # can re-attach a freshly constructed ``QWebEngineView`` to the
+        # same layout after sentinel finishes. Without the reference,
+        # ``self.layout()`` works but the call site is harder to grep.
+        self._layout = layout
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        # Round 19: collapsible header — toggle the panel between a
+        # compact "cookie strip only" state and the full publisher
+        # browser. Auto-collapses once every publisher is logged in so
+        # the right column doesn't waste 50 % of the window on a
+        # Chromium view the user has finished interacting with.
+        self._expanded = True
+        self._collapse_toggle = QtWidgets.QToolButton()
+        self._collapse_toggle.setObjectName("browser_collapse")
+        self._collapse_toggle.setText("▼ 收起浏览器")
+        self._collapse_toggle.setToolTip(
+            "登录完成后点这收起，只保留 cookie 状态条"
+        )
+        self._collapse_toggle.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self._collapse_toggle.setCheckable(True)
+        self._collapse_toggle.setChecked(True)  # start expanded
+        self._collapse_toggle.toggled.connect(self._set_expanded)
+
+        toggle_row = QtWidgets.QHBoxLayout()
+        toggle_row.setContentsMargins(8, 4, 8, 0)
+        toggle_row.addStretch(1)
+        toggle_row.addWidget(self._collapse_toggle)
+        layout.addLayout(toggle_row)
+
+        # Everything below this header is bundled in a single child
+        # container so we can show/hide the whole chunk when the user
+        # toggles collapsed mode. Without the container, hiding
+        # individual widgets leaves gaps because the outer VBoxLayout
+        # still allocates their geometry.
+        self._body = QtWidgets.QWidget()
+        self._body_layout = QtWidgets.QVBoxLayout(self._body)
+        self._body_layout.setContentsMargins(0, 0, 0, 0)
+        self._body_layout.setSpacing(0)
+        layout.addWidget(self._body, stretch=1)
 
         # Publisher shortcut row — small text buttons so the row stays
         # compact even with five entries.
@@ -1738,10 +2721,16 @@ class BrowserPanel(QtWidgets.QFrame):
             btn.setObjectName("publisher_btn")
             btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
             btn.setToolTip(url)
-            btn.clicked.connect(lambda _checked=False, u=url: self.open_url(u))
+            # Round 19: clicking a publisher shortcut also expands
+            # the panel automatically — otherwise the click would
+            # load the URL into a hidden view and the user would
+            # see nothing happen.
+            btn.clicked.connect(
+                lambda _checked=False, u=url: (self._set_expanded(True), self.open_url(u))
+            )
             publisher_row.addWidget(btn)
         publisher_row.addStretch(1)
-        layout.addLayout(publisher_row)
+        self._body_layout.addLayout(publisher_row)
 
         # Per-publisher cookie status strip — sits between the shortcut
         # row and the URL bar. The strip lists the same publishers
@@ -1778,7 +2767,7 @@ class BrowserPanel(QtWidgets.QFrame):
         self._cookie_refresh_btn.setToolTip("重新读取 cookie 状态")
         self._cookie_refresh_btn.clicked.connect(self._refresh_cookie_status)
         cookie_strip.addWidget(self._cookie_refresh_btn)
-        layout.addLayout(cookie_strip)
+        self._body_layout.addLayout(cookie_strip)
         self._refresh_cookie_status()
 
         # Free-form URL bar for ad-hoc navigation.
@@ -1789,12 +2778,33 @@ class BrowserPanel(QtWidgets.QFrame):
         self._url.setPlaceholderText("粘贴 publisher 链接（Enter 打开）…")
         self._url.returnPressed.connect(self._on_url_entered)
         url_row.addWidget(self._url, stretch=1)
-        layout.addLayout(url_row)
+        self._body_layout.addLayout(url_row)
 
         self._view = QWebEngineView()
         self._view.setUrl(QtCore.QUrl(self.HOME_URL))
         self._view.urlChanged.connect(self._on_url_changed)
-        layout.addWidget(self._view, stretch=1)
+        self._body_layout.addWidget(self._view, stretch=1)
+        # Round 18: track the URL the embedded view was showing before
+        # ``suspend_for_external_chrome`` tore it down, so the resumed
+        # view doesn't bounce the user back to the welcome page.
+        self._url_before_suspend: str = self.HOME_URL
+
+    def _set_expanded(self, expanded: bool) -> None:
+        """Toggle the body container between visible and hidden.
+
+        Round 19: hiding ``self._body`` keeps the header / toggle
+        button visible so the user can re-expand without hunting
+        through the layout. The publisher buttons + URL bar +
+        webview all live inside ``self._body`` and are hidden
+        together, so the panel collapses cleanly without leaving
+        gap rows.
+        """
+        self._expanded = bool(expanded)
+        self._collapse_toggle.setText(
+            "▼ 收起浏览器" if self._expanded else "▶ 展开浏览器"
+        )
+        self._body.setVisible(self._expanded)
+        self._collapse_toggle.setChecked(self._expanded)
 
     def _on_url_entered(self) -> None:
         self.open_url(self._url.text())
@@ -1805,17 +2815,18 @@ class BrowserPanel(QtWidgets.QFrame):
         # the user's private Chrome profile (``./data/chrome-cdp``)
         # for any of those domains; if at least one matches, the
         # publisher is "logged in".
+        #
+        # Round 19: derive ``publisher_domains`` from the unified
+        # ``PUBLISHERS`` catalog (same source the shortcut row and
+        # ``chrome_profiles._detect_publisher_cookie_domains`` use),
+        # so adding a new publisher in one place updates all three.
         from littrace.chrome_profiles import (
             _detect_publisher_cookie_domains,
         )
-        # Group domains by publisher (using the same shorthand names
-        # the shortcut row uses).
-        publisher_domains: list[tuple[str, list[str]]] = [
-            ("Wiley", ["wiley.com", "onlinelibrary.wiley.com"]),
-            ("ACS", ["acs.org", "pubs.acs.org"]),
-            ("Springer", ["springer.com"]),
-            ("Nature", ["nature.com"]),
-        ]
+        # Group domains by publisher using the unified catalog. We
+        # render every catalog entry that has at least one cookie
+        # domain (which is all of them today, but defends against
+        # a future "publisher with no login detection" entry).
         # Resolve the LitTrace-private Chrome profile path. The
         # detector only looks at the directory; we don't require the
         # file to exist (a fresh install simply reads as "all
@@ -1832,17 +2843,25 @@ class BrowserPanel(QtWidgets.QFrame):
         except Exception:
             present = set()
         bits: list[str] = []
-        # Map the short label back to the publisher sign-in URL so the
-        # ✗ marker becomes a clickable shortcut: clicking ✗ fires
-        # ``BrowserPanel.open_url`` for that publisher, which is the
-        # exact behaviour the user asked for ("主动弹出来就可以了").
+        # Iterate the unified catalog directly — each entry already
+        # carries its display name, cookie domains, sign-in URL, and
+        # ``requires_login`` flag, so we don't need the brittle
+        # ``endswith(label)`` lookup against ``PUBLISHER_LINKS``.
         any_unlogged = False
-        for label, domains in publisher_domains:
+        for pub in PUBLISHER_CATALOG:
+            label = pub.display_name
+            domains = list(pub.cookie_domains)
             logged = any(d in present for d in domains)
-            signin_url = next(
-                (u for btn_label, u in self.PUBLISHER_LINKS if btn_label.endswith(label)),
-                None,
-            )
+            # Round 19: open-access publishers (arXiv) always render
+            # ✓ and never trigger the "auto-collapse when all
+            # logged in" branch — they're never gated.
+            if not pub.requires_login:
+                tooltip = f"{label} 是开放获取，无需登录"
+                bits.append(
+                    f'<span title="{tooltip}" '
+                    f'style="color:#2a7a3a;">{label} ✓</span>'
+                )
+                continue
             # Round 17: render each ✓ / ✗ marker with a hover
             # tooltip so the user can hover before clicking.
             # ``title=`` is plain text only, no HTML, so the
@@ -1861,16 +2880,10 @@ class BrowserPanel(QtWidgets.QFrame):
                 # navigates straight to the publisher's sign-in page.
                 tooltip = f"{label} 未登录，点 ✗ 打开登录页"
                 bits.append(
-                    f'<a href="{signin_url}" title="{tooltip}" '
+                    f'<a href="{pub.sign_in_url}" title="{tooltip}" '
                     f'style="color:#cc785c;text-decoration:none;">'
                     f"{label} ✗</a>"
                 )
-        # arXiv doesn't need login (open access) — mark it as always
-        # ready so the user doesn't have to wonder.
-        bits.append(
-            f'<span title="arXiv 是开放获取，无需登录" '
-            f'style="color:#2a7a3a;">arXiv ✓</span>'
-        )
         # The first time the user opens the panel, the strip is a wall
         # of red ✗ and they have no idea what to do. Drop a tiny hint
         # so they know the ✗ markers are clickable sign-in shortcuts.
@@ -1880,6 +2893,15 @@ class BrowserPanel(QtWidgets.QFrame):
                 "&nbsp;· 点 ✗ 一键登录</span>"
             )
         self._cookie_status.setText("  ".join(bits))
+        # Round 19: auto-collapse once every publisher is logged in.
+        # The cookie strip stays visible so the user can still see
+        # the status; the chromium view, URL bar, and shortcut row
+        # all disappear until the user explicitly expands the panel
+        # again. We only auto-collapse on a transition (was-unlogged
+        # → now-all-logged-in) so flipping the panel back open
+        # doesn't bounce it closed on the next cookie refresh.
+        if not any_unlogged and self._expanded:
+            self._set_expanded(False)
 
     def _on_url_changed(self, url: QtCore.QUrl) -> None:
         # Don't echo about:blank into the URL bar — leaves a stale-looking
@@ -1889,6 +2911,10 @@ class BrowserPanel(QtWidgets.QFrame):
             self._url.clear()
         else:
             self._url.setText(text)
+            # Round 18: track the last non-blank URL so
+            # ``resume_after_external_chrome`` can land the user back
+            # where they were before sentinel ran.
+            self._url_before_suspend = text
 
     def open_url(self, url: str) -> None:
         """Load ``url`` in the embedded Chromium. Normalises bare hosts
@@ -1900,15 +2926,63 @@ class BrowserPanel(QtWidgets.QFrame):
             return
         if not text.startswith(("http://", "https://")):
             text = "https://" + text
+        if self._view is None:
+            # Round 18: panel was suspended for sentinel. Stash the URL
+            # so it lands on resume — without this, the user's last
+            # "click publisher X" intent is silently lost.
+            self._url_before_suspend = text
+            return
         self._view.setUrl(QtCore.QUrl(text))
-        text = url.toString()
-        if text == "about:blank":
-            self._url.clear()
-        else:
-            self._url.setText(text)
+        self._url_before_suspend = text
 
-    def open_url(self, url: str) -> None:
-        self._view.setUrl(QtCore.QUrl(url))
+    # ---- Suspend / resume (Round 18: external chrome handoff) ----
+
+    def suspend_for_external_chrome(self) -> None:
+        """Tear down the embedded ``QWebEngineView`` so its Chromium
+        instance releases the profile lock on ``data/chrome-cdp`` and
+        flushes cookies to disk before the external ``chrome.exe``
+        takes over for sentinel.
+
+        Idempotent — calling on an already-suspended panel is a no-op.
+        """
+        if self._view is None:
+            return
+        try:
+            self._view.stop()  # cancel any in-flight navigation
+            self._view.setUrl(QtCore.QUrl("about:blank"))
+            self._view.urlChanged.disconnect(self._on_url_changed)
+        except (RuntimeError, TypeError):
+            # ``disconnect`` raises if the connection was already torn
+            # down; the view itself is being deleted next so any
+            # remaining state doesn't matter.
+            pass
+        self._view.deleteLater()
+        self._view = None
+
+    def resume_after_external_chrome(self) -> None:
+        """Recreate the embedded ``QWebEngineView`` once the external
+        chrome has exited. Cookies already on disk
+        (``data/chrome-cdp/Default/Cookies``) are picked up by the new
+        embedded view automatically — the user does not need to log in
+        again.
+
+        Lands the user back on the URL they were on before
+        ``suspend_for_external_chrome`` ran; falls back to ``HOME_URL``
+        if there wasn't one.
+        """
+        if self._view is not None:
+            return
+        self._view = QWebEngineView()
+        self._view.urlChanged.connect(self._on_url_changed)
+        # Append to the layout — Qt removed the deleted widget from the
+        # layout automatically when ``deleteLater`` ran, so the new
+        # view lands at the bottom of the layout (after the URL bar),
+        # which is exactly where the old view sat.
+        self._layout.addWidget(self._view, stretch=1)
+        target = getattr(self, "_url_before_suspend", self.HOME_URL)
+        if not target or target == "about:blank":
+            target = self.HOME_URL
+        self._view.setUrl(QtCore.QUrl(target))
 
 
 # ---------------------------------------------------------------------------
@@ -1929,32 +3003,103 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._build_layout()
         self._wire_events()
         self._refresh_initial_state()
-        # ``auto_launch_chrome`` is true by default but no caller in the
-        # project actually invokes ``launch_chrome_for_cdp`` — so the
-        # private Chromium on ``./data/chrome-cdp`` only came up when
-        # the user clicked "🌐 打开 publisher 登录" in the daily dialog.
-        # Do it here too, in a background thread, so the embedded
-        # BrowserPanel's publisher buttons actually work the first time
-        # the user opens one. The thread is daemon, the work is gated
-        # by ``check_cdp_status`` (no-op if Chrome is already up), and
-        # failures are swallowed so an auto-launch miss never blocks
-        # the chat thread.
-        if getattr(self._controller.config.cdp_downloader, "auto_launch_chrome", False):
-            self._auto_launch_chrome()
+        # Round 18: do NOT auto-launch the external chrome on startup.
+        # Login now happens inside the embedded BrowserPanel (whose
+        # default profile was redirected to ``data/chrome-cdp`` in
+        # ``main()``). The external chrome is launched lazily only when
+        # sentinel needs CDP — see ``_acquire_external_chrome_for_sentinel``.
+        # Spawning both at once would race for the SingletonLock on
+        # ``data/chrome-cdp`` and either fail to start the external
+        # chrome or corrupt the on-disk Cookies SQLite.
 
     def _auto_launch_chrome(self) -> None:
+        # Round 18: this method now lives behind
+        # ``_acquire_external_chrome_for_sentinel`` (lazy, only when
+        # sentinel needs CDP). The startup-time auto-launch was removed
+        # because the embedded QtWebEngine view now writes cookies to
+        # ``data/chrome-cdp`` directly — there is no longer a need for
+        # a parallel external chrome to be alive for the publisher
+        # buttons to "work".
+        #
+        # The work runs on a daemon thread so the GUI thread doesn't
+        # block on Chrome's slow startup (~2-4 s on cold cache). The
+        # ``Popen`` handle from ``launch_chrome_for_cdp`` is stashed on
+        # ``self._external_chrome_proc`` so ``_release_external_chrome_for_sentinel``
+        # can ``terminate()`` it later.
         import threading
         from littrace.chrome_profiles import launch_chrome_for_cdp
 
         def _worker():
             try:
-                result = launch_chrome_for_cdp(self._controller.config)
+                # Round 18: littrace-qt's sentinel CDP companion always
+                # launches headless so the user never sees a second
+                # chrome.exe window over the Qt shell. Operators who need
+                # a visible chrome for SSO debugging flip
+                # ``cdp_downloader.headless = false`` in config.yaml.
+                result = launch_chrome_for_cdp(
+                    self._controller.config,
+                    headless=self._controller.config.cdp_downloader.headless,
+                )
                 if result.launched:
+                    self._external_chrome_proc = result.process
                     self._post_status("publisher Chrome 已启动（CDP 19222）")
+                elif result.process is not None:
+                    # CDP endpoint never came up but Chrome is alive —
+                    # kill it so we don't leak a chrome.exe holding the
+                    # profile lock.
+                    try:
+                        result.process.terminate()
+                        result.process.wait(timeout=5.0)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
         threading.Thread(target=_worker, daemon=True, name="littrace-auto-chrome").start()
+
+    # ---- External chrome lifecycle (sentinel needs CDP) ------------------
+
+    def _acquire_external_chrome_for_sentinel(self) -> None:
+        """Round 18: called right before ``subprocess.run(['littrace',
+        'sentinel', 'run', ...])`` fires. Tears down the embedded
+        ``QWebEngineView`` so its Chromium instance releases the profile
+        lock on ``data/chrome-cdp`` and flushes cookies to disk; then
+        spawns the external ``chrome.exe`` against the same profile so
+        sentinel can drive it via CDP.
+
+        Idempotent: if the external chrome is already alive, the call is
+        a no-op. The sentinel subprocess inherits any log-in the user did
+        in the embedded view because both targets the same on-disk
+        Cookies SQLite.
+        """
+        # Already up? nothing to do.
+        proc = getattr(self, "_external_chrome_proc", None)
+        if proc is not None and proc.poll() is None:
+            return
+        self._browser_panel.suspend_for_external_chrome()
+        self._external_chrome_proc = None
+        self._auto_launch_chrome()
+
+    def _release_external_chrome_for_sentinel(self) -> None:
+        """Round 18: called once sentinel finishes. Kill the external
+        chrome so the embedded QtWebEngine view can grab the profile
+        lock again; then re-show the BrowserPanel so the user lands
+        back on the publisher page they were on before.
+        """
+        proc = getattr(self, "_external_chrome_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        self._external_chrome_proc = None
+        self._browser_panel.resume_after_external_chrome()
 
     # ---- Cross-thread bridge for "运行今日管线" status ----------------
 
@@ -1988,6 +3133,67 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             QtCore.Q_ARG(str, text),
         )
 
+    @QtCore.Slot("QString")
+    def _show_daily_preview_from_any_thread(self, payload_json: str) -> None:
+        """Slot target for ``_post_daily_preview`` — pops the
+        non-modal ``DailyResultDialog`` on the GUI thread with the
+        payload built by the worker thread. JSON-encoded because
+        ``Q_ARG`` only carries primitives + ``QString``.
+
+        The dialog is non-modal + cached on ``self`` so the user can
+        flip back to it if they accidentally close it; the previous
+        behaviour (a status-bar one-liner) left no recovery path.
+        """
+        import json
+        try:
+            payload = json.loads(payload_json)
+        except Exception:
+            return
+        # If a previous preview is still on screen, just close it
+        # rather than stacking two dialogs. ``accepted`` is the
+        # cleanest signal that the user already reviewed the prior
+        # summary.
+        previous = getattr(self, "_daily_preview", None)
+        if previous is not None:
+            try:
+                previous.close()
+                previous.deleteLater()
+            except Exception:
+                pass
+        self._daily_preview = DailyResultDialog(
+            self,
+            topic=payload.get("topic", ""),
+            keywords=payload.get("keywords", ""),
+            year_min=int(payload.get("year_min") or 0),
+            year_max=int(payload.get("year_max") or 0),
+            target_papers=int(payload.get("target_papers") or 0),
+            rounds_done=int(payload.get("rounds_done") or 0),
+            cumulative_downloaded=int(payload.get("cumulative_downloaded") or 0),
+            cumulative_candidates=int(payload.get("cumulative_candidates") or 0),
+            warnings=list(payload.get("warnings") or []),
+            summary_lines=list(payload.get("summary_lines") or []),
+        )
+        self._daily_preview.show()
+        self._daily_preview.raise_()
+        self._daily_preview.activateWindow()
+
+    def _post_daily_preview(self, payload: dict) -> None:
+        """Worker-thread helper. JSON-encodes ``payload`` and routes
+        it onto the GUI thread so the user sees the structured
+        ``DailyResultDialog`` instead of just the headline status
+        line."""
+        import json
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            encoded = "{}"
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_show_daily_preview_from_any_thread",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, encoded),
+        )
+
     # ---- UI construction -------------------------------------------------
 
     def _build_layout(self) -> None:
@@ -2016,6 +3222,18 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._status_bar = QtWidgets.QStatusBar()
         self._status_bar.setObjectName("status")
         self.setStatusBar(self._status_bar)
+
+        # Round 19: 60 s tick to keep the RAG staleness badge fresh.
+        # Without this the user sees the badge flip from "fresh" to
+        # "stale" only on the next explicit refresh — which can be
+        # many minutes apart.
+        self._rag_tick_timer = QtCore.QTimer(self)
+        self._rag_tick_timer.setInterval(60_000)
+        self._rag_tick_timer.timeout.connect(
+            lambda: getattr(self, "_rag_panel", None)
+            and self._rag_panel.refresh_status()
+        )
+        self._rag_tick_timer.start()
 
     def _build_nav(self) -> QtWidgets.QWidget:
         nav = QtWidgets.QFrame()
@@ -2179,11 +3397,12 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         )
 
     def _on_run_daily(self) -> None:
-        # The button opens ``DailyConfigDialog`` first. The dialog
-        # blocks the chat thread until the user either accepts or
-        # cancels; both branches return immediately, this method just
-        # kicks off the worker (or the browser, if the user picked
-        # "🌐 打开 publisher 登录") once we have a config.
+        # Round 19: ``DailyConfigDialog`` is now non-modal — show it
+        # instead of exec'ing, and route the accepted / rejected
+        # signals to handler slots. This lets the user keep poking
+        # at the rest of the window (context panel, chat scrollback,
+        # etc.) while they tweak the parameters, and the X button /
+        # Esc key still cleanly cancels the run.
         existing_topic = "mxene_sensor"
         dialog = DailyConfigDialog(
             self,
@@ -2195,8 +3414,36 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 self._controller.config.literature_context, "default_recent_year_min", 2026
             ),
         )
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
+        # Wire one-shot handlers so the dialog doesn't have to know
+        # about the controller. ``accepted`` carries the chosen
+        # values; ``rejected`` is a no-op (user closed the dialog
+        # without running anything).
+        dialog.accepted.connect(
+            lambda dlg=dialog: self._on_daily_dialog_accepted(dlg)
+        )
+        dialog.rejected.connect(
+            lambda: self._status_bar.showMessage("已取消 daily 检索", 3000)
+        )
+        # Cache on the window so the user can close + reopen via
+        # the toolbar button without losing their input. A second
+        # open reuses the existing dialog and just ``raise_()``s it.
+        previous = getattr(self, "_daily_config_dialog", None)
+        if previous is not None:
+            try:
+                previous.close()
+                previous.deleteLater()
+            except Exception:
+                pass
+        self._daily_config_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_daily_dialog_accepted(self, dialog) -> None:
+        """Round 19: handler for the non-modal ``DailyConfigDialog``'s
+        ``accepted`` signal. Reads the chosen values, kicks off the
+        sentinel worker (or the publisher-login flow), and lets the
+        dialog close itself."""
         topic = dialog.topic()
         keywords = dialog.keywords()
         year_min = dialog.year_min()
@@ -2208,11 +3455,41 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             self._launch_publisher_login_browser()
             return
 
+        self._start_daily_run(
+            topic=topic,
+            keywords=keywords,
+            year_min=year_min,
+            year_max=year_max,
+            min_papers=min_papers,
+        )
+
+    def _start_daily_run(
+        self,
+        *,
+        topic: str,
+        keywords: str,
+        year_min: int,
+        year_max: int,
+        min_papers: int,
+    ) -> None:
+        """Round 19: the actual sentinel-subprocess kickoff. Extracted
+        from ``_on_run_daily`` so both the dialog-accepted path and
+        any future entrypoint (e.g. a slash command like
+        ``/run-daily mxene_sensor``) can share it. ``_on_run_daily``
+        handles the dialog lifecycle; this method assumes the
+        parameters are already validated and only does the launch.
+        """
         self._status_bar.showMessage(
             f"检索启动中…主题：{topic}（{year_min}-{year_max}，≥{min_papers} 篇）",
             3000,
         )
         self._rag_panel.set_status(f"运行中…主题 {topic}")
+        # Round 18: take the BrowserPanel offline and bring up the
+        # external chrome so sentinel can drive it via CDP. Both
+        # processes must NOT be alive simultaneously (SingletonLock on
+        # ``data/chrome-cdp``); ``_acquire`` suspends the embedded
+        # view first, then spawns the external one.
+        self._acquire_external_chrome_for_sentinel()
         import threading
 
         def _worker():
@@ -2225,115 +3502,161 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             # and use a per-round ``timeout`` because a single sentinel
             # run can take ~2 min on a cold OpenAlex cache; three
             # rounds would otherwise blow past the user wait budget.
-            MAX_ROUNDS = 2
-            PER_ROUND_TIMEOUT = 180
-            base_keywords = keywords or topic
-            queries = [
-                base_keywords,
-                f"{base_keywords} review",
-            ]
-            cumulative_downloaded = 0
-            cumulative_candidates = 0
-            rounds_done = 0
-            last_summary = ""
-            last_warnings: list[str] = []
-            for round_idx, q in enumerate(queries, start=1):
-                round_start = time.monotonic()
-                self._post_status(
-                    f"第 {round_idx}/{MAX_ROUNDS} 轮检索 · query='{q}'"
-                )
-                # Sentinel does not emit mid-run progress lines, so
-                # ``subprocess.run`` blocks silently for ~2 min. Park a
-                # background timer that re-posts the same status with
-                # the elapsed time appended so the user sees the run is
-                # alive. The timer is cancelled as soon as the round
-                # finishes (see ``_stop_progress_timer`` below).
-                progress_state = {"stop": False}
-                _stop_progress_timer = lambda: progress_state.update(stop=True)
-                self._start_progress_timer(
-                    round_idx, MAX_ROUNDS, q, round_start, progress_state
-                )
-                # Round 17: pass the user-selected year range and
-                # target count through to the sentinel subprocess.
-                # Previously only ``--watchlist`` / ``--topic`` were
-                # forwarded, so the dialog's "年份区间" and "最少
-                # 检索数目" fields were silently dropped and the
-                # pipeline ran with the watchlist's persisted
-                # defaults (or the hardcoded 2024 lower bound).
-                cmd, env, cwd = _littrace_cmd(
-                    "sentinel", "run",
-                    "--watchlist", topic,
-                    "--topic", q,
-                    "--year-min", str(year_min),
-                    "--year-max", str(year_max),
-                    "--target-papers", str(min_papers),
-                )
-                try:
-                    completed = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=PER_ROUND_TIMEOUT,
-                        cwd=cwd,
-                        env=env,
-                    )
-                finally:
-                    progress_state["stop"] = True
-                if completed is None:
-                    continue
-                if completed.returncode != 0:
-                    tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-1] or "(no output)"
+            try:
+                MAX_ROUNDS = 2
+                PER_ROUND_TIMEOUT = 180
+                base_keywords = keywords or topic
+                queries = [
+                    base_keywords,
+                    f"{base_keywords} review",
+                ]
+                cumulative_downloaded = 0
+                cumulative_candidates = 0
+                rounds_done = 0
+                last_summary = ""
+                last_warnings: list[str] = []
+                for round_idx, q in enumerate(queries, start=1):
+                    round_start = time.monotonic()
                     self._post_status(
-                        f"第 {round_idx} 轮 sentinel 退出 {completed.returncode}：{tail}"
+                        f"第 {round_idx}/{MAX_ROUNDS} 轮检索 · query='{q}'"
                     )
-                    continue
-                rounds_done += 1
-                summary = _summarise_sentinel_output(completed.stdout or "")
-                last_summary = summary
-                # Round 17: surface download-stage warnings that the
-                # sentinel run folded into ``warnings:``. Without
-                # this the user only saw the run summary and had no
-                # way to know that, say, the download step failed
-                # silently. The last warning wins because the most
-                # recent round's diagnostics are the freshest
-                # signal of an ongoing problem.
-                for line in (completed.stdout or "").splitlines():
-                    if line.startswith("warnings:"):
-                        last_warnings = [
-                            chunk.strip() for chunk in line[len("warnings:"):].split("；") if chunk.strip()
-                        ]
-                downloaded = _summary_value(summary, "downloaded:")
-                candidates = _summary_value(summary, "new_candidates:")
-                if downloaded is not None:
-                    cumulative_downloaded += downloaded
-                if candidates is not None:
-                    cumulative_candidates += candidates
-                # Stop early once we have enough downloads. Sentinel
-                # dedupes by DOI so accumulated downloaded is the
-                # real "we found N new papers" count.
-                if cumulative_downloaded >= min_papers:
-                    break
-            headline = (
-                f"检索完成（{rounds_done} 轮）· {last_summary}"
-            )
-            shortfall = []
-            if (
-                cumulative_downloaded is not None
-                and cumulative_downloaded < min_papers
-            ):
-                shortfall.append(
-                    f"{rounds_done} 轮累计下了 {cumulative_downloaded} 篇，"
-                    f"少于目标 {min_papers} 篇"
+                    # Sentinel does not emit mid-run progress lines, so
+                    # ``subprocess.run`` blocks silently for ~2 min. Park a
+                    # background timer that re-posts the same status with
+                    # the elapsed time appended so the user sees the run is
+                    # alive. The timer is cancelled as soon as the round
+                    # finishes (see ``_stop_progress_timer`` below).
+                    progress_state = {"stop": False}
+                    _stop_progress_timer = lambda: progress_state.update(stop=True)
+                    self._start_progress_timer(
+                        round_idx, MAX_ROUNDS, q, round_start, progress_state
+                    )
+                    # Round 17: pass the user-selected year range and
+                    # target count through to the sentinel subprocess.
+                    # Previously only ``--watchlist`` / ``--topic`` were
+                    # forwarded, so the dialog's "年份区间" and "最少
+                    # 检索数目" fields were silently dropped and the
+                    # pipeline ran with the watchlist's persisted
+                    # defaults (or the hardcoded 2024 lower bound).
+                    cmd, env, cwd = _littrace_cmd(
+                        "sentinel", "run",
+                        "--watchlist", topic,
+                        "--topic", q,
+                        "--year-min", str(year_min),
+                        "--year-max", str(year_max),
+                        "--target-papers", str(min_papers),
+                    )
+                    try:
+                        completed = subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=PER_ROUND_TIMEOUT,
+                            cwd=cwd,
+                            env=env,
+                        )
+                    finally:
+                        progress_state["stop"] = True
+                    if completed is None:
+                        continue
+                    if completed.returncode != 0:
+                        tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-1] or "(no output)"
+                        self._post_status(
+                            f"第 {round_idx} 轮 sentinel 退出 {completed.returncode}：{tail}"
+                        )
+                        continue
+                    rounds_done += 1
+                    summary = _summarise_sentinel_output(completed.stdout or "")
+                    last_summary = summary
+                    # Round 17: surface download-stage warnings that the
+                    # sentinel run folded into ``warnings:``. Without
+                    # this the user only saw the run summary and had no
+                    # way to know that, say, the download step failed
+                    # silently. The last warning wins because the most
+                    # recent round's diagnostics are the freshest
+                    # signal of an ongoing problem.
+                    for line in (completed.stdout or "").splitlines():
+                        if line.startswith("warnings:"):
+                            last_warnings = [
+                                chunk.strip() for chunk in line[len("warnings:"):].split("；") if chunk.strip()
+                            ]
+                    downloaded = _summary_value(summary, "downloaded:")
+                    candidates = _summary_value(summary, "new_candidates:")
+                    if downloaded is not None:
+                        cumulative_downloaded += downloaded
+                    if candidates is not None:
+                        cumulative_candidates += candidates
+                    # Stop early once we have enough downloads. Sentinel
+                    # dedupes by DOI so accumulated downloaded is the
+                    # real "we found N new papers" count.
+                    if cumulative_downloaded >= min_papers:
+                        break
+                headline = (
+                    f"检索完成（{rounds_done} 轮）· {last_summary}"
                 )
-            if cumulative_candidates is not None and cumulative_candidates < 5:
-                shortfall.append(
-                    f"累计检索到 {cumulative_candidates} 个候选"
+                shortfall = []
+                if (
+                    cumulative_downloaded is not None
+                    and cumulative_downloaded < min_papers
+                ):
+                    shortfall.append(
+                        f"{rounds_done} 轮累计下了 {cumulative_downloaded} 篇，"
+                        f"少于目标 {min_papers} 篇"
+                    )
+                if cumulative_candidates is not None and cumulative_candidates < 5:
+                    shortfall.append(
+                        f"累计检索到 {cumulative_candidates} 个候选"
+                    )
+                if last_warnings:
+                    shortfall.append("；".join(last_warnings))
+                if shortfall:
+                    headline += " · ⚠️ " + "；".join(shortfall)
+                self._post_status(headline)
+                # Round 19: pop the non-modal daily-result dialog so
+                # the user sees a structured summary instead of
+                # trying to parse a 200-character status-bar line.
+                # The dialog is informational only — by this point
+                # sentinel has already written to the workspace;
+                # ``mark_rag_refresh`` below keeps the staleness
+                # badge in sync with the same data the dialog
+                # surfaces. ``summary_lines`` carries the parsed
+                # per-round counter lines so the user can scroll
+                # through them at their own pace.
+                self._post_daily_preview(
+                    {
+                        "topic": topic,
+                        "keywords": keywords,
+                        "year_min": year_min,
+                        "year_max": year_max,
+                        "target_papers": min_papers,
+                        "rounds_done": rounds_done,
+                        "cumulative_downloaded": cumulative_downloaded,
+                        "cumulative_candidates": cumulative_candidates,
+                        "warnings": list(last_warnings),
+                        "summary_lines": [
+                            f"{i + 1}. {line}"
+                            for i, line in enumerate(last_summary.split(" · "))
+                            if line
+                        ],
+                    }
                 )
-            if last_warnings:
-                shortfall.append("；".join(last_warnings))
-            if shortfall:
-                headline += " · ⚠️ " + "；".join(shortfall)
-            self._post_status(headline)
+                # Round 19: stamp the controller's RAG refresh
+                # timestamp so the staleness badge updates from
+                # "stale" to "fresh" without the user having to
+                # restart the window. ``cumulative_candidates`` is
+                # the closest stand-in for chunk count the
+                # sentinel summary gives us; real chunk counts
+                # arrive via the dedicated rag_refresh tool which
+                # is run elsewhere in the pipeline.
+                self._controller.mark_rag_refresh(
+                    indexed_chunks=cumulative_candidates
+                )
+            finally:
+                # Round 18: even on exception, kill the external chrome
+                # and re-show the embedded view. Without this, a
+                # crashed sentinel run leaves the BrowserPanel blank
+                # and the user has to restart ``littrace-qt``.
+                self._release_external_chrome_for_sentinel()
 
         threading.Thread(target=_worker, daemon=True, name="littrace-daily").start()
 
@@ -2364,43 +3687,19 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(10000, _tick)
 
     def _launch_publisher_login_browser(self) -> None:
-        # ``littrace setup-browser --launch`` boots the LitTrace-private
-        # Chromium with ``--remote-debugging-port=19222`` against
-        # ``./data/chrome-cdp`` (independent of the user's day-to-day
-        # Chrome). Once the browser is up, the embedded BrowserPanel
-        # can be pointed at each publisher's sign-in page so the user
-        # can authenticate; the next sentinel run then has access to
-        # gated PDFs.
-        self._status_bar.showMessage("启动 publisher 登录浏览器…", 3000)
-        self._rag_panel.set_status("等待 publisher 登录…")
-        import threading
-
-        def _worker():
-            try:
-                cmd, env, cwd = _littrace_cmd("setup-browser", "--launch")
-                completed = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    cwd=cwd,
-                    env=env,
-                )
-                if completed.returncode == 0:
-                    self._post_status("publisher 浏览器已就绪（CDP 19222）")
-                else:
-                    tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-1]
-                    self._post_status(
-                        f"启动 publisher 浏览器失败（exit={completed.returncode}）：{tail}"
-                    )
-            except subprocess.TimeoutExpired:
-                self._post_status("启动 publisher 浏览器超时（30 秒）")
-            except Exception as exc:  # pragma: no cover - defensive
-                self._post_status(
-                    f"启动 publisher 浏览器失败: {type(exc).__name__}: {exc}"
-                )
-
-        threading.Thread(target=_worker, daemon=True, name="littrace-setup-browser").start()
+        # Round 18: login now happens inside the embedded BrowserPanel
+        # because ``main()`` redirected QtWebEngine's default profile to
+        # ``data/chrome-cdp`` — the same directory sentinel reads via
+        # CDP. There is no longer a separate external chrome to launch;
+        # pointing the embedded view at the first publisher's sign-in
+        # page is enough. The user can then click the other shortcuts
+        # (``🌐 ACS`` / ``🌐 Springer`` / ...) on the same view to log
+        # into the rest.
+        self._browser_panel.open_url(self._browser_panel.PUBLISHER_LINKS[0][1])
+        self._status_bar.showMessage(
+            "在右侧嵌入式浏览器里登录各 publisher 即可，cookie 自动写入 data/chrome-cdp",
+            5000,
+        )
 
     # ---- Event wiring ----------------------------------------------------
 
@@ -2437,6 +3736,8 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 self._controller.EVENT_AUTH_REQUIRED: self._on_auth_event,
                 self._controller.EVENT_AUTH_OK: self._on_auth_event,
                 self._controller.EVENT_THINKING_PROGRESS: self._on_thinking_progress_event,
+                self._controller.EVENT_SLASH_RESULT: self._on_slash_result_event,
+                self._controller.EVENT_RAG_PANEL_REFRESHED: self._on_rag_panel_event,
             },
         )
 
@@ -2450,6 +3751,13 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         role = body.get("role", "system")
         text = body.get("text", "")
         extras = {k: v for k, v in body.items() if k in ("action", "warnings")}
+        # Round 19: stash the most recent user message so the
+        # error bubble's "🔁 重试" link can re-submit it without
+        # making the user scroll up to copy/paste. Empty / slash
+        # commands are skipped (they don't make sense to retry
+        # through the same handler that just failed).
+        if role == "user" and text and not text.startswith("/"):
+            self._last_user_message = text
         # Round 17: when an assistant reply lands and a streaming
         # bubble is open, swap its content for the markdown-rendered
         # final reply and skip the duplicate ``append_message``. The
@@ -2464,6 +3772,32 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             self._chat_panel.finalize_streaming(text)
             return
         self._chat_panel.append_message(role, text, **extras)
+
+    def _on_slash_result_event(self, body: dict) -> None:
+        """Round 19: render a slash command result as a system bubble
+        in the chat scrollback. The format mirrors the CLI's plain
+        text (no markdown) so the user sees the same text they'd see
+        in a terminal.
+        """
+        name = body.get("name", "")
+        text = body.get("text", "")
+        label = f"/{name}" if name else "command"
+        self._chat_panel.append_message(
+            "system",
+            f"<b>{label}</b><br><pre style='white-space:pre-wrap;"
+            "font-family:Menlo,Consolas,monospace;font-size:12px;'>"
+            f"{_render_message_html(text)}</pre>",
+        )
+        if self._status_bar is not None:
+            self._status_bar.showMessage(f"执行 /{name}", 3000)
+
+    def _on_rag_panel_event(self, body: dict) -> None:
+        """Round 19: the controller emits this every time the RAG
+        panel needs to re-render — after a daily run finishes, when
+        ``mark_rag_refresh`` stamps a new timestamp, etc. We just
+        forward to ``RAGPanel.refresh_status``.
+        """
+        self._rag_panel.refresh_status()
 
     def _on_status_event(self, body: dict) -> None:
         self._status_bar.showMessage(body.get("text", ""))
@@ -2495,13 +3829,17 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         # ``TypeError: ...``) is hidden behind a small "details"
         # link — it used to be dumped into the chat as the main
         # text, which made every error look like a Python traceback.
+        #
+        # Round 19: inline action buttons under the error so the
+        # user doesn't have to scroll up, retype the message, or
+        # open the controller log to act:
+        #   * [🔁 重试]   re-submits the last user message
+        #   * [查看技术细节]   pops the raw stack trace
+        #   * For ``unauthorized`` errors, also surface [🔑 重新登录]
+        #     so the user doesn't have to hunt for the login button.
         message = body.get("message", "对话出错")
         suggestion = body.get("suggestion", "")
         error_code = body.get("error_code", "other")
-        # Inline message + suggestion + a details link. The link
-        # target is the raw ``TypeError: ...`` string, which we
-        # stash on the dialog as plain text (no HTML escaping
-        # needed because QPlainTextEdit handles escaping itself).
         raw = body.get("raw", "")
         html_parts = [f"⚠️ {message}"]
         if suggestion:
@@ -2509,10 +3847,40 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 f'<br><span style="color:#5c6068;font-size:11px;">'
                 f"{suggestion}</span>"
             )
+        # Build the inline action row. Each link uses the
+        # ``littrace:`` URI scheme so we can route the activation
+        # through ``_on_chat_anchor_clicked`` without opening a
+        # browser.
+        actions: list[str] = []
+        last_msg = getattr(self, "_last_user_message", None)
+        if last_msg:
+            actions.append(
+                '<a href="littrace:retry-last" '
+                'style="color:#3a8a8c;font-size:11px;'
+                'text-decoration:none;margin-right:10px;">'
+                '🔁 重试</a>'
+            )
         if raw:
+            actions.append(
+                '<a href="littrace:show-error-detail" '
+                'style="color:#3a8a8c;font-size:11px;'
+                'text-decoration:none;margin-right:10px;">'
+                '查看技术细节</a>'
+            )
+            # Stash for the click handler.
+            self._last_error_detail = (error_code, message, raw)
+        if error_code == "unauthorized":
+            actions.append(
+                '<a href="littrace:relogin" '
+                'style="color:#3a8a8c;font-size:11px;'
+                'text-decoration:none;margin-right:10px;">'
+                '🔑 重新登录</a>'
+            )
+        if actions:
             html_parts.append(
-                f'<br><a href="littrace:show-error-detail" '
-                f'style="color:#3a8a8c;font-size:11px;">查看技术细节</a>'
+                '<br><div style="margin-top:6px;font-size:11px;">'
+                + "".join(actions)
+                + "</div>"
             )
         self._chat_panel.append_message(
             "system", "".join(html_parts)
@@ -2710,6 +4078,23 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         from PySide6.QtGui import QDesktopServices
 
         text = url.toString()
+        # Round 19: inline retry action on chat errors. Re-submits
+        # the most recent user message (tracked in
+        # ``_on_message_event``) so the user doesn't have to scroll
+        # up + copy/paste after a transient failure.
+        if text.startswith("littrace:retry-last"):
+            last = getattr(self, "_last_user_message", None)
+            if not last:
+                self._status_bar.showMessage("没有可重试的上一条消息", 4000)
+                return
+            self._controller.submit_user_message(last)
+            return
+        # Round 19: one-click re-login when the error is an
+        # ``unauthorized``. Reuses the same login dialog the user
+        # sees on cold-start.
+        if text.startswith("littrace:relogin"):
+            self._show_auth_dialog("reauth", "请重新登录 ChatGPT 后重试")
+            return
         if text.startswith("littrace:show-error-detail"):
             detail = getattr(self, "_last_error_detail", None)
             if detail is None:
@@ -2933,6 +4318,25 @@ def main(argv: list[str] | None = None) -> int:
     QtCore.QCoreApplication.setOrganizationName("LitTrace")
     QtCore.QCoreApplication.setApplicationName("LitTrace Qt")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+
+    # Round 18: redirect QtWebEngine's default profile storage to the
+    # same ``data/chrome-cdp`` directory sentinel uses via CDP, so
+    # cookies written by the embedded BrowserPanel (when the user logs
+    # into Wiley / ACS / Springer / Nature) are immediately visible to
+    # the next ``sentinel run`` without a separate "open external
+    # browser and log in again" step. The env-var
+    # ``QTWEBENGINE_USER_DATA_DIR`` is documented as the standard knob
+    # but is silently ignored on PySide6 6.7.2 / Windows (verified
+    # 2026-09: the default profile still resolves to
+    # ``%LOCALAPPDATA%\\...\\QtWebEngine\\OffTheRecord``); the API
+    # path is the only thing that actually moves cookies.
+    from PySide6.QtWebEngineCore import QWebEngineProfile
+
+    profile_dir = config.cdp_downloader.chrome_user_data_dir.expanduser()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    default_profile = QWebEngineProfile.defaultProfile()
+    default_profile.setPersistentStoragePath(str(profile_dir))
+    default_profile.setCachePath(str(profile_dir))
 
     controller = ShellController(config)
     controller.start()

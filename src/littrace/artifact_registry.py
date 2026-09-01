@@ -232,9 +232,13 @@ class PostgresArtifactRegistry:
         try:
             import psycopg
         except ImportError as exc:
+            # ``psycopg`` ships in the ``rag`` optional extra (see
+            # pyproject.toml — ``storage`` only adds ``boto3`` for S3
+            # backends). Pointing users at ``storage`` makes them install
+            # the wrong dependency and hit the same ImportError again.
             raise RuntimeError(
-                "Postgres artifact registry requires the optional storage extra: "
-                "pip install -e '.[storage]'"
+                "Postgres artifact registry requires the optional rag extra: "
+                "pip install -e '.[rag]'"
             ) from exc
         return psycopg.connect(self.dsn)
 

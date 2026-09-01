@@ -1529,7 +1529,16 @@ def _print_browser_setup(config, profile_name: str | None, launch: bool) -> None
     for warning in discovery.warnings:
         print(f"warning: {warning}")
     if launch:
-        result = launch_chrome_for_cdp(config, profile_name=profile_name)
+        # Round 18: ``littrace setup-browser --launch`` is the
+        # explicit "I want a visible Chrome window I can sign in
+        # to" path — opt out of the headless default that
+        # ``littrace-qt`` uses for its sentinel companion. The
+        # ``report.launch_plan`` below keeps the default for the
+        # printed hint so users still see what the embedded Qt
+        # shell will spawn.
+        result = launch_chrome_for_cdp(
+            config, profile_name=profile_name, headless=False
+        )
         if result.already_available:
             print("cdp: already available")
         elif result.launched:

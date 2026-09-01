@@ -6,26 +6,22 @@ import platform
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 
 from littrace.access_layer.cdp import CDPStatus, check_cdp_status
 from littrace.config import LitTraceConfig
+from littrace.publisher_catalog import publisher_cookie_domains
 
 
-PUBLISHER_COOKIE_DOMAINS = [
-    "wiley.com",
-    "onlinelibrary.wiley.com",
-    "acs.org",
-    "pubs.acs.org",
-    "sciencedirect.com",
-    "elsevier.com",
-    "nature.com",
-    "springer.com",
-    "rsc.org",
-    "ieee.org",
-]
+# Round 19: derived from the unified ``publisher_catalog.PUBLISHERS``
+# list so adding a new publisher in one place automatically updates
+# the cookie-domain detector below. Kept as a tuple (not list) so
+# downstream code that iterates it can't accidentally mutate the
+# canonical ordering.
+PUBLISHER_COOKIE_DOMAINS = list(publisher_cookie_domains())
 
 
 class ChromeProfileInfo(BaseModel):
@@ -58,6 +54,13 @@ class ChromeLaunchResult(BaseModel):
     cdp_status: CDPStatus | None = None
     command: list[str] = Field(default_factory=list)
     error: str | None = None
+    # ``process`` exposes the live ``Popen`` handle so the caller can
+    # terminate the Chrome instance cleanly once it no longer needs the
+    # CDP endpoint. LitTrace-Qt holds this reference between sentinel
+    # runs so the next ``_acquire_external_chrome_for_sentinel`` call
+    # can no-op instead of spawning a second ``chrome.exe`` against the
+    # already-held profile (which would fail on SingletonLock).
+    process: Any = None
 
 
 class BrowserSetupReport(BaseModel):
@@ -106,6 +109,8 @@ def discover_chrome_profiles(config: LitTraceConfig) -> ChromeDiscoveryResult:
 def build_chrome_launch_plan(
     config: LitTraceConfig,
     profile_name: str | None = None,
+    *,
+    headless: bool | None = None,
 ) -> ChromeLaunchPlan | None:
     discovery = discover_chrome_profiles(config)
     if not discovery.executable or not discovery.user_data_dir:
@@ -114,6 +119,14 @@ def build_chrome_launch_plan(
     port = (
         _port_from_cdp_url(config.cdp_downloader.cdp_url)
         or config.cdp_downloader.remote_debugging_port
+    )
+    # Round 18: default to headless when the caller did not pass an
+    # explicit override. ``littrace-qt`` acquires external chrome for
+    # sentinel and never wants a separate window over its own QWebEngine
+    # view; the ``littrace setup-browser --launch`` CLI path opts out
+    # explicitly because the user asked for a visible chrome.
+    use_headless = (
+        config.cdp_downloader.headless if headless is None else headless
     )
     command = [
         discovery.executable,
@@ -124,6 +137,14 @@ def build_chrome_launch_plan(
         f"--user-data-dir={discovery.user_data_dir}",
         f"--profile-directory={selected}",
     ]
+    if use_headless:
+        # ``--headless=new`` is the modern Chromium headless that keeps
+        # the full cookie / network / CDP surface (vs. the old
+        # ``--headless`` which differs subtly and breaks some sites).
+        # ``--disable-gpu`` is the conventional belt for headless on
+        # Windows; without it Chromium falls back to software
+        # rendering which is fine but slow.
+        command += ["--headless=new", "--disable-gpu"]
     return ChromeLaunchPlan(
         command=command,
         cdp_url=f"http://127.0.0.1:{port}",
@@ -136,6 +157,8 @@ def launch_chrome_for_cdp(
     config: LitTraceConfig,
     profile_name: str | None = None,
     wait_seconds: float = 4.0,
+    *,
+    headless: bool | None = None,
 ) -> ChromeLaunchResult:
     status = check_cdp_status(config)
     if status.available:
@@ -145,7 +168,9 @@ def launch_chrome_for_cdp(
             already_available=True,
             cdp_status=status,
         )
-    plan = build_chrome_launch_plan(config, profile_name=profile_name)
+    plan = build_chrome_launch_plan(
+        config, profile_name=profile_name, headless=headless
+    )
     if plan is None:
         return ChromeLaunchResult(
             attempted=False,
@@ -187,6 +212,7 @@ def launch_chrome_for_cdp(
             cdp_status=status,
             command=plan.command,
             error=_explain_chrome_early_exit(plan, proc.returncode),
+            process=proc,
         )
     deadline = time.monotonic() + max(wait_seconds, 0.0)
     latest_status = status
@@ -199,13 +225,18 @@ def launch_chrome_for_cdp(
                 launched=True,
                 cdp_status=latest_status,
                 command=plan.command,
+                process=proc,
             )
+    # Process is still alive but the CDP endpoint never came up —
+    # surface the handle so the caller can kill it instead of leaking
+    # an orphan chrome.exe holding the profile lock.
     return ChromeLaunchResult(
         attempted=True,
         launched=False,
         cdp_status=latest_status,
         command=plan.command,
         error="Chrome was launched, but the CDP endpoint did not become available in time.",
+        process=proc,
     )
 
 

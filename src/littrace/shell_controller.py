@@ -137,6 +137,11 @@ class ShellController:
     # controller's chat turn coroutine exits.
     EVENT_THINKING_PROGRESS = "thinking_progress"
     THINKING_PROGRESS_INTERVAL = 1.5
+    # Round 19: emit when a local slash command (e.g. /papers, /workflow)
+    # produces a result. The GUI chat panel renders these as a
+    # system-style bubble so the user can see command output without
+    # leaving the chat surface.
+    EVENT_SLASH_RESULT = "slash_result"
 
     def __init__(self, config: LitTraceConfig) -> None:
         self._config = config
@@ -764,7 +769,275 @@ class ShellController:
         return list_chat_sessions(self._config)
 
     # ------------------------------------------------------------------
-    # Active paper management (Round 17)
+    # Slash command dispatch (Round 19)
+    # ------------------------------------------------------------------
+
+    def submit_slash_command(self, name: str, args: str = "") -> None:
+        """Execute a LitTrace slash command locally and emit the result.
+
+        Round 19: the GUI's ``_on_send`` previously forwarded every
+        ``/foo`` straight into Codex as a plain chat message, which
+        Codex has no way to interpret — so the 33 entries in
+        ``COMMAND_CATALOG`` were visually present but functionally
+        dead. The CLI's ``cli.py`` loop, by contrast, parses each
+        command and runs a real skill. This method closes that gap by
+        running the same skill the CLI would, but emitting the
+        formatted result through ``EVENT_SLASH_RESULT`` instead of
+        printing to stdout.
+
+        For commands whose natural home is the chat pipeline
+        (``/parse``, ``/table``, ``/storyline``, ``/full-text``) we
+        re-route into ``submit_user_message`` with the same Chinese
+        intent string the CLI uses, so the LLM gets exactly the same
+        prompt regardless of which shell invoked the slash.
+        """
+        handler = _SLASH_HANDLERS.get(name)
+        if handler is None:
+            self._emit(
+                self.EVENT_SLASH_RESULT,
+                name=name,
+                text=f"未知命令 /{name} — 输入 / 看可用命令。",
+            )
+            return
+        try:
+            handler(self, args)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._emit(
+                self.EVENT_SLASH_RESULT,
+                name=name,
+                text=f"/{name} 失败：{exc.__class__.__name__}: {exc}",
+            )
+
+    # Slash command handlers -------------------------------------------
+
+    def _slash_emit(self, name: str, text: str) -> None:
+        """Helper used by every local slash handler to publish a
+        system-style result. Centralised so future formatting (e.g.
+        folding into a richer renderer) needs to change in one spot.
+        """
+        self._emit(self.EVENT_SLASH_RESULT, name=name, text=text)
+
+    def _slash_show_context(self, args: str) -> None:
+        # Display handler — used by /papers and /context. Emits a
+        # ``context`` slash_result so the chat panel can render the
+        # formatted panel.
+        from littrace.cli import format_context_panel
+
+        text = format_context_panel(self._workspace)
+        self._slash_emit("context", text)
+
+    def _slash_dashboard(self, args: str) -> None:
+        # ``format_dashboard`` expects a ``ShellState`` — build a
+        # throwaway with the controller's session + workspace so the
+        # CLI formatter remains the single source of truth for the
+        # dashboard text.
+        from littrace.cli import ShellState, format_dashboard
+
+        state = ShellState(
+            workspace=self._workspace,
+            session_id=self._session.session_id,
+            session_root=str(self._session.root),
+            context_visible=self._workspace.context.visible_to_user,
+        )
+        self._slash_emit("dashboard", format_dashboard(state))
+
+    def _slash_workflow(self, args: str) -> None:
+        from littrace.skill_runner import build_workflow_status
+
+        report = build_workflow_status(self._workspace)
+        lines = [
+            f"Workflow: ready={report.ready_count}, "
+            f"blocked={report.blocked_count}, "
+            f"complete={report.complete_count}",
+        ]
+        for transition in report.transitions:
+            lines.append(
+                f"- {transition.source} -> {transition.target}: "
+                f"{transition.status} | {transition.artifact}"
+            )
+        if report.recommended_next_steps:
+            lines.append("下一步：" + "，".join(report.recommended_next_steps))
+        self._slash_emit("workflow", "\n".join(lines))
+
+    def _slash_quality(self, args: str) -> None:
+        from littrace.skill_runner import build_quality_report_skill
+
+        report = build_quality_report_skill(self._config, self._workspace)
+        lines = ["Quality metrics:"]
+        for name, value in report.metrics.items():
+            lines.append(f"- {name}: {value}")
+        if report.warnings:
+            lines.append("注意：" + "；".join(report.warnings[:8]))
+        self._slash_emit("quality", "\n".join(lines))
+
+    def _slash_quality_audits(self, args: str) -> None:
+        from littrace.quality_audits import (
+            audit_parser,
+            audit_tables,
+            audit_storyline,
+        )
+
+        lines: list[str] = []
+        for report in [
+            audit_parser(self._config, self._workspace),
+            audit_tables(self._workspace),
+            audit_storyline(self._workspace),
+        ]:
+            status = "passed" if report.passed else "needs work"
+            lines.append(f"- {report.component}: {status} ({report.score})")
+            for finding in report.findings[:3]:
+                lines.append(f"  - {finding}")
+        self._slash_emit("quality-audits", "\n".join(lines))
+
+    def _slash_ocr_choice(self, args: str) -> None:
+        from littrace.parse_jobs import decide_artifact_extraction_need
+
+        report = decide_artifact_extraction_need(self._workspace)
+        lines = [
+            f"OCR 建议: {report.recommended_parse_strategy}",
+            f"理由: {report.reason}",
+            "按钮:",
+        ]
+        for button in report.buttons:
+            marker = "推荐" if button.get("recommended") == "true" else "可选"
+            lines.append(
+                f"- [{marker}] {button['label']} -> "
+                f"parse_strategy={button['parse_strategy']}"
+            )
+            lines.append(f"  {button['description']}")
+        self._slash_emit("ocr-choice", "\n".join(lines))
+
+    def _slash_storyline_report(self, args: str) -> None:
+        from littrace.publication import render_publication_storyline
+
+        markdown, _ = render_publication_storyline(self._workspace, self._config)
+        self._slash_emit("storyline-report", markdown)
+
+    def _slash_storyline_review(self, args: str) -> None:
+        from littrace.publication import review_storyline
+
+        report = review_storyline(self._workspace)
+        lines = [
+            f"Storyline review: "
+            f"{'passed' if report.passed else 'needs work'} "
+            f"({report.claim_count} claims)",
+        ]
+        for warning in report.warnings:
+            lines.append(f"- {warning}")
+        self._slash_emit("storyline-review", "\n".join(lines))
+
+    def _slash_doctor(self, args: str) -> None:
+        # The CLI helper prints; capture via redirect to give the GUI
+        # a one-shot doctor summary in chat.
+        import io
+        from contextlib import redirect_stdout
+        from littrace.cli import _print_doctor
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_doctor(self._config)
+        self._slash_emit("doctor", buf.getvalue() or "（无输出）")
+
+    def _slash_setup_browser(self, args: str) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from littrace.cli import _print_browser_setup
+
+        launch = self._config.cdp_downloader.auto_launch_chrome
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_browser_setup(self._config, profile_name=None, launch=False)
+        self._slash_emit("setup-browser", buf.getvalue() or "（无输出）")
+
+    def _slash_hide_context(self, args: str) -> None:
+        with self._lock:
+            self._workspace = self._workspace.model_copy(
+                update={
+                    "context": self._workspace.context.model_copy(
+                        update={"visible_to_user": False},
+                    ),
+                },
+            )
+        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        self._slash_emit("hide-context", "已隐藏上下文窗。")
+
+    def _slash_reveal_context(self, args: str) -> None:
+        """Toggle the ``/show-context`` action: flip
+        ``visible_to_user`` back to True and re-render the panel.
+        Renamed from ``_slash_show_context`` to avoid colliding with
+        the ``/papers`` display handler — both used the same name in
+        Round 19's initial draft, and the latter silently shadowed
+        the former so /papers rendered an empty bubble.
+        """
+        with self._lock:
+            self._workspace = self._workspace.model_copy(
+                update={
+                    "context": self._workspace.context.model_copy(
+                        update={"visible_to_user": True},
+                    ),
+                },
+            )
+        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        from littrace.cli import format_context_panel
+
+        self._slash_emit("show-context", format_context_panel(self._workspace))
+
+    def _slash_init_config(self, args: str) -> None:
+        from littrace.config_wizard import write_config_template
+
+        result = write_config_template()
+        text = f"Config: {'created' if result.created else 'not changed'} at {result.path}"
+        if result.warnings:
+            text += "\n注意：" + "；".join(result.warnings)
+        self._slash_emit("init-config", text)
+
+    def _slash_set_bg(self, args: str) -> None:
+        from littrace.research_background import set_workspace_research_background
+        from littrace.session import save_workspace
+
+        if not args:
+            self._slash_emit(
+                "set-bg", "用法：/set-bg 我研究的是<材料>在<场景>中的<问题>"
+            )
+            return
+        with self._lock:
+            self._workspace = set_workspace_research_background(self._workspace, args)
+        save_workspace(self._session, self._workspace, config=self._config)
+        filters = self._workspace.context.filters
+        text = (
+            f"研究背景已设置 (status={filters.research_background_status})\n"
+            f"  主题: {filters.topic}\n"
+            f"  时间: {filters.research_background_set_at}"
+        )
+        self._slash_emit("set-bg", text)
+
+    def _slash_route_to_chat(self, args: str, *, intent: str, name: str) -> None:
+        """Re-route a GUI slash command into the chat pipeline with the
+        same Chinese prompt the CLI uses for the same command. We
+        don't try to re-implement the skill — the LLM is the executor.
+        """
+        self._slash_emit(name, f"已交给 Codex：{intent}")
+        self.submit_user_message(intent)
+
+    def _slash_export(self, args: str) -> None:
+        from littrace.export import export_session_bundle
+
+        bundle = export_session_bundle(
+            self._session, self._workspace, self._config
+        )
+        # Round 19: ``bundle`` is the {filename: contents} dict the
+        # API route would return. Render a short summary so the GUI
+        # chat bubble stays compact; the user can open the resulting
+        # files under ``<session>/artifacts/``.
+        files = ", ".join(sorted(bundle.keys())) or "(empty)"
+        self._slash_emit(
+            "export",
+            f"导出完成 → {files}",
+        )
+
+    # ------------------------------------------------------------------
+    # Active paper management (Round 17) — kept here so the class
+    # boundary stays clean after the Round 19 slash-command insert.
     # ------------------------------------------------------------------
 
     def deactivate_paper(self, paper_id: str) -> bool:
@@ -794,6 +1067,136 @@ class ShellController:
             )
         self._emit(self.EVENT_WORKSPACE_REFRESHED)
         return True
+
+    # ------------------------------------------------------------------
+    # Round 19: paper importance + pin/importance helpers. The
+    # ``LiteratureContext`` model already carries ``pinned_papers``;
+    # the new ``importance_levels`` field (added in this round) lets
+    # the user mark a paper as 1=normal, 2=important, 3=critical.
+    # ------------------------------------------------------------------
+
+    def toggle_paper_pin(self, paper_id: str) -> bool:
+        """Toggle whether ``paper_id`` is pinned. Returns the new
+        pinned state (True = now pinned).
+        """
+        with self._lock:
+            pinned = list(self._workspace.context.pinned_papers)
+            if paper_id in pinned:
+                pinned = [pid for pid in pinned if pid != paper_id]
+                new_state = False
+            else:
+                pinned.append(paper_id)
+                new_state = True
+            self._workspace = self._workspace.model_copy(
+                update={
+                    "context": self._workspace.context.model_copy(
+                        update={"pinned_papers": pinned},
+                    ),
+                },
+            )
+        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        return new_state
+
+    def mark_rag_refresh(self, indexed_chunks: int = 0) -> None:
+        """Record that a RAG refresh just completed.
+
+        Round 19: the GUI's ``RAGPanel`` shows the timestamp /
+        chunk count of the most recent refresh so the user can
+        tell at a glance whether the index is fresh or stale
+        (≥ 24 h ago). The controller owns the timestamp so the
+        state survives ``_refresh_rag_panel`` re-emits and is
+        queryable from non-GUI tests.
+        """
+        with self._lock:
+            self._last_rag_refresh_at = time.time()
+            self._last_rag_indexed_chunks = int(indexed_chunks)
+        self._emit(self.EVENT_RAG_PANEL_REFRESHED)
+
+    def get_rag_refresh_status(self) -> dict[str, Any]:
+        """Return the most recent RAG refresh status. Both fields
+        are optional — a fresh install returns ``None`` for both
+        and the GUI renders a friendly placeholder.
+        """
+        return {
+            "timestamp": getattr(self, "_last_rag_refresh_at", None),
+            "indexed_chunks": getattr(self, "_last_rag_indexed_chunks", 0),
+        }
+
+    def set_paper_importance(self, paper_id: str, level: int) -> bool:
+        """Set the importance of ``paper_id`` to ``level``
+        (1=normal, 2=important, 3=critical, 0=clear). Returns True
+        on success, False when the paper is not in the active set.
+        """
+        with self._lock:
+            if paper_id not in self._workspace.context.active_papers:
+                return False
+            levels = dict(self._workspace.context.importance_levels)
+            if level <= 0:
+                levels.pop(paper_id, None)
+            else:
+                levels[paper_id] = level
+            self._workspace = self._workspace.model_copy(
+                update={
+                    "context": self._workspace.context.model_copy(
+                        update={"importance_levels": levels},
+                    ),
+                },
+            )
+        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        return True
+
+
+# Slash command dispatch table (Round 19)
+#
+# The map is defined at module load time so a future ``/help`` command
+# can introspect it without re-iterating the controller class. Handlers
+# that just want to push a pre-canned intent into the chat pipeline
+# share ``_ControllerSlaskRouter._slash_route_to_chat`` so the routing
+# table stays small.
+
+
+def _slash_chat_intent_handler(intent: str):
+    def _handler(controller: "ShellController", args: str) -> None:
+        controller._slash_route_to_chat(args, intent=intent, name=intent.lstrip("/"))
+    return _handler
+
+
+_SLASH_HANDLERS: dict[str, Callable[["ShellController", str], None]] = {
+    # Tier A: display-only (formatted text, no skill side-effects)
+    "context": lambda c, a: c._slash_show_context(a),
+    "papers": lambda c, a: c._slash_show_context(a),
+    "dashboard": lambda c, a: c._slash_dashboard(a),
+    "workflow": lambda c, a: c._slash_workflow(a),
+    "quality": lambda c, a: c._slash_quality(a),
+    "quality-audits": lambda c, a: c._slash_quality_audits(a),
+    "ocr-choice": lambda c, a: c._slash_ocr_choice(a),
+    "storyline-report": lambda c, a: c._slash_storyline_report(a),
+    "storyline-review": lambda c, a: c._slash_storyline_review(a),
+    "doctor": lambda c, a: c._slash_doctor(a),
+    "setup-browser": lambda c, a: c._slash_setup_browser(a),
+    "hide-context": lambda c, a: c._slash_hide_context(a),
+    "show-context": lambda c, a: c._slash_reveal_context(a),
+    "export": lambda c, a: c._slash_export(a),
+    "init-config": lambda c, a: c._slash_init_config(a),
+    # Tier B: state mutation
+    "set-bg": lambda c, a: c._slash_set_bg(a),
+    # Tier A: route through chat pipeline (LLM executes the skill)
+    "parse": _slash_chat_intent_handler("解析当前文献全文"),
+    "table": _slash_chat_intent_handler("生成当前文献性能对比表"),
+    "storyline": _slash_chat_intent_handler("生成当前文献发展脉络"),
+    "full-text": _slash_chat_intent_handler("为当前文献构建 full-text context"),
+}
+
+
+def get_slash_command_names() -> list[str]:
+    """Return the sorted list of slash command names this controller
+    knows about. The Qt shell uses it to populate ``COMMAND_CATALOG``
+    so the popup stays in sync with the dispatch table — adding a new
+    slash in ``shell_controller`` only requires an entry in the GUI's
+    ``_populate_command_catalog`` list.
+    """
+    return sorted(_SLASH_HANDLERS)
+
 
 def _decode_jwt_exp(token: str) -> float | None:
     """Return the ``exp`` claim of a JWT, or ``None`` if the token

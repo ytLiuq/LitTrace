@@ -219,6 +219,14 @@ class CDPDownloaderConfig(BaseModel):
     # not need to run ``setup-browser --launch`` before every session.
     # Disable here (or set LITTRACE_AUTO_LAUNCH_CHROME=false) to opt out.
     auto_launch_chrome: bool = True
+    # Round 18: when littrace-qt spawns its private Chrome for the
+    # sentinel CDP endpoint, default to ``--headless=new`` so no
+    # separate window pops up over the Qt shell. The CLI's
+    # ``littrace setup-browser --launch`` still defaults to a visible
+    # chrome (the user explicitly asked for it). Set to False to force
+    # a headed chrome from inside littrace-qt too — useful for
+    # debugging cookie / SSO redirects.
+    headless: bool = True
     cloudflare_wait_seconds: float = 60.0
     user_action_wait_seconds: float = 30.0
     command_timeout_seconds: float = 60.0
