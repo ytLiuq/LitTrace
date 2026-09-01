@@ -55,7 +55,6 @@ where = ["src"]
 [project.scripts]
 littrace = "littrace.cli:main"
 littrace-tui = "littrace.tui:main"
-littrace-window = "littrace.window:main"
 littrace-qt = "littrace.window_qt:main"
 littrace-mcp = "littrace.mcp_server:main"
 

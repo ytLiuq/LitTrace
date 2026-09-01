@@ -69,6 +69,11 @@ class LiteratureSentinel:
             topic=self.watchlist.topic,
             discipline="materials chemistry",
             year_min=self.watchlist.year_min,
+            # Round 17: thread the user-selected year upper bound
+            # through to the retrieval layer. ``None`` means "no
+            # upper bound", which is also the backward-compat
+            # default when ``Watchlist.year_max`` is unset.
+            year_max=self.watchlist.year_max,
             live=self.config.api.enable_live_search,
             query_variants=list(self.watchlist.query_variants),
         )
@@ -120,17 +125,40 @@ class LiteratureSentinel:
             and paper.paper_id in workspace.context.active_papers
         ]
         downloaded_count = 0
+        download_warnings: list[str] = []
         if downloadable_ids:
-            download_result = await execute_downloads_skill(
-                self.config,
-                workspace,
-                DownloadExecutionRequest(
-                    paper_ids=downloadable_ids,
-                    session_id=self.store.session_id if hasattr(self.store, "session_id") else None,
-                    target="storage_only",
-                ),
-            )
-            downloaded_count = download_result.downloaded_count
+            try:
+                download_result = await execute_downloads_skill(
+                    self.config,
+                    workspace,
+                    DownloadExecutionRequest(
+                        paper_ids=downloadable_ids,
+                        session_id=self.store.session_id if hasattr(self.store, "session_id") else None,
+                        target="storage_only",
+                    ),
+                )
+                downloaded_count = download_result.downloaded_count
+                # Round 17: a zero-download count on a non-empty
+                # candidate list is almost always a transport / auth
+                # failure that used to be silent. Surface it as a
+                # warning so the user can see "下载 0 篇" in the
+                # status strip instead of wondering why
+                # ``downloaded=0`` while ``new_candidates>0``.
+                if downloadable_ids and downloaded_count == 0:
+                    download_warnings.append(
+                        f"下载阶段：{len(downloadable_ids)} 篇候选全部失败（详见 digest.md）"
+                    )
+            except Exception as exc:
+                # Round 17: previously an exception inside
+                # ``execute_downloads_skill`` would propagate up and
+                # abort the whole sentinel run (no digest, no
+                # quality report, no resource pack). Now we capture
+                # it as a warning so the user at least sees the
+                # rest of the run results — search hits, candidates,
+                # parse status — instead of an opaque traceback.
+                download_warnings.append(
+                    f"下载阶段失败：{exc.__class__.__name__}: {exc}"
+                )
 
         if self.config.sentinel_parse_on_daily:
             workspace, parse_report = await parse_workspace_skill(workspace, self.config)
@@ -156,6 +184,10 @@ class LiteratureSentinel:
             *quality_report.warnings,
             *table_harness.warnings,
             *parse_report.get("warnings", []),
+            # Round 17: download warnings are surfaced alongside
+            # quality / parse warnings so the digest and the GUI
+            # status strip both see them.
+            *download_warnings,
         ]
         try:
             _, rag_refresh_report = await refresh_session_rag_index(

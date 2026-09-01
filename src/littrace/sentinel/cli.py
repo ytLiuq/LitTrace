@@ -20,11 +20,26 @@ def init_sentinel(config: LitTraceConfig, watchlist_id: str, topic: str) -> str:
     return str(store.root)
 
 
-async def run_sentinel(config: LitTraceConfig, watchlist_id: str, topic: str | None = None):
-    store = ensure_sentinel_store(config, Watchlist(watchlist_id=watchlist_id, topic=topic or watchlist_id))
-    watchlist = load_watchlist(store)
-    if topic:
-        watchlist = watchlist.model_copy(update={"topic": topic, "objective": topic})
+async def run_sentinel(config: LitTraceConfig, watchlist_or_id, topic: str | None = None):
+    """Run the daily sentinel against ``watchlist_or_id``.
+
+    Round 17: accepts either a ``Watchlist`` instance (new callers
+    that already pre-applied CLI overrides) or a bare ``str``
+    watchlist id (legacy callers — the function still loads +
+    updates the watchlist itself, so a CLI that doesn't have the
+    override plumbing keeps working).
+    """
+    if isinstance(watchlist_or_id, Watchlist):
+        watchlist = watchlist_or_id
+    else:
+        watchlist_id = watchlist_or_id
+        store = ensure_sentinel_store(
+            config,
+            Watchlist(watchlist_id=watchlist_id, topic=topic or watchlist_id),
+        )
+        watchlist = load_watchlist(store)
+        if topic:
+            watchlist = watchlist.model_copy(update={"topic": topic, "objective": topic})
     sentinel = LiteratureSentinel(config, watchlist)
     return await sentinel.run()
 

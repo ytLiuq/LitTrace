@@ -13,6 +13,17 @@ class Watchlist(BaseModel):
     objective: str | None = None
     query_variants: list[str] = Field(default_factory=list)
     year_min: int = 2024
+    # Round 17: surface the year range cap and minimum-download
+    # target the user picks in ``DailyConfigDialog``. ``year_max``
+    # defaults to ``year_min`` for backward compat (older
+    # watchlists written before this commit didn't have the
+    # field, so a missing key must not crash ``model_validate``).
+    # ``target_papers`` is the "at least N new PDFs" floor —
+    # sentinel keeps retrying queries until either
+    # ``target_papers`` is reached or ``MAX_ROUNDS`` rounds have
+    # run.
+    year_max: int | None = None
+    target_papers: int = 10
     frequency: Literal["daily", "weekly"] = "daily"
     preferred_sources: list[str] = Field(default_factory=list)
     auto_download_open_access: bool = True

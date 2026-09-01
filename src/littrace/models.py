@@ -408,6 +408,12 @@ class PaperSearchRequest(BaseModel):
     topic: str
     discipline: str = "materials chemistry"
     year_min: int | None = 2023
+    # Round 17: honour an upper bound on publication year so the
+    # ``DailyConfigDialog`` "年份区间" upper bound reaches the
+    # retrieval layer. ``None`` means "no upper bound" and is the
+    # backward-compat default (older ``PaperSearchRequest``
+    # payloads from pre-Round-17 callers didn't have the field).
+    year_max: int | None = None
     limit: int = 40
     min_relevant_results: int = 5
     wants_recent: bool = True

@@ -6,6 +6,20 @@ from littrace.models import PaperMetadata
 from littrace.sentinel.state import Watchlist
 
 
+def _year_in_range(paper: PaperMetadata, watchlist: Watchlist) -> bool:
+    """Round 17: honour ``year_min`` AND ``year_max`` when scoring.
+    ``year_max`` is optional (older watchlists don't have it) so we
+    fall back to "no upper bound" when it's ``None``.
+    """
+    if not paper.year:
+        return False
+    if paper.year < watchlist.year_min:
+        return False
+    if watchlist.year_max is not None and paper.year > watchlist.year_max:
+        return False
+    return True
+
+
 def score_novelty(paper: PaperMetadata, watchlist: Watchlist) -> float:
     score = 0.2
     topic_words = set(re.findall(r"[A-Za-z0-9]+", watchlist.topic.lower()))
@@ -14,7 +28,7 @@ def score_novelty(paper: PaperMetadata, watchlist: Watchlist) -> float:
     ).lower()
     matches = sum(1 for word in topic_words if word and word in text)
     score += min(0.5, 0.1 * matches)
-    if paper.year and paper.year >= watchlist.year_min:
+    if _year_in_range(paper, watchlist):
         score += 0.2
     if paper.citation_count:
         score += min(0.1, paper.citation_count / 1000.0)
@@ -30,6 +44,6 @@ def score_relevance(paper: PaperMetadata, watchlist: Watchlist) -> float:
             if token and token in text:
                 hits += 1
     base = 0.25 + min(0.55, hits * 0.08)
-    if paper.year and paper.year >= watchlist.year_min:
+    if _year_in_range(paper, watchlist):
         base += 0.1
     return round(min(1.0, base), 3)

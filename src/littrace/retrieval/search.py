@@ -125,6 +125,12 @@ class MockMaterialsSearchClient:
             papers = [
                 paper for paper in papers if paper.year is None or paper.year >= request.year_min
             ]
+        # Round 17: honour ``year_max`` too. ``None`` means "no
+        # upper bound" (backward compat for pre-Round-17 callers).
+        if request.year_max is not None:
+            papers = [
+                paper for paper in papers if paper.year is None or paper.year <= request.year_max
+            ]
         return PaperSearchResult(request=request, papers=papers[: request.limit])
 
     async def fetch(self, request: PaperSearchRequest) -> PaperSearchResult:
@@ -348,6 +354,14 @@ class LiveSearchClient:
         filters = []
         if request.year_min is not None:
             filters.append(f"from_publication_date:{request.year_min}-01-01")
+        # Round 17: surface the user-selected "至" year as an
+        # OpenAlex ``until_publication_date`` filter so the upstream
+        # API doesn't return papers newer than the user asked for.
+        # Without this, the year range was half-applied (lower
+        # bound only) and the watchlist's "year upper bound" was a
+        # silent no-op.
+        if request.year_max is not None:
+            filters.append(f"until_publication_date:{request.year_max}-12-31")
         if filters:
             params["filter"] = ",".join(filters)
         if self.config.api.openalex_api_key:
@@ -414,6 +428,17 @@ class LiveSearchClient:
         for params in attempts:
             if request.year_min is not None:
                 params["filter"] = f"from-pub-date:{request.year_min}-01-01"
+            # Round 17: same as the openalex path — push the upper
+            # bound through to crossref so the user's "至" year
+            # actually reaches the upstream API. The crossref
+            # ``until-pub-date`` filter is the documented counterpart
+            # of ``from-pub-date``.
+            if request.year_max is not None:
+                existing = params.get("filter")
+                until = f"until-pub-date:{request.year_max}-12-31"
+                params["filter"] = (
+                    f"{existing},{until}" if existing else until
+                )
             if self.config.api.crossref_mailto:
                 params["mailto"] = self.config.api.crossref_mailto
         items: list[dict] = []

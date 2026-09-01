@@ -1,17 +1,22 @@
 """GUI-agnostic controller that owns LitTrace session state and the chat /
-workspace / RAG side effects. Both the Tk shell (`littrace.window`) and
-the Qt WebEngine shell (`littrace.window_qt`) bind to the same
-``ShellController`` so business logic lives in exactly one place.
+workspace / RAG side effects. The Qt WebEngine shell
+(``littrace.window_qt``) binds to this ``ShellController`` so business
+logic lives in exactly one place. The legacy Tk shell
+(``littrace.window``) was removed in Round 17 — the project now ships
+a single ``littrace-qt`` entry point.
 
 The controller never imports Tk or Qt. It only emits Python events on a
 plain ``ShellEventBus`` and runs asyncio work in a worker thread, the
-same pattern the Tk shell has used since the codex App Server integration
-landed. Concrete shells translate these events into widget updates.
+same pattern the codex App Server integration landed. Concrete shells
+translate these events into widget updates.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -91,6 +96,47 @@ class ShellController:
     EVENT_OCR_BUTTONS_REFRESHED = "ocr_buttons_refreshed"
     EVENT_SESSION_HISTORY_REFRESHED = "session_history_refreshed"
     EVENT_ERROR = "error"
+    # Round 17: warmup lifecycle. ``EVENT_WARMUP_STARTED`` fires when
+    # ``_prime_service`` kicks off the CodexAppServerChatService spawn
+    # so the shell can show "正在准备 Codex…" instead of a frozen
+    # "就绪". ``EVENT_WARMUP_DONE`` fires once the spawn + JSON-RPC
+    # ``initialize`` handshake completes (or the warmup is skipped
+    # because the runtime mode / service import vetoed it). Both
+    # events carry ``phase`` ("spawning" / "initializing" / "ready"
+    # / "failed") and an optional ``detail`` for the status strip.
+    EVENT_WARMUP_STARTED = "warmup_started"
+    EVENT_WARMUP_DONE = "warmup_done"
+    # Round 17: streaming lifecycle. ``EVENT_ASSISTANT_STREAM_OPEN``
+    # fires once at the start of a turn so the shell can open a
+    # streaming bubble (cursor pinned to its end). ``EVENT_ASSISTANT_DELTA``
+    # fires for every codex ``item/agentMessage/delta`` frame, with
+    # ``delta`` carrying the raw text to append to the bubble. Shells
+    # must be tolerant of ``delta`` arriving between turns (the
+    # server occasionally flushes a tail frame after ``completed``)
+    # by either dropping it or appending to a now-frozen bubble —
+    # either way the final ``EVENT_MESSAGE_APPENDED`` carries the
+    # authoritative full text, so a stray delta never breaks the
+    # chat scrollback.
+    EVENT_ASSISTANT_STREAM_OPEN = "assistant_stream_open"
+    EVENT_ASSISTANT_DELTA = "assistant_delta"
+    # Round 17: OAuth lifecycle. ``EVENT_AUTH_REQUIRED`` fires when
+    # the controller detects that the Codex App Server's auth.json
+    # is missing / expired / revoked. The shell reacts by surfacing
+    # a one-shot dialog with the ``codex login --device-auth``
+    # instructions and a "Re-check" button the user clicks after
+    # running the command in their terminal. ``EVENT_AUTH_OK``
+    # fires when a subsequent re-check sees the auth restored, so
+    # the shell can drop the warning banner and resume normal chat.
+    EVENT_AUTH_REQUIRED = "auth_required"
+    EVENT_AUTH_OK = "auth_ok"
+    # Round 17: progress heartbeat. Fires every
+    # ``THINKING_PROGRESS_INTERVAL`` seconds while a turn is in
+    # flight, carrying the elapsed time so the shell can render
+    # "已思考 3.2s …" instead of a frozen "思考中…". Stops when
+    # ``EVENT_THINKING`` fires with ``active=False`` or when the
+    # controller's chat turn coroutine exits.
+    EVENT_THINKING_PROGRESS = "thinking_progress"
+    THINKING_PROGRESS_INTERVAL = 1.5
 
     def __init__(self, config: LitTraceConfig) -> None:
         self._config = config
@@ -113,6 +159,18 @@ class ShellController:
         # never lands on a not-yet-ready service and silently
         # downgrades to the legacy ``handle_agent_chat`` path.
         self._service_ready = threading.Event()
+        # Round 17: throttle auth re-checks so the shell's "Re-check"
+        # button doesn't hammer the auth.json file on every click.
+        # The last-check timestamp is recorded here; the controller
+        # only re-emits ``EVENT_AUTH_REQUIRED`` if the previous check
+        # is older than ``AUTH_RECHECK_MIN_INTERVAL`` seconds AND the
+        # state is still bad. ``EVENT_AUTH_OK`` always fires when
+        # the check passes, so the shell can drop the warning
+        # banner as soon as the user fixes the auth.
+        self._last_auth_check_ts: float = 0.0
+        self._auth_required_emitted: bool = False
+
+    AUTH_RECHECK_MIN_INTERVAL = 5.0
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -146,6 +204,14 @@ class ShellController:
             asyncio.run_coroutine_threadsafe(self._prime_service(), self._loop)
         except Exception:  # pragma: no cover - defensive
             pass
+        # Round 17: fire-and-forget auth probe so the shell can
+        # prompt the user to ``codex login --device-auth`` before
+        # the first chat turn lands a 401. Cheap (parses a single
+        # auth.json file) so running it on the main thread is fine.
+        try:
+            self.check_codex_auth()
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     async def _prime_service(self) -> None:
         """Pre-build ``CodexAppServerChatService`` and force the runtime
@@ -162,6 +228,13 @@ class ShellController:
         with self._service_lock:
             if self._service is None:
                 self._service = CodexAppServerChatService(self._config)
+        # Announce the warmup so the shell can flip the status bar
+        # from "就绪" to "正在准备 Codex…". Without this the user
+        # sees "就绪" → 5-10 s of frozen silence → first token,
+        # which looks like the app is hung. With the event the user
+        # sees "正在准备 Codex…(spawning)" → "...(initializing)" →
+        # "就绪" → first user turn feels instant.
+        self._emit(self.EVENT_WARMUP_STARTED, phase="spawning")
         # ``service.warmup()`` builds the runtime manager and forces it
         # to open the codex subprocess + run the JSON-RPC ``initialize``
         # handshake. A previous version awaited the warmup here, but
@@ -175,10 +248,55 @@ class ShellController:
         self._service_ready.set()
 
     async def _run_warmup(self) -> None:
+        # Step through the warmup with progress events so the shell
+        # can show "spawning → initializing → ready" instead of one
+        # long indeterminate wait. The two ``WARMUP_STARTED`` /
+        # ``WARMUP_DONE`` events frame the whole thing; the second
+        # event also fires on failure so the shell always ends up
+        # back in "就绪" (or a non-blocking warning) and never
+        # freezes on "正在准备 Codex…".
         try:
-            await self._service.warmup()
-        except Exception:
-            pass
+            self._emit(self.EVENT_WARMUP_STARTED, phase="initializing")
+            ok = await self._service.warmup()
+        except Exception as exc:
+            self._emit(
+                self.EVENT_WARMUP_DONE,
+                phase="failed",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        self._emit(
+            self.EVENT_WARMUP_DONE,
+            phase="ready" if ok else "failed",
+            detail="" if ok else "codex app-server 启动失败；首轮对话会自动重试",
+        )
+
+    async def _emit_progress_loop(self, started_at: float) -> None:
+        """Emit ``EVENT_THINKING_PROGRESS`` heartbeats while a turn
+        is in flight.
+
+        Round 17: a chat turn can stall in the codex App Server for
+        30+ seconds (long context, slow model, network jitter), and
+        the static "思考中…" label looks frozen. The heartbeat
+        keeps the shell's thinking strip alive with elapsed-time
+        updates without spamming — ``THINKING_PROGRESS_INTERVAL``
+        caps the rate at ~0.7 Hz.
+
+        The loop is cancelled when ``_run_chat_turn``'s ``finally``
+        block runs, which always happens whether the turn
+        completes, errors, or is interrupted, so the heartbeat
+        never outlives the turn.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.THINKING_PROGRESS_INTERVAL)
+                elapsed = time.monotonic() - started_at
+                self._emit(
+                    self.EVENT_THINKING_PROGRESS,
+                    elapsed_seconds=round(elapsed, 1),
+                )
+        except asyncio.CancelledError:
+            return
 
     async def _prime_real_turn(self) -> None:
         """Run a one-token ``.`` turn so the OpenAI API path is warm
@@ -210,6 +328,174 @@ class ShellController:
         self._loop.call_soon_threadsafe(self._loop.stop)
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=2.0)
+
+    # ------------------------------------------------------------------
+    # Auth (Round 17)
+    # ------------------------------------------------------------------
+
+    def check_codex_auth(self, *, force: bool = False) -> None:
+        """Inspect the CodexAppServer auth.json and emit
+        ``EVENT_AUTH_REQUIRED`` / ``EVENT_AUTH_OK`` accordingly.
+
+        Cheap (parses a single small JSON file) and idempotent, so
+        it's safe to call from any number of triggers (window
+        startup, "Re-check" button, post-warmup fail).
+
+        ``force=True`` skips the recheck throttle so a click on
+        the dialog's "立即重试" button always re-reads the file.
+        The user might have just run ``codex login --device-auth``
+        in another terminal — the throttle exists to make sure we
+        don't re-poll every 200 ms during a tight UI loop.
+        """
+        now = time.monotonic()
+        if (
+            not force
+            and (now - self._last_auth_check_ts) < self.AUTH_RECHECK_MIN_INTERVAL
+        ):
+            return
+        self._last_auth_check_ts = now
+        status = self._read_codex_auth_status()
+        if status.ok:
+            self._auth_required_emitted = False
+            self._emit(
+                self.EVENT_AUTH_OK,
+                detail=status.detail,
+            )
+            return
+        # Only emit ``EVENT_AUTH_REQUIRED`` once per "still bad"
+        # streak so the shell doesn't keep re-opening the dialog
+        # on every check. The user has to either click "Re-check"
+        # (force=True) or actually fix the auth before we emit
+        # again.
+        if self._auth_required_emitted and not force:
+            return
+        self._auth_required_emitted = True
+        self._emit(
+            self.EVENT_AUTH_REQUIRED,
+            reason=status.reason,
+            detail=status.detail,
+            codex_home=str(self._codex_auth_path()),
+        )
+
+    def _codex_auth_path(self) -> "Path":
+        """Return the FIRST existing ``auth.json`` path that the
+        App Server might consult, falling back to the configured
+        mode's primary path so the caller can detect "missing".
+
+        Round 17: codex 0.149.0-alpha.4.3's app-server reads from
+        the host's ``~/.codex/auth.json`` regardless of the
+        ``codex_home_mode`` setting, even when ``codex login`` ran
+        against an isolated LitTrace home. We therefore probe both
+        locations and return whichever file actually exists, so a
+        user with ``codex_home_mode: shared`` who logged in inside
+        ``data/codex-home`` (the documented workaround) still gets
+        detected as authenticated.
+
+        Falls back to the SHARED primary path when neither file
+        exists — the dialog will surface a "missing" status, which
+        is the right hint when the user genuinely hasn't logged
+        in.
+        """
+        from pathlib import Path
+
+        runtime = self._config.agent_runtime
+        shared_path = Path.home() / ".codex" / "auth.json"
+        isolated_path = runtime.codex_home.expanduser().resolve() / "auth.json"
+        for candidate in (shared_path, isolated_path):
+            if candidate.exists():
+                return candidate
+        # No auth.json on disk — return whichever path the
+        # controller's configured mode expects so the caller can
+        # show the right hint ("run codex login" without spelling
+        # out a path).
+        return (
+            shared_path
+            if runtime.codex_home_mode.value == "shared"
+            else isolated_path
+        )
+
+    @dataclass(frozen=True)
+    class _AuthStatus:
+        ok: bool
+        reason: str = ""
+        detail: str = ""
+
+    def _read_codex_auth_status(self) -> "_AuthStatus":
+        """Inspect the CodexAppServer auth.json file and decide
+        whether the user is currently authenticated.
+
+        Round 17: the file's ``tokens.id_token`` is a JWT whose
+        ``exp`` claim carries the expiry timestamp. We decode the
+        payload (no signature verification — this is a UI signal,
+        not a security boundary; the codex app-server validates
+        on the actual API call) and compare to ``time.time()``.
+        The "soon to expire" window is 1 hour so the user has a
+        heads-up before the first 401 lands.
+
+        Three failure modes are reported distinctly so the
+        dialog can suggest the right remediation:
+          * missing file → ``codex login --device-auth``
+          * file present but no ``tokens`` block → ``codex login``
+          * id_token expired → ``codex login --device-auth`` (refresh)
+        """
+        from pathlib import Path
+
+        path = self._codex_auth_path()
+        if not path.exists():
+            return self._AuthStatus(
+                ok=False,
+                reason="missing_auth_file",
+                detail=f"找不到 {path}；请在终端跑 codex login --device-auth",
+            )
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return self._AuthStatus(
+                ok=False,
+                reason="auth_file_unreadable",
+                detail=f"{path} 解析失败：{exc.__class__.__name__}: {exc}",
+            )
+        tokens = raw.get("tokens")
+        if not isinstance(tokens, dict):
+            return self._AuthStatus(
+                ok=False,
+                reason="no_tokens",
+                detail=f"{path} 没有 tokens 字段；请重新 codex login",
+            )
+        id_token = tokens.get("id_token")
+        if not isinstance(id_token, str) or not id_token:
+            return self._AuthStatus(
+                ok=False,
+                reason="no_id_token",
+                detail=f"{path} 缺少 id_token；请重新 codex login",
+            )
+        exp = _decode_jwt_exp(id_token)
+        if exp is None:
+            return self._AuthStatus(
+                ok=False,
+                reason="unparseable_jwt",
+                detail=f"{path} 的 id_token 不是合法 JWT",
+            )
+        now = time.time()
+        if exp <= now:
+            return self._AuthStatus(
+                ok=False,
+                reason="token_expired",
+                detail=f"id_token 已于 {_fmt_unix(exp)} 过期；请在终端跑 codex login --device-auth",
+            )
+        if exp - now < 3600:
+            # Soon-to-expire: still "ok" for the next chat turn,
+            # but warn so the user can refresh proactively.
+            return self._AuthStatus(
+                ok=True,
+                reason="token_expiring_soon",
+                detail=f"id_token 将于 {_fmt_unix(exp)} 过期（不到 1 小时）",
+            )
+        return self._AuthStatus(
+            ok=True,
+            reason="ok",
+            detail=f"id_token 有效（至 {_fmt_unix(exp)}）",
+        )
 
     def _run_event_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -265,6 +551,28 @@ class ShellController:
         )
 
     async def _run_chat_turn(self, text: str, *, silent: bool = False) -> None:
+        # Round 17: spawn the progress heartbeat task alongside the
+        # turn coroutine. The heartbeat emits ``EVENT_THINKING_PROGRESS``
+        # every 1.5 s while the turn is in flight and is cancelled
+        # before the turn's terminal status fires (so the user
+        # never sees a stale "已思考 12s" line after the answer
+        # lands).
+        progress_task: asyncio.Task | None = None
+        turn_started_at = time.monotonic()
+        try:
+            progress_task = asyncio.create_task(
+                self._emit_progress_loop(turn_started_at)
+            )
+            await self._drive_chat_turn(text, silent=silent)
+        finally:
+            if progress_task is not None:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    async def _drive_chat_turn(self, text: str, *, silent: bool) -> None:
         # Wait for ``_prime_service`` to finish (or skip) before
         # touching the service — otherwise a user turn that races
         # the background warm-up can land on a not-yet-ready client
@@ -308,8 +616,35 @@ class ShellController:
         try:
             self._emit(self.EVENT_THINKING, active=True, label="调用 Codex / 模型…")
             if service is not None:
+                # Round 17: stream assistant deltas so the chat bubble
+                # fills token-by-token instead of waiting for the full
+                # turn to land. ``on_delta`` is a SYNC callback (the
+                # codex client awaits the returned coroutine if any,
+                # so a plain function is fine) — we just ``_emit`` the
+                # delta event and the Qt shell queues the bubble
+                # update via ``QMetaObject.invokeMethod``. ``_emit``
+                # only does a Python-side pub/sub dispatch, no Qt
+                # involvement, so calling it from the controller's
+                # asyncio worker thread is safe.
+                #
+                # ``EVENT_ASSISTANT_STREAM_OPEN`` fires before the
+                # first delta so the shell can open a bubble with the
+                # cursor pinned to its end; ``append_delta`` is a
+                # no-op until that fires.
+                stream_open_emitted = False
+
+                def _on_delta(delta: str) -> None:
+                    nonlocal stream_open_emitted
+                    if not stream_open_emitted:
+                        stream_open_emitted = True
+                        self._emit(self.EVENT_ASSISTANT_STREAM_OPEN)
+                    self._emit(self.EVENT_ASSISTANT_DELTA, delta=delta)
+
                 response, workspace = await service.chat(
-                    request, self._workspace, self._session
+                    request,
+                    self._workspace,
+                    self._session,
+                    on_delta=_on_delta,
                 )
             else:
                 response, workspace = await handle_agent_chat(
@@ -319,7 +654,19 @@ class ShellController:
                     session=self._session,
                 )
         except Exception as exc:
-            self._emit(self.EVENT_ERROR, message=f"{type(exc).__name__}: {exc}")
+            # Round 17: classify the failure before forwarding it
+            # to the shell. ``codex_runtime.errors`` already maps
+            # transport failures to ``CodexErrorCode`` enums; we
+            # translate the code into a user-facing one-liner plus
+            # a "what to do next" hint. A bare ``Exception`` falls
+            # through to the previous generic message.
+            error_payload = _classify_chat_error(exc)
+            self._emit(self.EVENT_ERROR, **error_payload)
+            # 401 specifically should re-probe the auth file — the
+            # token may have just expired since the last check.
+            if error_payload.get("error_code") == "unauthorized":
+                self._auth_required_emitted = False
+                self.check_codex_auth(force=True)
             self._emit(self.EVENT_THINKING, active=False)
             self._emit(self.EVENT_STATUS_CHANGED, text="错误")
             return
@@ -362,3 +709,218 @@ class ShellController:
             if paper is not None:
                 papers.append(paper)
         return papers
+
+    # ------------------------------------------------------------------
+    # Session switching (Round 17)
+    # ------------------------------------------------------------------
+
+    def switch_session(self, session_id: str) -> bool:
+        """Switch the controller's active session to ``session_id``.
+
+        Round 17: ``TracePanel.set_sessions`` renders a list of
+        historical sessions but the click was previously a no-op —
+        the user could see other sessions but never load them. Now
+        ``switch_session`` re-binds the controller to the chosen
+        session's workspace + chat history and emits a
+        ``session_history_refreshed`` event so the shell can re-render
+        the chat scrollback.
+
+        Returns True when the switch succeeded; False when the
+        requested session doesn't exist (or is archived). The shell
+        surfaces the failure as a chat bubble so the user knows
+        nothing happened.
+        """
+        from littrace.session import load_existing_session
+
+        target = load_existing_session(self._config, session_id)
+        if target is None:
+            self._emit(self.EVENT_ERROR, **{
+                "error_code": "other",
+                "message": f"找不到 session {session_id}",
+                "suggestion": "该 session 可能已被删除或归档。",
+                "raw": f"load_existing_session returned None for {session_id}",
+            })
+            return False
+        with self._lock:
+            self._session = target
+            self._workspace = load_workspace(target)
+        self._emit(self.EVENT_SESSION_HISTORY_REFRESHED)
+        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        # Drop any in-flight streaming anchor so the new session's
+        # first chat turn starts with a clean slate.
+        self._emit(self.EVENT_STATUS_CHANGED, text="已切换 session")
+        return True
+
+    def list_sessions(self) -> list[Any]:
+        """Return the available session summaries for the shell's
+        history list.
+
+        Round 17: exposed on the controller so the Qt shell can
+        re-render the session list after a switch (the new
+        active session should appear bolded in the list).
+        """
+        from littrace.session import list_chat_sessions
+
+        return list_chat_sessions(self._config)
+
+    # ------------------------------------------------------------------
+    # Active paper management (Round 17)
+    # ------------------------------------------------------------------
+
+    def deactivate_paper(self, paper_id: str) -> bool:
+        """Remove ``paper_id`` from the active-papers list.
+
+        Round 17: ``ContextPanel`` exposes a right-click
+        "取消激活" action on each active paper so the user can
+        prune the working set without restarting the session.
+        Previously the only way to drop a paper was to edit the
+        session's workspace JSON by hand.
+
+        Returns True when the paper was actually removed; False
+        when the id wasn't in the active list (so the shell can
+        show a status message instead of a confusing empty refresh).
+        """
+        with self._lock:
+            active = list(self._workspace.context.active_papers)
+            if paper_id not in active:
+                return False
+            active = [pid for pid in active if pid != paper_id]
+            self._workspace = self._workspace.model_copy(
+                update={
+                    "context": self._workspace.context.model_copy(
+                        update={"active_papers": active},
+                    ),
+                },
+            )
+        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        return True
+
+def _decode_jwt_exp(token: str) -> float | None:
+    """Return the ``exp`` claim of a JWT, or ``None`` if the token
+    can't be decoded.
+
+    Round 17 helper for ``_read_codex_auth_status``. We only need
+    the payload (base64url-decoded JSON) — no signature
+    verification, since this is a UI-side expiry probe, not a
+    security check. The codex App Server validates the signature
+    on every API call and surfaces 401s as ``UnauthorizedError``,
+    which the service layer already turns into
+    ``EVENT_AUTH_REQUIRED`` at chat-turn time.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload_b64 = parts[1]
+    # Pad to a multiple of 4 so base64 doesn't complain about
+    # missing ``=`` padding (JWTs strip the trailing ``=``).
+    payload_b64 += "=" * (-len(payload_b64) % 4)
+    try:
+        payload = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+    except Exception:
+        return None
+    try:
+        payload_obj = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    exp = payload_obj.get("exp")
+    if isinstance(exp, (int, float)):
+        return float(exp)
+    return None
+
+
+def _fmt_unix(ts: float) -> str:
+    """Round 17 helper for auth dialog text. Returns a human-
+    readable ``YYYY-MM-DD HH:MM`` timestamp in local time so the
+    user can sanity-check the JWT ``exp`` claim without
+    remembering that codex uses UTC.
+    """
+    import time as _time
+    return _time.strftime("%Y-%m-%d %H:%M", _time.localtime(ts))
+
+
+# Round 17: error taxonomy for ``EVENT_ERROR``. The Qt shell looks
+# up ``error_code`` and ``suggestion`` to render a friendly
+# message and a "what to do next" hint, instead of dumping the
+# raw ``TypeError: ...`` traceback into the chat scrollback.
+# Add new entries here when ``CodexErrorCode`` gains new values;
+# the controller test suite asserts every enum value has a
+# mapping.
+_CHAT_ERROR_MESSAGES: dict[str, tuple[str, str]] = {
+    "context_window_exceeded": (
+        "对话历史过长，模型已无法继续阅读。",
+        "请开一个新对话（点击左侧 Session 列表中的「新建」），或者精简之前的问题。",
+    ),
+    "session_budget_exceeded": (
+        "本次会话的 token 预算已用完。",
+        "请开新对话或联系管理员调整上限。",
+    ),
+    "usage_limit_exceeded": (
+        "已达到 ChatGPT 套餐的用量上限。",
+        "请稍后再试，或在 codex 客户端升级套餐。",
+    ),
+    "active_turn_not_steerable": (
+        "当前轮次无法被插入新指令。",
+        "请等待上一轮回答完成后再发送。",
+    ),
+    "bad_request": (
+        "codex 拒绝了这个请求（参数或状态不合法）。",
+        "请重试一次；如果持续失败，重启 littrace-qt。",
+    ),
+    "unauthorized": (
+        "codex 登录已过期或被撤销。",
+        "请在终端跑 `codex login --device-auth`，完成后回到本窗口点「重新检查」。",
+    ),
+    "sandbox_error": (
+        "codex 的沙箱拒绝了这次操作。",
+        "请检查 config.yaml 的 agent_runtime.sandbox_policy；"
+        "需要写文件时改为 workspace-write 或 danger-full-access。",
+    ),
+    "internal_server_error": (
+        "codex 内部错误。",
+        "请稍后重试；如果持续失败，重启 littrace-qt。",
+    ),
+    "other": (
+        "对话出错。",
+        "请重试一次，必要时重启 littrace-qt。",
+    ),
+}
+
+
+def _classify_chat_error(exc: BaseException) -> dict[str, str]:
+    """Map a chat-turn exception to the ``EVENT_ERROR`` payload.
+
+    Round 17: instead of forwarding ``f"{type(exc).__name__}: {exc}"``
+    as a single string, return a dict with the structured
+    ``error_code`` (string form of ``CodexErrorCode`` when
+    available), a one-line ``message`` for the chat bubble, and a
+    multi-line ``suggestion`` for the shell's details popup.
+    """
+    # Try the structured ``CodexErrorCode`` first — codex
+    # transport failures already carry it.
+    code_str: str | None = None
+    error_code = getattr(exc, "error_code", None)
+    if error_code is not None:
+        code_str = getattr(error_code, "value", str(error_code))
+    # Fall back to substring heuristics for legacy exceptions
+    # that pre-date the structured-error vocabulary.
+    if code_str is None:
+        message = str(exc).lower()
+        if "unauthorized" in message or "401" in message:
+            code_str = "unauthorized"
+        elif "context window" in message or "context length" in message:
+            code_str = "context_window_exceeded"
+        elif "usage limit" in message or "rate limit" in message:
+            code_str = "usage_limit_exceeded"
+        elif "sandbox" in message:
+            code_str = "sandbox_error"
+        else:
+            code_str = "other"
+    friendly, suggestion = _CHAT_ERROR_MESSAGES.get(
+        code_str, _CHAT_ERROR_MESSAGES["other"]
+    )
+    return {
+        "error_code": code_str,
+        "message": friendly,
+        "suggestion": suggestion,
+        "raw": f"{type(exc).__name__}: {exc}",
+    }

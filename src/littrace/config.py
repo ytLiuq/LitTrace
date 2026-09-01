@@ -486,19 +486,66 @@ def load_config(path: str | Path | None = None) -> LitTraceConfig:
 
     with config_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
-    config = _with_env_overrides(LitTraceConfig.model_validate(raw))
+    try:
+        validated = LitTraceConfig.model_validate(raw)
+    except Exception as exc:  # pydantic.ValidationError in practice
+        raise _format_config_error(config_path, exc) from exc
+    config = _with_env_overrides(validated)
     # Remember the config.yaml location so other components (notably
     # ``littrace doctor`` and the codex_home resolver) can interpret
     # relative paths against the same directory the user actually picked,
     # regardless of the cwd they happened to launch from.
     config._config_path = config_path
     # Re-anchor every relative Path declared in config.yaml to the config
-    # directory. Without this, a user launching ``littrace-window`` from
+    # directory. Without this, a user launching ``littrace-qt`` from
     # Finder or a parent directory ends up with paper_library_dir pointing
     # at ``./data/papers`` relative to the wrong cwd — and silent ``parsed=0``
     # failures in sentinel because there are no PDFs to parse.
     config = _reanchor_relative_paths(config, config_path.parent)
     return config
+
+
+def _format_config_error(config_path: Path, exc: Exception) -> Exception:
+    """Wrap a Pydantic ``ValidationError`` (or any other model
+    validation failure) in a more user-friendly exception so the
+    CLI / GUI exit message points at the offending field rather
+    than dumping the raw error repr.
+
+    Round 17: ``model_validate`` raises ``pydantic.ValidationError``
+    with a ``loc`` tuple (e.g. ``("agent_runtime", "turn_timeout_seconds")``)
+    and a ``msg`` string ("Input should be a valid number"). The
+    wrapped exception re-emits those details as a one-line summary
+    followed by a bulleted list of every error, so the user knows
+    which key to fix in ``config.yaml`` without scrolling through
+    pydantic's multi-line traceback.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        # Non-validation error — re-emit verbatim.
+        return exc
+    try:
+        err_list = errors()
+    except Exception:
+        return exc
+    lines: list[str] = [
+        f"config.yaml 校验失败（{config_path}）：",
+    ]
+    for err in err_list[:10]:
+        loc = ".".join(str(part) for part in err.get("loc", ())) or "<root>"
+        msg = err.get("msg", "")
+        # The ``input`` repr can be huge (e.g. a nested dict); cap
+        # the inline value at 60 chars so the line stays
+        # terminal-friendly.
+        raw_input = err.get("input")
+        if raw_input is not None:
+            value_repr = repr(raw_input)
+            if len(value_repr) > 60:
+                value_repr = value_repr[:57] + "...'"
+            msg = f"{msg}（值：{value_repr}）"
+        lines.append(f"  • {loc}: {msg}")
+    if len(err_list) > 10:
+        lines.append(f"  … 还有 {len(err_list) - 10} 条错误未列出")
+    return ValueError("\n".join(lines))
 
 
 def _reanchor_relative_paths(

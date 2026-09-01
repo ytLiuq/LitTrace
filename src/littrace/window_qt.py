@@ -116,6 +116,28 @@ def _summary_value(summary: str, key: str) -> int | None:
     return None
 
 
+# Map the structured ``reason`` strings the controller emits on
+# ``EVENT_AUTH_REQUIRED`` to user-friendly Chinese one-liners shown
+# above the device-auth steps in ``_show_auth_dialog``. Keeping this
+# in the Qt module (not in the controller) lets the controller stay
+# GUI-agnostic while the dialog text matches the shell's voice.
+_AUTH_REASON_TEXT = {
+    "missing_auth_file": "找不到 Codex 登录凭据文件",
+    "auth_file_unreadable": "Codex 凭据文件解析失败",
+    "no_tokens": "Codex 凭据文件没有 tokens 字段",
+    "no_id_token": "Codex 凭据文件缺少 id_token",
+    "unparseable_jwt": "Codex id_token 不是合法 JWT",
+    "token_expired": "Codex 登录已过期",
+}
+
+
+def _reason_to_text(reason: str, detail: str) -> str:
+    base = _AUTH_REASON_TEXT.get(reason, "Codex 登录状态异常")
+    if detail:
+        return f"{base}：{detail}"
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Message body rendering
 # ---------------------------------------------------------------------------
@@ -581,13 +603,21 @@ class TracePanel(QtWidgets.QFrame):
         layout.addWidget(self._view, stretch=3)
 
         # Session history sub-panel
-        history_title = QtWidgets.QLabel("历史 Session")
+        history_title = QtWidgets.QLabel("历史 Session（点击切换）")
         history_title.setObjectName("pane_title")
         layout.addWidget(history_title)
 
         self._sessions = QtWidgets.QListWidget()
         self._sessions.setObjectName("sessions")
-        self._sessions.setMaximumHeight(180)
+        self._sessions.setMaximumHeight(220)
+        # Round 17: surface the click-to-switch affordance. Both
+        # ``itemClicked`` and ``itemActivated`` are wired because
+        # Qt's accessibility / keyboard default-activation path
+        # uses ``itemActivated``, while the mouse path uses
+        # ``itemClicked``. Connecting both keeps the behaviour
+        # consistent regardless of input method.
+        self._sessions.itemClicked.connect(self._on_session_clicked)
+        self._sessions.itemActivated.connect(self._on_session_clicked)
         layout.addWidget(self._sessions, stretch=2)
 
     def render_workflow_trace(self, trace_steps: Iterable[str]) -> None:
@@ -604,11 +634,82 @@ class TracePanel(QtWidgets.QFrame):
             label = f"{session.session_id}  ({session.created_at[:19]})"
             item = QtWidgets.QListWidgetItem(label)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, session.session_id)
+            item.setToolTip(
+                f"session_id: {session.session_id}\n"
+                f"创建时间: {session.created_at}\n"
+                "点击切换到该 session"
+            )
             if session.session_id == current_session_id:
                 font = item.font()
                 font.setBold(True)
                 item.setFont(font)
+                item.setForeground(QtGui.QColor("#3a8a8c"))
             self._sessions.addItem(item)
+
+    def _on_session_clicked(self, item: QtWidgets.QListWidgetItem) -> None:
+        session_id = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not session_id:
+            return
+        # Hand off to the parent LitTraceQtWindow which owns the
+        # controller. ``TracePanel`` stays GUI-only and never
+        # imports the controller, so the parent binds the click
+        # to ``controller.switch_session``.
+        window = self.window()
+        if window is not None and hasattr(window, "_on_session_switch_requested"):
+            window._on_session_switch_requested(session_id)
+
+    # ---- Session switching ---------------------------------------------
+
+    def _on_session_switch_requested(self, session_id: str) -> None:
+        # Round 17: ``TracePanel`` hands session clicks here so the
+        # controller-driven switch + UI refresh happens in one
+        # place. ``controller.switch_session`` emits
+        # ``SESSION_HISTORY_REFRESHED`` on success, which our
+        # already-wired slot re-renders against.
+        if session_id == self._controller.session.session_id:
+            self._status_bar.showMessage(
+                f"已在 session {session_id}", 3000
+            )
+            return
+        ok = self._controller.switch_session(session_id)
+        if ok:
+            # Re-render the session list so the new active row is
+            # bolded; refresh the context pane to match the new
+            # session's active papers; clear the chat scrollback so
+            # the user doesn't see a confusing mix of two
+            # sessions' messages.
+            try:
+                sessions = self._controller.list_sessions()
+                self._trace_panel.set_sessions(
+                    sessions,
+                    current_session_id=self._controller.session.session_id,
+                )
+            except Exception:
+                pass
+            self._context_panel.refresh(
+                list(self._controller.list_active_papers())
+            )
+            self._chat_panel.clear()
+
+    def _on_paper_deactivate_requested(self, paper: Any) -> None:
+        # Round 17: ``ContextPanel`` hands the right-click
+        # "取消激活" action here. ``controller.deactivate_paper``
+        # already emits ``EVENT_WORKSPACE_REFRESHED`` so the
+        # context list re-renders against the new active set.
+        paper_id = getattr(paper, "paper_id", None)
+        if not paper_id:
+            return
+        ok = self._controller.deactivate_paper(paper_id)
+        if ok:
+            self._status_bar.showMessage(
+                f"已取消激活：{paper.title[:40]}",
+                3000,
+            )
+        else:
+            self._status_bar.showMessage(
+                f"该 paper 不在激活列表中：{paper.title[:40]}",
+                3000,
+            )
 
 
 class ChatPanel(QtWidgets.QFrame):
@@ -629,9 +730,27 @@ class ChatPanel(QtWidgets.QFrame):
 
         self._view = QtWidgets.QTextBrowser()
         self._view.setObjectName("chat_view")
-        self._view.setOpenExternalLinks(True)
+        self._view.setOpenExternalLinks(False)
         self._view.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._view.customContextMenuRequested.connect(self._on_chat_context_menu)
+        # Round 17: surface "查看技术细节" inline error links. The
+        # link target uses the ``littrace:show-error-detail`` scheme
+        # so a click never opens an external browser; the parent
+        # window's ``_on_chat_anchor_clicked`` slot pops the raw
+        # ``TypeError: ...`` payload into a non-modal dialog.
+        # ``setOpenExternalLinks(False)`` keeps http(s) links from
+        # auto-opening — those still go through the parent slot
+        # and we re-emit them via QDesktopServices so the user's
+        # default browser handles them.
+        # Round 17 bug fix: ``_on_chat_anchor_clicked`` lives on
+        # the main window, not on ChatPanel; the previous
+        # ``self._view.anchorClicked.connect(self._on_chat_anchor_clicked)``
+        # silently referenced a non-existent method on the
+        # panel. Forward through ``self.window()`` so the main
+        # window's slot handles the click.
+        self._view.anchorClicked.connect(
+            lambda url, _panel=self: _panel.window()._on_chat_anchor_clicked(url)
+        )
         layout.addWidget(self._view, stretch=1)
 
         # Thinking strip — sits between the chat scrollback and the input
@@ -809,11 +928,25 @@ class ChatPanel(QtWidgets.QFrame):
     def _tick_thinking(self) -> None:
         self._thinking_frame = (self._thinking_frame + 1) % len(_THINKING_FRAMES)
         dots = _THINKING_FRAMES[self._thinking_frame]
-        self._thinking.setText(f"{self._thinking_label}  {dots}")
+        elapsed = getattr(self, "_thinking_elapsed", None)
+        if elapsed is not None:
+            # Show one decimal place up to 10 s, then integer —
+            # past 10 s the user mostly cares about "is it still
+            # alive" rather than sub-second precision.
+            if elapsed < 10:
+                elapsed_text = f"{elapsed:.1f}s"
+            else:
+                elapsed_text = f"{int(elapsed)}s"
+            self._thinking.setText(
+                f"{self._thinking_label}  {dots}  ({elapsed_text})"
+            )
+        else:
+            self._thinking.setText(f"{self._thinking_label}  {dots}")
 
     def set_thinking(self, active: bool, label: str = "") -> None:
         if active:
             self._thinking_label = label or "思考中"
+            self._thinking_elapsed: float | None = None
             self._thinking.show()
             self._tick_thinking()
             self._thinking_timer.start()
@@ -821,6 +954,17 @@ class ChatPanel(QtWidgets.QFrame):
             self._thinking_timer.stop()
             self._thinking.hide()
             self._thinking_label = ""
+            self._thinking_elapsed = None
+
+    def set_thinking_elapsed(self, elapsed_seconds: float) -> None:
+        """Round 17: append the elapsed-seconds counter so the user
+        sees "思考中… 3.2s" instead of a frozen spinner. The label
+        and the dots are kept in sync via ``_tick_thinking`` so the
+        elapsed seconds never overwrite the dots (or vice versa).
+        """
+        self._thinking_elapsed = elapsed_seconds
+        if self._thinking.isVisible():
+            self._tick_thinking()
 
     # ---- Slash popup logic ----------------------------------------------
 
@@ -1009,21 +1153,185 @@ class ChatPanel(QtWidgets.QFrame):
         select_all = menu.addAction("全选")
         select_all.triggered.connect(self._view.selectAll)
         clear_action = menu.addAction("清屏")
-        clear_action.triggered.connect(self._view.clear)
+        clear_action.triggered.connect(self.clear)
         menu.exec(self._view.mapToGlobal(pos))
 
-    # ---- Right-click copy/paste menu -----------------------------------
+    def clear(self) -> None:
+        # Round 17: clear the scrollback AND the streaming anchor
+        # so the next chat turn starts with a fresh bubble. The
+        # right-click "清屏" menu item and the session switch path
+        # both go through here.
+        self._view.clear()
+        self._streaming_anchor = None
 
-    def _on_chat_context_menu(self, pos: QtCore.QPoint) -> None:
-        menu = QtWidgets.QMenu(self)
-        copy_action = menu.addAction("复制")
-        copy_action.setEnabled(self._view.textCursor().hasSelection())
-        copy_action.triggered.connect(self._view.copy)
-        select_all = menu.addAction("全选")
-        select_all.triggered.connect(self._view.selectAll)
-        clear_action = menu.addAction("清屏")
-        clear_action.triggered.connect(self._view.clear)
-        menu.exec(self._view.mapToGlobal(pos))
+    # ---- Streaming bubble -----------------------------------------------
+
+    def open_streaming_bubble(self) -> None:
+        """Open a new empty assistant bubble and record its block
+        position so subsequent ``append_delta`` calls append at its
+        tail regardless of where new blocks land in the document.
+
+        Round 17: ``_view.textCursor()`` returns a cursor at position
+        0 on first read, so a naive ``insertText`` from a delta
+        callback would insert at the TOP of the document — which is
+        why an earlier attempt at streaming showed the assistant's
+        reply inside the user's bubble. The contract is:
+
+          * ``open_streaming_bubble`` appends a new block to the
+            document end and records the new block's character
+            position as ``self._streaming_anchor``.
+          * ``append_delta`` moves the cursor to that anchor and
+            then to ``EndOfBlock`` before inserting, so even if the
+            user fires off another turn (which appends a new block
+            *after* the streaming bubble), the delta still lands at
+            the streaming bubble's tail.
+
+        ``_streaming_anchor`` is ``None`` when no streaming bubble
+        is open; ``append_delta`` is a no-op in that state.
+        """
+        from PySide6.QtGui import QTextBlockFormat
+
+        bubble_color = "#ffffff"
+        text_color = DESIGN["ink"]
+        wrap = "12px 12px 12px 4px"  # assistant tail bottom-left
+        max_width = "78%"
+        cursor = self._view.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        block_fmt = QTextBlockFormat()
+        block_fmt.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        block_fmt.setTopMargin(8)
+        block_fmt.setBottomMargin(8)
+        cursor.insertBlock(block_fmt)
+        # Remember the block start position before ``insertHtml``
+        # moves the cursor past the inserted span. The anchor is
+        # the character offset of the new block's first character;
+        # ``append_delta`` calls ``setPosition`` then ``EndOfBlock``
+        # to land at the tail.
+        doc = self._view.document()
+        anchor = doc.lastBlock().position()
+        cursor.insertHtml(
+            f'<span style="display:inline-block;max-width:{max_width};'
+            f"background:{bubble_color};color:{text_color};"
+            f"border:1px solid {DESIGN['hairline']};"
+            f"border-radius:{wrap};padding:8px 12px;"
+            f"line-height:1.4;"
+            f'"></span>'
+        )
+        self._streaming_anchor = anchor
+        self._view.setTextCursor(cursor)
+        sb = self._view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def append_delta(self, delta: str) -> None:
+        """Append ``delta`` to the streaming bubble.
+
+        ``append_delta`` is called many times per turn (codex ships
+        deltas as small as a few characters), so it MUST be cheap.
+        The implementation jumps the cursor to the streaming
+        anchor's block, moves to the end of that block, and calls
+        ``insertText`` — no markdown re-render, no block-format
+        rewrite. Falls back to a no-op if the streaming bubble
+        isn't open yet (race: a stray delta arrived before
+        ``open_streaming_bubble``).
+        """
+        if not delta:
+            return
+        anchor = getattr(self, "_streaming_anchor", None)
+        if anchor is None:
+            return
+        cursor = self._view.textCursor()
+        cursor.setPosition(anchor)
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.EndOfBlock)
+        cursor.insertText(delta)
+        self._view.setTextCursor(cursor)
+        sb = self._view.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def finalize_streaming(self, full_text: str = "") -> None:
+        """Close the streaming bubble.
+
+        Round 17: the chat path emits ``EVENT_MESSAGE_APPENDED`` after
+        every assistant turn. If we left the streaming bubble open
+        AND appended a new ``assistant`` bubble for the same reply,
+        the user would see the streamed text + the same text rendered
+        as a new bubble below it. So at finalize time we have two
+        choices:
+
+          (a) drop the streaming bubble entirely and let
+              ``EVENT_MESSAGE_APPENDED`` render the final reply as
+              a fresh bubble (current behaviour when streaming is
+              disabled).
+          (b) keep the streaming bubble, replace its content with
+              the markdown-rendered final reply, and skip the new
+              bubble from ``EVENT_MESSAGE_APPENDED``.
+
+        We do (b): the streamed text is the same text the user will
+        see in the final bubble, but with raw ``\n`` separators
+        instead of ``<br>``. Replacing the bubble body with the
+        rendered markdown (bold / code / lists / …) lifts the
+        fidelity in one step at the end of the turn, without
+        re-rendering every delta mid-stream.
+
+        ``full_text`` is the controller's authoritative final reply;
+        if the streaming bubble never opened (e.g. deltas arrived
+        after ``completed``), ``full_text`` is the only content the
+        user sees — and ``replace_streaming_bubble`` falls back to
+        ``append_message`` in that case.
+        """
+        anchor = getattr(self, "_streaming_anchor", None)
+        if anchor is None:
+            # Streaming bubble never opened (race: deltas arrived
+            # after ``completed`` without a preceding ``open``).
+            # Render the final text as a normal assistant bubble
+            # so the user still sees the reply.
+            if full_text:
+                self.append_message("assistant", full_text)
+            return
+        if full_text:
+            self.replace_streaming_bubble(full_text)
+        self._streaming_anchor = None
+
+    def replace_streaming_bubble(self, full_text: str) -> None:
+        """Swap the streaming bubble's body for the markdown-rendered
+        final reply. Used at the end of a streaming turn so the user
+        sees bold / code / lists instead of the raw streamed text.
+        """
+        anchor = getattr(self, "_streaming_anchor", None)
+        if anchor is None:
+            return
+        body = _strip_leading_narration(_render_message_html(full_text))
+        body = _strip_trailing_narration(body)
+        cursor = self._view.textCursor()
+        cursor.setPosition(anchor)
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.EndOfBlock)
+        # ``cursor.hasSelection()`` is False — we are collapsed at the
+        # end of the block, which contains the streaming span. The
+        # span is the LAST element in the block, so a forward
+        # selection to the block end + a backward selection to the
+        # span start picks up everything inside the span. Using
+        # ``StartOfBlock`` → ``EndOfBlock`` would also work but
+        # would erase any whitespace or block-level markers we want
+        # to keep — the block itself only contains the streaming
+        # span in practice.
+        cursor.movePosition(
+            QtGui.QTextCursor.MoveOperation.StartOfBlock,
+            QtGui.QTextCursor.MoveMode.MoveAnchor,
+        )
+        cursor.movePosition(
+            QtGui.QTextCursor.MoveOperation.EndOfBlock,
+            QtGui.QTextCursor.MoveMode.KeepAnchor,
+        )
+        # Replace the selection (which is the entire streaming span)
+        # with the freshly rendered HTML.
+        cursor.insertHtml(
+            f'<span style="display:inline-block;max-width:78%;'
+            f"background:#ffffff;color:{DESIGN['ink']};"
+            f"border:1px solid {DESIGN['hairline']};"
+            f"border-radius:12px 12px 12px 4px;padding:8px 12px;"
+            f"line-height:1.4;"
+            f'">{body}</span>'
+        )
+        self._view.setTextCursor(cursor)
 
 
 class ContextPanel(QtWidgets.QFrame):
@@ -1041,8 +1349,25 @@ class ContextPanel(QtWidgets.QFrame):
         title.setObjectName("pane_title")
         layout.addWidget(title)
 
+        # Round 17: one-line hint so the user knows the right-click
+        # menu exists. Without it the only way to discover the
+        # "取消激活" action was trial and error.
+        hint = QtWidgets.QLabel("右键单条可取消激活")
+        hint.setObjectName("status")
+        hint.setStyleSheet(
+            f"color:{DESIGN['ink_subtle']};font-size:11px;"
+        )
+        layout.addWidget(hint)
+
         self._list = QtWidgets.QListWidget()
         self._list.setObjectName("context")
+        # Right-click context menu for the per-paper actions
+        # ("取消激活" / "查看详情"). Custom menu policy keeps the
+        # menu off when the user clicks empty space.
+        self._list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(
+            self._on_context_menu
+        )
         layout.addWidget(self._list, stretch=1)
 
     def refresh(self, papers: list[PaperMetadata]) -> None:
@@ -1059,7 +1384,58 @@ class ContextPanel(QtWidgets.QFrame):
                 f"{index}. {paper.title}  ({year}, {source})"
             )
             item.setData(QtCore.Qt.ItemDataRole.UserRole, paper)
+            # Round 17: hover tooltip surfaces the metadata that
+            # doesn't fit on the list row (DOI, full author list,
+            # access type, citation count). The 5-line wrap is
+            # enough for typical paper metadata; longer
+            # abstracts / methods would need a separate dialog
+            # but the user can grep the digest for those.
+            tooltip_parts = [
+                f"标题：{paper.title}",
+                f"年份：{year}",
+                f"来源：{source}",
+            ]
+            if getattr(paper, "doi", None):
+                tooltip_parts.append(f"DOI：{paper.doi}")
+            if getattr(paper, "authors", None):
+                authors = paper.authors or []
+                if authors:
+                    shown = "、".join(authors[:3])
+                    if len(authors) > 3:
+                        shown += f" 等 {len(authors)} 位"
+                    tooltip_parts.append(f"作者：{shown}")
+            if getattr(paper, "access_type", None):
+                tooltip_parts.append(
+                    f"访问类型：{paper.access_type.value if hasattr(paper.access_type, 'value') else paper.access_type}"
+                )
+            if getattr(paper, "citation_count", None):
+                tooltip_parts.append(f"引用数：{paper.citation_count}")
+            item.setToolTip("\n".join(tooltip_parts))
             self._list.addItem(item)
+
+    def _on_context_menu(self, pos: QtCore.QPoint) -> None:
+        item = self._list.itemAt(pos)
+        if item is None:
+            return
+        paper = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if paper is None:
+            return
+        menu = QtWidgets.QMenu(self)
+        deactivate = menu.addAction("取消激活")
+        deactivate.triggered.connect(
+            lambda: self._request_deactivate(paper)
+        )
+        menu.exec(self._list.mapToGlobal(pos))
+
+    def _request_deactivate(self, paper: Any) -> None:
+        # Delegate to the parent LitTraceQtWindow which owns the
+        # controller. The window's slot calls
+        # ``controller.deactivate_paper`` and emits the
+        # ``WORKSPACE_REFRESHED`` event our existing slot already
+        # handles, so the list re-renders against the new state.
+        window = self.window()
+        if window is not None and hasattr(window, "_on_paper_deactivate_requested"):
+            window._on_paper_deactivate_requested(paper)
 
 
 class RAGPanel(QtWidgets.QFrame):
@@ -1467,26 +1843,33 @@ class BrowserPanel(QtWidgets.QFrame):
                 (u for btn_label, u in self.PUBLISHER_LINKS if btn_label.endswith(label)),
                 None,
             )
+            # Round 17: render each ✓ / ✗ marker with a hover
+            # tooltip so the user can hover before clicking.
+            # ``title=`` is plain text only, no HTML, so the
+            # tooltip strings are rendered as-is by Qt.
             if logged:
                 color = "#2a7a3a"
                 mark = "✓"
                 bits.append(
-                    f'<span style="color:{color};">{label} {mark}</span>'
+                    f'<span title="{label} 已登录（cookie 来自 {", ".join(domains)}）" '
+                    f'style="color:{color};">{label} {mark}</span>'
                 )
             else:
                 any_unlogged = True
                 # ✗ is a clickable shortcut: the click fires
                 # ``open_url(signin_url)`` so the embedded Chromium
                 # navigates straight to the publisher's sign-in page.
+                tooltip = f"{label} 未登录，点 ✗ 打开登录页"
                 bits.append(
-                    f'<a href="{signin_url}" '
+                    f'<a href="{signin_url}" title="{tooltip}" '
                     f'style="color:#cc785c;text-decoration:none;">'
                     f"{label} ✗</a>"
                 )
         # arXiv doesn't need login (open access) — mark it as always
         # ready so the user doesn't have to wonder.
         bits.append(
-            f'<span style="color:#2a7a3a;">arXiv ✓</span>'
+            f'<span title="arXiv 是开放获取，无需登录" '
+            f'style="color:#2a7a3a;">arXiv ✓</span>'
         )
         # The first time the user opens the panel, the strip is a wall
         # of red ✗ and they have no idea what to do. Drop a tiny hint
@@ -1853,6 +2236,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             cumulative_candidates = 0
             rounds_done = 0
             last_summary = ""
+            last_warnings: list[str] = []
             for round_idx, q in enumerate(queries, start=1):
                 round_start = time.monotonic()
                 self._post_status(
@@ -1869,12 +2253,22 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 self._start_progress_timer(
                     round_idx, MAX_ROUNDS, q, round_start, progress_state
                 )
+                # Round 17: pass the user-selected year range and
+                # target count through to the sentinel subprocess.
+                # Previously only ``--watchlist`` / ``--topic`` were
+                # forwarded, so the dialog's "年份区间" and "最少
+                # 检索数目" fields were silently dropped and the
+                # pipeline ran with the watchlist's persisted
+                # defaults (or the hardcoded 2024 lower bound).
+                cmd, env, cwd = _littrace_cmd(
+                    "sentinel", "run",
+                    "--watchlist", topic,
+                    "--topic", q,
+                    "--year-min", str(year_min),
+                    "--year-max", str(year_max),
+                    "--target-papers", str(min_papers),
+                )
                 try:
-                    cmd, env, cwd = _littrace_cmd(
-                        "sentinel", "run",
-                        "--watchlist", topic,
-                        "--topic", q,
-                    )
                     completed = subprocess.run(
                         cmd,
                         capture_output=True,
@@ -1885,28 +2279,29 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                     )
                 finally:
                     progress_state["stop"] = True
-                try:
-                    completed = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=PER_ROUND_TIMEOUT,
-                        cwd=cwd,
-                        env=env,
-                    )
-                except subprocess.TimeoutExpired:
-                    self._post_status(
-                        f"第 {round_idx} 轮超时（{PER_ROUND_TIMEOUT // 60} 分钟），跳过"
-                    )
+                if completed is None:
                     continue
-                except Exception as exc:  # pragma: no cover - defensive
+                if completed.returncode != 0:
+                    tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-1] or "(no output)"
                     self._post_status(
-                        f"第 {round_idx} 轮失败: {type(exc).__name__}: {exc}"
+                        f"第 {round_idx} 轮 sentinel 退出 {completed.returncode}：{tail}"
                     )
                     continue
                 rounds_done += 1
                 summary = _summarise_sentinel_output(completed.stdout or "")
                 last_summary = summary
+                # Round 17: surface download-stage warnings that the
+                # sentinel run folded into ``warnings:``. Without
+                # this the user only saw the run summary and had no
+                # way to know that, say, the download step failed
+                # silently. The last warning wins because the most
+                # recent round's diagnostics are the freshest
+                # signal of an ongoing problem.
+                for line in (completed.stdout or "").splitlines():
+                    if line.startswith("warnings:"):
+                        last_warnings = [
+                            chunk.strip() for chunk in line[len("warnings:"):].split("；") if chunk.strip()
+                        ]
                 downloaded = _summary_value(summary, "downloaded:")
                 candidates = _summary_value(summary, "new_candidates:")
                 if downloaded is not None:
@@ -1934,6 +2329,8 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 shortfall.append(
                     f"累计检索到 {cumulative_candidates} 个候选"
                 )
+            if last_warnings:
+                shortfall.append("；".join(last_warnings))
             if shortfall:
                 headline += " · ⚠️ " + "；".join(shortfall)
             self._post_status(headline)
@@ -2008,93 +2405,76 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
     # ---- Event wiring ----------------------------------------------------
 
     def _wire_events(self) -> None:
-        controller = self._controller
+        # Round 17: route every ``ShellEvent`` through the shared
+        # ``EventBridge`` instead of hand-rolling one
+        # ``@Slot``/``invokeMethod`` pair per event kind. The
+        # bridge installs a single dynamically-generated slot per
+        # event kind, JSON-decodes the payload on the GUI thread,
+        # and dispatches by ``kind``. Per-event handlers below
+        # take a plain ``body: dict`` — no more
+        # ``_decode_event`` + ``if kind !=`` boilerplate at the
+        # top of every slot.
+        #
+        # ``self._event_bridge`` is parented to ``self`` so Qt
+        # tears it down with the window.
+        from littrace.qt_shell import EventBridge, install_subscriptions
 
-        # Qt widgets must only be touched from the GUI thread, but the
-        # controller emits events on its asyncio worker thread. Earlier
-        # iterations tried ``QTimer.singleShot(0, lambda)`` from the
-        # worker thread — that bound the timer to a thread with no Qt
-        # event loop, so the lambda never fired. The current bridge
-        # declares ``@Slot``-decorated methods on ``self`` (so they live
-        # in the Qt meta-object system) and then dispatches every event
-        # via ``QMetaObject.invokeMethod(self, "...", QueuedConnection,
-        # ...)`` from the worker thread. ``QueuedConnection`` posts the
-        # call onto the receiver's thread (the GUI thread), where the
-        # actual widget mutation runs. The ``@Slot`` registration is
-        # what makes the method invokable — plain Python methods are
-        # silently dropped by ``invokeMethod`` even with
-        # ``QueuedConnection``.
-        def post(handler_name: str) -> "callable":
-            # ``QMetaObject.invokeMethod`` with ``Q_ARG("QVariant", ...)``
-            # serialises Python objects through Qt's meta-system, which
-            # has no idea what a ``ShellEvent`` is and ends up handing
-            # the slot a bare ``str`` (its ``repr()``). ``Q_ARG(str, ...)``
-            # with a JSON payload + ``@Slot(str)`` is the documented
-            # cross-thread path: the slot receives a real Python string
-            # that ``json.loads`` can rebuild into the dict shape the
-            # handler expects.
-            def _wrapper(event: ShellEvent) -> None:
-                payload = json.dumps(
-                    {"kind": event.kind, "payload": event.payload},
-                    ensure_ascii=False,
-                )
-                QtCore.QMetaObject.invokeMethod(
-                    self,
-                    handler_name,
-                    QtCore.Qt.ConnectionType.QueuedConnection,
-                    QtCore.Q_ARG(str, payload),
-                )
+        if not hasattr(self, "_event_bridge"):
+            self._event_bridge = EventBridge(self, self._controller)
+        install_subscriptions(
+            self._controller,
+            self._event_bridge,
+            {
+                self._controller.EVENT_MESSAGE_APPENDED: self._on_message_event,
+                self._controller.EVENT_STATUS_CHANGED: self._on_status_event,
+                self._controller.EVENT_THINKING: self._on_thinking_event,
+                self._controller.EVENT_WORKSPACE_REFRESHED: self._on_workspace_event,
+                self._controller.EVENT_ERROR: self._on_error_event,
+                self._controller.EVENT_WARMUP_STARTED: self._on_warmup_event,
+                self._controller.EVENT_WARMUP_DONE: self._on_warmup_event,
+                self._controller.EVENT_ASSISTANT_STREAM_OPEN: self._on_stream_open_event,
+                self._controller.EVENT_ASSISTANT_DELTA: self._on_stream_delta_event,
+                self._controller.EVENT_AUTH_REQUIRED: self._on_auth_event,
+                self._controller.EVENT_AUTH_OK: self._on_auth_event,
+                self._controller.EVENT_THINKING_PROGRESS: self._on_thinking_progress_event,
+            },
+        )
 
-            return _wrapper
-
-        controller.bus.subscribe(post("_qt_on_message_event"))
-        controller.bus.subscribe(post("_qt_on_status_event"))
-        controller.bus.subscribe(post("_qt_on_thinking_event"))
-        controller.bus.subscribe(post("_qt_on_workspace_event"))
-        controller.bus.subscribe(post("_qt_on_error_event"))
-
-    def _decode_event(self, payload: str) -> tuple[str, dict]:
-        """Restore a ``(kind, payload_dict)`` pair from the JSON string
-        the ``post()`` trampoline passes across threads.
-        """
-        try:
-            data = json.loads(payload)
-        except (TypeError, ValueError):
-            return "", {}
-        return data.get("kind", ""), data.get("payload", {}) or {}
-
-    @QtCore.Slot(str)
-    def _qt_on_message_event(self, payload: str) -> None:
-        kind, body = self._decode_event(payload)
-        if kind != self._controller.EVENT_MESSAGE_APPENDED:
-            return
+    def _on_message_event(self, body: dict) -> None:
+        # Round 17: routed through ``EventBridge`` so the
+        # ``controller -> bus -> bridge -> slot`` plumbing is no
+        # longer hand-rolled. The handler now receives the
+        # decoded payload dict directly; the JSON decode +
+        # ``if kind != EVENT_X: return`` boilerplate moved into
+        # the bridge's per-kind slot.
         role = body.get("role", "system")
         text = body.get("text", "")
         extras = {k: v for k, v in body.items() if k in ("action", "warnings")}
+        # Round 17: when an assistant reply lands and a streaming
+        # bubble is open, swap its content for the markdown-rendered
+        # final reply and skip the duplicate ``append_message``. The
+        # streamed text is the same string the controller emits here;
+        # re-rendering it as a new bubble would put two copies of the
+        # same reply on screen. ``finalize_streaming`` is a no-op
+        # when no streaming bubble is open (legacy / non-streaming
+        # path), in which case ``append_message`` runs as before.
+        if role == "assistant" and getattr(
+            self._chat_panel, "_streaming_anchor", None
+        ) is not None:
+            self._chat_panel.finalize_streaming(text)
+            return
         self._chat_panel.append_message(role, text, **extras)
 
-    @QtCore.Slot(str)
-    def _qt_on_status_event(self, payload: str) -> None:
-        kind, body = self._decode_event(payload)
-        if kind != self._controller.EVENT_STATUS_CHANGED:
-            return
+    def _on_status_event(self, body: dict) -> None:
         self._status_bar.showMessage(body.get("text", ""))
 
-    @QtCore.Slot(str)
-    def _qt_on_thinking_event(self, payload: str) -> None:
-        kind, body = self._decode_event(payload)
-        if kind != self._controller.EVENT_THINKING:
-            return
+    def _on_thinking_event(self, body: dict) -> None:
         self._chat_panel.set_thinking(
             active=bool(body.get("active")),
             label=str(body.get("label", "思考中")),
         )
 
-    @QtCore.Slot(str)
-    def _qt_on_workspace_event(self, payload: str) -> None:
-        kind, body = self._decode_event(payload)
-        if kind != self._controller.EVENT_WORKSPACE_REFRESHED:
-            return
+    def _on_workspace_event(self, body: dict) -> None:
         self._context_panel.refresh(list(self._controller.list_active_papers()))
         self._trace_panel.render_workflow_trace(
             ["工作区刷新"]
@@ -2104,14 +2484,261 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             ]
         )
 
-    @QtCore.Slot(str)
-    def _qt_on_error_event(self, payload: str) -> None:
-        kind, body = self._decode_event(payload)
-        if kind != self._controller.EVENT_ERROR:
-            return
+    def _on_error_event(self, body: dict) -> None:
+        # Round 17: the controller now sends a structured error
+        # payload with ``error_code`` (one of the ``CodexErrorCode``
+        # string values, or ``"other"``), a user-facing ``message``,
+        # and an optional ``suggestion``. Render the message into
+        # the chat scrollback as a system bubble, then surface the
+        # suggestion in the status bar so the user can act on it
+        # without scrolling. The raw ``raw`` payload (containing
+        # ``TypeError: ...``) is hidden behind a small "details"
+        # link — it used to be dumped into the chat as the main
+        # text, which made every error look like a Python traceback.
+        message = body.get("message", "对话出错")
+        suggestion = body.get("suggestion", "")
+        error_code = body.get("error_code", "other")
+        # Inline message + suggestion + a details link. The link
+        # target is the raw ``TypeError: ...`` string, which we
+        # stash on the dialog as plain text (no HTML escaping
+        # needed because QPlainTextEdit handles escaping itself).
+        raw = body.get("raw", "")
+        html_parts = [f"⚠️ {message}"]
+        if suggestion:
+            html_parts.append(
+                f'<br><span style="color:#5c6068;font-size:11px;">'
+                f"{suggestion}</span>"
+            )
+        if raw:
+            html_parts.append(
+                f'<br><a href="littrace:show-error-detail" '
+                f'style="color:#3a8a8c;font-size:11px;">查看技术细节</a>'
+            )
         self._chat_panel.append_message(
-            "system", f"⚠️ {body.get('message', 'error')}"
+            "system", "".join(html_parts)
         )
+        # Status bar: condensed one-liner. The full detail is in
+        # the chat bubble + the click-through dialog.
+        if suggestion:
+            # First line of the suggestion, no newlines.
+            short = suggestion.splitlines()[0].strip()
+            self._status_bar.showMessage(f"⚠️ {message} — {short}", 10000)
+        else:
+            self._status_bar.showMessage(f"⚠️ {message}", 5000)
+        # Remember the most recent raw error text so the link
+        # click can pop it up.
+        if raw:
+            self._last_error_detail = (error_code, message, raw)
+
+    def _on_warmup_event(self, body: dict) -> None:
+        # Translate ``WARMUP_STARTED`` / ``WARMUP_DONE`` into the
+        # status bar strip. The two-phase progression
+        # "正在启动 codex…(spawning)" → "...(initializing)" →
+        # "就绪" tells the user the app isn't frozen between window
+        # paint and the first turn. ``WARMUP_DONE`` with phase
+        # "failed" lands in the chat as a non-fatal warning — the
+        # first user turn will retry the spawn automatically.
+        # The bridge tags ``body`` with ``__kind`` so this single
+        # handler can branch on which warmup event fired without
+        # inspecting the bridge's internal ``_installed`` map.
+        kind = body.get("__kind", "")
+        phase = str(body.get("phase", ""))
+        detail = str(body.get("detail", "") or "")
+        if kind == self._controller.EVENT_WARMUP_STARTED:
+            label = {
+                "spawning": "正在启动 codex…(spawning)",
+                "initializing": "正在启动 codex…(initializing)",
+            }.get(phase, "正在启动 codex…")
+            self._status_bar.showMessage(label)
+            return
+        # WARMUP_DONE.
+        if phase == "ready":
+            self._status_bar.showMessage("就绪（codex 已预热）", 4000)
+        elif phase == "failed":
+            msg = "codex 预热失败；首轮对话将自动重试"
+            if detail:
+                msg = f"{msg}（{detail}）"
+            self._status_bar.showMessage(msg, 8000)
+            self._chat_panel.append_message(
+                "system", f"⚠️ {msg}"
+            )
+
+    def _on_stream_open_event(self, body: dict) -> None:
+        # Open a streaming bubble. ``EVENT_ASSISTANT_STREAM_OPEN`` is
+        # guaranteed by the controller to fire before the first delta,
+        # so the bubble is ready by the time ``append_delta`` lands.
+        self._chat_panel.open_streaming_bubble()
+
+    def _on_stream_delta_event(self, body: dict) -> None:
+        # Append one delta frame to the streaming bubble. ``delta`` is
+        # the raw text from codex's ``item/agentMessage/delta``
+        # notification; ``ChatPanel.append_delta`` is a no-op when no
+        # streaming bubble is open, so a stray frame arriving after
+        # ``completed`` is silently dropped.
+        delta = body.get("delta", "")
+        if not isinstance(delta, str):
+            return
+        self._chat_panel.append_delta(delta)
+
+    def _on_thinking_progress_event(self, body: dict) -> None:
+        # Append the elapsed-seconds counter to the thinking strip
+        # so the user sees the turn is still alive. ``elapsed_seconds``
+        # is rounded to one decimal so the label doesn't twitch
+        # between 3.142 and 3.149.
+        elapsed = body.get("elapsed_seconds", 0)
+        try:
+            elapsed_f = float(elapsed)
+        except (TypeError, ValueError):
+            return
+        self._chat_panel.set_thinking_elapsed(elapsed_f)
+
+    def _on_auth_event(self, body: dict) -> None:
+        # Round 17: OAuth lifecycle. ``auth_required`` opens a
+        # dialog with the device-auth instructions and a "Re-check"
+        # button that calls ``controller.check_codex_auth(force=True)``
+        # after the user runs ``codex login`` in their terminal.
+        # ``auth_ok`` closes any open dialog so the user can keep
+        # chatting immediately. The dialog is modeless so the chat
+        # input stays usable while the warning is on screen.
+        # The bridge tags ``body`` with ``__kind`` so this single
+        # handler can branch on which auth event fired.
+        kind = body.get("__kind", "")
+        if kind == self._controller.EVENT_AUTH_REQUIRED:
+            self._show_auth_dialog(
+                reason=str(body.get("reason", "")),
+                detail=str(body.get("detail", "")),
+            )
+            return
+        # AUTH_OK.
+        self._dismiss_auth_dialog()
+        # Show a brief status confirmation so the user knows
+        # the warning cleared because their login worked, not
+        # because of a bug.
+        detail = str(body.get("detail", ""))
+        self._status_bar.showMessage(
+            f"codex 已认证（{detail}）" if detail else "codex 已认证",
+            4000,
+        )
+
+    def _show_auth_dialog(self, reason: str, detail: str) -> None:
+        # Tear down any stale dialog from a previous check before
+        # opening a fresh one — a re-check that still fails
+        # shouldn't stack two dialogs on the user's screen.
+        existing = getattr(self, "_auth_dialog", None)
+        if existing is not None:
+            try:
+                existing.close()
+                existing.deleteLater()
+            except RuntimeError:
+                pass
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("需要 Codex 登录")
+        dialog.setModal(False)
+        dialog.resize(540, 320)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        title = QtWidgets.QLabel("⚠️ Codex 未登录或登录已过期")
+        title.setStyleSheet(
+            f"font-size:16px;font-weight:600;color:{DESIGN['accent_coral']};"
+        )
+        layout.addWidget(title)
+
+        reason_label = QtWidgets.QLabel(_reason_to_text(reason, detail))
+        reason_label.setWordWrap(True)
+        reason_label.setStyleSheet(
+            f"font-size:13px;color:{DESIGN['ink']};"
+        )
+        layout.addWidget(reason_label)
+
+        steps = QtWidgets.QLabel(
+            "请在终端运行：\n\n"
+            "    codex login --device-auth\n\n"
+            "按提示在浏览器里完成登录后，回到这里点 "
+            "「重新检查」，对话就会恢复。"
+        )
+        steps.setStyleSheet(
+            f"font-size:12px;color:{DESIGN['ink_muted']};"
+            "font-family:Menlo,Consolas,monospace;"
+        )
+        steps.setWordWrap(True)
+        layout.addWidget(steps)
+
+        layout.addStretch(1)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.setSpacing(8)
+        button_row.addStretch(1)
+        recheck_btn = QtWidgets.QPushButton("🔄 重新检查")
+        recheck_btn.setObjectName("subnav_btn_primary")
+        recheck_btn.setDefault(True)
+        recheck_btn.clicked.connect(
+            lambda: self._controller.check_codex_auth(force=True)
+        )
+        button_row.addWidget(recheck_btn)
+        close_btn = QtWidgets.QPushButton("稍后再说")
+        close_btn.setObjectName("subnav_btn")
+        close_btn.clicked.connect(dialog.close)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        dialog.show()
+        self._auth_dialog = dialog
+
+    def _dismiss_auth_dialog(self) -> None:
+        existing = getattr(self, "_auth_dialog", None)
+        if existing is None:
+            return
+        try:
+            existing.close()
+            existing.deleteLater()
+        except RuntimeError:
+            pass
+        self._auth_dialog = None
+
+    def _on_chat_anchor_clicked(self, url: QtCore.QUrl) -> None:
+        # Round 17: error-detail link in the chat bubble. The link
+        # target is the ``littrace:show-error-detail`` scheme
+        # followed by an opaque token (the most recent raw error
+        # string). We don't actually validate the token — the
+        # dialog only ever shows the cached ``_last_error_detail``
+        # payload, so a forged link can at most show the user's
+        # own last error. http(s) links fall through to the
+        # system's default browser via QDesktopServices.
+        from PySide6.QtGui import QDesktopServices
+
+        text = url.toString()
+        if text.startswith("littrace:show-error-detail"):
+            detail = getattr(self, "_last_error_detail", None)
+            if detail is None:
+                return
+            error_code, message, raw = detail
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle(f"技术细节 · {error_code}")
+            dlg.resize(640, 320)
+            layout = QtWidgets.QVBoxLayout(dlg)
+            layout.setContentsMargins(16, 12, 16, 12)
+            heading = QtWidgets.QLabel(message)
+            heading.setStyleSheet(
+                f"font-size:13px;font-weight:600;color:{DESIGN['ink']};"
+            )
+            layout.addWidget(heading)
+            view = QtWidgets.QPlainTextEdit(raw)
+            view.setReadOnly(True)
+            view.setStyleSheet(
+                f"font-family:Menlo,Consolas,monospace;font-size:11px;"
+                f"color:{DESIGN['ink_muted']};"
+            )
+            layout.addWidget(view, stretch=1)
+            ok_btn = QtWidgets.QPushButton("关闭")
+            ok_btn.clicked.connect(dlg.accept)
+            layout.addWidget(ok_btn, alignment=QtCore.Qt.AlignmentFlag.AlignRight)
+            dlg.exec()
+            return
+        if text.startswith(("http://", "https://")):
+            QDesktopServices.openUrl(url)
 
     # ---- Initial state ---------------------------------------------------
 

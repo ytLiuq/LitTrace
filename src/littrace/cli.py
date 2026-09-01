@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,7 +80,13 @@ from littrace.evaluation.retrieval_eval import run_retrieval_golden_eval
 from littrace.sentinel.cli import access_review as sentinel_access_review
 from littrace.sentinel.cli import init_sentinel, run_sentinel
 from littrace.sentinel.cli import resume_after_login as sentinel_resume_after_login
-from littrace.sentinel.storage import get_sentinel_store, load_sentinel_state
+from littrace.sentinel.state import Watchlist
+from littrace.sentinel.storage import (
+    ensure_sentinel_store,
+    get_sentinel_store,
+    load_sentinel_state,
+    load_watchlist,
+)
 from littrace.session import (
     append_message,
     create_chat_session,
@@ -277,16 +284,50 @@ async def _run_sentinel_command(config) -> None:
     action = sys.argv[2]
     watchlist_id = _arg_value("--watchlist") or _arg_value("--watchlist-id") or "mxene_sensor"
     topic = _arg_value("--topic") or _arg_value("--objective")
+    # Round 17: thread the user-selected year range and minimum
+    # target through to the watchlist so ``run_sentinel`` picks
+    # them up. ``None`` / unset falls back to the watchlist's
+    # existing value (or the Watchlist default for new fields).
+    year_min_arg = _arg_int("--year-min", None)
+    year_max_arg = _arg_int("--year-max", None)
+    target_papers_arg = _arg_int("--target-papers", None)
 
     if action == "init":
         root = init_sentinel(config, watchlist_id, topic or watchlist_id)
         print(f"sentinel initialized: {root}")
         return
     if action == "run":
-        result = await run_sentinel(config, watchlist_id, topic)
+        # Apply the optional override flags by patching the
+        # watchlist BEFORE constructing ``LiteratureSentinel``
+        # (which calls ``save_watchlist`` in its constructor — the
+        # override therefore persists across the run).
+        from littrace.sentinel.storage import (
+            ensure_sentinel_store,
+            load_watchlist,
+        )
+        store = ensure_sentinel_store(
+            config,
+            Watchlist(watchlist_id=watchlist_id, topic=topic or watchlist_id),
+        )
+        watchlist = load_watchlist(store)
+        updates: dict[str, Any] = {}
+        if topic:
+            updates["topic"] = topic
+            updates["objective"] = topic
+        if year_min_arg is not None:
+            updates["year_min"] = year_min_arg
+        if year_max_arg is not None:
+            updates["year_max"] = year_max_arg
+        if target_papers_arg is not None:
+            updates["target_papers"] = target_papers_arg
+        if updates:
+            watchlist = watchlist.model_copy(update=updates)
+        result = await run_sentinel(config, watchlist)
         print(f"run_id: {result.summary.run_id}")
         print(f"watchlist: {result.summary.watchlist_id}")
         print(f"topic: {result.summary.topic}")
+        print(f"year_range: {watchlist.year_min}-{watchlist.year_max or 'now'}")
+        print(f"target_papers: {watchlist.target_papers}")
         print(f"new_candidates: {result.summary.new_candidates_count}")
         print(f"downloaded: {result.summary.downloaded_count}")
         print(f"parsed: {result.summary.parsed_count}")
@@ -1464,7 +1505,7 @@ def _print_codex_auth_diagnostics(config) -> None:
     print(f"  codex_home resolved: {home}")
     print(f"  auth.json: {'present' if auth.exists() else 'missing'}")
     if binary_ok:
-        print("  tip: littrace-window uses codex for chat. If chat fails with 401,")
+        print("  tip: littrace-qt uses codex for chat. If chat fails with 401,")
         print("       check that auth.json above points to a valid OpenAI API key,")
         print("       or set LITTRACE_CODEX_HOME_MODE=shared to use the default ~/.codex.")
 
