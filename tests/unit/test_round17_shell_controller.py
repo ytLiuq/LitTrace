@@ -1129,9 +1129,10 @@ def test_run_daily_acquires_external_chrome_around_sentinel_subprocess(
         self._external_chrome_proc = None
 
     def fake_run(cmd, **kw):
+        # Kept for backwards compat in case the worker regresses to
+        # ``subprocess.run``; not used by the current production code
+        # (Round 20 switched to ``subprocess.Popen`` for cancellability).
         call_log.append("sentinel")
-        # Return a fake ``CompletedProcess`` so the worker treats
-        # the round as successful.
         from subprocess import CompletedProcess
         return CompletedProcess(
             args=cmd,
@@ -1139,6 +1140,49 @@ def test_run_daily_acquires_external_chrome_around_sentinel_subprocess(
             stdout="new_candidates: 1\ndownloaded: 1\nparsed: 1\n",
             stderr="",
         )
+
+    class _FakePopen:
+        """Round 20: stand-in for ``subprocess.Popen`` whose ``wait()``
+        returns immediately with rc=0 (mimicking a fast sentinel round)
+        and whose ``stdout`` / ``stderr`` yield the fake summary lines.
+        Without this stub the worker would spawn a real
+        ``littrace sentinel run`` subprocess which either hangs or
+        fails, depending on the dev environment.
+        """
+
+        def __init__(self, cmd, **kw) -> None:
+            call_log.append("sentinel")
+            self._stdout = iter(["new_candidates: 1\n", "downloaded: 1\n", "parsed: 1\n"])
+            self._stderr = iter([])
+            self._rc = 0
+            self._terminated = False
+
+        def wait(self, timeout=None):
+            return self._rc
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            self._terminated = True
+
+        def kill(self):
+            self._terminated = True
+
+        @property
+        def stdout(self):
+            return _FakeStream(self._stdout)
+
+        @property
+        def stderr(self):
+            return _FakeStream(self._stderr)
+
+    class _FakeStream:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def read(self):
+            return "".join(self._lines)
 
     monkeypatch.setattr(
         LitTraceQtWindow,
@@ -1148,7 +1192,7 @@ def test_run_daily_acquires_external_chrome_around_sentinel_subprocess(
         LitTraceQtWindow,
         "_release_external_chrome_for_sentinel", fake_release,
     )
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
 
     # Drive ``_on_run_daily`` synchronously — the worker thread
     # joins immediately because the fake sentinel returns instantly.
@@ -2470,3 +2514,179 @@ def test_run_daily_shows_dialog_without_blocking(tmp_path, monkeypatch):
     dlg = win._daily_config_dialog
     assert dlg is not None, "dialog must be cached on the window"
     assert dlg.shown, "dialog.show() must have been called"
+
+
+def test_daily_run_can_be_cancelled_mid_flight(tmp_path, monkeypatch):
+    """Round 20: clicking the stop button (or pressing any future
+    "abort" affordance) must actually interrupt the running sentinel
+    subprocess instead of letting it run to the 180 s round timeout.
+    The previous behaviour silently ran for up to ``MAX_ROUNDS *
+    PER_ROUND_TIMEOUT`` = 6 minutes regardless of the cancel button —
+    a real annoyance when the user picked the wrong topic.
+    """
+    import os
+    import threading
+    import time
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from littrace.window_qt import LitTraceQtWindow
+    QApplication.instance() or QApplication([])
+
+    # Fake dialog so ``_on_run_daily`` doesn't try to open a real one.
+    class _StubDialog:
+        def __init__(self, parent, **kw) -> None:
+            self.accepted = _SignalStub()
+            self.rejected = _SignalStub()
+            self.shown = False
+        def show(self) -> None: self.shown = True
+        def raise_(self) -> None: return None
+        def activateWindow(self) -> None: return None
+        def close(self) -> None: return None
+        def deleteLater(self) -> None: return None
+        def exec(self) -> int: return 0
+        def topic(self) -> str: return "mxene_sensor"
+        def keywords(self) -> str: return ""
+        def year_min(self) -> int: return 2023
+        def year_max(self) -> int: return 2026
+        def min_papers(self) -> int: return 10
+        def open_login_after(self) -> bool: return False
+        def fire_accepted(self) -> None:
+            for slot in list(self.accepted.slots):
+                slot()
+
+    class _SignalStub:
+        def __init__(self) -> None:
+            self.slots: list = []
+        def connect(self, slot) -> None:
+            self.slots.append(slot)
+
+    # Popen that blocks on ``wait()`` until the cancel event is set —
+    # this mimics a slow sentinel round that the user wants to abort.
+    started = threading.Event()
+    cancel_observed = threading.Event()
+    terminate_called = threading.Event()
+
+    class _SlowPopen:
+        def __init__(self, cmd, **kw) -> None:
+            self._cmd = cmd
+            self._stdout = type("_S", (), {"read": lambda self: ""})()
+            self._stderr = type("_S", (), {"read": lambda self: "(cancelled)"})()
+            self._rc = None
+            started.set()
+
+        def wait(self, timeout=None):
+            # Mimic ``subprocess.wait`` semantics: return None while
+            # alive, the rc once exited. We poll the cancel event so
+            # the worker's wait-loop breaks out promptly.
+            deadline = time.monotonic() + (timeout or 0.001)
+            while time.monotonic() < deadline:
+                # Check from inside the fake — the production worker
+                # passes the cancel event to its wait-loop, but our
+                # fake wait just needs to wake up occasionally so the
+                # worker's own event-check has a chance to fire.
+                time.sleep(0.05)
+                if hasattr(_SlowPopen, "_cancel_flag") and _SlowPopen._cancel_flag.is_set():
+                    cancel_observed.set()
+                    self._rc = -15  # SIGTERM-ish
+                    return self._rc
+            return None
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            terminate_called.set()
+            _SlowPopen._cancel_flag.set()
+            self._rc = -15
+
+        def kill(self):
+            terminate_called.set()
+            _SlowPopen._cancel_flag.set()
+            self._rc = -9
+
+        @property
+        def stdout(self): return self._stdout
+        @property
+        def stderr(self): return self._stderr
+
+    monkeypatch.setattr("littrace.window_qt.DailyConfigDialog", _StubDialog)
+    monkeypatch.setattr("subprocess.Popen", _SlowPopen)
+
+    # Make acquire/release no-ops so the worker focuses on the
+    # subprocess lifecycle, which is what this test exercises.
+    monkeypatch.setattr(
+        LitTraceQtWindow,
+        "_acquire_external_chrome_for_sentinel",
+        lambda self: setattr(self, "_external_chrome_proc", None),
+    )
+    monkeypatch.setattr(
+        LitTraceQtWindow,
+        "_release_external_chrome_for_sentinel",
+        lambda self: (
+            setattr(self, "_external_chrome_proc", None),
+            self._browser_panel.resume_after_external_chrome(),
+        ),
+    )
+
+    win, _ctrl = _make_littrace_window(tmp_path)
+    # Show the window so the status-bar child widget's ``isVisible()``
+    # returns True after ``setVisible(True)`` — Qt visibility is
+    # hierarchical and a hidden parent makes child widgets report as
+    # not-visible even if they were explicitly shown.
+    win.show()
+    QApplication.processEvents()
+    # The worker reads ``self._daily_cancel_event`` by name — share
+    # the SAME event with the fake so we can flip it from the GUI
+    # thread and the worker's wait-loop sees it.
+    _SlowPopen._cancel_flag = win._daily_cancel_event
+
+    # Drive the dialog accept → worker thread.
+    win._on_run_daily()
+    win._daily_config_dialog.fire_accepted()
+
+    # Wait for the worker to actually call Popen.
+    assert started.wait(timeout=2.0), "Popen was never called by worker"
+    # Give the worker a tick to land in its wait-loop.
+    time.sleep(0.1)
+
+    # Pre-cancel: button must be visible (kill switch is offered).
+    assert win._daily_stop_btn.isVisible(), (
+        "stop button must be visible for the duration of a daily run "
+        "so the user has a mid-flight kill switch"
+    )
+    # No cancel yet → button is enabled.
+    assert win._daily_stop_btn.isEnabled(), "stop button must start enabled"
+
+    # Click the stop button — this is the user-facing kill switch.
+    win._on_stop_daily_clicked()
+    assert not win._daily_stop_btn.isEnabled(), (
+        "stop button must disable itself after click so a second "
+        "click doesn't race with the in-flight terminate()"
+    )
+
+    # The fake Popen noticed the cancel flag and the worker should
+    # now wrap up the round loop.
+    assert cancel_observed.wait(timeout=2.0), (
+        "worker did not observe the cancel event within 2 s — it "
+        "is still parked in ``proc.wait()`` and ignoring the stop"
+    )
+    assert terminate_called.is_set(), (
+        "the stop handler must call ``proc.terminate()`` to nudge "
+        "the subprocess; without it the worker has to wait for the "
+        "fake's wait() to time out on its own"
+    )
+
+    # Let the worker thread finish so the stop button gets hidden.
+    for _ in range(40):
+        time.sleep(0.05)
+        if not win._daily_stop_btn.isVisible():
+            break
+    QApplication.processEvents()
+    assert not win._daily_stop_btn.isVisible(), (
+        "stop button must hide again once the worker wraps up — "
+        "otherwise it sticks around after every run"
+    )
+    assert win._sentinel_proc is None, (
+        "worker must clear ``_sentinel_proc`` after wrapping up; "
+        "a leftover handle would leak Popen state across runs"
+    )

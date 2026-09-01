@@ -1,9 +1,44 @@
 from __future__ import annotations
 
 import asyncio
-import curses
 import textwrap
 from dataclasses import dataclass, field
+
+# Round 20: ``curses`` (and its ``_curses`` C extension) is only
+# available on macOS / Linux / WSL. On native Windows it raises
+# ``ModuleNotFoundError: No module named '_curses'`` at import time
+# even though the *Python* ``curses`` package itself is shipped. We
+# import lazily here so that ``import littrace.tui`` from a
+# Windows-only dev box (or any test that touches tui-adjacent code)
+# succeeds; ``main()`` then raises a clear error if curses isn't
+# actually available.
+try:
+    import curses  # type: ignore[import-not-found]
+    _CURSES_IMPORT_ERROR: Exception | None = None
+except ImportError as exc:  # pragma: no cover — exercised on Windows
+    curses = None  # type: ignore[assignment]
+    _CURSES_IMPORT_ERROR = exc
+
+
+def _require_curses() -> None:
+    """Raise a friendly error if the curses runtime isn't available.
+
+    Called by ``main()`` so the user gets a single, actionable
+    message instead of a deep ``ModuleNotFoundError`` stack. The
+    ``littrace-tui`` script entry-point should never be invoked on
+    Windows; this is just the safety net for ``python -m
+    littrace.tui`` from a Windows shell.
+    """
+    if _CURSES_IMPORT_ERROR is not None or curses is None:
+        raise RuntimeError(
+            "littrace-tui requires the 'curses' runtime, which is "
+            "only available on macOS / Linux / WSL. On native Windows "
+            "use `littrace-qt` instead (the Qt GUI), or install "
+            "`windows-curses` (`pip install windows-curses`) if you "
+            "specifically need the TUI. (Original error: "
+            f"{_CURSES_IMPORT_ERROR.__class__.__name__}: {_CURSES_IMPORT_ERROR})"
+        ) from _CURSES_IMPORT_ERROR
+
 
 from littrace.chat import handle_chat
 from littrace.config import load_config
@@ -24,6 +59,12 @@ class TUIState:
 
 
 def main() -> None:
+    # Round 20: bail early with a friendly error if curses isn't
+    # installed (Windows + no ``windows-curses``). Without this,
+    # ``curses.wrapper`` would raise the underlying
+    # ``ModuleNotFoundError: No module named '_curses'`` from inside
+    # the curses package init, which is hard for users to act on.
+    _require_curses()
     curses.wrapper(lambda screen: asyncio.run(run_tui(screen)))
 
 
@@ -197,7 +238,12 @@ def wrap_text(text: str, width: int) -> list[str]:
 
 
 def _add_clipped(
-    screen, y: int, x: int, text: str, width: int, attr: int = curses.A_NORMAL
+    screen,
+    y: int,
+    x: int,
+    text: str,
+    width: int,
+    attr: int = 0,  # ``curses.A_NORMAL`` is 0; hard-coded so the module loads on hosts without the ``_curses`` extension
 ) -> None:
     if width <= 0:
         return

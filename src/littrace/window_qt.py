@@ -2944,6 +2944,18 @@ class BrowserPanel(QtWidgets.QFrame):
         takes over for sentinel.
 
         Idempotent — calling on an already-suspended panel is a no-op.
+
+        Round 20: ``deleteLater`` only schedules the view for deletion
+        on the next event-loop tick. Without ``processEvents()`` here
+        the view (and its Chromium cookie store) is still alive when
+        ``_auto_launch_chrome`` spawns the external chrome ~10 ms later,
+        and QtWebEngine's SQLite-backed cookie file is async — even
+        after ``processEvents`` returns the cookies may not have been
+        fsync'd yet. Sentinel then reads stale cookies and falls back
+        to "logged out" semantics, silently failing to fetch gated
+        PDFs the user just logged in to see. The brief sleep gives
+        Chromium enough wall-clock to flush before we hand the
+        profile to a different process.
         """
         if self._view is None:
             return
@@ -2958,6 +2970,13 @@ class BrowserPanel(QtWidgets.QFrame):
             pass
         self._view.deleteLater()
         self._view = None
+        # Run the deferred delete synchronously + give Chromium a
+        # moment to fsync the SQLite cookie store. 250 ms is empirical:
+        # shorter (e.g. 50 ms) misses occasional fsync races on
+        # Windows; longer doesn't measurably improve reliability.
+        QtWidgets.QApplication.processEvents()
+        import time
+        time.sleep(0.25)
 
     def resume_after_external_chrome(self) -> None:
         """Recreate the embedded ``QWebEngineView`` once the external
@@ -3052,8 +3071,26 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                         result.process.wait(timeout=5.0)
                     except Exception:
                         pass
-            except Exception:
-                pass
+                else:
+                    # Round 20: chrome failed to launch entirely. The
+                    # previous behaviour silently swallowed this so the
+                    # user only saw a cryptic "sentinel 退出 1" line
+                    # ~2 minutes later with no hint that chrome was the
+                    # root cause. Surface the launcher's own error
+                    # message (e.g. "Could not build a Chrome launch
+                    # command", or the SingletonLock conflict message
+                    # from ``chrome_profiles._explain_chrome_early_exit``)
+                    # so the user knows to fix Chrome / check config.
+                    msg = result.error or "external chrome 未启动（原因未知）"
+                    self._post_status(f"⚠️ publisher Chrome 启动失败：{msg}")
+            except Exception as exc:
+                # Round 20: ``launch_chrome_for_cdp`` itself raised
+                # (rather than returning a result with an error field).
+                # Still surface it instead of letting sentinel fail
+                # later with a non-actionable message.
+                self._post_status(
+                    f"⚠️ publisher Chrome 启动异常：{exc.__class__.__name__}: {exc}"
+                )
 
         threading.Thread(target=_worker, daemon=True, name="littrace-auto-chrome").start()
 
@@ -3100,6 +3137,34 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 pass
         self._external_chrome_proc = None
         self._browser_panel.resume_after_external_chrome()
+
+    def _on_stop_daily_clicked(self) -> None:
+        """Round 20: kill switch for the daily sentinel run. Sets the
+        cancel event so the worker's wait-loop notices and breaks out
+        of the current round (instead of waiting out
+        ``PER_ROUND_TIMEOUT``); also terminate()s the live subprocess
+        so the user doesn't see the next round start while the stop
+        button is "processing". The actual chrome teardown happens
+        in the worker's ``finally`` block — this method only flips
+        the flag and nudges the subprocess.
+        """
+        if not self._daily_cancel_event.is_set():
+            self._daily_cancel_event.set()
+            self._status_bar.showMessage("正在停止 daily 检索…", 0)
+            # Disable the button so a second click doesn't try to
+            # re-terminate an already-terminated process (harmless
+            # but produces a noisy traceback on Windows if the
+            # subprocess already exited).
+            self._daily_stop_btn.setEnabled(False)
+            proc = getattr(self, "_sentinel_proc", None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    # Process already gone — the worker's wait loop
+                    # will see ``returncode`` on the next poll and
+                    # exit cleanly on its own.
+                    pass
 
     # ---- Cross-thread bridge for "运行今日管线" status ----------------
 
@@ -3222,6 +3287,37 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._status_bar = QtWidgets.QStatusBar()
         self._status_bar.setObjectName("status")
         self.setStatusBar(self._status_bar)
+
+        # Round 20: persistent "停止 daily 检索" button in the status
+        # bar. Hidden by default; shown for the duration of a daily
+        # run so the user can interrupt a stuck/wrong-topic run
+        # without having to wait ``MAX_ROUNDS * PER_ROUND_TIMEOUT``
+        # for the worker to time out. The cancel button on the
+        # ``DailyConfigDialog`` itself only fires before the worker
+        # starts (the dialog closes on accept), so a separate
+        # mid-run kill switch is needed.
+        self._daily_stop_btn = QtWidgets.QToolButton()
+        self._daily_stop_btn.setText("⏹ 停止 daily 检索")
+        self._daily_stop_btn.setObjectName("daily_stop_btn")
+        self._daily_stop_btn.setToolTip(
+            "立刻终止正在跑的 sentinel 子进程与外部 chrome，"
+            "已经下载的文件保留在 workspace"
+        )
+        self._daily_stop_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self._daily_stop_btn.setVisible(False)
+        self._daily_stop_btn.clicked.connect(self._on_stop_daily_clicked)
+        self._status_bar.addPermanentWidget(self._daily_stop_btn)
+        # Round 20: cancellation primitives. ``_daily_cancel_event`` is
+        # set by the GUI thread when the user clicks the stop button;
+        # the worker thread checks it between rounds and breaks out
+        # early. ``_sentinel_proc`` is the live ``Popen`` handle so the
+        # GUI thread can ``terminate()`` the subprocess directly — the
+        # wait-with-timeout loop in the worker also polls the event so
+        # we don't have to wait out the full ``PER_ROUND_TIMEOUT`` on a
+        # cancel.
+        import threading
+        self._daily_cancel_event = threading.Event()
+        self._sentinel_proc: subprocess.Popen | None = None
 
         # Round 19: 60 s tick to keep the RAG staleness badge fresh.
         # Without this the user sees the badge flip from "fresh" to
@@ -3484,6 +3580,13 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             3000,
         )
         self._rag_panel.set_status(f"运行中…主题 {topic}")
+        # Round 20: reset the cancellation primitive so a previous run's
+        # leftover "cancelled" flag doesn't immediately abort this run,
+        # then show the stop button so the user knows they have a kill
+        # switch for this run.
+        self._daily_cancel_event.clear()
+        self._daily_stop_btn.setEnabled(True)
+        self._daily_stop_btn.setVisible(True)
         # Round 18: take the BrowserPanel offline and bring up the
         # external chrome so sentinel can drive it via CDP. Both
         # processes must NOT be alive simultaneously (SingletonLock on
@@ -3546,17 +3649,84 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                         "--year-max", str(year_max),
                         "--target-papers", str(min_papers),
                     )
+                    # Round 20: Popen instead of subprocess.run so the
+                    # GUI thread can ``terminate()`` the subprocess when
+                    # the user clicks the stop button. The wait loop
+                    # polls the cancellation event every second so we
+                    # don't sit on the full ``PER_ROUND_TIMEOUT`` after
+                    # a cancel. ``self._sentinel_proc`` is read by the
+                    # GUI thread (only ``.poll()`` + ``.terminate()``)
+                    # — both calls are documented thread-safe on
+                    # ``Popen``, no lock required.
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        cwd=cwd,
+                        env=env,
+                    )
+                    self._sentinel_proc = proc
                     try:
-                        completed = subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            text=True,
-                            timeout=PER_ROUND_TIMEOUT,
-                            cwd=cwd,
-                            env=env,
-                        )
+                        completed: subprocess.CompletedProcess | None = None
+                        deadline = time.monotonic() + PER_ROUND_TIMEOUT
+                        while True:
+                            # ``Popen.wait(timeout=...)`` returns None
+                            # while alive and raises ``TimeoutExpired``
+                            # on timeout — we want neither; we want a
+                            # loop that also bails on the cancel event.
+                            try:
+                                rc = proc.wait(timeout=1.0)
+                            except subprocess.TimeoutExpired:
+                                rc = None
+                            if rc is not None:
+                                stdout = proc.stdout.read() if proc.stdout else ""
+                                stderr = proc.stderr.read() if proc.stderr else ""
+                                completed = subprocess.CompletedProcess(
+                                    args=cmd,
+                                    returncode=rc,
+                                    stdout=stdout,
+                                    stderr=stderr,
+                                )
+                                break
+                            if self._daily_cancel_event.is_set():
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=5.0)
+                                except subprocess.TimeoutExpired:
+                                    proc.kill()
+                                stdout = proc.stdout.read() if proc.stdout else ""
+                                stderr = proc.stderr.read() if proc.stderr else ""
+                                completed = subprocess.CompletedProcess(
+                                    args=cmd,
+                                    returncode=-1,
+                                    stdout=stdout,
+                                    stderr=stderr or "(user cancelled)",
+                                )
+                                break
+                            if time.monotonic() > deadline:
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=5.0)
+                                except subprocess.TimeoutExpired:
+                                    proc.kill()
+                                stdout = proc.stdout.read() if proc.stdout else ""
+                                stderr = proc.stderr.read() if proc.stderr else ""
+                                completed = subprocess.CompletedProcess(
+                                    args=cmd,
+                                    returncode=-1,
+                                    stdout=stdout,
+                                    stderr=stderr or "(round timeout)",
+                                )
+                                break
                     finally:
+                        self._sentinel_proc = None
                         progress_state["stop"] = True
+                    if self._daily_cancel_event.is_set():
+                        # User cancelled — break out of the round loop
+                        # entirely instead of trying the next round.
+                        self._post_status(f"已在第 {round_idx} 轮后停止 daily 检索")
+                        break
                     if completed is None:
                         continue
                     if completed.returncode != 0:
@@ -3657,6 +3827,17 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 # crashed sentinel run leaves the BrowserPanel blank
                 # and the user has to restart ``littrace-qt``.
                 self._release_external_chrome_for_sentinel()
+                # Round 20: hide the stop button once the run is done
+                # (whether it finished, errored out, or was cancelled).
+                # The button would otherwise stick around on the status
+                # bar after every daily run and confuse the user.
+                self._daily_stop_btn.setVisible(False)
+                # Defensive: if the worker exits with the subprocess
+                # handle still on the window (shouldn't happen — the
+                # ``finally`` above clears it — but worth guarding
+                # against a programmer error that would leak the
+                # Popen handle).
+                self._sentinel_proc = None
 
         threading.Thread(target=_worker, daemon=True, name="littrace-daily").start()
 

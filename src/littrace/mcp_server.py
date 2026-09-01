@@ -34,9 +34,44 @@ import secrets
 import sys
 from pathlib import Path
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import CallToolResult, TextContent, Tool
+# Round 20: ``mcp`` is an *optional* dependency (``pip install -e '.[mcp]'``)
+# but historically these imports sat at module top. Anyone importing
+# ``littrace`` (e.g. ``littrace.codex_runtime.service`` reaches into
+# ``littrace.mcp_server`` for ``_token_path``) would crash at import
+# time on a machine without the ``mcp`` package installed — even when
+# they only wanted the chat / sentinel paths. We now load the MCP SDK
+# lazily and surface a clear ``MCP_NOT_AVAILABLE`` sentinel so callers
+# can degrade gracefully (e.g. chat still works, just without MCP
+# tool routing).
+try:
+    from mcp.server import Server  # type: ignore[import-not-found]
+    from mcp.server.stdio import stdio_server  # type: ignore[import-not-found]
+    from mcp.types import CallToolResult, TextContent, Tool  # type: ignore[import-not-found]
+    _MCP_IMPORT_ERROR: Exception | None = None
+except ImportError as exc:  # pragma: no cover — exercised on no-mcp installs
+    Server = None  # type: ignore[assignment,misc]
+    stdio_server = None  # type: ignore[assignment]
+    CallToolResult = None  # type: ignore[assignment,misc]
+    TextContent = None  # type: ignore[assignment,misc]
+    Tool = None  # type: ignore[assignment,misc]
+    _MCP_IMPORT_ERROR = exc
+
+
+def require_mcp_sdk() -> None:
+    """Raise a friendly error if the optional ``mcp`` extra isn't installed.
+
+    Callers that genuinely need the MCP runtime (i.e. ``littrace-mcp`` CLI,
+    codex-runtime MCP bridge) invoke this at entry; everything else can
+    import this module to read ``_token_path`` / config without paying
+    the cost of pulling in the MCP SDK.
+    """
+    if _MCP_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "LitTrace MCP server requires the optional 'mcp' extra: "
+            "pip install -e '.[mcp]'. (Original error: "
+            f"{_MCP_IMPORT_ERROR.__class__.__name__}: {_MCP_IMPORT_ERROR})"
+        ) from _MCP_IMPORT_ERROR
+
 
 from littrace.codex_runtime.gateway import LitTraceToolGateway, app_server_tool_specs
 from littrace.config import LitTraceConfig, load_config
@@ -52,7 +87,45 @@ from littrace.skill_runner import (
 
 logger = get_logger("mcp_server")
 
-app = Server("littrace")
+
+class _NoOpApp:
+    """Round 20: stand-in for ``mcp.server.Server`` used when the
+    optional ``mcp`` extra isn't installed. Every decorator and method
+    here is a no-op so ``@app.list_tools()`` / ``@app.call_tool()`` keep
+    working as syntactic sugar (and the tool handler functions still get
+    defined), but ``main()`` refuses to actually run the loop and raises
+    ``RuntimeError`` via ``require_mcp_sdk()``.
+
+    Without this, a no-mcp install would either crash at the
+    ``app = Server("littrace")`` line (the old behaviour) or crash at
+    the ``@app.list_tools()`` decorator (which would be ``None.list_tools``)
+    — either way making ``import littrace`` itself blow up for users
+    who only want the chat path.
+    """
+
+    def list_tools(self):
+        return lambda fn: fn
+
+    def call_tool(self):
+        return lambda fn: fn
+
+    def run(self, *args, **kwargs):
+        raise NotImplementedError("MCP SDK unavailable; install the 'mcp' extra")
+
+    def create_initialization_options(self):
+        raise NotImplementedError("MCP SDK unavailable; install the 'mcp' extra")
+
+
+if _MCP_IMPORT_ERROR is None:
+    app = Server("littrace")
+else:
+    # The module is being imported on a host without the ``mcp`` extra.
+    # Substituting a no-op lets the rest of the file (decorators,
+    # ``_token_path``, config) load cleanly so other parts of LitTrace
+    # that just want the token path don't pull the MCP SDK transitively.
+    app = _NoOpApp()
+
+
 APP_SERVER_GATEWAY = os.environ.get("LITTRACE_MCP_GATEWAY", "").strip() == "1"
 
 # Round 13 step 3: lazy, process-wide gateway singleton so the
@@ -640,6 +713,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
 
 async def main():
     """Run the MCP server over stdio."""
+    # Round 20: bail early with a clear message if the optional
+    # ``mcp`` extra isn't installed. Without this check the
+    # ``_NoOpApp`` stub would raise an obscure ``NotImplementedError``
+    # inside ``app.run``; this is more discoverable for the operator.
+    require_mcp_sdk()
     logger.info("mcp_server_starting")
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
