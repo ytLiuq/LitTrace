@@ -4,6 +4,7 @@ import hashlib
 import asyncio
 import math
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
@@ -181,6 +182,8 @@ class LiveSearchClient:
                 }
                 if self.config.api.enable_europe_pmc:
                     sources[f"europe_pmc_variant_{index}"] = self._search_europe_pmc(client, variant_request)
+                if self.config.api.enable_arxiv:
+                    sources[f"arxiv_variant_{index}"] = self._search_arxiv(client, variant_request)
                 if self.config.api.core_api_key:
                     sources[f"core_variant_{index}"] = self._search_core(client, variant_request)
                 source_results = await asyncio.wait_for(
@@ -285,29 +288,128 @@ class LiveSearchClient:
             if not results:
                 break
             for item in results:
-                title = item.get("title")
-                if not title:
+                try:
+                    title = item.get("title")
+                    if not title:
+                        continue
+                    doi = _normalize_doi(item.get("doi"))
+                    full_text_payload = item.get("fullTextUrlList") or {}
+                    full_text = (
+                        full_text_payload.get("fullTextUrl", [])
+                        if isinstance(full_text_payload, dict)
+                        else []
+                    )
+                    if not isinstance(full_text, list):
+                        full_text = []
+                    pdf_url = next(
+                        (
+                            entry.get("url")
+                            for entry in full_text
+                            if isinstance(entry, dict)
+                            and entry.get("documentStyle") == "pdf"
+                        ),
+                        None,
+                    )
+                    raw_id = item.get("id") or item.get("pmid")
+                    source_urls = []
+                    if raw_id:
+                        raw_id_text = str(raw_id)
+                        source_urls = [
+                            raw_id_text
+                            if raw_id_text.startswith(("http://", "https://"))
+                            else f"https://europepmc.org/article/MED/{raw_id_text}"
+                        ]
+                    author_string = item.get("authorString")
+                    papers.append(PaperMetadata(
+                        paper_id=_paper_id(doi, str(title)), title=str(title),
+                        authors=[author_string] if isinstance(author_string, str) else [],
+                        year=_safe_year(item.get("pubYear")), journal=item.get("journalTitle"),
+                        publisher="Europe PMC", doi=doi, abstract=item.get("abstractText"),
+                        source_urls=source_urls, pdf_url=pdf_url,
+                        access_type=AccessType.OPEN_ACCESS if pdf_url else AccessType.UNAVAILABLE,
+                    ))
+                except Exception as exc:  # noqa: BLE001 - isolate malformed source records
+                    self.diagnostics.errors.append(
+                        f"europe_pmc_record: {exc.__class__.__name__}: {exc}"
+                    )
                     continue
-                doi = _normalize_doi(item.get("doi"))
-                full_text = item.get("fullTextUrlList", {}).get("fullTextUrl", [])
-                pdf_url = next(
-                    (entry.get("url") for entry in full_text if entry.get("documentStyle") == "pdf"),
-                    None,
-                )
-                papers.append(PaperMetadata(
-                    paper_id=_paper_id(doi, title), title=title,
-                    authors=[item.get("authorString")] if item.get("authorString") else [],
-                    year=_safe_year(item.get("pubYear")), journal=item.get("journalTitle"),
-                    publisher="Europe PMC", doi=doi, abstract=item.get("abstractText"),
-                    source_urls=[item.get("id")] if item.get("id") else [], pdf_url=pdf_url,
-                    access_type=AccessType.OPEN_ACCESS if pdf_url else AccessType.UNAVAILABLE,
-                ))
             self._progress(
                 stage="search_source_page", status="finished", source="europe_pmc",
                 page=max(1, (len(papers) + min(100, target) - 1) // min(100, target)),
                 count=len(results), total=len(papers),
             )
             cursor = payload.get("nextCursorMark")
+        return papers[:target]
+
+    async def _search_arxiv(
+        self, client: httpx.AsyncClient, request: PaperSearchRequest
+    ) -> list[PaperMetadata]:
+        """Search arXiv's Atom API and normalize records into PaperMetadata.
+
+        arXiv does not expose DOI for most preprints, so the stable arXiv
+        identifier is used as the paper id and source URL.  Parsing is kept
+        defensive: malformed entries are skipped individually so one record
+        cannot make the whole source unavailable.
+        """
+        target = min(max(request.limit, 25), 200)
+        response = await _get_with_retries(
+            client,
+            "https://export.arxiv.org/api/query",
+            params={
+                "search_query": _arxiv_search_query(request.topic),
+                "start": 0,
+                "max_results": target,
+                "sortBy": "submittedDate" if request.wants_recent else "relevance",
+                "sortOrder": "descending",
+            },
+            source="arxiv",
+            diagnostics=self.diagnostics,
+        )
+        try:
+            root = ET.fromstring(response.text)
+        except ET.ParseError as exc:
+            raise ValueError(f"arXiv Atom parse failed: {exc}") from exc
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        papers: list[PaperMetadata] = []
+        for entry in root.findall("atom:entry", ns):
+            try:
+                title = " ".join((entry.findtext("atom:title", default="", namespaces=ns)).split())
+                entry_id = (entry.findtext("atom:id", default="", namespaces=ns)).strip()
+                if not title or not entry_id:
+                    continue
+                arxiv_id = entry_id.rstrip("/").rsplit("/", 1)[-1]
+                pdf_url = None
+                for link in entry.findall("atom:link", ns):
+                    if link.attrib.get("title") == "pdf":
+                        pdf_url = link.attrib.get("href")
+                        break
+                if not pdf_url:
+                    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+                published = entry.findtext("atom:published", default="", namespaces=ns)
+                authors = [
+                    " ".join((author.findtext("atom:name", default="", namespaces=ns)).split())
+                    for author in entry.findall("atom:author", ns)
+                ]
+                papers.append(PaperMetadata(
+                    paper_id=f"arxiv:{arxiv_id}",
+                    title=title,
+                    authors=[author for author in authors if author],
+                    year=_safe_year(published),
+                    journal="arXiv",
+                    publisher="arXiv",
+                    abstract=" ".join((entry.findtext("atom:summary", default="", namespaces=ns)).split()) or None,
+                    source_urls=[entry_id],
+                    pdf_url=pdf_url,
+                    access_type=AccessType.OPEN_ACCESS,
+                ))
+            except Exception as exc:  # noqa: BLE001
+                self.diagnostics.errors.append(
+                    f"arxiv_record: {exc.__class__.__name__}: {exc}"
+                )
+        self._progress(
+            stage="search_source_page", status="finished", source="arxiv",
+            page=1, count=len(papers), total=len(papers),
+        )
         return papers[:target]
 
     async def _search_core(
@@ -355,13 +457,13 @@ class LiveSearchClient:
         if request.year_min is not None:
             filters.append(f"from_publication_date:{request.year_min}-01-01")
         # Round 17: surface the user-selected "至" year as an
-        # OpenAlex ``until_publication_date`` filter so the upstream
+        # OpenAlex ``to_publication_date`` filter so the upstream
         # API doesn't return papers newer than the user asked for.
         # Without this, the year range was half-applied (lower
         # bound only) and the watchlist's "year upper bound" was a
         # silent no-op.
         if request.year_max is not None:
-            filters.append(f"until_publication_date:{request.year_max}-12-31")
+            filters.append(f"to_publication_date:{request.year_max}-12-31")
         if filters:
             params["filter"] = ",".join(filters)
         if self.config.api.openalex_api_key:
@@ -667,6 +769,23 @@ def _safe_year(value: object) -> int | None:
     except (TypeError, ValueError):
         return None
     return year if 1000 <= year <= 3000 else None
+
+
+def _arxiv_search_query(topic: str) -> str:
+    """Build an arXiv query that requires every meaningful topic term.
+
+    Passing ``all:<topic>`` to arXiv treats the whitespace-separated terms as
+    a broad expression and can return unrelated newest submissions.  The API
+    supports boolean ``AND`` between field clauses, which gives the live
+    source useful precision while preserving a single-term/CJK query.
+    """
+    terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*|[\u4e00-\u9fff]+", topic or "")
+    terms = list(dict.fromkeys(term for term in terms if term.strip()))
+    if not terms:
+        return f"all:{topic.strip()}"
+    if len(terms) == 1:
+        return f"all:{terms[0]}"
+    return " AND ".join(f"all:{term}" for term in terms[:8])
 
 
 async def _crossref_items(client: httpx.AsyncClient, params: dict[str, str | int]) -> list[dict]:

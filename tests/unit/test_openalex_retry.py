@@ -76,6 +76,59 @@ def test_bare_topic_does_not_inject_material_or_mechanism_variants() -> None:
     assert variants == ["碳基PDMS柔性薄膜传感器长时间受压漂移"]
 
 
+@pytest.mark.anyio
+async def test_openalex_uses_supported_upper_date_filter() -> None:
+    requested_urls: list[httpx.URL] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(request.url)
+        return httpx.Response(200, json={"results": []})
+
+    client = LiveSearchClient(LitTraceConfig())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        await client._search_openalex(
+            http_client,
+            PaperSearchRequest(topic="MXene sensor", year_min=2023, year_max=2026),
+        )
+
+    query = str(requested_urls[0])
+    assert "to_publication_date%3A2026-12-31" in query
+    assert "until_publication_date" not in query
+
+
+@pytest.mark.anyio
+async def test_europe_pmc_skips_malformed_record_and_keeps_valid_records() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "resultList": {
+                    "result": [
+                        ["malformed"],
+                        {
+                            "title": "Valid pressure sensor paper",
+                            "id": "123",
+                            "authorString": {"unexpected": "object"},
+                            "fullTextUrlList": {"fullTextUrl": "not-a-list"},
+                        },
+                    ]
+                },
+                "nextCursorMark": None,
+            },
+        )
+
+    client = LiveSearchClient(LitTraceConfig())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        papers = await client._search_europe_pmc(
+            http_client,
+            PaperSearchRequest(topic="pressure sensor", limit=2),
+        )
+
+    assert len(papers) == 1
+    assert papers[0].title == "Valid pressure sensor paper"
+    assert any("europe_pmc_record" in error for error in client.diagnostics.errors)
+
+
 def test_live_search_continues_past_minimum_to_return_extra_results() -> None:
     request = PaperSearchRequest(
         topic="carbon PDMS pressure sensor", limit=40, min_relevant_results=5

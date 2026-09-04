@@ -60,6 +60,11 @@
           "title": "Enable Europe Pmc",
           "type": "boolean"
         },
+        "enable_arxiv": {
+          "default": true,
+          "title": "Enable Arxiv",
+          "type": "boolean"
+        },
         "request_timeout_seconds": {
           "default": 20.0,
           "title": "Request Timeout Seconds",

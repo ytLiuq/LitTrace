@@ -66,6 +66,7 @@ api:
   crossref_mailto: "your-email@example.com"
   request_timeout_seconds: 20
   enable_live_search: true
+  enable_arxiv: true
 
 cdp_downloader:
   cdp_url: "http://127.0.0.1:19222"

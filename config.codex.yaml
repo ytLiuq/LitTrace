@@ -1,0 +1,111 @@
+# Codex-first profile.
+# Secrets and provider URLs are loaded from .env.local via DEEPSEEK_* and
+# LITTRACE_RAG_* variables; this file is safe to keep without credentials.
+
+storage:
+  paper_library_dir: "./data/papers"
+  metadata_dir: "./data/metadata"
+  cache_dir: "./data/cache"
+  sessions_dir: "./sessions"
+
+artifact_storage:
+  backend: "local"
+  local_root: "./data/artifacts"
+
+metadata_store:
+  backend: "postgres"
+  postgres_dsn: "postgresql://littrace:littrace@localhost:5433/littrace"
+  schema_name: "littrace"
+
+api:
+  user_agent: "LitTrace/0.1 mailto:ytliu011@sjtu.edu.cn"
+  request_timeout_seconds: 60
+  enable_live_search: true
+  enable_europe_pmc: true
+  enable_arxiv: true
+
+rag:
+  enabled: true
+  backend: "pgvector"
+  postgres_dsn: "postgresql://littrace:littrace@localhost:5433/littrace"
+  schema_name: "littrace_rag"
+  collection_prefix: "littrace"
+  embedding_provider: "openai-compatible"
+  embedding_model: "text-embedding-v3"
+  embedding_dimension: 1024
+  auto_refresh_enabled: true
+  auto_download_open_access: true
+
+browser:
+  browser_act_path: "browser-act"
+  required: true
+  default_browser_name: "littrace-publisher-direct"
+  default_browser_type: "chrome-direct"
+  confirm_before_use: true
+
+cdp_downloader:
+  cdp_url: "http://127.0.0.1:19222"
+  chrome_user_data_dir: "./data/chrome-cdp"
+  chrome_profile_name: "Default"
+  auto_launch_chrome: true
+  headless: false
+  remote_debugging_port: 19222
+  cloudflare_wait_seconds: 60
+  user_action_wait_seconds: 300
+  command_timeout_seconds: 60
+  repository_download_timeout_seconds: 120
+
+paper_download:
+  mode: "download_all_allowed"
+  allow_requires_login_download: true
+  organize_by: "year_doi"
+  max_concurrent_downloads: 3
+
+parsing:
+  default_parser: "docling"
+  parse_strategy: "auto"
+  docling_workers: 2
+  preferred_engines:
+    - "docling"
+    - "paddleocr"
+    - "marker"
+    - "grobid"
+
+literature_context:
+  visible_to_user: true
+  default_year_min: 2023
+  default_recent_year_min: 2023
+  preferred_disciplines:
+    - "materials science"
+    - "chemistry"
+  preferred_publishers:
+    - "Wiley"
+    - "American Chemical Society"
+    - "Springer Nature"
+    - "Royal Society of Chemistry"
+    - "Elsevier"
+    - "MDPI"
+    - "Nature Portfolio"
+
+llm:
+  provider: "deepseek"
+  enabled: true
+  intent_parser_enabled: true
+  temperature: 0.2
+
+agent_runtime:
+  mode: "codex_app_server"
+  codex_command:
+    - "/Applications/ChatGPT.app/Contents/Resources/codex"
+    - "app-server"
+  codex_home: "./data/codex-home"
+  codex_home_mode: "shared"
+  fallback_to_legacy: true
+  startup_timeout_seconds: 30
+  request_timeout_seconds: 60
+  turn_timeout_seconds: 300
+  sandbox_policy: "read-only"
+  rollout_enabled: true
+  codex_config_overrides:
+    model_provider: '"openai"'
+  mcp_server_name: "littrace"

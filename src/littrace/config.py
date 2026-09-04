@@ -184,6 +184,10 @@ class APIConfig(BaseModel):
     crossref_mailto: str | None = None
     core_api_key: str | None = None
     enable_europe_pmc: bool = True
+    # Query the arXiv Atom API as an additional live source.  Keeping this
+    # configurable lets offline/minimal deployments disable the source
+    # without changing the search pipeline.
+    enable_arxiv: bool = True
     request_timeout_seconds: float = 20.0
     enable_live_search: bool = False
 
@@ -588,11 +592,27 @@ def _reanchor_relative_paths(
             "codex_home": _reanchor(runtime.codex_home, base_dir),
         }
     )
+    cdp = config.cdp_downloader
+    new_cdp = cdp.model_copy(
+        update={
+            "chrome_user_data_dir": (
+                _reanchor(cdp.chrome_user_data_dir, base_dir)
+                if cdp.chrome_user_data_dir is not None
+                else None
+            ),
+            "default_output_dir": (
+                _reanchor(cdp.default_output_dir, base_dir)
+                if cdp.default_output_dir is not None
+                else None
+            ),
+        }
+    )
     return config.model_copy(
         update={
             "storage": new_storage,
             "artifact_storage": new_artifact,
             "agent_runtime": new_runtime,
+            "cdp_downloader": new_cdp,
         }
     )
 
