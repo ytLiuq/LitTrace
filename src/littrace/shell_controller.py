@@ -136,6 +136,8 @@ class ShellController:
     # ``EVENT_THINKING`` fires with ``active=False`` or when the
     # controller's chat turn coroutine exits.
     EVENT_THINKING_PROGRESS = "thinking_progress"
+    # Fine-grained topic-pipeline updates consumed by the Qt Trace panel.
+    EVENT_TRACE_PROGRESS = "trace_progress"
     THINKING_PROGRESS_INTERVAL = 1.5
     # Round 19: emit when a local slash command (e.g. /papers, /workflow)
     # produces a result. The GUI chat panel renders these as a
@@ -695,6 +697,138 @@ class ShellController:
 
     def refresh_context(self) -> None:
         self._emit(self.EVENT_WORKSPACE_REFRESHED)
+
+    def reload_workspace_if_newer(self) -> bool:
+        """Reload the session workspace when another worker committed it."""
+        from littrace.state_db import state_store_from_config
+
+        try:
+            record = state_store_from_config(self._config).get_session_state(
+                self._session.session_id
+            )
+            remote_revision = int(getattr(record, "revision", -1)) if record else -1
+            local_revision = int(self._workspace.context.filters.workspace_revision)
+            if remote_revision <= local_revision:
+                return False
+            latest = load_workspace(self._session)
+        except Exception:
+            return False
+        latest_revision = int(latest.context.filters.workspace_revision)
+        with self._lock:
+            if latest_revision <= int(self._workspace.context.filters.workspace_revision):
+                return False
+            self._workspace = latest
+        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        self._emit(self.EVENT_RAG_PANEL_REFRESHED)
+        return True
+
+    def search_topic(
+        self,
+        topic: str,
+        *,
+        keywords: str = "",
+        year_min: int | None = None,
+        year_max: int | None = None,
+        requested_rag_ready: int = 10,
+    ) -> None:
+        """Start the user-facing topic-to-RAG pipeline."""
+        topic = " ".join((topic or "").split())
+        keywords = " ".join((keywords or "").split())
+        if not topic:
+            self._emit(
+                self.EVENT_ERROR,
+                message="研究主题不能为空",
+                error_code="invalid_input",
+            )
+            return
+        query = " ".join(part for part in (topic, keywords) if part)
+        self._emit(self.EVENT_STATUS_CHANGED, text="正在检索相关文献…")
+        self._emit(self.EVENT_THINKING, active=True, label="检索、下载并构建 RAG…")
+        if self._loop is None:
+            self._emit(self.EVENT_ERROR, message="controller event loop not ready")
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._run_topic_search(
+                query,
+                canonical_topic=topic,
+                keywords=keywords,
+                year_min=year_min,
+                year_max=year_max,
+                requested_rag_ready=max(1, int(requested_rag_ready)),
+            ),
+            self._loop,
+        )
+
+    async def _run_topic_search(
+        self,
+        query: str,
+        *,
+        canonical_topic: str,
+        keywords: str,
+        year_min: int | None,
+        year_max: int | None,
+        requested_rag_ready: int,
+    ) -> None:
+        from littrace.models import PaperSearchRequest
+        from littrace.topic_search import run_topic_search
+
+        def on_progress(payload: dict[str, object]) -> None:
+            self._emit(self.EVENT_TRACE_PROGRESS, **payload)
+
+        request = PaperSearchRequest(
+            topic=query,
+            year_min=year_min,
+            year_max=year_max,
+            # Over-fetch candidates because the target is defined on the
+            # final RAG-ready set, after download/parse/embedding failures.
+            limit=max(requested_rag_ready * 5, 50),
+            live=self._config.api.enable_live_search,
+        )
+        try:
+            result = await run_topic_search(
+                self._config,
+                self._session,
+                request,
+                requested_rag_ready=requested_rag_ready,
+                canonical_topic=canonical_topic,
+                keywords=keywords,
+                progress_callback=on_progress,
+            )
+        except Exception as exc:
+            self._emit(
+                self.EVENT_ERROR,
+                error_code="topic_search_failed",
+                message=f"主题检索失败：{exc}",
+                raw=f"{exc.__class__.__name__}: {exc}",
+            )
+            self._emit(self.EVENT_THINKING, active=False)
+            self._emit(self.EVENT_STATUS_CHANGED, text="检索失败")
+            return
+        with self._lock:
+            self._workspace = result.workspace
+        status = result.workspace.context.filters.paper_pipeline_status
+        reply = "\n".join([
+            f"### 研究主题检索完成：{query}",
+            f"- 检索候选：**{result.candidate_count} 篇**",
+            f"- 已进入对象存储：**{result.downloaded_count} 篇**",
+            f"- 已解析：**{result.parsed_count} 篇**",
+            f"- RAG ready：**{result.rag_ready_count} 篇** / 目标 {requested_rag_ready} 篇",
+            f"- 需要登录：{result.requires_login_count} 篇；下载失败：{result.failed_download_count} 篇",
+        ])
+        if status:
+            reply += "\n\n#### 文献状态\n" + "\n".join(
+                f"- {paper_id}：{state}" for paper_id, state in status.items()
+            )
+        if result.warnings:
+            reply += "\n\n> " + "\n> ".join(result.warnings[:8])
+        self._emit(self.EVENT_MESSAGE_APPENDED, role="assistant", text=reply)
+        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+        self._emit(self.EVENT_RAG_PANEL_REFRESHED)
+        self._emit(self.EVENT_THINKING, active=False)
+        self._emit(
+            self.EVENT_STATUS_CHANGED,
+            text=("检索完成" if result.status == "completed" else f"检索结束：{result.status}"),
+        )
 
     def refresh_ocr_buttons(self) -> None:
         self._emit(self.EVENT_OCR_BUTTONS_REFRESHED)

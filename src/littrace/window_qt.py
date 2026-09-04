@@ -19,8 +19,10 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import json
+import html
 import sys
 import threading
 import time
@@ -128,6 +130,77 @@ def _summary_value(summary: str, key: str) -> int | None:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _single_line(value: object, fallback: str = "-") -> str:
+    """Collapse user/API text before placing it in a Markdown summary."""
+    text = " ".join(str(value or "").split())
+    return text or fallback
+
+
+def _find_available_loopback_port(start: int, attempts: int = 50) -> int:
+    """Return the first bindable loopback port at or above ``start``."""
+    for port in range(max(1, start), min(65535, start + attempts)):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError(f"No free loopback port found near {start}")
+
+
+def _format_daily_preview_markdown(payload: dict[str, object]) -> str:
+    """Build the daily result as Markdown for the chat renderer.
+
+    The chat panel accepts Markdown-like plain text and escapes raw HTML.  The
+    old daily path passed an HTML fragment into that API, so tags such as
+    ``<br>`` and ``&nbsp;`` were displayed literally.  Keeping this formatter
+    text-only also makes the same result readable in copied chat transcripts.
+    """
+    topic = _single_line(payload.get("topic"))
+    keywords = _single_line(payload.get("keywords"), "")
+    year_min = int(payload.get("year_min") or 0)
+    year_max = int(payload.get("year_max") or 0)
+    target_papers = int(payload.get("target_papers") or 0)
+    rounds_done = int(payload.get("rounds_done") or 0)
+    downloaded = int(payload.get("cumulative_downloaded") or 0)
+    candidates = int(payload.get("cumulative_candidates") or 0)
+    new_candidates = int(payload.get("new_candidates") or 0)
+    seen_candidates = int(payload.get("seen_candidates") or 0)
+    warnings = [_single_line(item, "") for item in payload.get("warnings") or []]
+    errors = [_single_line(item, "") for item in payload.get("errors") or []]
+    summary_lines = [
+        _single_line(item, "") for item in payload.get("summary_lines") or []
+    ]
+
+    lines = [
+        "### 研究主题检索失败" if errors and rounds_done == 0 else "### 研究主题检索完成",
+        f"- 研究主题：**{topic}**",
+        f"- 年份范围：{year_min}-{year_max}",
+        f"- 执行轮次：{rounds_done}",
+        f"- 检索文献：**{candidates} 篇**（新增 {new_candidates}，已存在 {seen_candidates}）",
+        f"- 下载文献：**{downloaded} 篇**（目标 {target_papers} 篇）",
+    ]
+    if keywords:
+        lines.insert(2, f"- 检索词：{keywords}")
+    if summary_lines:
+        lines.extend(["", "#### 每轮明细"])
+        lines.extend(f"- {line}" for line in summary_lines if line)
+    if downloaded < target_papers and target_papers > 0:
+        lines.extend([
+            "",
+            f"> 下载数量少于目标：已下载 {downloaded} 篇，目标 {target_papers} 篇。",
+        ])
+    if candidates < 5:
+        lines.extend(["", f"> 本次仅检索到 {candidates} 篇候选文献。"])
+    for warning in warnings:
+        if warning:
+            lines.append(f"> {warning}")
+    for error in errors:
+        if error:
+            lines.append(f"> 错误：{error}")
+    return "\n".join(lines)
 
 
 # Map the structured ``reason`` strings the controller emits on
@@ -380,7 +453,7 @@ def _littrace_cmd(*args: str) -> tuple[list[str], dict[str, str], str]:
     Hard-coding ``["littrace", ...]`` broke when the shell was launched
     via PyInstaller/py2app or any environment where the ``$PATH`` did
     not include the venv bin directory: ``subprocess.run`` raised
-    ``FileNotFoundError`` and the user clicked "运行今日管线" only to
+    ``FileNotFoundError`` and the user clicked "搜索研究主题" only to
     see the status bar silently stay on "运行中…" forever. A second,
     subtler bug surfaced once that was fixed: ``python -m littrace.cli``
     resolves ``config.yaml`` relative to the *child's* cwd (not the
@@ -399,7 +472,10 @@ def _littrace_cmd(*args: str) -> tuple[list[str], dict[str, str], str]:
     else:
         cmd = [sys.executable, "-m", "littrace.cli", *args]
     env = {
-        "LITTRACE_CONFIG": str(project_root / "config.yaml"),
+        "LITTRACE_CONFIG": os.environ.get(
+            "LITTRACE_CONFIG",
+            str(project_root / "config.yaml"),
+        ),
         "PYTHONPATH": str(project_root / "src"),
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
@@ -570,7 +646,7 @@ COMMAND_CATALOG: list[tuple[str, str, bool, str]] = [
     ("storyline-report", "导出 storyline 报告", True, "解析"),
     ("storyline-review", "Reviewer 审阅 storyline", True, "解析"),
     # Group: 工具
-    ("dashboard", "打开 RAG / Daily 仪表盘", True, "工具"),
+    ("dashboard", "打开 RAG 状态面板", True, "工具"),
     ("quality", "运行质量门", True, "工具"),
     ("agents", "列出可用 agents", False, "工具"),
     ("workflow", "显示当前 workflow trace", True, "工具"),
@@ -635,6 +711,7 @@ class TracePanel(QtWidgets.QFrame):
         self._view.setObjectName("trace_view")
         self._view.setOpenExternalLinks(False)
         self._workflow_body.layout().addWidget(self._view)
+        self._trace_lines: list[str] = []
 
         # Section 2: session history.
         self._sessions_toggle, self._sessions_body = self._build_collapsible(
@@ -719,8 +796,53 @@ class TracePanel(QtWidgets.QFrame):
         return toggle, body
 
     def render_workflow_trace(self, trace_steps: Iterable[str]) -> None:
-        body = "<br>".join(f"• {step}" for step in trace_steps) or "(等待任务…)"
+        self._trace_lines = [str(step) for step in trace_steps]
+        self._render_trace()
+
+    def render_trace_progress(self, payload: dict[str, object]) -> None:
+        """Append a concise, human-readable live pipeline update."""
+        stage = str(payload.get("stage", ""))
+        labels = {
+            "search_started": "开始检索",
+            "search_variant_started": "检索查询变体",
+            "search_source_finished": "检索源完成",
+            "search_source_page": "检索源分页完成",
+            "candidate_expansion": "候选池扩展",
+            "search_finished": "检索完成",
+            "download_finished": "下载阶段完成",
+            "download_retry_finished": "下载重试完成",
+            "parse_finished": "解析阶段完成",
+            "parse_retry_finished": "解析重试完成",
+            "rag_finished": "RAG 入库完成",
+            "rag_retry_finished": "RAG 重试完成",
+            "status_message": "运行状态",
+        }
+        label = labels.get(stage, stage or "运行中")
+        if stage == "status_message" and payload.get("message"):
+            label = str(payload["message"])
+        source = str(payload.get("source", ""))
+        count = payload.get("count")
+        details: list[str] = []
+        if source:
+            details.append(source)
+        if count is not None:
+            details.append(f"{count} 篇")
+        for key, name in (("downloaded", "下载"), ("parsed", "解析"), ("ready", "RAG"), ("failed", "失败"), ("requires_login", "待登录")):
+            if key in payload:
+                details.append(f"{name} {payload[key]}")
+        if payload.get("query"):
+            details.append(f"查询：{payload['query']}")
+        line = label + (" · " + " · ".join(details) if details else "")
+        self._trace_lines.append(line)
+        self._trace_lines = self._trace_lines[-80:]
+        self._render_trace()
+
+    def _render_trace(self) -> None:
+        body = "<br>".join(
+            f"• {html.escape(line)}" for line in self._trace_lines
+        ) or "(等待任务…)"
         self._view.setHtml(f"<div>{body}</div>")
+        self._view.verticalScrollBar().setValue(self._view.verticalScrollBar().maximum())
 
     def render_execution_path(self, steps: Iterable[str]) -> None:
         body = "<br>".join(f"→ {step}" for step in steps) or ""
@@ -759,35 +881,12 @@ class TracePanel(QtWidgets.QFrame):
     # ---- Session switching ---------------------------------------------
 
     def _on_session_switch_requested(self, session_id: str) -> None:
-        # Round 17: ``TracePanel`` hands session clicks here so the
-        # controller-driven switch + UI refresh happens in one
-        # place. ``controller.switch_session`` emits
-        # ``SESSION_HISTORY_REFRESHED`` on success, which our
-        # already-wired slot re-renders against.
-        if session_id == self._controller.session.session_id:
-            self._status_bar.showMessage(
-                f"已在 session {session_id}", 3000
-            )
-            return
-        ok = self._controller.switch_session(session_id)
-        if ok:
-            # Re-render the session list so the new active row is
-            # bolded; refresh the context pane to match the new
-            # session's active papers; clear the chat scrollback so
-            # the user doesn't see a confusing mix of two
-            # sessions' messages.
-            try:
-                sessions = self._controller.list_sessions()
-                self._trace_panel.set_sessions(
-                    sessions,
-                    current_session_id=self._controller.session.session_id,
-                )
-            except Exception:
-                pass
-            self._context_panel.refresh(
-                list(self._controller.list_active_papers())
-            )
-            self._chat_panel.clear()
+        # The main window owns the controller.  Keep this compatibility
+        # shim safe for callers that still reach the panel method directly;
+        # normal clicks dispatch to the parent window above.
+        window = self.window()
+        if window is not self and hasattr(window, "_on_session_switch_requested"):
+            window._on_session_switch_requested(session_id)
 
     def _on_paper_deactivate_requested(self, paper: Any) -> None:
         # Round 17: ``ContextPanel`` hands the right-click
@@ -855,9 +954,17 @@ class ChatPanel(QtWidgets.QFrame):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
+        title_row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("对话")
         title.setObjectName("pane_title")
-        layout.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self._clear_btn = QtWidgets.QToolButton()
+        self._clear_btn.setText("清空")
+        self._clear_btn.setToolTip("清空当前聊天窗口文字")
+        self._clear_btn.clicked.connect(self.clear)
+        title_row.addWidget(self._clear_btn)
+        layout.addLayout(title_row)
 
         self._view = QtWidgets.QTextBrowser()
         self._view.setObjectName("chat_view")
@@ -1669,6 +1776,7 @@ class ContextPanel(QtWidgets.QFrame):
         self._cached_papers: list[PaperMetadata] = []
         self._cached_pinned: list[str] = []
         self._cached_importance: dict[str, int] = {}
+        self._cached_pipeline_status: dict[str, str] = {}
 
     def refresh(self, papers: list[PaperMetadata]) -> None:
         # Read the pin/importance state directly from the
@@ -1682,6 +1790,9 @@ class ContextPanel(QtWidgets.QFrame):
             ctx = window._controller.workspace.context
             pinned = list(ctx.pinned_papers)
             importance = dict(ctx.importance_levels)
+            self._cached_pipeline_status = dict(
+                getattr(ctx.filters, "paper_pipeline_status", {}) or {}
+            )
         self._cached_papers = list(papers)
         self._cached_pinned = pinned
         self._cached_importance = importance
@@ -1710,6 +1821,7 @@ class ContextPanel(QtWidgets.QFrame):
                 continue
             visible_index += 1
             importance = self._cached_importance.get(paper_id, 1) if paper_id else 1
+            pipeline_status = self._cached_pipeline_status.get(paper_id or "")
             pin_mark = "📌 " if paper_id in pinned_set else ""
             if importance >= 3:
                 imp_mark = "🔥 "
@@ -1719,9 +1831,10 @@ class ContextPanel(QtWidgets.QFrame):
                 imp_mark = ""
             year = paper.year or "n.d."
             source = paper.journal or paper.publisher or "unknown source"
+            status_text = f" · {pipeline_status}" if pipeline_status else ""
             item = QtWidgets.QListWidgetItem(
                 f"{pin_mark}{imp_mark}{visible_index}. {paper.title}  "
-                f"({year}, {source})"
+                f"({year}, {source}){status_text}"
             )
             item.setData(QtCore.Qt.ItemDataRole.UserRole, paper)
             item.setToolTip(self._format_tooltip(paper))
@@ -1764,6 +1877,11 @@ class ContextPanel(QtWidgets.QFrame):
             tooltip_parts.append(f"访问类型：{at_str}")
         if getattr(paper, "citation_count", None):
             tooltip_parts.append(f"引用数：{paper.citation_count}")
+        pipeline_status = self._cached_pipeline_status.get(
+            getattr(paper, "paper_id", ""),
+        )
+        if pipeline_status:
+            tooltip_parts.append(f"处理状态：{pipeline_status}")
         return "\n".join(tooltip_parts)
 
     def _on_context_menu(self, pos: QtCore.QPoint) -> None:
@@ -2050,7 +2168,7 @@ class PaperDetailDialog(QtWidgets.QDialog):
 
 
 class RAGPanel(QtWidgets.QFrame):
-    """Right column middle — single Daily run entry point + RAG status.
+    """Right column middle — direct topic search entry point + RAG status.
 
     Round 19: the original panel only showed a transient
     "运行中…/尚未启动" label. After a daily run the user couldn't
@@ -2082,12 +2200,12 @@ class RAGPanel(QtWidgets.QFrame):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
-        title = QtWidgets.QLabel("今日管线 / RAG")
+        title = QtWidgets.QLabel("文献检索 / RAG")
         title.setObjectName("pane_title")
         layout.addWidget(title)
 
         helper = QtWidgets.QLabel(
-            "检索最新文献 → 下载开放访问 PDF → 用 docling 解析 → 写入 RAG 索引。"
+            "按研究主题检索相关文献，完成下载、解析并写入当前 RAG。"
         )
         helper.setObjectName("status")
         helper.setWordWrap(True)
@@ -2098,10 +2216,10 @@ class RAGPanel(QtWidgets.QFrame):
         run_btn.clicked.connect(on_run_daily)
         layout.addWidget(run_btn)
 
-        refresh_btn = QtWidgets.QPushButton("⟳ 立即 refresh")
+        refresh_btn = QtWidgets.QPushButton("⟳ 再次检索")
         refresh_btn.setObjectName("subnav_btn")
         refresh_btn.setToolTip(
-            "复用「搜索研究主题」流程：re-fetch → re-parse → 写 RAG"
+            "重新按主题检索并更新当前文献上下文"
         )
         refresh_btn.clicked.connect(on_run_daily)
         layout.addWidget(refresh_btn)
@@ -2202,12 +2320,11 @@ def _fmt_age(seconds: int) -> str:
 
 
 class DailyConfigDialog(QtWidgets.QDialog):
-    """Collect the parameters that drive ``littrace sentinel run`` from
-    the user before the daily pipeline kicks off. Four fields:
+    """Collect parameters for a direct topic-to-RAG search.
 
-      * 研究主题 (used as sentinel watchlist id, required)
+      * 研究主题 (natural-language search topic, required)
       * 开始 / 结束年份 (year range for retrieval)
-      * 最少检索数目 (target count; warns if the run comes up short)
+      * RAG 目标数量 (minimum papers that should become RAG-ready)
 
     Round 19: the dialog is non-modal (``setModal(False)``) so the
     user can still browse the context panel, switch sessions, or
@@ -2234,7 +2351,7 @@ class DailyConfigDialog(QtWidgets.QDialog):
         default_min_papers: int = 10,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("检索并补全文献 · 配置")
+        self.setWindowTitle("检索相关文献 · 配置")
         # Round 19: non-modal so the user can keep poking at the
         # rest of the window while they tweak the parameters.
         # Closing the dialog (X button, Esc, "取消") rejects the run.
@@ -2252,15 +2369,15 @@ class DailyConfigDialog(QtWidgets.QDialog):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
 
-        title = QtWidgets.QLabel("检索并补全文献")
+        title = QtWidgets.QLabel("检索相关文献")
         title.setStyleSheet(
             f"font-size:18px;font-weight:600;color:{DESIGN['ink']};"
         )
         layout.addWidget(title)
 
         subtitle = QtWidgets.QLabel(
-            "告诉 sentinel 要研究什么主题、什么年份区间、最少要几篇。"
-            "只检索开放访问论文；要看 publisher 内的论文，先点下面的「打开 publisher 登录」。"
+            "输入研究主题和可选关键词。检索结果会进入当前文献上下文，"
+            "并继续下载、解析和写入 RAG。"
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(
@@ -2272,11 +2389,11 @@ class DailyConfigDialog(QtWidgets.QDialog):
         form.setSpacing(10)
         form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
 
-        # 主题（watchlist id，必填）
+        # 主题（自然语言检索词，必填）
         self._topic_input = QtWidgets.QLineEdit(
             self._settings.value("daily/topic", default_topic, type=str)
         )
-        self._topic_input.setPlaceholderText("e.g. mxene_sensor, perovskite_solar, mof_co2")
+        self._topic_input.setPlaceholderText("例如：柔性压阻传感器")
         self._topic_input.selectAll()
         form.addRow("研究主题 *", self._topic_input)
 
@@ -2306,14 +2423,14 @@ class DailyConfigDialog(QtWidgets.QDialog):
         year_row.addStretch(1)
         form.addRow("年份区间", year_row)
 
-        # 最少检索数
+        # RAG 目标数量
         self._min_papers_input = QtWidgets.QSpinBox()
         self._min_papers_input.setRange(1, 200)
         self._min_papers_input.setValue(int(
             self._settings.value("daily/min_papers", default_min_papers)
         ))
         self._min_papers_input.setSuffix(" 篇")
-        form.addRow("最少检索数目", self._min_papers_input)
+        form.addRow("RAG 目标数量", self._min_papers_input)
 
         layout.addLayout(form)
         layout.addStretch(1)
@@ -2366,12 +2483,7 @@ class DailyConfigDialog(QtWidgets.QDialog):
     def _validate_and_accept(self) -> None:
         topic = self._topic_input.text().strip()
         if not topic:
-            self._error_label.setText("研究主题是必填的（用于 sentinel watchlist id）")
-            return
-        if not topic.replace("_", "").replace("-", "").isalnum():
-            self._error_label.setText(
-                "主题只能是字母数字 + _ + -（用作 watchlist id 文件名）"
-            )
+            self._error_label.setText("研究主题不能为空")
             return
         if self._year_min_input.value() > self._year_max_input.value():
             self._error_label.setText("开始年份不能晚于结束年份")
@@ -2426,7 +2538,8 @@ class DailyResultDialog(QtWidgets.QDialog):
         try:
             super().__init__(None)
             self.setWindowTitle("daily 检索结果 (deprecated)")
-            self.resize(0, 0)
+            self.resize(520, 320)
+            self.setMinimumSize(360, 220)
         except Exception:
             pass
 
@@ -2597,7 +2710,7 @@ class BrowserPanel(QtWidgets.QFrame):
             btn.clicked.connect(
                 lambda _checked=False, u=url: (
                     self._set_expanded(True),
-                    self._open_publisher_in_littrace_chrome(u),
+                    self.open_url(u),
                 )
             )
             publisher_row.addWidget(btn)
@@ -2748,44 +2861,24 @@ class BrowserPanel(QtWidgets.QFrame):
         profile_root = (
             self._config.cdp_downloader.chrome_user_data_dir
         ).expanduser()
-        # Layer 1: ask the live Chrome via CDP. This is what
-        # surfaces the macOS login state to the UI.
+        # Layer 1: ask the browser-level CDP endpoint. ``Storage.getCookies``
+        # reads the whole cookie jar without creating a page target; the old
+        # ``connect_new_tab`` implementation leaked one about:blank per refresh.
         present_cdp: set[str] = set()
         try:
-            import json as _json
-            from littrace.access_layer.cdp_core import CDPBrowser
-            browser = CDPBrowser(
-                self._config.cdp_downloader.cdp_url,
-                reconnect_attempts=1,
-                command_timeout_seconds=2.0,
-            )
-            browser.connect_new_tab()
-            # Probe every publisher cookie domain. ``Network.getCookies``
-            # matches by URL host (incl. subdomain), so feed one
-            # ``https://<domain>/`` per catalog entry.
+            from littrace.chrome_profiles import read_cdp_cookies
+
+            cookies = read_cdp_cookies(self._config)
             for pub in PUBLISHER_CATALOG:
                 for d in pub.cookie_domains:
-                    probe = f"https://{d.lstrip('.')}/"
-                    try:
-                        browser.ws.send(_json.dumps({
-                            "id": 8001,
-                            "method": "Network.getCookies",
-                            "params": {"urls": [probe]},
-                        }))
-                        resp = _json.loads(browser.ws.recv())
-                        for c in (resp.get("result") or {}).get("cookies") or []:
-                            if c.get("name") == "__cf_bm":
-                                continue  # CF bot-mgmt, not a session
-                            host = c.get("domain", "").lstrip(".")
-                            if host and (host == d.lstrip(".") or host.endswith("." + d.lstrip("."))):
-                                present_cdp.add(d)
-                                break
-                    except Exception:
-                        pass
-            try:
-                browser.ws.close()
-            except Exception:
-                pass
+                    for cookie in cookies:
+                        if cookie.get("name") == "__cf_bm":
+                            continue
+                        host = str(cookie.get("domain") or "").lstrip(".")
+                        domain = d.lstrip(".")
+                        if host and (host == domain or host.endswith("." + domain)):
+                            present_cdp.add(d)
+                            break
         except Exception:
             # No live Chrome or CDP unreachable — fall through to the
             # SQLite path below.
@@ -3086,7 +3179,7 @@ class BrowserPanel(QtWidgets.QFrame):
         lit_chrome_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         lit_chrome_btn.clicked.connect(
             lambda: (
-                self._open_publisher_in_littrace_chrome(url),
+                self.open_url(url),
                 dlg.accept(),
             )
         )
@@ -3161,86 +3254,8 @@ class BrowserPanel(QtWidgets.QFrame):
         layout.addLayout(button_row)
 
     def _open_publisher_in_littrace_chrome(self, url: str) -> None:
-        """Launch a LitTrace-managed Chrome window pointed at the
-        publisher sign-in page so the user can complete CF + login
-        against the *same* profile ``cdp_downloader`` uses.
-
-        Why this exists: opening ``webbrowser.open(url)`` from the
-        cloudflare dialog drops the user into whichever browser the OS
-        considers default (Safari on macOS, Edge on Windows). Cookies
-        written there live in that browser's profile — completely
-        separate from ``./data/chrome-cdp`` that the next
-        ``sentinel run`` will use. The user is then stuck verifying
-        Cloudflare once per publisher per run.
-
-        The fix: spin up a Chrome process bound to LitTrace's profile
-        and navigate it to the sign-in URL. ``cf_clearance`` lands in
-        the same SQLite file the next ``cdp_downloader`` Chrome will
-        read — *no* cookie import dance, *no* profile-share config.
-
-        Round 22: this intentionally launches with ``headless=False``
-        so the user actually sees the window and can interact with
-        the publisher's login form. The window stays open until the
-        user closes it (or until we detect a successful login via
-        cookie polling — see ``_wait_for_login``). After that the
-        process is terminated so sentinel can spawn its own headless
-        Chrome against the now-unlocked profile.
-
-        Implementation note: ``cdp_downloader.py`` already had the
-        recipe for spinning up Chrome via CDP — we reuse it here
-        verbatim rather than forking subprocess plumbing.
-        """
-        if self._config is None:
-            self.navigation_message.emit("❌ 无 config，无法启动 publisher 登录")
-            return
-        # Round 25: the previous version launched Chrome synchronously
-        # on the main thread (``launch_chrome_for_cdp`` waits up to
-        # ``wait_seconds=4`` for the CDP endpoint, plus
-        # ``browser.navigate(url, wait_seconds=6)`` waits another 6
-        # seconds for the page to load). That was 10+ seconds of
-        # frozen UI every time the user clicked a publisher button.
-        #
-        # Round 26: even after pushing ``launch + connect + navigate``
-        # onto a background thread, the QTimer(2s) polling for cookie
-        # arrival meant the user could still see a "卡顿" feel during
-        # long authentications (CF + SSO round-trip can take 30+s).
-        # This round replaces the polling with **event-driven** cookie
-        # detection via ``QtCDPBrowser.subscribe_event``. Chrome
-        # pushes ``Network.cookieChanged`` the instant any cookie
-        # is written, and the main thread's event loop dispatches
-        # our handler within microseconds — no polling, no race
-        # conditions, no perceived freeze.
-        #
-        # The pipeline is now:
-        #   1. Main thread: emit status, spawn a worker thread that
-        #      calls ``launch_chrome_for_cdp`` (still synchronous —
-        #      ``Popen`` + a few ``time.sleep`` polls — but on a
-        #      background thread, so the UI doesn't notice).
-        #   2. Worker thread: fetch the page-level WebSocket URL
-        #      from ``GET /json/list``, hand it back to the main
-        #      thread via ``QMetaObject.invokeMethod``.
-        #   3. Main thread: construct ``QtCDPBrowser``, subscribe to
-        #      ``Network.cookieChanged``, open the WebSocket. CDP
-        #      commands and event delivery all flow through Qt's
-        #      event loop from here on — zero polling.
-        self.navigation_message.emit("🌐 启动 LitTrace Chrome…")
-        # ``publisher_label`` is the human-readable name we look for
-        # in ``cookie_changed`` callbacks. We pass it down so the
-        # background thread doesn't need to import the catalog.
-        publisher_domain = self._publisher_domain_for_url(url) or "publisher"
-        threading.Thread(
-            target=self._launch_publisher_chrome_worker,
-            args=(url, publisher_domain),
-            daemon=True,
-            name="littrace-publisher-launcher",
-        ).start()
-        self.navigation_message.emit("🌐 启动 LitTrace Chrome…")
-        threading.Thread(
-            target=self._launch_publisher_chrome_worker,
-            args=(url,),
-            daemon=True,
-            name="littrace-publisher-launcher",
-        ).start()
+        """Compatibility entry point for the unified auth-window path."""
+        self.open_url(url)
 
     def _emit_status_threadsafe(self, message: str) -> None:
         """Push a ``navigation_message`` emit through the Qt event
@@ -4011,6 +4026,9 @@ class BrowserPanel(QtWidgets.QFrame):
         if not text.startswith(("http://", "https://")):
             text = "https://" + text
         self._url_before_suspend = text
+        # A challenge URL from a previous publisher must not trigger a false
+        # Cloudflare prompt for the new authentication window.
+        self._url_history = []
         # Lazy QtCDPBrowser launch. The instance is parented to
         # the main window so Qt tears it down on close; the
         # ``_qt_cdp_browser`` attribute also tracks the running
@@ -4204,6 +4222,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         proc = getattr(self, "_external_chrome_proc", None)
         if proc is not None and proc.poll() is None:
             return
+        self._isolate_private_cdp_port()
         # If the user opened a publisher Chrome via QtCDPBrowser
         # (still alive, talking to CDP 19222), sentinel will reuse
         # it via the same already_available=True branch in
@@ -4224,6 +4243,36 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._browser_panel.suspend_for_external_chrome()
         self._external_chrome_proc = None
         self._auto_launch_chrome()
+
+    def _isolate_private_cdp_port(self) -> None:
+        """Move LitTrace off an occupied endpoint it does not own.
+
+        A reachable CDP port is not proof that the browser uses LitTrace's
+        private profile. Users may run their normal Chrome with remote
+        debugging enabled on the same port. Reusing that process would open
+        publisher authentication in their personal browser and put cookies in
+        the wrong profile.
+        """
+        proc = getattr(self, "_external_chrome_proc", None)
+        if proc is not None and proc.poll() is None:
+            return
+        from littrace.chrome_profiles import (
+            cdp_uses_configured_profile,
+            check_cdp_status,
+        )
+
+        config = self._controller.config
+        if not check_cdp_status(config).available:
+            return
+        if cdp_uses_configured_profile(config):
+            return
+        preferred = int(config.cdp_downloader.remote_debugging_port) + 1
+        port = _find_available_loopback_port(preferred)
+        config.cdp_downloader.remote_debugging_port = port
+        config.cdp_downloader.cdp_url = f"http://127.0.0.1:{port}"
+        self._post_status(
+            f"检测到 {preferred - 1} 端口属于其他 Chrome，LitTrace 已切换到隔离端口 {port}"
+        )
 
     def _release_external_chrome_for_sentinel(self) -> None:
         """Round 18: called once sentinel finishes. Kill the external
@@ -4467,7 +4516,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                     # exit cleanly on its own.
                     pass
 
-    # ---- Cross-thread bridge for "运行今日管线" status ----------------
+    # ---- Cross-thread bridge for topic-search status ----------------
 
     @QtCore.Slot("QString")
     def _set_rag_status_from_any_thread(self, text: str) -> None:
@@ -4484,6 +4533,12 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         # status label never updates.
         self._rag_panel._status.setText(text)
 
+    @QtCore.Slot("QString")
+    def _set_trace_status_from_any_thread(self, text: str) -> None:
+        self._trace_panel.render_trace_progress(
+            {"stage": "status_message", "message": text}
+        )
+
     def _post_status(self, text: str) -> None:
         # Posted from a daemon worker thread (``_on_run_daily``). The
         # ``@Slot(str)`` decorator on ``_set_rag_status_from_any_thread``
@@ -4495,6 +4550,12 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         QtCore.QMetaObject.invokeMethod(
             self,
             "_set_rag_status_from_any_thread",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, text),
+        )
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_set_trace_status_from_any_thread",
             QtCore.Qt.ConnectionType.QueuedConnection,
             QtCore.Q_ARG(str, text),
         )
@@ -4523,81 +4584,12 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             payload = json.loads(payload_json)
         except Exception:
             return
-        topic = payload.get("topic", "")
-        keywords = payload.get("keywords", "")
-        year_min = int(payload.get("year_min") or 0)
-        year_max = int(payload.get("year_max") or 0)
-        target_papers = int(payload.get("target_papers") or 0)
-        rounds_done = int(payload.get("rounds_done") or 0)
-        cumulative_downloaded = int(payload.get("cumulative_downloaded") or 0)
-        cumulative_candidates = int(payload.get("cumulative_candidates") or 0)
-        new_candidates = int(payload.get("new_candidates") or 0)
-        seen_candidates = int(payload.get("seen_candidates") or 0)
-        warnings = list(payload.get("warnings") or [])
-        summary_lines = list(payload.get("summary_lines") or [])
         # Cache so the context panel can still highlight the topic.
         self._last_daily_payload = dict(payload)
-        # Build the bubble. ``summary_lines`` carries the parsed
-        # per-round counter lines so the user can scroll through
-        # them at their own pace; the headline mirrors the same
-        # numbers the status strip shows.
-        lines: list[str] = []
-        lines.append("📚 <b>daily 检索完成</b>")
-        lines.append(f"&nbsp;&nbsp;主题：<b>{_render_message_html(topic or '—')}</b>"
-                     f"&nbsp;·&nbsp;{year_min}–{year_max}"
-                     f"&nbsp;·&nbsp;目标 ≥ {target_papers} 篇")
-        if keywords:
-            lines.append(
-                f"&nbsp;&nbsp;关键词：{_render_message_html(keywords)}"
-            )
-        lines.append(
-            f"&nbsp;&nbsp;完成 {rounds_done} 轮"
-            f"&nbsp;·&nbsp;<b style='color:#2a7a3a'>新增下载 "
-            f"{cumulative_downloaded}</b> 篇"
-            f"&nbsp;·&nbsp;候选 {cumulative_candidates} 篇"
-            f"（新 {new_candidates} · 已纳入上下文 {seen_candidates}）"
-        )
-        if summary_lines:
-            lines.append("&nbsp;&nbsp;<b>每轮明细</b>")
-            for sline in summary_lines:
-                lines.append(
-                    f"&nbsp;&nbsp;&nbsp;&nbsp;{_render_message_html(sline)}"
-                )
-        # Shortfall warnings (mirrors the old dialog's
-        # ``累计下载 X 篇，少于目标 Y 篇`` / ``仅检索到 X 个候选``
-        # hints). Color-coded so the user notices immediately.
-        if cumulative_downloaded < target_papers and target_papers > 0:
-            lines.append(
-                "<br>&nbsp;&nbsp;⚠️ "
-                f"<span style='color:#cc785c'>累计下载 "
-                f"{cumulative_downloaded} 篇，少于目标 {target_papers} 篇。"
-                "可以再跑一轮或放宽关键词。</span>"
-            )
-        if cumulative_candidates < 5:
-            if seen_candidates > 0 and new_candidates == 0:
-                lines.append(
-                    "<br>&nbsp;&nbsp;ℹ️ "
-                    "<span style='color:#5c6068'>本次检索到 "
-                    f"{cumulative_candidates} 个新候选，另有 "
-                    f"{seen_candidates} 篇已在之前的检索中纳入上下文。"
-                    "如需新文献请修改主题、年份或关键词再试。</span>"
-                )
-            else:
-                lines.append(
-                    "<br>&nbsp;&nbsp;⚠️ "
-                    f"<span style='color:#cc785c'>仅检索到 "
-                    f"{cumulative_candidates} 个候选，主题可能过于冷门或过新。"
-                    "</span>"
-                )
-        if warnings:
-            warn_text = _render_message_html("；".join(warnings))
-            lines.append(
-                "<br>&nbsp;&nbsp;⚠️ "
-                f"<span style='color:#cc785c'>{warn_text}</span>"
-            )
-        html = "<br>".join(lines)
         if hasattr(self, "_chat_panel") and self._chat_panel is not None:
-            self._chat_panel.append_message("system", html)
+            self._chat_panel.append_message(
+                "system", _format_daily_preview_markdown(payload)
+            )
 
     def _post_daily_preview(self, payload: dict) -> None:
         """Worker-thread helper. JSON-encodes ``payload`` and routes
@@ -4644,6 +4636,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._status_bar = QtWidgets.QStatusBar()
         self._status_bar.setObjectName("status")
         self.setStatusBar(self._status_bar)
+        self._status_bar.setSizeGripEnabled(True)
 
         # Round 20: persistent "停止 daily 检索" button in the status
         # bar. Hidden by default; shown for the duration of a daily
@@ -4676,7 +4669,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         self._daily_cancel_event = threading.Event()
         self._sentinel_proc: subprocess.Popen | None = None
 
-        # Round 19: 60 s tick to keep the RAG staleness badge fresh.
+        # Keep RAG staleness and externally committed parse results fresh.
         # Without this the user sees the badge flip from "fresh" to
         # "stale" only on the next explicit refresh — which can be
         # many minutes apart.
@@ -4687,6 +4680,16 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             and self._rag_panel.refresh_status()
         )
         self._rag_tick_timer.start()
+        self._workspace_sync_timer = QtCore.QTimer(self)
+        self._workspace_sync_timer.setInterval(1500)
+        self._workspace_sync_timer.timeout.connect(self._poll_workspace_sync)
+        self._workspace_sync_timer.start()
+
+    def _poll_workspace_sync(self) -> None:
+        try:
+            self._controller.reload_workspace_if_newer()
+        except Exception:
+            pass
 
     def _build_nav(self) -> QtWidgets.QWidget:
         nav = QtWidgets.QFrame()
@@ -4698,10 +4701,61 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         title.setStyleSheet(f"color:{DESIGN['on_dark']};font-weight:600;font-size:15px;")
         layout.addWidget(title)
         layout.addStretch(1)
-        session = QtWidgets.QLabel(f"session: {self._controller.session.session_id}")
-        session.setStyleSheet(f"color:{DESIGN['on_dark']};font-size:11px;")
-        layout.addWidget(session)
+        self._session_label = QtWidgets.QLabel(
+            f"session: {self._controller.session.session_id}"
+        )
+        self._session_label.setStyleSheet(f"color:{DESIGN['on_dark']};font-size:11px;")
+        layout.addWidget(self._session_label)
+        self._session_switch_btn = QtWidgets.QPushButton("切换 Session")
+        self._session_switch_btn.setObjectName("subnav_btn")
+        self._session_switch_btn.setToolTip("选择并切换当前聊天 Session")
+        self._session_switch_btn.clicked.connect(self._open_session_switch_dialog)
+        layout.addWidget(self._session_switch_btn)
         return nav
+
+    def _open_session_switch_dialog(self) -> None:
+        try:
+            sessions = self._controller.list_sessions()
+        except Exception as exc:
+            self._status_bar.showMessage(f"读取 Session 失败：{exc}", 5000)
+            return
+        if not sessions:
+            self._status_bar.showMessage("暂无可切换的 Session", 3000)
+            return
+        labels = [
+            f"{item.session_id}  ({str(item.created_at)[:19]})"
+            for item in sessions
+        ]
+        current = next(
+            (index for index, item in enumerate(sessions)
+             if item.session_id == self._controller.session.session_id),
+            0,
+        )
+        selected, accepted = QtWidgets.QInputDialog.getItem(
+            self, "切换 Session", "选择目标 Session：", labels, current, False
+        )
+        if not accepted:
+            return
+        index = labels.index(selected)
+        self._on_session_switch_requested(sessions[index].session_id)
+
+    def _on_session_switch_requested(self, session_id: str) -> None:
+        if session_id == self._controller.session.session_id:
+            self._status_bar.showMessage(f"已在 session {session_id}", 3000)
+            return
+        if not self._controller.switch_session(session_id):
+            return
+        self._session_label.setText(f"session: {self._controller.session.session_id}")
+        try:
+            self._trace_panel.set_sessions(
+                self._controller.list_sessions(),
+                current_session_id=self._controller.session.session_id,
+            )
+        except Exception:
+            pass
+        self._context_panel.refresh(list(self._controller.list_active_papers()))
+        self._chat_panel.clear()
+        self._trace_panel.render_workflow_trace(["已切换 Session", session_id])
 
     def _build_brand_strip(self) -> QtWidgets.QWidget:
         strip = QtWidgets.QWidget()
@@ -4850,7 +4904,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             "\n"
             "• 左侧：执行 Trace + 历史 Session（点击切换）\n"
             "• 中间：对话窗口，输入 / 触发 slash 命令自动完成\n"
-            "• 右上：文献上下文 / RAG / Daily 操作\n"
+            "• 右上：文献上下文、检索状态和 RAG 状态\n"
             "• 右下：嵌入式 Chromium 浏览器（用于 publisher 页面）\n"
             "\n"
             "Slash 命令示例： /papers  /parse  /table  /storyline  /quit\n"
@@ -4883,7 +4937,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             lambda dlg=dialog: self._on_daily_dialog_accepted(dlg)
         )
         dialog.rejected.connect(
-            lambda: self._status_bar.showMessage("已取消 daily 检索", 3000)
+            lambda: self._status_bar.showMessage("已取消主题检索", 3000)
         )
         # Cache on the window so the user can close + reopen via
         # the toolbar button without losing their input. A second
@@ -4916,12 +4970,12 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             self._launch_publisher_login_browser()
             return
 
-        self._start_daily_run(
-            topic=topic,
+        self._controller.search_topic(
+            topic,
             keywords=keywords,
             year_min=year_min,
             year_max=year_max,
-            min_papers=min_papers,
+            requested_rag_ready=min_papers,
         )
 
     def _start_daily_run(
@@ -5006,6 +5060,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 rounds_done = 0
                 last_summary = ""
                 last_warnings: list[str] = []
+                failed_rounds: list[str] = []
                 for round_idx, q in enumerate(queries, start=1):
                     round_start = time.monotonic()
                     self._post_status(
@@ -5045,6 +5100,12 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                         # shows nothing.
                         "--main-session-id",
                         self._controller.session.session_id,
+                    )
+                    # The GUI may move LitTrace to a free port when the
+                    # configured endpoint belongs to the user's own Chrome.
+                    # Propagate that runtime choice into the subprocess.
+                    env["LITTRACE_REMOTE_DEBUGGING_PORT"] = str(
+                        self._controller.config.cdp_downloader.remote_debugging_port
                     )
                     # Round 20: Popen instead of subprocess.run so the
                     # GUI thread can ``terminate()`` the subprocess when
@@ -5128,6 +5189,9 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                         continue
                     if completed.returncode != 0:
                         tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-1] or "(no output)"
+                        failed_rounds.append(
+                            f"第 {round_idx} 轮退出 {completed.returncode}：{tail}"
+                        )
                         self._post_status(
                             f"第 {round_idx} 轮 sentinel 退出 {completed.returncode}：{tail}"
                         )
@@ -5227,6 +5291,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                         "new_candidates": cumulative_new_candidates,
                         "seen_candidates": cumulative_seen_candidates,
                         "warnings": list(last_warnings),
+                        "errors": failed_rounds if rounds_done == 0 else [],
                         "summary_lines": [
                             f"{i + 1}. {line}"
                             for i, line in enumerate(last_summary.split(" · "))
@@ -5343,14 +5408,9 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(10000, _tick)
 
     def _launch_publisher_login_browser(self) -> None:
-        # Round 18: login now happens inside the embedded BrowserPanel
-        # because ``main()`` redirected QtWebEngine's default profile to
-        # ``data/chrome-cdp`` — the same directory sentinel reads via
-        # CDP. There is no longer a separate external chrome to launch;
-        # pointing the embedded view at the first publisher's sign-in
-        # page is enough. The user can then click the other shortcuts
-        # (``🌐 ACS`` / ``🌐 Springer`` / ...) on the same view to log
-        # into the rest.
+        # Publisher login always opens a visible top-level window owned by
+        # LitTrace's private Chrome profile. The browser panel is now only the
+        # control surface; it no longer embeds the authenticated page.
         self._browser_panel.open_url(self._browser_panel.PUBLISHER_LINKS[0][1])
         self._status_bar.showMessage(
             "在 LitTrace Chrome 里登录各 publisher 即可，cookie 自动写入 data/chrome-cdp",
@@ -5367,49 +5427,39 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         silently invisible to sentinel (different profile, different
         Keychain on macOS).
 
-        Implementation: reuse the existing ``_external_chrome_proc``
-        / ``launch_chrome_for_cdp`` machinery to make sure a
-        LitTrace Chrome is alive on port 19222, then drive it via
-        the synchronous ``CDPBrowser`` (the same client sentinel
-        uses). We don't depend on QtCDPBrowser because the URL
-        bar + publisher-shortcut clicks happen on the main thread
-        and we don't need the WebSocket-event plumbing for a
-        single ``Page.navigate`` call. The CDPBrowser is created
-        on a worker thread to avoid blocking the Qt event loop.
+        A worker verifies that the configured CDP endpoint belongs to the
+        private profile, starts that Chrome when needed, and creates a new
+        top-level target through CDP. This keeps the GUI responsive and avoids
+        reusing a tab in the user's day-to-day browser.
         """
-        # 1. Make sure a LitTrace Chrome is alive on CDP 19222.
-        # ``_acquire_external_chrome_for_sentinel`` already handles
-        # this (it also refuses to use a stale QtCDPBrowser pointed
-        # at the wrong profile, which is the bug we are fixing).
-        self._acquire_external_chrome_for_sentinel()
-        # 2. Sanity check: did Chrome actually come up?
-        from littrace.chrome_profiles import check_cdp_status
-
-        status = check_cdp_status(self._controller.config)
-        if not status.available or not status.web_socket_debugger_url:
-            self._post_status(
-                f"⚠️ LitTrace Chrome 未在 19222 上响应，无法在隔离 profile 中打开 {url}"
-            )
-            return
-        # 3. Drive the navigate on a worker thread so we never
-        # block the Qt event loop. Reuse a single CDPBrowser
-        # across calls so the same tab persists (no new about:blank
-        # on every click).
-        import threading
-        from littrace.access_layer.cdp_core import CDPBrowser
-
         def _worker():
             try:
-                browser = getattr(self, "_littrace_login_browser", None)
-                if browser is None:
-                    browser = CDPBrowser(
-                        status.web_socket_debugger_url,
-                        reconnect_attempts=2,
-                        command_timeout_seconds=15.0,
+                from littrace.chrome_profiles import launch_chrome_for_cdp
+                lock = getattr(self, "_publisher_chrome_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._publisher_chrome_lock = lock
+                with lock:
+                    self._isolate_private_cdp_port()
+                    result = launch_chrome_for_cdp(
+                        self._controller.config,
+                        headless=False,
+                        new_window=True,
+                        initial_url=url,
                     )
-                    browser.connect_new_tab()
-                    self._littrace_login_browser = browser
-                browser.navigate(url, wait_seconds=8.0)
+                if result.error:
+                    self._post_status(
+                        f"⚠️ LitTrace Chrome 启动失败：{result.error}"
+                    )
+                elif result.launched:
+                    self._external_chrome_proc = result.process
+                    self._post_status("已在独立的 LitTrace Chrome 窗口打开出版社鉴权")
+                elif result.already_available:
+                    self._post_status("已在独立的 LitTrace Chrome 窗口打开出版社鉴权")
+                else:
+                    self._post_status(
+                        f"⚠️ LitTrace Chrome 启动失败：{result.error or '未知原因'}"
+                    )
             except Exception as exc:
                 self._post_status(
                     f"⚠️ LitTrace Chrome 导航失败：{exc.__class__.__name__}: {exc}"
@@ -5454,6 +5504,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 self._controller.EVENT_THINKING_PROGRESS: self._on_thinking_progress_event,
                 self._controller.EVENT_SLASH_RESULT: self._on_slash_result_event,
                 self._controller.EVENT_RAG_PANEL_REFRESHED: self._on_rag_panel_event,
+                self._controller.EVENT_TRACE_PROGRESS: self._on_trace_progress_event,
             },
         )
 
@@ -5533,6 +5584,9 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 for i, p in enumerate(self._controller.list_active_papers())
             ]
         )
+
+    def _on_trace_progress_event(self, body: dict) -> None:
+        self._trace_panel.render_trace_progress(body)
 
     def _on_error_event(self, body: dict) -> None:
         # Round 17: the controller now sends a structured error
