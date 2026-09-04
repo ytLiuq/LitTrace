@@ -227,8 +227,13 @@ class CDPDownloaderConfig(BaseModel):
     # a headed chrome from inside littrace-qt too — useful for
     # debugging cookie / SSO redirects.
     headless: bool = True
+    # Round 27: defaults bumped so the sentinel subprocess has
+    # time to wait for the user to clear a Cloudflare challenge
+    # in the shared Chrome window before it gives up. The GUI
+    # now pops a modal — see ``_cf_wait_file`` in cdp_downloader
+    # — so the user actually has a chance to notice the request.
     cloudflare_wait_seconds: float = 60.0
-    user_action_wait_seconds: float = 30.0
+    user_action_wait_seconds: float = 300.0
     command_timeout_seconds: float = 60.0
     repository_download_timeout_seconds: float = 120.0
     websocket_reconnect_attempts: int = 3

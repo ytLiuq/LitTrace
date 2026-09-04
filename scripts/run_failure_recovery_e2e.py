@@ -13,7 +13,7 @@ from littrace.config import ArtifactStorageConfig, MetadataStoreConfig, StorageC
 from littrace.models import PaperMetadata
 from littrace.ocr.registry import build_ocr_tool
 from littrace.rag_jobs import run_pending_embedding_jobs
-from littrace.state_db import EmbeddingJobRecord, state_store_from_config
+from littrace.state_db import AsyncTaskRecord, state_store_from_config
 from littrace.session import create_chat_session, load_workspace, save_workspace
 
 
@@ -21,8 +21,24 @@ async def main() -> None:
     if not os.environ.get("LITTRACE_RAG_EMBEDDING_BASE_URL"):
         raise RuntimeError("LITTRACE_RAG_EMBEDDING_BASE_URL is required")
     run_id = uuid4().hex[:10]
-    root = Path("/private/tmp/littrace-e2e") / f"recovery-{run_id}"
-    source_pdfs = sorted(Path("/private/tmp/littrace-e2e").glob("**/paper.pdf"))
+    root = Path("/tmp/littrace-recovery-e2e") / f"recovery-{run_id}"
+    # Look for any PDF produced by ``run_seven_publisher_download_e2e.py``
+    # (which writes ``{publisher}/{publisher}.pdf``) and also accept the
+    # older ``paper.pdf`` layout for backwards compatibility.
+    candidate_globs = [
+        Path("/tmp/littrace-seven-publisher-e2e").glob("**/*.pdf"),
+        Path("/tmp/littrace-e2e").glob("**/paper.pdf"),
+        Path("/tmp/littrace-e2e").glob("**/*.pdf"),
+    ]
+    source_pdfs: list[Path] = []
+    seen: set[Path] = set()
+    for glob_iter in candidate_globs:
+        for candidate in glob_iter:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            source_pdfs.append(candidate)
+    source_pdfs = sorted(source_pdfs)
     if not source_pdfs:
         raise RuntimeError("a real previously downloaded PDF is required for recovery validation")
     source_pdf = source_pdfs[-1]
@@ -62,10 +78,12 @@ async def main() -> None:
 
     original_url = config.rag.embedding_base_url
     state_store = state_store_from_config(config)
-    state_store.enqueue_embedding_job(
-        EmbeddingJobRecord(
-            profile_id=f"pending:{session.session_id}",
+    state_store.enqueue_async_task(
+        AsyncTaskRecord(
+            task_id=f"recovery-{run_id}",
             session_id=session.session_id,
+            kind="embedding_job",
+            profile_id=f"pending:{session.session_id}",
             artifact_id="paper_pdf:recovery-paper",
             content_sha256="recovery-content",
         )
@@ -73,15 +91,18 @@ async def main() -> None:
     config.rag.embedding_base_url = "http://127.0.0.1:1/v1"
     failed = await run_pending_embedding_jobs(config, limit=20)
     config.rag.embedding_base_url = original_url
-    jobs = state_store.list_embedding_jobs(session_id=session.session_id, limit=20)
+    jobs = state_store.list_async_tasks(session_id=session.session_id, kind="embedding_job", limit=20)
     for job in jobs:
         if job.status in {"failed", "dead"}:
             job.status = "queued"
             job.next_attempt_at = None
             job.completed_at = None
-            state_store.update_embedding_job(job)
+            state_store.update_async_task(job)
     recovered = await run_pending_embedding_jobs(config, limit=20)
-    pending = len(state_store.list_pending_embedding_jobs(limit=20))
+    pending = len([
+        j for j in state_store.list_async_tasks(kind="embedding_job", limit=20)
+        if j.status == "queued"
+    ])
     result = {
         "session_id": session.session_id,
         "source_pdf": str(source_pdf),

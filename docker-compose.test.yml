@@ -1,0 +1,29 @@
+services:
+  littrace-test:
+    image: python:3.12-bookworm
+    container_name: littrace-codex-test
+    working_dir: /littrace
+    volumes:
+      # Mount source. .venv is excluded — we rebuild it inside the
+      # container because the macOS arm64 venv is not portable to
+      # Linux/arm64 wheels used by Docker Desktop.
+      - .:/littrace
+      # Read-only copy of the host's OpenAI API key (skip the OAuth
+      # dance + skip the macOS DuGuanJia block).
+      - ${HOME}/.codex/auth.json:/tmp/host-auth.json:ro
+    environment:
+      LITTRACE_CONFIG_PATH: /littrace/config.yaml
+      # host.docker.internal is the macOS Docker Desktop alias for
+      # the host loopback (gateway IP), so the in-container Postgres
+      # DSN can reach pgvector already running on the host.
+      LITTRACE_POSTGRES_DSN: postgresql://littrace:littrace@host.docker.internal:5433/littrace
+      LITTRACE_RAG_POSTGRES_DSN: postgresql://littrace:littrace@host.docker.internal:5433/littrace
+      # Use a private codex home inside the container — do NOT mount
+      # the host ~/.codex, otherwise the macOS hooks.state / DuGuanJia
+      # side-effects could leak in through the overlay.
+      CODEX_HOME: /tmp/codex-home
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["bash", "-lc", "tail -f /dev/null"]
+    stdin_open: true
+    tty: true

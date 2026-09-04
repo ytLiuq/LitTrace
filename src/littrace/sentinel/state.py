@@ -90,7 +90,21 @@ class SentinelRunSummary(BaseModel):
     topic: str
     started_at: str
     finished_at: str | None = None
-    new_candidates_count: int = 0
+    # Round 23: the user wants sentinel to surface *every* paper
+    # the search returns on each run, not just papers the
+    # dedup-by-seen-papers-id logic hasn't recorded yet. Two
+    # counters track the distinction:
+    #
+    # - ``candidate_count``: every paper returned by the search this
+    #   run (after dedup-by-DOI against ``workspace.papers`` so we
+    #   don't double-count papers the workspace already has).
+    # - ``new_candidate_count``: subset of ``candidate_count``
+    #   whose ``paper_id`` is not in ``SentinelState.seen_paper_ids``.
+    #   Useful for "did this run surface any *new* paper I haven't
+    #   seen before?" UX questions.
+    candidate_count: int = 0
+    new_candidate_count: int = 0
+    seen_candidate_count: int = 0
     downloaded_count: int = 0
     parsed_count: int = 0
     access_task_count: int = 0

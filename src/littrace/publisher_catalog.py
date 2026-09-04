@@ -78,14 +78,33 @@ PUBLISHERS: tuple[Publisher, ...] = (
     Publisher(
         slug="acs",
         display_name="ACS",
-        sign_in_url="https://pubs.acs.org/action/showLogin",
+        # Round 22: ACS's real login entry point is /action/login
+        # (NOT /action/showLogin which used to be the previous
+        # placeholder, and NOT /action/sso which doesn't exist as a
+        # login entry on pubs.acs.org). Verified against the live
+        # ACS publications site.
+        sign_in_url="https://pubs.acs.org/action/login",
         cookie_domains=("acs.org", "pubs.acs.org"),
     ),
     Publisher(
         slug="springer",
         display_name="Springer",
+        # Round 22: ``link.springer.com/signup-login`` immediately
+        # 302-redirects to the Spring Nature federated identity
+        # provider at ``idp-personal-authenticator.springernature.com``;
+        # the actual login session cookie lands on
+        # ``springernature.com`` (not on ``springer.com`` or
+        # ``link.springer.com``). Without the extra domain the
+        # cookie detector returns "logged out" after a successful
+        # login, and ``sentinel`` falls back to public-only fetches.
         sign_in_url="https://link.springer.com/signup-login",
-        cookie_domains=("springer.com", "link.springer.com"),
+        cookie_domains=(
+            "springer.com",
+            "link.springer.com",
+            "springernature.com",
+            "idp.springernature.com",
+            "idp-personal-authenticator.springernature.com",
+        ),
     ),
     Publisher(
         slug="elsevier",
@@ -119,8 +138,18 @@ PUBLISHERS: tuple[Publisher, ...] = (
     Publisher(
         slug="mdpi",
         display_name="MDPI",
-        sign_in_url="https://www.mdpi.com/login",
-        cookie_domains=("mdpi.com",),
+        # Round 22: ``https://www.mdpi.com/login`` returns 404 (the
+        # endpoint never existed — it was carried over from the
+        # legacy ``PUBLISHER_LINKS`` parallel list with no live
+        # verification). The real MDPI account login lives at
+        # ``/user/login`` per MDPI's current site, but that page
+        # itself 302-redirects to ``login.mdpi.com/login`` (MDPI's
+        # central auth gateway). The session cookie lands on
+        # ``login.mdpi.com`` — without that domain in
+        # ``cookie_domains`` the detector still returns "logged out"
+        # after a successful login.
+        sign_in_url="https://www.mdpi.com/user/login",
+        cookie_domains=("mdpi.com", "login.mdpi.com"),
     ),
     Publisher(
         slug="arxiv",

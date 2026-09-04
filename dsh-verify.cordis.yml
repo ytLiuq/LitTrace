@@ -1,0 +1,51 @@
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+  config:
+    maxTokensAsSuccess: false
+
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    apiKeyEnv: OPENAI_API_KEY
+    streamIdleTimeoutMs: 172800000
+    models:
+      - id: !!js process.env.DSH_MODEL ?? 'qwen-plus'
+        contextWindow: 32768
+
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: littrace-mcp
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: littrace
+    transport: stdio
+    command: !!js process.env.LITTRACE_MCP_BIN ?? 'python'
+    args:
+      - -m
+      - littrace.mcp_server
+    cwd: /littrace
+    env:
+      LITTRACE_CONFIG_PATH: /littrace/config.yaml
+      LITTRACE_MCP_TOKEN: mcp-verify-token
+      PYTHONPATH: /littrace/src
+
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    includeHarnessIdentity: false
+    includeRuntimeContext: false
+    persona: 'You have access to the littrace MCP server tools. Call get_workspace_context and report the workspace_revision and paper_count back to the user. Be concise.'
+    workspaceContext: false
+    skills:
+      enabled: false
+    toolBash: false
+    toolJobs: false
+    enabledTools:
+      - mcp__littrace__get_workspace_context
+
+- id: sessions
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: /tmp/dsh-sessions
+    compression: none

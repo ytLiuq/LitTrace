@@ -20,7 +20,13 @@ def init_sentinel(config: LitTraceConfig, watchlist_id: str, topic: str) -> str:
     return str(store.root)
 
 
-async def run_sentinel(config: LitTraceConfig, watchlist_or_id, topic: str | None = None):
+async def run_sentinel(
+    config: LitTraceConfig,
+    watchlist_or_id,
+    topic: str | None = None,
+    *,
+    main_session_id: str | None = None,
+):
     """Run the daily sentinel against ``watchlist_or_id``.
 
     Round 17: accepts either a ``Watchlist`` instance (new callers
@@ -28,6 +34,14 @@ async def run_sentinel(config: LitTraceConfig, watchlist_or_id, topic: str | Non
     watchlist id (legacy callers — the function still loads +
     updates the watchlist itself, so a CLI that doesn't have the
     override plumbing keeps working).
+
+    Round 24: ``main_session_id`` is the GUI's chat session id.
+    When provided, sentinel writes paper metadata, parsed output,
+    RAG chunks, and artifacts into *that* session — making the
+    GUI's main workspace the single source of truth. Without
+    ``main_session_id`` (e.g. CLI invocation without a GUI) sentinel
+    falls back to the legacy ``sentinel:<watchlist>`` session so
+    standalone ``littrace sentinel run`` keeps working.
     """
     if isinstance(watchlist_or_id, Watchlist):
         watchlist = watchlist_or_id
@@ -40,16 +54,26 @@ async def run_sentinel(config: LitTraceConfig, watchlist_or_id, topic: str | Non
         watchlist = load_watchlist(store)
         if topic:
             watchlist = watchlist.model_copy(update={"topic": topic, "objective": topic})
-    sentinel = LiteratureSentinel(config, watchlist)
+    sentinel = LiteratureSentinel(
+        config, watchlist, main_session_id=main_session_id,
+    )
     return await sentinel.run()
 
 
-def access_review(config: LitTraceConfig, watchlist_id: str, topic: str | None = None):
+def access_review(
+    config: LitTraceConfig,
+    watchlist_id: str,
+    topic: str | None = None,
+    *,
+    main_session_id: str | None = None,
+):
     store = ensure_sentinel_store(config, Watchlist(watchlist_id=watchlist_id, topic=topic or watchlist_id))
     watchlist = load_watchlist(store)
     if topic:
         watchlist = watchlist.model_copy(update={"topic": topic, "objective": topic})
-    sentinel = LiteratureSentinel(config, watchlist)
+    sentinel = LiteratureSentinel(
+        config, watchlist, main_session_id=main_session_id,
+    )
     return sentinel.access_review()
 
 

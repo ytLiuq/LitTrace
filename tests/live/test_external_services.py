@@ -16,10 +16,20 @@ pytestmark = pytest.mark.live
 # ---- test_live_download.py ----
 
 import os
+from uuid import uuid4
 
-from littrace.config import ArtifactStorageConfig, StorageConfig, load_config
+from littrace.config import ArtifactStorageConfig, MetadataStoreConfig, StorageConfig, load_config
 from littrace.downloads import execute_downloads
 from littrace.models import AccessType, DownloadExecutionRequest, PaperMetadata
+from littrace.sentinel.agent import LiteratureSentinel
+from littrace.sentinel.state import Watchlist
+from littrace.session import create_chat_session, load_workspace, save_workspace
+from littrace.rag_jobs import run_daily_rag_maintenance
+from littrace.research_background import assess_research_background, set_workspace_research_background
+from littrace.artifact_registry import artifact_registry_from_config
+from littrace.artifact_store import BlobRef, artifact_store_from_config
+from littrace.retrieval.rag_search import search_session_rag
+from littrace.retrieval.search import filter_papers_by_retrieval_policy
 
 
 @pytest.mark.live
@@ -79,7 +89,7 @@ async def test_live_daily_update_runs_discovery_and_downloads(tmp_path: Path):
     config.cdp_downloader.repository_download_timeout_seconds = 120
     # Keep this smoke test focused on the discovery/download contract. OCR has
     # its own parser tests and can be run as a follow-up workflow.
-    config.sentinel.parse_on_daily = False
+    config.sentinel_parse_on_daily = False
 
     watchlist = Watchlist(
         watchlist_id="live_daily_smoke",
@@ -229,7 +239,7 @@ import sys
 from pathlib import Path
 
 
-ROOT = Path(__file__).parents[1]
+ROOT = Path(__file__).parents[2]
 
 
 def _require_live() -> None:
