@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin
@@ -51,6 +52,36 @@ async def execute_downloads(
     task_store = download_task_store_from_config(config)
     session_id = request.session_id or "adhoc"
     async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        # Round 28: build ONE shared CDP browser for the whole batch
+        # so gated papers reuse a single Chrome tab instead of
+        # creating 45 phantom ``about:blank`` tabs. The browser is
+        # synchronised with the asyncio semaphore so concurrent
+        # plan items still serialize through one tab — that's
+        # actually what we want for CF / SSO flows which need the
+        # page state to settle between navigations.
+        from littrace.access_layer.cdp_core import CDPBrowser
+        shared_browser: "CDPBrowser | None" = None
+        if not request.dry_run and any(
+            p.access_type == AccessType.REQUIRES_LOGIN
+            for p in target_papers
+        ):
+            try:
+                shared_browser = await asyncio.to_thread(
+                    CDPBrowser,
+                    config.cdp_downloader.cdp_url,
+                    reconnect_attempts=(
+                        config.cdp_downloader.websocket_reconnect_attempts
+                    ),
+                    command_timeout_seconds=(
+                        config.cdp_downloader.command_timeout_seconds
+                    ),
+                )
+                await asyncio.to_thread(shared_browser.connect_new_tab)
+            except Exception:
+                # If the shared browser can't start up, fall back
+                # to the per-paper one — the previous behaviour.
+                shared_browser = None
+
         async def run_plan_item(plan_item):
             paper = next(paper for paper in target_papers if paper.paper_id == plan_item.paper_id)
             task = DownloadTask.from_paper(
@@ -69,6 +100,7 @@ async def execute_downloads(
                 request.dry_run,
                 task,
                 write_local=(request.target != "storage_only"),
+                shared_browser=shared_browser,
             )
             _record_terminal_acquisition_event(config, task)
             if not request.dry_run and config.download_retry.enabled:
@@ -82,6 +114,17 @@ async def execute_downloads(
                 return await run_plan_item(plan_item)
 
         items = list(await asyncio.gather(*(run_bounded(item) for item in plan.items)))
+
+        # Round 29: tear down the shared browser ONCE at the end of
+        # the batch. Per-paper teardown used to leak 45 ``about:blank``
+        # tabs into the user's Chrome window; now the batch owns the
+        # browser's lifecycle so a single ``close()`` cleans up the
+        # tab and websocket together.
+        if shared_browser is not None:
+            try:
+                await asyncio.to_thread(shared_browser.close)
+            except Exception:
+                pass
 
     return DownloadExecutionResult(
         items=items,
@@ -102,10 +145,13 @@ async def _execute_one(
     task: DownloadTask,
     *,
     write_local: bool = True,
+    shared_browser: "CDPBrowser | None" = None,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
     _record_task_lifecycle(config, task, "acquisition_started")
     if paper.access_type == AccessType.REQUIRES_LOGIN and paper.doi:
-        return await _execute_cdp_download_async(config, paper, dry_run, task)
+        return await _execute_cdp_download_async(
+            config, paper, dry_run, task, browser=shared_browser,
+        )
     pdf_url = paper.pdf_url
     if paper.access_type == AccessType.OPEN_ACCESS and not pdf_url:
         report = await resolve_full_text_for_paper(client, paper, config)
@@ -309,6 +355,7 @@ def _execute_cdp_download(
     task: DownloadTask,
     *,
     prior_error: str | None = None,
+    browser=None,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
     target_path = target_pdf_path(config, paper)
     if dry_run:
@@ -321,7 +368,10 @@ def _execute_cdp_download(
     task.requires_login = True
     task.attempt_count += 1
     task.mark(DownloadTaskStatus.DOWNLOADING)
-    result = download_paper_via_cdp(config, paper.doi or paper.paper_id, target_path)
+    result = download_paper_via_cdp(
+        config, paper.doi or paper.paper_id, target_path,
+        browser=browser,
+    )
     error = result.error or prior_error
     storage_ref: dict[str, object] | None = None
     if result.downloaded and target_path.exists():
@@ -364,8 +414,18 @@ async def _execute_cdp_download_async(
     task: DownloadTask,
     *,
     prior_error: str | None = None,
+    browser=None,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
-    """Run the blocking CDP client without blocking other download workers."""
+    """Run the blocking CDP client without blocking other download workers.
+
+    Round 28: caller can pass a shared ``browser`` instance so a
+    single Chrome tab is reused across all gated papers in the
+    batch. Without the shared browser, each call creates a fresh
+    ``about:blank`` tab and leaves it open after the download —
+    45 gated papers → 45 phantom tabs the user has to close by
+    hand. Reusing the tab keeps Chrome's tab bar clean and cuts
+    the per-paper CDP connection setup cost.
+    """
     return await asyncio.to_thread(
         _execute_cdp_download,
         config,
@@ -373,6 +433,7 @@ async def _execute_cdp_download_async(
         dry_run,
         task,
         prior_error=prior_error,
+        browser=browser,
     )
 
 
@@ -609,3 +670,6 @@ def _record_terminal_acquisition_event(config: LitTraceConfig, task: DownloadTas
     else:
         return
     _record_task_lifecycle(config, task, event_type)
+
+
+

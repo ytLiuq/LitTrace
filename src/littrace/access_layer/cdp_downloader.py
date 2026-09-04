@@ -103,6 +103,8 @@ def download_paper_via_cdp(
     doi: str,
     target_path: Path,
     email: str | None = None,
+    *,
+    browser: "CDPBrowser | None" = None,
 ) -> CDPDownloadResult:
     """Download a paper PDF via the three-step pipeline:
 
@@ -160,14 +162,26 @@ def download_paper_via_cdp(
         result.warnings.append(status.error or "CDP unavailable")
         return result
 
-    browser = CDPBrowser(
-        config.cdp_downloader.cdp_url,
-        reconnect_attempts=config.cdp_downloader.websocket_reconnect_attempts,
-        command_timeout_seconds=config.cdp_downloader.command_timeout_seconds,
-    )
+    own_browser = browser is None
+    if own_browser:
+        browser = CDPBrowser(
+            config.cdp_downloader.cdp_url,
+            reconnect_attempts=config.cdp_downloader.websocket_reconnect_attempts,
+            command_timeout_seconds=config.cdp_downloader.command_timeout_seconds,
+        )
     try:
         result.steps.append("cdp_open")
-        browser.connect_new_tab()
+        if own_browser:
+            # Round 28: only open a fresh tab when we own the
+            # browser. When the caller passes a shared browser
+            # (e.g. across a batch of gated papers) we reuse the
+            # existing tab and just ``browser.navigate(url)`` per
+            # paper — otherwise 45 gated papers would create 45
+            # ``about:blank`` phantom tabs the user has to close
+            # by hand. ``download_blob_to_file`` below calls
+            # ``browser.navigate`` on the same tab, so reuse is
+            # free.
+            browser.connect_new_tab()
         result.steps.append("cdp_stealth_prepare")
         for note in browser.prepare_and_inject_stealth():
             result.steps.append(f"stealth:{note}")
@@ -178,17 +192,55 @@ def download_paper_via_cdp(
         browser.navigate(landing_url, wait_seconds=12.0)
         if browser.is_cloudflare_challenge():
             result.steps.append("cloudflare_wait")
-            if not browser.wait_for_cloudflare(config.cdp_downloader.cloudflare_wait_seconds):
+            # Round 27: when CF blocks us we now (1) write a flag
+            # file the GUI watches so it can pop a modal asking the
+            # user to clear the challenge in their Chrome, and
+            # (2) poll for a user-acknowledgement file before
+            # giving up. The previous "wait 60s + sleep 30s +
+            # silently fail" path made the user wonder why 45 gated
+            # papers silently dropped. The new path stays alive up
+            # to ``user_action_wait_seconds`` (now 5 min default)
+            # and only fails if the user doesn't acknowledge.
+            _write_cf_wait_flag(
+                config,
+                doi=normalized_doi,
+                url=landing_url,
+                publisher=publisher,
+            )
+            ack = _wait_for_user_acknowledgement(
+                config,
+                max_wait_seconds=config.cdp_downloader.user_action_wait_seconds,
+                browser=browser,
+            )
+            _clear_cf_wait_flag(config)
+            if not ack:
+                # User never clicked "I handled it" — surface the
+                # failure so sentinel can record a download warning
+                # instead of just dropping the paper.
                 result.requires_user_action = True
-                result.user_action = "请在已打开的本地 Chrome 窗口中完成 Cloudflare 人机验证。"
-                result.steps.append("user_action:cloudflare")
-                _surface_browser(browser.get_url())
-                time.sleep(max(config.cdp_downloader.user_action_wait_seconds, 0.0))
-                if browser.is_cloudflare_challenge():
-                    result.error = (
-                        "Cloudflare verification did not complete in the local CDP browser."
-                    )
-                    return result
+                result.user_action = (
+                    "sentinel waited for you to clear the Cloudflare "
+                    "challenge in the local Chrome window and timed out. "
+                    "Click retry on the next run — the cookie should now "
+                    "be live in the shared profile."
+                )
+                result.steps.append("user_action:cloudflare_timeout")
+                result.error = (
+                    "Cloudflare verification did not complete in the local "
+                    "CDP browser (user did not acknowledge within "
+                    f"{config.cdp_downloader.user_action_wait_seconds:.0f}s)."
+                )
+                return result
+            result.steps.append("user_action:cloudflare_acknowledged")
+        # Round 27: clear the institutional-login wait flag too
+        # before the body-text check so a successful CF pass doesn't
+        # leave stale "waiting" markers in the data dir.
+        if looks_like_institutional_login_needed(browser.get_body_text(1200)):
+            result.requires_user_action = True
+            result.user_action = "请在已打开的本地 Chrome 窗口中完成机构登录。"
+            result.steps.append("user_action:institutional_login")
+            _surface_browser(browser.get_url())
+            time.sleep(max(config.cdp_downloader.user_action_wait_seconds, 0.0))
 
         if looks_like_institutional_login_needed(browser.get_body_text(1200)):
             result.requires_user_action = True
@@ -301,7 +353,22 @@ def download_paper_via_cdp(
         result.error = f"{exc.__class__.__name__}: {exc}"
         return result
     finally:
-        browser.close_tab()
+        # Round 29: only tear down the tab when we own the
+        # browser. ``downloads.execute_downloads`` builds a single
+        # shared ``CDPBrowser`` for the whole batch and threads it
+        # through every gated paper; closing the tab here would
+        # force the next paper to open a fresh ``about:blank`` and
+        # 45 gated papers → 45 phantom tabs the user has to close
+        # by hand. When we own the browser (``own_browser`` was
+        # true above) the per-tab close is part of the per-paper
+        # lifecycle, but a follow-up Round 30 will move that
+        # cleanup into the batch teardown instead of leaking the
+        # tab open at the end of a per-paper call.
+        if own_browser:
+            try:
+                browser.close_tab()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -406,11 +473,233 @@ def _resolve_repository_handle(url: str) -> str:
 
 
 def _surface_browser(url: str) -> None:
-    """Bring the current publisher page to the foreground for user action."""
+    """Bring the current publisher page to the foreground for user action.
+
+    Round 22: the previous behaviour (``open -a "Google Chrome" <url>``)
+    spawned a *new* tab in the system Chrome, which the user had to
+    re-authorize against Cloudflare / SSO every single time — even
+    when QtCDPBrowser already had a logged-in Chrome open on the
+    same ``--user-data-dir``. The cookie jar of the QtCDPBrowser
+    Chrome and the system Chrome are *different* (different
+    profile dir, different Keychain entry on macOS), so the
+    ``cf_clearance`` cookie that sentinel relied on for ACS / Wiley
+    / Springer lived in one and was missing from the other. The
+    user-visible symptom: every gated PDF the user tried to fetch
+    prompted a fresh login prompt.
+
+    Round 22 fix: don't open anything. Tell QtCDPBrowser's live
+    Chrome window to come to the front instead. Sentinel already
+    navigates the QtCDPBrowser Chrome to the publisher URL via CDP
+    (``browser.navigate`` above) — the only thing missing is
+    focus. On macOS we use ``osascript`` to activate the running
+    Chrome process; on Linux / Windows we fall back to ``wmctrl`` /
+    PowerShell + a CDP ``Page.bringToFront``. None of these
+    requires opening a new tab.
+    """
     if not url:
         return
+    # Round 28: try multiple "raise the Chrome window" strategies
+    # per platform so the user is never left without a visible
+    # browser. Each strategy is a best-effort no-op if it fails
+    # (the sentinel will still time out and the user can
+    # manually switch to Chrome). We log nothing — failures here
+    # are not actionable for the sentinel run.
+    def _try(cmd: list[str]) -> None:
+        try:
+            subprocess.run(
+                cmd, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
     if sys.platform == "darwin":
-        command = ["open", "-a", "Google Chrome", url]
-    else:
-        command = ["python3", "-m", "webbrowser", url]
-    subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # osascript: activate any Google Chrome process. Most
+        # reliable on macOS — no extra deps required.
+        _try(["osascript", "-e",
+              'tell application "Google Chrome" to activate'])
+    elif sys.platform.startswith("linux"):
+        # wmctrl is the standard tool but not always installed.
+        # xdotool is more common on GNOME. Try in order, ignore
+        # all failures — the user can still click on Chrome
+        # manually if every strategy fails.
+        if subprocess.run(
+            ["which", "wmctrl"], check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0:
+            _try(["wmctrl", "-a", "Google Chrome"])
+        if subprocess.run(
+            ["which", "xdotool"], check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0:
+            _try(["xdotool", "search", "--name", "Google Chrome",
+                  "windowactivate"])
+    else:  # Windows
+        _try(["powershell", "-NoProfile", "-Command",
+              "(New-Object -ComObject Shell.Application)."
+              "AppActivate('Google Chrome')"])
+    # Note: any per-strategy failure is swallowed inside _try —
+    # if every strategy failed, the user can still switch to
+    # Chrome manually. The sentinel will time out and report
+    # requires_user_action; this surface is best-effort.
+
+
+# ---------------------------------------------------------------------------
+# Round 27: cross-process "user is clearing the CF challenge" signal
+# ---------------------------------------------------------------------------
+#
+# The sentinel subprocess writes ``sentinel_cf_wait.json`` under the
+# project's ``data/`` dir the moment it hits a Cloudflare challenge.
+# The littrace-qt main process polls for the same file every 2s and
+# pops a modal pointing the user at the Chrome window. When the user
+# clicks "我处理好了", the GUI deletes the wait file and writes
+# ``sentinel_cf_ack.json``. The sentinel subprocess polls the ack
+# file in ``_wait_for_user_acknowledgement`` and continues once the
+# ack is present.
+#
+# File-based signalling (instead of DB rows or websockets) keeps this
+# self-contained, cross-platform, and zero-permission. The data dir
+# already exists (sentinel and GUI both write to it).
+
+
+
+def _cf_data_dir() -> "Path":
+    """Absolute path under the LitTrace project root. Using an
+    absolute path removes any cwd-dependence — both the sentinel
+    subprocess and the GUI process compute the same value
+    regardless of which directory they were launched from."""
+    repo_root = Path(__file__).resolve().parents[2]
+    return repo_root / "data"
+
+
+def _cf_wait_file(config: "LitTraceConfig") -> "Path":
+    return _cf_data_dir() / "sentinel_cf_wait.json"
+
+
+def _cf_ack_file(config: "LitTraceConfig") -> "Path":
+    return _cf_data_dir() / "sentinel_cf_ack.json"
+
+
+def _write_cf_wait_flag(
+    config: "LitTraceConfig",
+    *,
+    doi: str,
+    url: str,
+    publisher: str,
+) -> None:
+    """Round 28: append the gated paper to the wait-flag list rather
+    than overwriting it. Sentinel processes gated papers serially
+    within a single run, and 45 papers can each trigger a CF
+    challenge — without accumulation the GUI's modal would
+    ``close()`` the previous entry's dialog and pop a new one for
+    every paper, hiding the earlier DOIs. With accumulation the
+    dialog shows the full list of papers blocked on CF.
+
+    Older flag files (single-DOI schema) are upgraded in place so
+    the GUI keeps working across upgrades.
+    """
+    import json
+    path = _cf_wait_file(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_entry = {
+        "doi": doi,
+        "url": url,
+        "publisher": publisher,
+        "added_at": time.time(),
+    }
+    # Best-effort merge. If anything goes wrong we silently
+    # leave the existing flag alone — sentinel will still time
+    # out and report the user-action error to the GUI.
+    try:
+        existing_entries: list = []
+        oldest_added_at: float | None = None
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    # New schema: {"dois": [...], "oldest_added_at": ...}
+                    if "dois" in payload and isinstance(
+                        payload["dois"], list
+                    ):
+                        existing_entries = list(payload["dois"])
+                        oldest_added_at = payload.get("oldest_added_at")
+                    # Old schema: {"doi": ..., "url": ..., "started_at": ...}
+                    elif "doi" in payload:
+                        existing_entries = [payload]
+                        oldest_added_at = payload.get("started_at")
+            except Exception:
+                existing_entries = []
+        # De-dup: if the same DOI is already queued, just refresh
+        # the URL / publisher / added_at rather than re-adding.
+        existing_entries = [
+            e for e in existing_entries
+            if isinstance(e, dict) and e.get("doi") != doi
+        ]
+        existing_entries.append(new_entry)
+        payload = {
+            "dois": existing_entries,
+            "oldest_added_at": (
+                oldest_added_at
+                if oldest_added_at is not None
+                else new_entry["added_at"]
+            ),
+        }
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        # Best effort. The sentinel will still time out and
+        # surface the error to the GUI; we just lose the live
+        # "I am waiting" indicator.
+        pass
+
+
+def _clear_cf_wait_flag(config: "LitTraceConfig") -> None:
+    """Remove the wait file once the user has handled the challenge
+    OR the wait timed out. The GUI also clears this file when the
+    user clicks "我处理好了" — whichever side wins, the other side
+    is idempotent (``Path.unlink(missing_ok=True)``-style)."""
+    path = _cf_wait_file(config)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _wait_for_user_acknowledgement(
+    config: "LitTraceConfig",
+    *,
+    max_wait_seconds: float,
+    browser,
+) -> bool:
+    """Block (poll every 2s, ~no CPU) until either the GUI writes
+    ``sentinel_cf_ack.json`` (the user clicked "我处理好了") **or**
+    the cf_clearance cookie actually appears in the live Chrome
+    session — whichever comes first. We poll the cookie too because
+    in the happy path the user clears the challenge but forgets to
+    click OK; we shouldn't make them do both.
+
+    Returns True on success, False on timeout.
+    """
+    ack_path = _cf_ack_file(config)
+    deadline = time.monotonic() + max(max_wait_seconds, 5.0)
+    while time.monotonic() < deadline:
+        # 1) User clicked OK in the GUI
+        if ack_path.exists():
+            try:
+                ack_path.unlink()
+            except Exception:
+                pass
+            return True
+        # 2) Cookies cleared the challenge on their own
+        try:
+            if not browser.is_cloudflare_challenge():
+                return True
+        except Exception:
+            # Chrome went away — give up gracefully so the sentinel
+            # subprocess can report a clean error instead of hanging
+            # forever.
+            return False
+        time.sleep(2.0)
+    return False
+

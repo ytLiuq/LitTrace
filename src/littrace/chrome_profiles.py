@@ -136,6 +136,21 @@ def build_chrome_launch_plan(
         f"--remote-allow-origins=http://127.0.0.1:{port}",
         f"--user-data-dir={discovery.user_data_dir}",
         f"--profile-directory={selected}",
+        # Round 22: on macOS, Chrome encrypts the cookie SQLite file
+        # with a Keychain secret by default, which makes the cookie
+        # table unreadable to ``sqlite3`` AND invisible to a freshly
+        # launched Chrome process (the secret lives in the user's
+        # login Keychain, not in ``user-data-dir``). For an automated
+        # workflow that needs cookies to survive across our own
+        # Chrome restarts (publisher login → sentinel run), that's a
+        # foot-gun: the cookie the user just earned is silently lost.
+        # ``--use-mock-keychain`` switches Chrome to its built-in
+        # fallback that stores the encryption secret alongside the
+        # profile — usable on any platform but only needed on macOS.
+        # Round 22: kept as a no-op on Linux/Windows because Linux
+        # Chrome does not have the equivalent setting and Windows
+        # already writes cookies in plain SQLite.
+        "--use-mock-keychain",
     ]
     if use_headless:
         # ``--headless=new`` is the modern Chromium headless that keeps
@@ -338,19 +353,36 @@ def _resolve_chrome_executable(config: LitTraceConfig) -> Path | None:
 
 
 def _resolve_user_data_dir(config: LitTraceConfig) -> Path | None:
+    """Return the user-data-dir for LitTrace's private Chrome.
+
+    Round 29: previously this fell back to the platform default
+    Chrome profile (``~/Library/Application Support/Google/Chrome``
+    on macOS, etc.) when ``config.cdp_downloader.chrome_user_data_dir``
+    was unset. That fallback was the root cause of the "鉴权打开
+    浏览器仍然是用户的浏览器" bug — if a user accidentally
+    cleared ``chrome_user_data_dir`` in config.yaml, sentinel
+    and the publisher-login flow would launch Chrome against
+    the user's day-to-day profile, write SSO cookies there, and
+    silently lose them (LitTrace reads from a different
+    directory next time). Now we hard-require an explicit
+    LitTrace-private dir: the schema default is
+    ``./data/chrome-cdp`` (see ``CDPDownloaderConfig``), and
+    any explicit ``None`` in config is treated as a config
+    error rather than a "use the user's Chrome" signal.
+    """
     configured = config.cdp_downloader.chrome_user_data_dir
     if configured:
         return configured.expanduser()
-    system = platform.system().lower()
-    home = Path.home()
-    if system == "darwin":
-        return home / "Library/Application Support/Google/Chrome"
-    if system == "windows":
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            return Path(local_app_data) / "Google/Chrome/User Data"
-        return None
-    return home / ".config/google-chrome"
+    # Hard-fail rather than silently fall back to the user's
+    # day-to-day Chrome. Operators who really want the platform
+    # default can set an absolute path explicitly.
+    raise RuntimeError(
+        "cdp_downloader.chrome_user_data_dir is unset; refusing to "
+        "fall back to the platform's default Chrome profile. Set it "
+        "to a LitTrace-private directory (e.g. ./data/chrome-cdp) in "
+        "config.yaml so publisher SSO cookies stay isolated from the "
+        "user's day-to-day Chrome."
+    )
 
 
 def _read_profiles(user_data_dir: Path) -> list[ChromeProfileInfo]:

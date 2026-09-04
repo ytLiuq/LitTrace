@@ -3,9 +3,25 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
+
+# Round 22: Python's stdout is line-buffered by default, so a
+# ``print()`` call gets held in the buffer until the next newline
+# or until the process flushes. When the GUI's daily-run driver
+# SIGTERMs the sentinel subprocess via ``proc.terminate()``
+# (PER_ROUND_TIMEOUT = 180s), the buffered stdout never reaches
+# the parent's pipe — ``proc.stdout.read()`` returns an empty
+# string and ``_summarise_sentinel_output`` finds no ``new_candidates:``
+# / ``downloaded:`` lines → the dialog displays 0/0/0/1 instead
+# of the real counters.
+#
+# Force unbuffered stdout at process startup so every print() lands
+# in the pipe immediately. ``flush=True`` on individual print()s
+# would also work but is easy to forget when adding new diagnostics.
+sys.stdout.reconfigure(line_buffering=True)
 
 from littrace.attachments import attach_pdf_to_paper, check_download_presence
 from littrace.workflow_status import build_workflow_status
@@ -322,20 +338,79 @@ async def _run_sentinel_command(config) -> None:
             updates["target_papers"] = target_papers_arg
         if updates:
             watchlist = watchlist.model_copy(update=updates)
-        result = await run_sentinel(config, watchlist)
-        print(f"run_id: {result.summary.run_id}")
-        print(f"watchlist: {result.summary.watchlist_id}")
-        print(f"topic: {result.summary.topic}")
-        print(f"year_range: {watchlist.year_min}-{watchlist.year_max or 'now'}")
-        print(f"target_papers: {watchlist.target_papers}")
-        print(f"new_candidates: {result.summary.new_candidates_count}")
-        print(f"downloaded: {result.summary.downloaded_count}")
-        print(f"parsed: {result.summary.parsed_count}")
-        print(f"access_tasks: {result.summary.access_task_count}")
+        # Round 24: thread the GUI main session id through so
+        # sentinel writes paper metadata + RAG chunks directly into
+        # the main workspace, not into a separate
+        # ``sentinel:<watchlist_id>`` session. The mirror step we
+        # added in Round 23 was a band-aid; the proper fix is for
+        # the user-facing workspace to be the single source of
+        # truth. We also accept the legacy
+        # ``LITTRACE_SENTINEL_MAIN_SESSION`` env var so the
+        # standalone ``littrace sentinel run`` (no GUI) keeps
+        # working — it falls back to the sentinel session when
+        # nothing is passed.
+        main_session_id = _arg_value("--main-session-id") or os.environ.get(
+            "LITTRACE_SENTINEL_MAIN_SESSION"
+        )
+        # Round 29: defensive wrap. ``run_sentinel`` can fail
+        # partway (the most recent occurrence was an
+        # ``AttributeError`` on a renamed ``WorkspaceFilters``
+        # field that crashed the subprocess *before* the
+        # summary lines were printed — leaving the GUI's daily
+        # dialog at 0/0/0 with no diagnostic). Now we catch any
+        # unexpected exception, still emit the counter lines
+        # (zeros + a warning), so the GUI parses a coherent
+        # result and surfaces the real error in the warning
+        # line instead of silently dropping the run.
+        try:
+            result = await run_sentinel(
+                config, watchlist, main_session_id=main_session_id,
+            )
+        except Exception as sentinel_exc:
+            import traceback
+            tb = traceback.format_exc(limit=4)
+            run_id = f"error-{int(time.time())}"
+            print(f"run_id: {run_id}", flush=True)
+            print(f"watchlist: {watchlist.watchlist_id}", flush=True)
+            print(f"topic: {watchlist.topic}", flush=True)
+            print(f"year_range: {watchlist.year_min}-{watchlist.year_max or 'now'}", flush=True)
+            print(f"target_papers: {watchlist.target_papers}", flush=True)
+            print("new_candidates: 0", flush=True)
+            print("candidates_total: 0", flush=True)
+            print("candidates_seen: 0", flush=True)
+            print("downloaded: 0", flush=True)
+            print("parsed: 0", flush=True)
+            print("access_tasks: 0", flush=True)
+            print(
+                "warnings: sentinel crashed before printing "
+                f"summary: {sentinel_exc.__class__.__name__}: {sentinel_exc} | "
+                f"trace: {tb.replace(chr(10), ' | ')}",
+                flush=True,
+            )
+            return
+        # Round22: every line ends with ``flush=True`` because the
+        # GUI's daily-run driver SIGTERMs us on PER_ROUND_TIMEOUT
+        # (180s); without explicit flush the buffered stdout is lost
+        # mid-run and ``_summarise_sentinel_output`` returns 0/0/0/0
+        # to the dialog. We tried ``sys.stdout.reconfigure`` at
+        # module import (still in place below) but it doesn't survive
+        # the asyncio.run + nest-of-callbacks path on every Python
+        # version — the explicit flush is the belt-and-braces.
+        print(f"run_id: {result.summary.run_id}", flush=True)
+        print(f"watchlist: {result.summary.watchlist_id}", flush=True)
+        print(f"topic: {result.summary.topic}", flush=True)
+        print(f"year_range: {watchlist.year_min}-{watchlist.year_max or 'now'}", flush=True)
+        print(f"target_papers: {watchlist.target_papers}", flush=True)
+        print(f"new_candidates: {result.summary.new_candidate_count}", flush=True)
+        print(f"candidates_total: {result.summary.candidate_count}", flush=True)
+        print(f"candidates_seen: {result.summary.seen_candidate_count}", flush=True)
+        print(f"downloaded: {result.summary.downloaded_count}", flush=True)
+        print(f"parsed: {result.summary.parsed_count}", flush=True)
+        print(f"access_tasks: {result.summary.access_task_count}", flush=True)
         if result.summary.digest_path:
-            print(f"digest: {result.summary.digest_path}")
+            print(f"digest: {result.summary.digest_path}", flush=True)
         if result.summary.warnings:
-            print("warnings: " + "；".join(result.summary.warnings))
+            print("warnings: " + "；".join(result.summary.warnings), flush=True)
         return
     if action == "status":
         store = get_sentinel_store(config, watchlist_id)
