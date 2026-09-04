@@ -610,8 +610,12 @@ class CodexAppServerChatService:
 
     def _mcp_server_config(self) -> dict[str, Any]:
         project_root = Path(__file__).resolve().parents[3]
+        configured_path = getattr(self.config, "_config_path", None)
         config_path = Path(
-            os.environ.get("LITTRACE_CONFIG_PATH", project_root / "config.yaml")
+            os.environ.get(
+                "LITTRACE_CONFIG_PATH",
+                configured_path or project_root / "config.yaml",
+            )
         ).expanduser()
         env = {
             "LITTRACE_MCP_GATEWAY": "1",

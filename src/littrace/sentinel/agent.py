@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +10,12 @@ from littrace.models import AccessType, DownloadExecutionRequest, LiteratureWork
 from littrace.sentinel.digest import build_digest_markdown, save_digest
 from littrace.sentinel.resource_pack import ResourcePack, build_resource_pack, save_resource_pack
 from littrace.sentinel.state import AccessTask, SentinelRunSummary, SentinelState, Watchlist
-from littrace.session import save_workspace as _save_workspace_to_session
+from littrace.session import (
+    load_or_create_session,
+    load_workspace as load_session_workspace,
+    save_workspace as _save_workspace_to_session,
+)
+from littrace.parse_jobs import enqueue_parse_job, run_pending_parse_jobs
 from littrace.state_db import state_store_from_config
 from littrace.sentinel.storage import (
     SentinelStore,
@@ -98,11 +104,20 @@ class LiteratureSentinel:
             # upper bound", which is also the backward-compat
             # default when ``Watchlist.year_max`` is unset.
             year_max=self.watchlist.year_max,
+            # Each UI round should process the amount the user requested,
+            # rather than the model default (20) regardless of the target.
+            # A later round can broaden the query when too few PDFs succeed.
+            limit=max(1, self.watchlist.target_papers),
             live=self.config.api.enable_live_search,
             query_variants=list(self.watchlist.query_variants),
         )
 
         search = await search_papers_skill(request, self.config)
+        pipeline_warnings: list[str] = []
+        if search.diagnostics and search.diagnostics.errors:
+            pipeline_warnings.append(
+                "检索源部分失败：" + "；".join(search.diagnostics.errors[:3])
+            )
 
         # Round 24: route the RAG collection into the user's main
         # session so the agent can search it later via
@@ -151,16 +166,26 @@ class LiteratureSentinel:
             if paper_id not in workspace.full_text_reports
         ]
         if unresolved_ids:
-            probe_workspace = workspace.model_copy(deep=True)
-            probe_workspace.context.active_papers = unresolved_ids
-            probe_workspace = await resolve_workspace_full_text_skill(
-                probe_workspace, self.config
-            )
-            for paper_id in unresolved_ids:
-                workspace.full_text_reports[paper_id] = probe_workspace.full_text_reports[
-                    paper_id
-                ]
-                workspace.papers[paper_id] = probe_workspace.papers[paper_id]
+            try:
+                probe_workspace = workspace.model_copy(deep=True)
+                probe_workspace.context.active_papers = unresolved_ids
+                probe_workspace = await resolve_workspace_full_text_skill(
+                    probe_workspace, self.config
+                )
+                for paper_id in unresolved_ids:
+                    report = probe_workspace.full_text_reports.get(paper_id)
+                    if report is not None:
+                        workspace.full_text_reports[paper_id] = report
+                    probed_paper = probe_workspace.papers.get(paper_id)
+                    if probed_paper is not None:
+                        workspace.papers[paper_id] = probed_paper
+            except Exception as exc:
+                # Search metadata is still valid when one publisher probe
+                # fails. Preserve those candidates instead of collapsing the
+                # entire run into the CLI's 0/0 failure summary.
+                pipeline_warnings.append(
+                    f"全文链接探测失败：{exc.__class__.__name__}: {exc}"
+                )
 
         access_tasks = _build_access_tasks(workspace, state)
         state.access_queue = _merge_access_tasks(state.access_queue, access_tasks)
@@ -176,6 +201,7 @@ class LiteratureSentinel:
         ]
         downloaded_count = 0
         download_warnings: list[str] = []
+        parse_report: dict[str, object] = {"parsed_count": 0, "warnings": []}
         if downloadable_ids:
             try:
                 download_result = await execute_downloads_skill(
@@ -183,7 +209,7 @@ class LiteratureSentinel:
                     workspace,
                     DownloadExecutionRequest(
                         paper_ids=downloadable_ids,
-                        session_id=self.store.session_id if hasattr(self.store, "session_id") else None,
+                        session_id=self.target_session_id,
                         target="storage_only",
                     ),
                 )
@@ -198,6 +224,38 @@ class LiteratureSentinel:
                     download_warnings.append(
                         f"下载阶段：{len(downloadable_ids)} 篇候选全部失败（详见 digest.md）"
                     )
+                downloaded_ids = [
+                    item.paper_id
+                    for item in download_result.items
+                    if item.status == "downloaded"
+                ]
+                if downloaded_ids:
+                    # Persist the paper/artifact-bearing workspace first, then
+                    # let the durable parse worker materialize object-store
+                    # bytes and commit parsed output under CAS.
+                    save_sentinel_workspace(self.store, workspace, config=self.config)
+                    target_session = load_or_create_session(
+                        self.config, self.target_session_id
+                    )
+                    current_workspace = load_session_workspace(target_session)
+                    enqueue_parse_job(
+                        self.config,
+                        target_session,
+                        current_workspace,
+                        downloaded_ids,
+                    )
+                    parse_execution = await run_pending_parse_jobs(
+                        self.config,
+                        limit=len(downloaded_ids),
+                        session_id=self.target_session_id,
+                    )
+                    workspace = load_session_workspace(target_session)
+                    parse_report = {
+                        "parsed_count": parse_execution.parsed,
+                        "warnings": parse_execution.warnings,
+                    }
+                else:
+                    parse_report = {"parsed_count": 0, "warnings": []}
             except Exception as exc:
                 # Round 17: previously an exception inside
                 # ``execute_downloads_skill`` would propagate up and
@@ -222,7 +280,14 @@ class LiteratureSentinel:
         # parse step ran. ``parse_workspace_skill`` is imported
         # above for legacy callers; we don't need to call it again.
         try:
-            workspace, table_harness = await extract_tables_skill(workspace, self.config)
+            table_timeout = min(
+                max(float(self.config.llm.metric_extraction_timeout_seconds), 1.0),
+                60.0,
+            )
+            workspace, table_harness = await asyncio.wait_for(
+                extract_tables_skill(workspace, self.config),
+                timeout=table_timeout,
+            )
         except Exception as exc:
             workspace, table_harness = extract_structured_artifacts(workspace)
             table_harness.warnings.append(
@@ -255,8 +320,11 @@ class LiteratureSentinel:
             ),
             "warnings": [],
         }
-        quality_report = build_quality_report_skill(self.config, workspace)
+        quality_report = build_quality_report_skill(
+            self.config, workspace, session_id=self.target_session_id
+        )
         quality_warnings = [
+            *pipeline_warnings,
             *quality_report.warnings,
             *table_harness.warnings,
             *parse_report.get("warnings", []),

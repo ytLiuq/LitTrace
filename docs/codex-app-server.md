@@ -39,8 +39,9 @@ history, turn execution, streaming, and tool orchestration.
 - `agent_thread_bindings` maps one LitTrace session to one durable Codex thread.
   A Postgres advisory lock permits only one active turn for that session.
 - Codex runs in a session-specific scratch directory with `sandbox=read-only`
-  and `approvalPolicy=never`. Domain writes happen only through allowlisted MCP
-  commands, not shell or filesystem access.
+  and `approvalPolicy=on-request`. LitTrace automatically approves only its
+  own empty MCP tool-approval form; shell and filesystem approvals remain
+  denied. Domain writes happen only through allowlisted MCP commands.
 - App Server defaults to a dedicated LitTrace `CODEX_HOME`; global MCP servers,
   skills, threads, and Codex memories are not inherited.
 - App Server starts a required LitTrace MCP process. It exposes only:

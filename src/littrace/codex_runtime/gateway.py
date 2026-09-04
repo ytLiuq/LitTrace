@@ -606,7 +606,9 @@ class LitTraceToolGateway:
                 limit=_bounded_int(args.get("limit"), default=20, minimum=1, maximum=100),
             )
         if name == "quality_report":
-            report = build_quality_report(self.config, workspace)
+            report = build_quality_report(
+                self.config, workspace, session_id=binding.session_id
+            )
             return report.model_dump(mode="json")
         query = str(args.get("query") or "").strip()
         if not query:
@@ -771,6 +773,7 @@ class LitTraceToolGateway:
             for paper_id in updated.context.active_papers
             if paper_id in updated.papers
         ]
+        diagnostics = new_filters.search_diagnostics or {}
         result = {
             "session_id": binding.session_id,
             "tool": "search_papers",
@@ -779,6 +782,8 @@ class LitTraceToolGateway:
             "search_mode": new_filters.search_mode,
             "paper_count": len(updated.papers),
             "active_paper_count": len(active_papers),
+            "degraded": bool(diagnostics.get("errors")),
+            "search_diagnostics": diagnostics,
             "papers": [
                 {
                     "paper_id": paper.paper_id,
@@ -955,10 +960,22 @@ class LitTraceToolGateway:
             "paper_ids": paper_ids,
             "parse_strategy": parse_strategy,
             "expected_revision": expected_revision,
+            "artifact_sha256": sorted(
+                (source.get("paper_id") or "", source.get("sha256") or "")
+                for source in sources
+            ),
         }
         arguments_sha256 = _command_sha256(command)
         task_digest = sha256(
-            f"{binding.session_id}\0enqueue_parse\0{idempotency_key}".encode()
+            json.dumps(
+                {
+                    "session_id": binding.session_id,
+                    "idempotency_key": idempotency_key,
+                    "artifact_sha256": command["artifact_sha256"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
         ).hexdigest()[:32]
         task_id = f"parse:{task_digest}"
         task = AsyncTaskRecord(

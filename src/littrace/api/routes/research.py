@@ -79,7 +79,10 @@ async def search_preview(
         config,
         header_session_id=x_littrace_session_id,
     )
+    session = load_or_create_session(config, auth.session_id)
     workspace = await run_search_preview(request, config)
+    if auth.source != "default":
+        save_workspace(session, workspace, config=config)
     api_app._set_workspace(workspace)
     api_app.append_trace(
         config,

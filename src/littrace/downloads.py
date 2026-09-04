@@ -16,7 +16,11 @@ from littrace.artifact_store import (
     build_artifact_object_key,
 )
 from littrace.artifact_registry import ArtifactRecord, artifact_registry_from_config
-from littrace.access_layer.cdp import download_paper_via_cdp, identify_publisher
+from littrace.access_layer.cdp import (
+    check_cdp_status,
+    download_paper_via_cdp,
+    identify_publisher,
+)
 from littrace.access_layer.paths import build_download_plan, target_pdf_path
 from littrace.config import LitTraceConfig
 from littrace.download_tasks import (
@@ -61,11 +65,41 @@ async def execute_downloads(
         # page state to settle between navigations.
         from littrace.access_layer.cdp_core import CDPBrowser
         shared_browser: "CDPBrowser | None" = None
+        shared_browser_lock = asyncio.Lock()
         if not request.dry_run and any(
             p.access_type == AccessType.REQUIRES_LOGIN
             for p in target_papers
         ):
             try:
+                status = check_cdp_status(config)
+                from littrace.chrome_profiles import (
+                    cdp_uses_configured_profile,
+                    launch_chrome_for_cdp,
+                )
+
+                private_profile = status.available and cdp_uses_configured_profile(config)
+                if (not status.available or not private_profile) and config.cdp_downloader.auto_launch_chrome:
+
+                    launch = await asyncio.to_thread(
+                        launch_chrome_for_cdp,
+                        config,
+                        headless=False,
+                    )
+                    if launch.error and launch.process is not None:
+                        try:
+                            launch.process.terminate()
+                        except Exception:
+                            pass
+                    if launch.cdp_status is not None:
+                        status = launch.cdp_status
+                if not status.available:
+                    raise RuntimeError(
+                        f"CDP browser unavailable at {config.cdp_downloader.cdp_url}"
+                    )
+                if not private_profile and not config.cdp_downloader.auto_launch_chrome:
+                    raise RuntimeError(
+                        "Configured CDP endpoint is not owned by LitTrace's private Chrome profile"
+                    )
                 shared_browser = await asyncio.to_thread(
                     CDPBrowser,
                     config.cdp_downloader.cdp_url,
@@ -80,6 +114,11 @@ async def execute_downloads(
             except Exception:
                 # If the shared browser can't start up, fall back
                 # to the per-paper one — the previous behaviour.
+                if shared_browser is not None:
+                    try:
+                        await asyncio.to_thread(shared_browser.close_tab)
+                    except Exception:
+                        pass
                 shared_browser = None
 
         async def run_plan_item(plan_item):
@@ -101,6 +140,7 @@ async def execute_downloads(
                 task,
                 write_local=(request.target != "storage_only"),
                 shared_browser=shared_browser,
+                shared_browser_lock=shared_browser_lock,
             )
             _record_terminal_acquisition_event(config, task)
             if not request.dry_run and config.download_retry.enabled:
@@ -113,26 +153,27 @@ async def execute_downloads(
             async with semaphore:
                 return await run_plan_item(plan_item)
 
-        items = list(await asyncio.gather(*(run_bounded(item) for item in plan.items)))
+        try:
+            items = list(await asyncio.gather(*(run_bounded(item) for item in plan.items)))
+        finally:
+            # Close the target as well as the WebSocket, including cancellation
+            # and exception paths. ``close()`` alone leaves about:blank open.
+            if shared_browser is not None:
+                try:
+                    await asyncio.to_thread(shared_browser.close_tab)
+                except Exception:
+                    pass
 
-        # Round 29: tear down the shared browser ONCE at the end of
-        # the batch. Per-paper teardown used to leak 45 ``about:blank``
-        # tabs into the user's Chrome window; now the batch owns the
-        # browser's lifecycle so a single ``close()`` cleans up the
-        # tab and websocket together.
-        if shared_browser is not None:
-            try:
-                await asyncio.to_thread(shared_browser.close)
-            except Exception:
-                pass
-
+    # Keep this field aligned with the download plan: it describes selected
+    # papers whose publisher requires authentication, regardless of whether
+    # this attempt already reached a terminal auth-required state.
+    requires_login_count = sum(
+        paper.access_type == AccessType.REQUIRES_LOGIN for paper in target_papers
+    )
     return DownloadExecutionResult(
         items=items,
         downloaded_count=sum(item.status == "downloaded" for item in items),
-        requires_login_count=sum(
-            item.action == "cdp_publisher_download" or item.status == "requires_login"
-            for item in items
-        ),
+        requires_login_count=requires_login_count,
         skipped_count=sum(item.status == "skipped" for item in items),
     )
 
@@ -146,12 +187,28 @@ async def _execute_one(
     *,
     write_local: bool = True,
     shared_browser: "CDPBrowser | None" = None,
+    shared_browser_lock: asyncio.Lock | None = None,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
     _record_task_lifecycle(config, task, "acquisition_started")
+
+    async def run_cdp(prior_error: str | None = None):
+        async def execute():
+            return await _execute_cdp_download_async(
+                config,
+                paper,
+                dry_run,
+                task,
+                prior_error=prior_error,
+                browser=shared_browser,
+            )
+
+        if shared_browser is not None and shared_browser_lock is not None:
+            async with shared_browser_lock:
+                return await execute()
+        return await execute()
+
     if paper.access_type == AccessType.REQUIRES_LOGIN and paper.doi:
-        return await _execute_cdp_download_async(
-            config, paper, dry_run, task, browser=shared_browser,
-        )
+        return await run_cdp()
     pdf_url = paper.pdf_url
     if paper.access_type == AccessType.OPEN_ACCESS and not pdf_url:
         report = await resolve_full_text_for_paper(client, paper, config)
@@ -190,13 +247,9 @@ async def _execute_one(
                         candidate_response = await client.get(candidate_url)
                         candidate_response.raise_for_status()
                     except httpx.HTTPStatusError as exc:
-                        if paper.doi and exc.response.status_code in {401, 403, 429}:
-                            return await _execute_cdp_download_async(
-                                config,
-                                paper,
-                                dry_run,
-                                task,
-                                prior_error=f"{exc.__class__.__name__}: {exc}",
+                        if paper.doi and exc.response.status_code in {401, 403, 418, 429}:
+                            return await run_cdp(
+                                f"{exc.__class__.__name__}: {exc}"
                             )
                         continue
                     except httpx.HTTPError:
@@ -239,13 +292,7 @@ async def _execute_one(
                     ), task
             error = f"Response does not look like a PDF: {content_type}"
             if paper.doi and _should_try_cdp_fallback(response):
-                return await _execute_cdp_download_async(
-                    config,
-                    paper,
-                    dry_run,
-                    task,
-                    prior_error=error,
-                )
+                return await run_cdp(error)
             if _looks_like_human_verification_response(response):
                 error = (
                     "Source returned a human-verification or access-block page instead of "
@@ -308,14 +355,8 @@ async def _execute_one(
         ), task
     except httpx.HTTPStatusError as exc:
         error = f"{exc.__class__.__name__}: {exc}"
-        if paper.doi and exc.response.status_code in {401, 403, 429}:
-            return await _execute_cdp_download_async(
-                config,
-                paper,
-                dry_run,
-                task,
-                prior_error=error,
-            )
+        if paper.doi and exc.response.status_code in {401, 403, 418, 429}:
+            return await run_cdp(error)
         task.mark(DownloadTaskStatus.FAILED, error=error)
         task.schedule_retry(config.download_retry.base_delay_seconds)
         return DownloadExecutionItem(
@@ -329,13 +370,7 @@ async def _execute_one(
     except httpx.HTTPError as exc:
         error = f"{exc.__class__.__name__}: {exc}"
         if paper.doi and _should_try_cdp_after_open_access_http_error(paper, exc):
-            return _execute_cdp_download(
-                config,
-                paper,
-                dry_run,
-                task,
-                prior_error=error,
-            )
+            return await run_cdp(error)
         task.mark(DownloadTaskStatus.FAILED, error=error)
         task.schedule_retry(config.download_retry.base_delay_seconds)
         return DownloadExecutionItem(
@@ -576,8 +611,9 @@ def _store_pdf_artifact(
     # and the lifecycle event. This protects against double-download from
     # chat intent + auto_resume + a retry worker all racing.
     prior = registry.find_in_session(artifact_id, session_id=task.session_id)
+    prior_ref = None
     if prior is not None and prior.sha256 and prior.sha256 == _sha256_hex(data):
-        ref = BlobRef(
+        prior_ref = BlobRef(
             backend=prior.backend,
             bucket=prior.bucket,
             object_key=prior.object_key,
@@ -586,8 +622,12 @@ def _store_pdf_artifact(
             content_type=prior.content_type,
             uri=prior.bucket and f"s3://{prior.bucket}/{prior.object_key}" or prior.object_key,
         )
-        record = prior
-    else:
+        if store.exists(prior_ref):
+            ref = prior_ref
+            record = prior
+        else:
+            prior_ref = None
+    if prior_ref is None:
         ref = store.put_bytes(
             object_key,
             data,
@@ -670,6 +710,3 @@ def _record_terminal_acquisition_event(config: LitTraceConfig, task: DownloadTas
     else:
         return
     _record_task_lifecycle(config, task, event_type)
-
-
-

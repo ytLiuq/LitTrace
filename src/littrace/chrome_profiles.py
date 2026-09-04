@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shlex
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -111,6 +113,8 @@ def build_chrome_launch_plan(
     profile_name: str | None = None,
     *,
     headless: bool | None = None,
+    new_window: bool = False,
+    initial_url: str | None = None,
 ) -> ChromeLaunchPlan | None:
     discovery = discover_chrome_profiles(config)
     if not discovery.executable or not discovery.user_data_dir:
@@ -160,6 +164,10 @@ def build_chrome_launch_plan(
         # Windows; without it Chromium falls back to software
         # rendering which is fine but slow.
         command += ["--headless=new", "--disable-gpu"]
+    if new_window:
+        command.append("--new-window")
+    if initial_url:
+        command.append(initial_url)
     return ChromeLaunchPlan(
         command=command,
         cdp_url=f"http://127.0.0.1:{port}",
@@ -174,17 +182,31 @@ def launch_chrome_for_cdp(
     wait_seconds: float = 4.0,
     *,
     headless: bool | None = None,
+    new_window: bool = False,
+    initial_url: str | None = None,
 ) -> ChromeLaunchResult:
     status = check_cdp_status(config)
-    if status.available:
+    if status.available and not initial_url and cdp_uses_configured_profile(config):
         return ChromeLaunchResult(
             attempted=False,
             launched=False,
             already_available=True,
             cdp_status=status,
         )
+    if status.available and not cdp_uses_configured_profile(config):
+        # A reachable endpoint may belong to the user's normal Chrome. Move
+        # LitTrace to a free private port before launching its own profile.
+        preferred = int(config.cdp_downloader.remote_debugging_port) + 1
+        port = _find_free_loopback_port(preferred)
+        config.cdp_downloader.remote_debugging_port = port
+        config.cdp_downloader.cdp_url = f"http://127.0.0.1:{port}"
+        status = check_cdp_status(config)
     plan = build_chrome_launch_plan(
-        config, profile_name=profile_name, headless=headless
+        config,
+        profile_name=profile_name,
+        headless=headless,
+        new_window=new_window,
+        initial_url=initial_url,
     )
     if plan is None:
         return ChromeLaunchResult(
@@ -192,6 +214,29 @@ def launch_chrome_for_cdp(
             launched=False,
             cdp_status=status,
             error="Could not build a Chrome launch command.",
+        )
+    if status.available:
+        try:
+            _open_url_in_existing_cdp(
+                status,
+                initial_url or "about:blank",
+                new_window=new_window,
+            )
+        except Exception as exc:
+            return ChromeLaunchResult(
+                attempted=True,
+                launched=False,
+                already_available=False,
+                cdp_status=status,
+                command=plan.command,
+                error=f"{exc.__class__.__name__}: {exc}",
+            )
+        return ChromeLaunchResult(
+            attempted=True,
+            launched=False,
+            already_available=True,
+            cdp_status=status,
+            command=plan.command,
         )
     # LitTrace defaults chrome_user_data_dir to a private directory under
     # the repo so its Chrome process never collides with the user's
@@ -253,6 +298,133 @@ def launch_chrome_for_cdp(
         error="Chrome was launched, but the CDP endpoint did not become available in time.",
         process=proc,
     )
+
+
+def cdp_uses_configured_profile(config: LitTraceConfig) -> bool:
+    """Return whether the reachable CDP Chrome owns LitTrace's profile.
+
+    Chrome's ``SingletonLock`` contains the PID of the process holding a user
+    data directory. Matching that process's command line avoids treating an
+    unrelated user Chrome on the same debugging port as LitTrace's browser.
+    """
+    if not check_cdp_status(config).available:
+        return False
+    try:
+        user_data_dir = _resolve_user_data_dir(config)
+    except Exception:
+        return False
+    if user_data_dir is None:
+        return False
+    lock = user_data_dir / "SingletonLock"
+    try:
+        target = os.readlink(lock)
+        pid = int(target.rsplit("-", 1)[-1])
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    command = completed.stdout.strip()
+    if completed.returncode != 0 or not command:
+        return False
+    configured = str(user_data_dir.resolve())
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    profile_args = [
+        arg.split("=", 1)[1]
+        for arg in argv
+        if arg.startswith("--user-data-dir=")
+    ]
+    profile_matches = any(
+        Path(value).expanduser().resolve() == Path(configured)
+        for value in profile_args
+    )
+    # A matching debugging port is not sufficient: the user's normal Chrome
+    # may also expose that port. Only an explicit user-data-dir match proves
+    # that the reachable browser owns LitTrace's private profile.
+    return profile_matches
+
+
+def _find_free_loopback_port(start: int, attempts: int = 50) -> int:
+    for port in range(max(1, start), min(65535, start + attempts)):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError(f"No free loopback port found near {start}")
+
+
+def _open_url_in_existing_cdp(
+    status: CDPStatus,
+    url: str,
+    *,
+    new_window: bool,
+) -> str:
+    """Create a page target, optionally in a real top-level window."""
+    payload = _send_browser_cdp_command(
+        status,
+        "Target.createTarget",
+        {
+            "url": url,
+            "newWindow": bool(new_window),
+            "background": False,
+        },
+    )
+    target_id = (payload.get("result") or {}).get("targetId")
+    if not target_id:
+        raise RuntimeError("Chrome did not return a target id")
+    return str(target_id)
+
+
+def read_cdp_cookies(config: LitTraceConfig) -> list[dict[str, Any]]:
+    """Read all cookies through the browser endpoint without creating a tab."""
+    status = check_cdp_status(config)
+    if not status.available:
+        return []
+    payload = _send_browser_cdp_command(status, "Storage.getCookies", {})
+    cookies = (payload.get("result") or {}).get("cookies") or []
+    return [cookie for cookie in cookies if isinstance(cookie, dict)]
+
+
+def _send_browser_cdp_command(
+    status: CDPStatus,
+    method: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Send one command to Chrome's browser-level WebSocket."""
+    if not status.web_socket_debugger_url:
+        raise RuntimeError("CDP browser websocket URL is unavailable")
+    import websocket
+
+    ws = websocket.create_connection(
+        status.web_socket_debugger_url,
+        timeout=10.0,
+        origin=status.cdp_url,
+    )
+    try:
+        message_id = 1
+        ws.send(json.dumps({
+            "id": message_id,
+            "method": method,
+            "params": params,
+        }))
+        while True:
+            payload = json.loads(ws.recv())
+            if payload.get("id") != message_id:
+                continue
+            if payload.get("error"):
+                raise RuntimeError(str(payload["error"]))
+            return payload
+    finally:
+        ws.close()
 
 
 def _explain_chrome_early_exit(plan: ChromeLaunchPlan, returncode: int | None) -> str:

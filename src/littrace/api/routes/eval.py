@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header
 
 from littrace.api.backend import api_app
 from littrace.eval_api import (
@@ -52,8 +53,15 @@ def eval_pdf_parsing(topic: str | None = None) -> EvalMetricReport:
 
 
 @router.get("/eval/pdf-benchmark", response_model=PDFBenchmarkReport)
-def eval_pdf_benchmark() -> PDFBenchmarkReport:
-    return benchmark_pdf_parsing(api_app.WORKSPACE, api_app.load_config())
+def eval_pdf_benchmark(
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> PDFBenchmarkReport:
+    config = api_app.load_config()
+    from littrace.api.auth import resolve_request_session
+    auth = resolve_request_session(config, header_session_id=x_littrace_session_id)
+    return benchmark_pdf_parsing(
+        api_app.WORKSPACE, config, session_id=auth.session_id
+    )
 
 
 @router.post("/eval/pdf-benchmark/file", response_model=LivePDFBenchmarkReport)
@@ -128,5 +136,12 @@ async def eval_rerank_learn(live: bool = True) -> RerankLearningReport:
 
 
 @router.get("/quality", response_model=QualityReport)
-def quality() -> QualityReport:
-    return build_quality_report_skill(api_app.load_config(), api_app.WORKSPACE)
+def quality(
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> QualityReport:
+    config = api_app.load_config()
+    from littrace.api.auth import resolve_request_session
+    auth = resolve_request_session(config, header_session_id=x_littrace_session_id)
+    return build_quality_report_skill(
+        config, api_app.WORKSPACE, session_id=auth.session_id
+    )

@@ -143,7 +143,15 @@ def download_paper_via_cdp(
         result.warnings.append("No Unpaywall email configured; skipped OA repository lookup.")
 
     status = check_cdp_status(config)
-    if not status.available and config.cdp_downloader.auto_launch_chrome:
+    private_profile = False
+    if status.available:
+        try:
+            from littrace.chrome_profiles import cdp_uses_configured_profile
+
+            private_profile = cdp_uses_configured_profile(config)
+        except Exception:
+            private_profile = False
+    if (not status.available or not private_profile) and config.cdp_downloader.auto_launch_chrome:
         # Import lazily: chrome_profiles uses the shared cdp module for status
         # models, while this module is itself imported by that module.
         from littrace.chrome_profiles import launch_chrome_for_cdp
@@ -152,14 +160,23 @@ def download_paper_via_cdp(
             config,
             profile_name=config.cdp_downloader.chrome_profile_name,
         )
+        if launch.error and launch.process is not None:
+            try:
+                launch.process.terminate()
+            except Exception:
+                pass
         if launch.cdp_status is not None:
             status = launch.cdp_status
+        private_profile = bool(status.available)
     if not status.available:
         result.error = (
             f"CDP browser is not available at {status.cdp_url}. "
             "Start Chrome with --remote-debugging-port=19222."
         )
         result.warnings.append(status.error or "CDP unavailable")
+        return result
+    if not private_profile:
+        result.error = "Configured CDP endpoint is not owned by LitTrace's private Chrome profile."
         return result
 
     own_browser = browser is None
@@ -337,6 +354,28 @@ def download_paper_via_cdp(
             return result
 
         result.warnings.append(f"fetch_blob failed: {info}")
+        # ACS and other publisher pages often return an access-denied body
+        # without a literal ``HTTP 403`` marker. Treat the final CDP failure as
+        # an interactive authorization opportunity, keep the same visible
+        # LitTrace Chrome target in the foreground, and retry after the user
+        # completes publisher/institution login.
+        if not result.requires_user_action and _is_likely_auth_failure(str(info)):
+            result.requires_user_action = True
+            result.user_action = (
+                "请在已打开的 LitTrace Chrome 窗口中完成出版社或机构鉴权，"
+                "完成后保持页面打开，LitTrace 会自动重试 PDF。"
+            )
+            result.steps.append("user_action:publisher_login_retry")
+            _surface_browser(browser.get_url())
+            time.sleep(max(config.cdp_downloader.user_action_wait_seconds, 0.0))
+            result.steps.append("fetch_blob_retry_after_publisher_login")
+            ok, info = browser.fetch_blob_to_file(pdf_url, target_path)
+            if ok:
+                result.downloaded = True
+                result.requires_user_action = False
+                result.method = "cdp_fetch_blob_after_publisher_login"
+                result.file_size = int(info)
+                return result
         result.steps.append("anchor_download")
         browser.trigger_anchor_download(pdf_url, target_path.name)
         time.sleep(15.0)
@@ -470,6 +509,26 @@ def _resolve_repository_handle(url: str) -> str:
         return str(httpx.URL(response.url).join(match.group(1)))
     except Exception:
         return url
+
+
+def _is_likely_auth_failure(detail: str) -> bool:
+    """Return whether a CDP fetch failure plausibly needs user login."""
+    lowered = detail.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "http 401",
+            "http 403",
+            "unauthorized",
+            "forbidden",
+            "access denied",
+            "login",
+            "sign in",
+            "institution",
+            "cloudflare",
+            "captcha",
+        )
+    )
 
 
 def _surface_browser(url: str) -> None:
@@ -702,4 +761,3 @@ def _wait_for_user_acknowledgement(
             return False
         time.sleep(2.0)
     return False
-

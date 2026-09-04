@@ -49,35 +49,9 @@ async def run(
         idempotency_key=idempotency_key,
     )
     final = _output_or_raise(result, "execute_downloads")
-    # Round 25: kick off ``parse_workspace_skill`` synchronously
-    # after every download. Sentinel used to gate this on
-    # ``config.sentinel.parse_on_daily`` (default False) so most
-    # runs never auto-parsed; users had to either flip that flag or
-    # manually call ``/parse``. The user explicitly asked for
-    # "silent parse on download" — parse is now unconditional after
-    # any ``execute_downloads`` that lands PDFs in the artifact
-    # store. The parse skill itself is short-lived; we surface
-    # progress via the status strip so the user can see
-    # "已下载 N 篇，正在解析 M 篇".
-    if final.downloaded_count > 0 and not request.dry_run:
-        from littrace.skills.parse_workspace_papers.run import (
-            run as parse_workspace_papers_skill,
-        )
-        try:
-            _, parse_report = await parse_workspace_papers_skill(
-                workspace, config,
-                context=context,
-                ledger=ledger,
-                policy=policy,
-                idempotency_key=f"parse-after-{idempotency_key or 'adhoc'}",
-            )
-        except Exception as exc:  # noqa: BLE001
-            # Parse failures must not break the download result —
-            # the PDFs are already in the object store and the user
-            # can re-trigger parse manually.
-            print(
-                f"[execute_downloads] silent parse failed: "
-                f"{exc.__class__.__name__}: {exc}",
-                flush=True,
-            )
+    # Parsing is a separate durable stage. A storage-only download does not
+    # create a local PDF, so invoking the local parser here would always report
+    # a false missing-PDF failure. The topic pipeline enqueues parse_job rows
+    # after artifact registration and the worker materializes bytes from the
+    # object store before parsing.
     return final

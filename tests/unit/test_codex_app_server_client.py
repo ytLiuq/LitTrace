@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from littrace.codex_runtime.client import AppServerClient
+from littrace.codex_runtime.client import AppServerClient, AppServerError
 
 
 class _FakeStdin:
@@ -155,6 +155,120 @@ def test_jsonl_client_is_full_duplex_and_fails_closed(monkeypatch) -> None:
         assert process.stdin.messages[0]["method"] == "initialize"
         assert process.stdin.messages[1]["method"] == "initialized"
         await asyncio.wait_for(client.close(), timeout=2)
+
+    asyncio.run(scenario())
+
+
+def test_child_environment_does_not_inherit_outer_codex_sandbox(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("CODEX_PERMISSION_PROFILE", ":workspace")
+    monkeypatch.setenv("CODEX_THREAD_ID", "outer-thread")
+    client = AppServerClient(environment={"CODEX_HOME": "/tmp/littrace-home"})
+    child_env = client._child_environment()
+    assert "CODEX_SANDBOX_NETWORK_DISABLED" not in child_env
+    assert "CODEX_PERMISSION_PROFILE" not in child_env
+    assert "CODEX_THREAD_ID" not in child_env
+    assert child_env["CODEX_HOME"] == "/tmp/littrace-home"
+
+
+def test_mcp_permissions_are_granted_only_for_readonly_mcp_item() -> None:
+    async def scenario() -> None:
+        client = AppServerClient()
+        client._mcp_item_ids["thr-test"] = {"mcp-item"}
+        writes: list[dict[str, object]] = []
+
+        async def capture(message: dict[str, object]) -> None:
+            writes.append(message)
+
+        client._write = capture  # type: ignore[method-assign]
+        await client._handle_server_request(
+            1,
+            "item/permissions/requestApproval",
+            {
+                "threadId": "thr-test",
+                "itemId": "mcp-item",
+                "permissions": {
+                    "network": {"enabled": True},
+                    "fileSystem": {
+                        "entries": [
+                            {"access": "read", "path": {"type": "path", "path": "/tmp"}},
+                            {"access": "write", "path": {"type": "path", "path": "/tmp"}},
+                        ]
+                    },
+                },
+            },
+        )
+        assert writes == [
+            {
+                "id": 1,
+                "result": {
+                    "permissions": {
+                        "network": {"enabled": True},
+                        "fileSystem": {
+                            "entries": [
+                                {"access": "read", "path": {"type": "path", "path": "/tmp"}}
+                            ]
+                        },
+                    },
+                    "scope": "turn",
+                },
+            }
+        ]
+
+        writes.clear()
+        await client._handle_server_request(
+            2,
+            "item/permissions/requestApproval",
+            {
+                "threadId": "thr-test",
+                "itemId": "shell-item",
+                "permissions": {"network": {"enabled": True}},
+            },
+        )
+        assert writes[0]["result"] == {"permissions": {}, "scope": "turn"}
+
+    asyncio.run(scenario())
+
+
+def test_littrace_mcp_approval_elicitation_is_accepted() -> None:
+    async def scenario() -> None:
+        client = AppServerClient()
+        writes: list[dict[str, object]] = []
+
+        async def capture(message: dict[str, object]) -> None:
+            writes.append(message)
+
+        client._write = capture  # type: ignore[method-assign]
+        await client._handle_server_request(
+            7,
+            "mcpServer/elicitation/request",
+            {
+                "serverName": "littrace",
+                "_meta": {"codex_approval_kind": "mcp_tool_call"},
+                "requestedSchema": {"type": "object", "properties": {}},
+            },
+        )
+        assert writes == [
+            {
+                "id": 7,
+                "result": {"action": "accept", "content": {}, "_meta": None},
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_transport_failure_wakes_turn_queue() -> None:
+    async def scenario() -> None:
+        client = AppServerClient()
+        queue = asyncio.Queue()
+        client._thread_queues["thr-test"] = queue
+        client._fail_turn_queues(AppServerError("broken pipe"))
+        message = await asyncio.wait_for(queue.get(), timeout=1)
+        assert message == {
+            "method": "__transport_error__",
+            "params": {"error": "broken pipe"},
+        }
 
     asyncio.run(scenario())
 

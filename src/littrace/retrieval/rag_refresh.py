@@ -28,6 +28,7 @@ class RagRefreshReport(BaseModel):
     refreshed_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     paper_count: int = 0
     source_count: int = 0
+    paper_ids: list[str] = Field(default_factory=list)
     chunk_count: int = 0
     upserted_count: int = 0
     stale_chunk_count: int = 0
@@ -95,6 +96,7 @@ async def refresh_session_rag_index(
             backend=profile.backend,
             paper_count=len(workspace.parsed_papers),
             source_count=0,
+            paper_ids=[],
             chunk_count=0,
             upserted_count=0,
             skipped=True,
@@ -154,6 +156,7 @@ async def refresh_session_rag_index(
         backend=profile.backend,
         paper_count=len(workspace.parsed_papers),
         source_count=len({draft.paper_id for draft in drafts}),
+        paper_ids=sorted({draft.paper_id for draft in drafts}),
         chunk_count=len(drafts),
         upserted_count=upserted,
         stale_chunk_count=stale_deleted,

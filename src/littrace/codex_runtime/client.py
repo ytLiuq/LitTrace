@@ -137,6 +137,7 @@ class AppServerClient:
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._thread_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._turn_request_tasks: dict[str, set[asyncio.Task[None]]] = {}
+        self._mcp_item_ids: dict[str, set[str]] = {}
         self._next_id = 0
         self._write_lock = asyncio.Lock()
         self._stderr_tail: deque[str] = deque(maxlen=100)
@@ -234,7 +235,7 @@ class AppServerClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=self.stream_limit,
-                env={**os.environ, **self.environment},
+                env=self._child_environment(),
             )
         except OSError as exc:
             raise AppServerError(
@@ -260,6 +261,26 @@ class AppServerClient:
         except Exception:
             await self.close()
             raise
+
+    def _child_environment(self) -> dict[str, str]:
+        """Build a child environment without the parent's Codex turn policy."""
+        inherited = dict(os.environ)
+        for key in (
+            "CODEX_SANDBOX",
+            "CODEX_SANDBOX_NETWORK_DISABLED",
+            "CODEX_PERMISSION_PROFILE",
+            "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_SHELL",
+            "CODEX_CI",
+            "CODEX_APP_TOOLS_PIPE_PATH",
+        ):
+            inherited.pop(key, None)
+        # Explicit AppServerClient values remain authoritative. This is how
+        # isolated mode intentionally supplies its own CODEX_HOME.
+        inherited.update(self.environment)
+        return inherited
 
     async def request(
         self,
@@ -417,6 +438,11 @@ class AppServerClient:
                     message = await get_task
                 method = message.get("method")
                 params = message.get("params") or {}
+                if method == "__transport_error__":
+                    raise AppServerError(
+                        "Codex App Server transport failed: "
+                        f"{params.get('error') or 'unknown error'}"
+                    )
                 if params.get("turnId") != turn_id and (
                     not isinstance(params.get("turn"), dict)
                     or params["turn"].get("id") != turn_id
@@ -519,6 +545,7 @@ class AppServerClient:
             raise AppServerError(f"Codex turn timed out: {turn_id}") from exc
         finally:
             self._thread_queues.pop(thread_id, None)
+            self._mcp_item_ids.pop(thread_id, None)
             pending = self._turn_request_tasks.pop(thread_id, None)
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -836,6 +863,16 @@ class AppServerClient:
             raise
         except Exception as exc:  # noqa: BLE001 - background reader must wake every pending RPC
             self._fail_pending(exc)
+            self._fail_turn_queues(exc)
+
+    def _fail_turn_queues(self, exc: Exception) -> None:
+        """Wake active turns immediately when the JSONL transport dies."""
+        message = {
+            "method": "__transport_error__",
+            "params": {"error": str(exc)},
+        }
+        for queue in tuple(self._thread_queues.values()):
+            queue.put_nowait(message)
 
     async def _read_stderr(self) -> None:
         assert self._process is not None and self._process.stderr is not None
@@ -902,15 +939,15 @@ class AppServerClient:
                         method=method,
                         params=params,
                     )
+                item = params.get("item") or {}
+                if method == "item/started" and item.get("type") == "mcpToolCall":
+                    item_id = item.get("id")
+                    if isinstance(item_id, str):
+                        self._mcp_item_ids.setdefault(thread_id, set()).add(item_id)
                 await self._thread_queues[thread_id].put(message)
 
-    # codex-harness exposes a 6-word approval decision vocabulary.
-    # LitTrace rejects every approval server-initiated request because
-    # every domain mutation is already mediated by the Mcp Gateway's
-    # own CAS + idempotency check — letting codex run shell / patch
-    # commands would create a second write path. The full vocabulary
-    # is wired so a future deployment that wants to allow some
-    # decisions can flip a flag without rewriting the handler.
+    # LitTrace rejects shell and patch approvals because domain mutations
+    # are already mediated by the MCP Gateway's CAS + idempotency checks.
     _APPROVAL_REJECTED_METHODS = frozenset(
         {
             "item/commandExecution/requestApproval",
@@ -939,6 +976,14 @@ class AppServerClient:
         method: str,
         params: dict[str, Any],
     ) -> None:
+        recorder = self._recorder_for(params.get("threadId"))
+        if recorder is not None:
+            recorder.append(
+                type_="server_request",
+                request_id=request_id,
+                method=method,
+                params=params,
+            )
         if method in self._APPROVAL_REJECTED_METHODS:
             # LitTrace is read-only at the App Server level. Every
             # mutation goes through the Mcp Gateway's CAS + idempotent
@@ -947,25 +992,64 @@ class AppServerClient:
             await self._reply_approval(request_id, "decline")
             return
         if method == "mcpServer/elicitation/request":
-            # Elicitation has a 3-state vocabulary (accept / decline
-            # / cancel), distinct from the 6-word approval set.
-            await self._write(
-                {
-                    "id": request_id,
-                    "result": {"action": "decline", "content": None, "_meta": None},
-                }
+            # Codex 0.151 represents MCP tool approval as an elicitation
+            # request. Auto-approve only LitTrace's own empty approval form;
+            # arbitrary MCP elicitation (which may ask for secrets or user
+            # input) must still be declined without a UI callback.
+            server_name = params.get("serverName")
+            meta = params.get("_meta") or {}
+            requested_schema = params.get("requestedSchema") or {}
+            is_littrace_approval = (
+                server_name == "littrace"
+                and isinstance(meta, dict)
+                and meta.get("codex_approval_kind") == "mcp_tool_call"
+                and isinstance(requested_schema, dict)
+                and not (requested_schema.get("required") or [])
+                and not (requested_schema.get("properties") or {})
             )
-            return
-        if method == "item/permissions/requestApproval":
-            # Modern codex-harness folds network-policy amendment
-            # into the permissions flow. Returning an empty
-            # permissions set with scope=turn is the documented
-            # "no extra authorization granted" response.
             await self._write(
                 {
                     "id": request_id,
                     "result": {
-                        "permissions": {},
+                        "action": "accept" if is_littrace_approval else "decline",
+                        "content": {} if is_littrace_approval else None,
+                        "_meta": None,
+                    },
+                }
+            )
+            return
+        if method == "item/permissions/requestApproval":
+            # In 0.151 this response is a permission grant, not a
+            # yes/no decision. Only an item already announced as an MCP
+            # call can receive its requested network/read permissions.
+            # Shell commands and file changes remain denied above.
+            thread_id = params.get("threadId")
+            item_id = params.get("itemId")
+            is_mcp_call = (
+                isinstance(thread_id, str)
+                and isinstance(item_id, str)
+                and item_id in self._mcp_item_ids.get(thread_id, set())
+            )
+            requested = params.get("permissions")
+            granted: dict[str, Any] = {}
+            if is_mcp_call and isinstance(requested, dict):
+                network = requested.get("network")
+                if isinstance(network, dict) and network.get("enabled") is True:
+                    granted["network"] = {"enabled": True}
+                filesystem = requested.get("fileSystem")
+                if isinstance(filesystem, dict):
+                    read_entries = [
+                        entry
+                        for entry in (filesystem.get("entries") or [])
+                        if isinstance(entry, dict) and entry.get("access") == "read"
+                    ]
+                    if read_entries:
+                        granted["fileSystem"] = {"entries": read_entries}
+            await self._write(
+                {
+                    "id": request_id,
+                    "result": {
+                        "permissions": granted,
                         "scope": "turn",
                     },
                 }

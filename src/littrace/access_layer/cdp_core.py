@@ -598,6 +598,11 @@ class CDPBrowser:
                         return
             except Exception:
                 pass
+        # The old target may still exist even though reconnecting its
+        # WebSocket failed (for example, a transient /json request failure).
+        # Close it before allocating a replacement so retries cannot accumulate
+        # orphaned about:blank pages.
+        self.close_tab()
         self.connect_new_tab()
         self._reinit_after_reconnect()
 

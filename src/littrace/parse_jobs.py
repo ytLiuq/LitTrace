@@ -32,7 +32,12 @@ from littrace.artifact_store import (
 from littrace.config import LitTraceConfig
 from littrace.evidence.parsing import parse_workspace_papers
 from littrace.models import LiteratureWorkspace, PaperMetadata, ParsedPaper
-from littrace.state_db import AsyncTaskQueueReport, AsyncTaskRecord, StateStore
+from littrace.state_db import (
+    AsyncTaskQueueReport,
+    AsyncTaskRecord,
+    StateStore,
+    state_store_from_config,
+)
 
 
 class ParseExecutionOutput(BaseModel):
@@ -62,11 +67,84 @@ ParseExecutor = Callable[
 SourceShaLookup = Callable[[str, str], str | None]
 
 
+def enqueue_parse_job(
+    config: LitTraceConfig,
+    session,
+    workspace: LiteratureWorkspace,
+    paper_ids: list[str],
+    *,
+    parse_strategy: str = "auto",
+) -> AsyncTaskRecord:
+    """Create a durable parse task for already-stored PDF artifacts.
+
+    The task snapshots both metadata and immutable artifact records so the
+    worker can materialize PDFs from object storage without relying on the
+    user's local paper directory.
+    """
+    ids = list(dict.fromkeys(paper_ids))
+    if not ids:
+        raise ValueError("paper_ids must not be empty")
+    registry = artifact_registry_from_config(config)
+    papers = []
+    sources = []
+    for paper_id in ids:
+        paper = workspace.papers.get(paper_id)
+        if paper is None:
+            raise ValueError(f"Unknown paper for parse job: {paper_id}")
+        source = registry.find_in_session(
+            f"paper_pdf:{paper_id}",
+            session_id=session.session_id,
+        )
+        if source is None or not source.sha256:
+            raise ValueError(f"PDF artifact is not registered: {paper_id}")
+        papers.append(paper.model_dump(mode="json"))
+        sources.append(source.model_dump(mode="json"))
+    now = datetime.now(UTC).isoformat()
+    source_fingerprint = sorted(
+        (str(source.get("paper_id") or ""), str(source.get("sha256") or ""))
+        for source in sources
+    )
+    digest = sha256(
+        json.dumps(
+            {
+                "session_id": session.session_id,
+                "paper_ids": ids,
+                "strategy": parse_strategy,
+                "sources": source_fingerprint,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    task = AsyncTaskRecord(
+        task_id=f"parse:{digest}",
+        session_id=session.session_id,
+        kind="parse_job",
+        artifact_id=f"parse_batch:{digest}",
+        event_type="parse_requested",
+        source_revision=str(workspace.context.filters.workspace_revision),
+        result_json={
+            "schema_version": "littrace.parse_job.v1",
+            "command": {
+                "paper_ids": ids,
+                "parse_strategy": parse_strategy,
+                "papers": papers,
+                "sources": sources,
+            },
+        },
+        created_at=now,
+        updated_at=now,
+    )
+    state_store_from_config(config).enqueue_async_task(task)
+    return task
+
+
 async def run_pending_parse_jobs(
     config: LitTraceConfig,
     *,
     limit: int = 10,
     worker_id: str | None = None,
+    session_id: str | None = None,
     state_store: StateStore | None = None,
     executor: ParseExecutor | None = None,
     source_sha_lookup: SourceShaLookup | None = None,
@@ -90,12 +168,15 @@ async def run_pending_parse_jobs(
 
     report = ParseJobBatchReport()
     owner = worker_id or f"parse:{socket.gethostname()}:{uuid4().hex[:12]}"
-    jobs = state_store.claim_pending_async_tasks(
-        worker_id=owner,
-        kind="parse_job",
-        limit=max(1, limit),
-        lease_seconds=max(config.download_retry.interval_seconds * 8, 600.0),
-    )
+    claim_kwargs = {
+        "worker_id": owner,
+        "kind": "parse_job",
+        "limit": max(1, limit),
+        "lease_seconds": max(config.download_retry.interval_seconds * 8, 600.0),
+    }
+    if session_id is not None:
+        claim_kwargs["session_id"] = session_id
+    jobs = state_store.claim_pending_async_tasks(**claim_kwargs)
     if not jobs:
         report.finished_at = datetime.now(UTC).isoformat()
         return report

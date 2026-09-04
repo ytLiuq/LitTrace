@@ -2,19 +2,11 @@
 
 ## TL;DR
 
-`mode: codex_app_server` is wired up end-to-end (mcp_servers config, JSON-RPC
-client, sandbox overrides, fallback refusal detection) and the App Server
-itself launches cleanly. The upstream stdio exec-mode guard, however, blocks
-MCP tool calls in every version we tested (codex 0.140.0 / 0.146.1 / 0.149.1
-/ 0.150.1 npm + `0.149.0-alpha.4.3` bundled with ChatGPT.app).
-
-ChatGPT.app's bundled codex + `--enable exec_permission_approvals /
-enable_mcp_apps / request_permissions_tool` reaches the MCP server fine and
-the tool returns `success: true`, but the model then misreads the
-empty-but-valid workspace as a refusal and refuses to call any further tool.
-That confused phrasing is now caught by `littrace.codex_runtime.service.
-_looks_like_refusal` so `fallback_to_legacy=True` cleanly hands the turn to
-LitTrace's native chat path.
+`mode: codex_app_server` is wired up end-to-end (MCP config, JSON-RPC client,
+sandbox overrides, approval handling, and fallback detection). With the
+ChatGPT.app bundled Codex 0.151.0-alpha.7.2, a real turn can approve and call
+LitTrace MCP tools and return their workspace result. `fallback_to_legacy=true`
+remains enabled for provider or network failures.
 
 ## What works right now
 
@@ -26,25 +18,17 @@ LitTrace's native chat path.
 - The MCP server still starts (`LITTRACE_MCP_GATEWAY=1`) so any external MCP
   client can drive the 15 gateway tools directly.
 
-## What is wired up but does not yet work
+## Current verification
 
-- `mode: codex_app_server` reaches MCP tools, but the model treats an
-  empty-but-valid response as a refusal and refuses to proceed. The fallback
-  detection is in place, so a turn that hits the refusal will route to
-  legacy, but the App Server's own process stays alive between turns and a
-  subsequent chat can hang on a stale client. We do not recommend flipping
-  the default until upstream codex fixes the empty-workspace refusal
-  interpretation.
-
-## Switch back to App Server when
-
-- Upstream codex fixes the stdio exec-mode guard (any 0.151+ patch that lets
-  the model successfully call MCP tools on an empty workspace, or that
-  exposes a different protocol — `codex mcp-server` over the `exec-server`
-  socket, for example).
-- The `request_timeout_seconds` can be lowered enough that even a confused
-  refusal reply becomes a quick 30-second timeout instead of a hanging
-  connection.
+- `mode: codex_app_server` reaches LitTrace MCP tools on Codex Desktop
+  0.151.0-alpha.7.2. The client accepts the explicit LitTrace MCP approval
+  elicitation and returns the tool result to the model.
+- The child process strips outer Codex sandbox variables so a nested launch
+  does not inherit `CODEX_SANDBOX_NETWORK_DISABLED` and reset its response
+  stream. Shell and file-change approvals remain denied.
+- Keep `fallback_to_legacy: true` for provider/network outages. A transport
+  failure now wakes the active turn immediately instead of waiting for the
+  full turn timeout.
 
 ## Configuration
 

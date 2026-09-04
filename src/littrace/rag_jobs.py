@@ -64,6 +64,7 @@ class RagEmbeddingJobBatchReport(BaseModel):
     figure_enrichment_failed: int = 0
     warnings: list[str] = Field(default_factory=list)
     job_ids: list[str] = Field(default_factory=list)
+    ready_paper_ids: list[str] = Field(default_factory=list)
 
 
 class ResearchBackgroundSyncReport(BaseModel):
@@ -242,6 +243,7 @@ async def run_session_research_background_sync(
     embedding_report = await run_pending_embedding_jobs(
         config,
         limit=max(config.literature_context.active_context_limit * 2, 20),
+        session_id=session.session_id,
     )
     report.outbox_dispatched = embedding_report.outbox_dispatched
     report.embedding_jobs_processed = embedding_report.processed
@@ -275,6 +277,7 @@ async def run_pending_embedding_jobs(
     config: LitTraceConfig,
     *,
     limit: int = 20,
+    session_id: str | None = None,
 ) -> RagEmbeddingJobBatchReport:
     report = RagEmbeddingJobBatchReport()
     state_store = state_store_from_config(config)
@@ -282,7 +285,9 @@ async def run_pending_embedding_jobs(
         report.skipped += 1
         report.finished_at = datetime.now(UTC).isoformat()
         return report
-    dispatched, outbox_failed, outbox_warnings = dispatch_embedding_outbox(config, limit=limit)
+    dispatched, outbox_failed, outbox_warnings = dispatch_embedding_outbox(
+        config, limit=limit, session_id=session_id,
+    )
     report.outbox_dispatched = dispatched
     report.outbox_failed = outbox_failed
     report.warnings.extend(outbox_warnings)
@@ -291,12 +296,15 @@ async def run_pending_embedding_jobs(
     # A dispatcher accepting an event is progress, but embedding is only counted
     # as processed after the pgvector refresh succeeds below.
     worker_id = f"{socket.gethostname()}:{uuid4().hex[:12]}"
-    jobs = state_store.claim_pending_async_tasks(
-        worker_id=worker_id,
-        kind="embedding_job",
-        limit=limit,
-        lease_seconds=max(config.download_retry.interval_seconds * 4, 120.0),
-    )
+    claim_kwargs = {
+        "worker_id": worker_id,
+        "kind": "embedding_job",
+        "limit": limit,
+        "lease_seconds": max(config.download_retry.interval_seconds * 4, 120.0),
+    }
+    if session_id is not None:
+        claim_kwargs["session_id"] = session_id
+    jobs = state_store.claim_pending_async_tasks(**claim_kwargs)
     if not jobs:
         report.finished_at = datetime.now(UTC).isoformat()
         return report
@@ -312,6 +320,26 @@ async def run_pending_embedding_jobs(
         try:
             session = load_or_create_session(config, session_id)
             workspace = load_workspace(session)
+            ready_jobs: list[AsyncTaskRecord] = []
+            for job in session_jobs:
+                paper_id = _paper_id_from_artifact_id(job.artifact_id)
+                parsed = workspace.parsed_papers.get(paper_id) if paper_id else None
+                if parsed is None or not coerce_parsed(parsed).parsed:
+                    _defer_embedding_job(state_store, job)
+                    report.skipped += 1
+                    report.warnings.append(
+                        f"embedding_job:{job.task_id}: waiting_for_parse"
+                    )
+                    continue
+                ready_jobs.append(job)
+            session_jobs = ready_jobs
+            if not session_jobs:
+                continue
+            artifact_ids = {
+                paper_id
+                for job in session_jobs
+                if (paper_id := _paper_id_from_artifact_id(job.artifact_id)) is not None
+            }
             for paper_id in artifact_ids or workspace.parsed_papers.keys():
                 parsed = workspace.parsed_papers.get(paper_id)
                 if parsed is None:
@@ -334,6 +362,10 @@ async def run_pending_embedding_jobs(
             )
             save_workspace(session, workspace, config=config)
             result_json = refresh_report.model_dump(mode="json")
+            report.ready_paper_ids.extend(
+                paper_id for paper_id in refresh_report.paper_ids
+                if paper_id not in report.ready_paper_ids
+            )
             for job in session_jobs:
                 report.job_ids.append(job.task_id)
                 _mark_embedding_job_completed(state_store, job, result_json)
@@ -348,6 +380,19 @@ async def run_pending_embedding_jobs(
                 )
     report.finished_at = datetime.now(UTC).isoformat()
     return report
+
+
+def _defer_embedding_job(state_store, job: AsyncTaskRecord) -> None:
+    """Return an embedding job to the queue until parsing is committed."""
+    now = datetime.now(UTC)
+    job.status = "queued"
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.last_heartbeat_at = None
+    job.next_attempt_at = (now + timedelta(seconds=5)).isoformat()
+    job.last_error = "waiting_for_parse"
+    job.updated_at = now.isoformat()
+    state_store.update_async_task(job)
 
 
 async def run_daily_rag_daemon(

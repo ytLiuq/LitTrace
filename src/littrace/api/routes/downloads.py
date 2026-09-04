@@ -31,7 +31,7 @@ from littrace.download_tasks import DownloadTaskStatus, download_task_store_from
 from littrace.models import DownloadExecutionRequest, DownloadExecutionResult, PublisherDownloadProgress
 from littrace.publisher_session import PublisherSessionE2EReport, build_publisher_session_e2e_report
 from littrace.skill_runner import build_download_plan_skill, execute_downloads_skill
-from littrace.session import load_or_create_session, save_workspace
+from littrace.session import load_or_create_session, load_workspace, save_workspace
 
 
 
@@ -92,7 +92,9 @@ async def downloads_execute(
             "session_id": auth.session_id,
         }
     )
-    return await execute_downloads_skill(config, api_app.WORKSPACE, request)
+    session = load_or_create_session(config, auth.session_id) if auth.source != "default" else None
+    workspace = load_workspace(session) if session else api_app.WORKSPACE
+    return await execute_downloads_skill(config, workspace, request)
 
 
 @router.post("/downloads/login/{paper_id}", response_model=LoginLaunchResult)
@@ -122,15 +124,22 @@ def downloads_browser_session(
 
 
 @router.post("/downloads/check", response_model=DownloadPresenceReport)
-def downloads_check() -> DownloadPresenceReport:
-    return check_download_presence(api_app.load_config(), api_app.WORKSPACE)
+def downloads_check(
+    x_littrace_session_id: Annotated[str | None, Header(alias="X-LitTrace-Session-Id")] = None,
+) -> DownloadPresenceReport:
+    config = api_app.load_config()
+    auth = resolve_request_session(config, header_session_id=x_littrace_session_id)
+    return check_download_presence(
+        config, api_app.WORKSPACE, session_id=auth.session_id
+    )
 
 
 @router.post("/downloads/resume", response_model=AutoResumeResult)
 async def downloads_resume(session_id: str | None = None) -> AutoResumeResult:
     config = api_app.load_config()
     session = load_or_create_session(config, session_id) if session_id else None
-    workspace, result = await auto_resume_downloaded_pdfs_async(config, api_app.WORKSPACE, session)
+    workspace_input = load_workspace(session) if session else api_app.WORKSPACE
+    workspace, result = await auto_resume_downloaded_pdfs_async(config, workspace_input, session)
     api_app._set_workspace(workspace)
     if session:
         save_workspace(session, api_app.WORKSPACE, config=config)
@@ -145,9 +154,10 @@ async def downloads_watch(
 ) -> DownloadWatchResult:
     config = api_app.load_config()
     session = load_or_create_session(config, session_id) if session_id else None
+    workspace_input = load_workspace(session) if session else api_app.WORKSPACE
     workspace, result = await watch_and_resume_downloads_async(
         config,
-        api_app.WORKSPACE,
+        workspace_input,
         session,
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
@@ -182,8 +192,9 @@ def attach_si(
         config,
         auth.session_id,
     )
-    result = attach_supplementary_file(api_app.WORKSPACE, session, paper_id, source_path)
-    save_workspace(session, api_app.WORKSPACE, config=config)
+    workspace = load_workspace(session)
+    result = attach_supplementary_file(workspace, session, paper_id, source_path)
+    save_workspace(session, workspace, config=config)
     return result
 
 

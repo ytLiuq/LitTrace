@@ -5,6 +5,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from littrace.artifact_registry import artifact_registry_from_config
+from littrace.artifact_store import BlobRef, artifact_store_from_config
 from littrace.config import LitTraceConfig
 from littrace.ocr.registry import build_ocr_tool
 from littrace.ocr.tool import OCRMode
@@ -15,11 +17,14 @@ from littrace.evidence.parsing import local_pdf_path
 class PDFBenchmarkReport(BaseModel):
     active_papers: int
     local_pdf_count: int
+    object_storage_pdf_count: int = 0
     parsed_count: int
     failed_count: int
     parsed_with_page_evidence: int
     average_evidence_confidence: float
     local_pdf_rate: float = 0.0
+    object_storage_pdf_rate: float = 0.0
+    pdf_available_rate: float = 0.0
     parsed_rate: float = 0.0
     warnings: list[str] = Field(default_factory=list)
 
@@ -39,6 +44,8 @@ class LivePDFBenchmarkReport(BaseModel):
 def benchmark_pdf_parsing(
     workspace: LiteratureWorkspace,
     config: LitTraceConfig,
+    *,
+    session_id: str | None = None,
 ) -> PDFBenchmarkReport:
     active_ids = workspace.context.active_papers
     local_pdf_count = 0
@@ -47,6 +54,25 @@ def benchmark_pdf_parsing(
     parsed_with_page_evidence = 0
     confidences: list[float] = []
     warnings: list[str] = []
+    stored_pdf_ids: set[str] = set()
+    if session_id:
+        try:
+            registry = artifact_registry_from_config(config)
+            store = artifact_store_from_config(config)
+            for record in registry.list_for_session(session_id=session_id):
+                if record.kind != "paper_pdf" or not record.paper_id or not record.sha256:
+                    continue
+                if store.exists(BlobRef(
+                    backend=record.backend,
+                    bucket=record.bucket,
+                    object_key=record.object_key,
+                    sha256=record.sha256,
+                    size_bytes=record.size_bytes,
+                    content_type=record.content_type,
+                )):
+                    stored_pdf_ids.add(record.paper_id)
+        except Exception as exc:  # noqa: BLE001 - quality reporting is best effort
+            warnings.append(f"Artifact store audit unavailable: {exc.__class__.__name__}: {exc}")
 
     for paper_id in active_ids:
         paper = workspace.papers[paper_id]
@@ -73,8 +99,10 @@ def benchmark_pdf_parsing(
         if has_page:
             parsed_with_page_evidence += 1
 
-    if active_ids and local_pdf_count == 0:
-        warnings.append("No local PDFs found for the active context.")
+    if active_ids and local_pdf_count == 0 and not stored_pdf_ids:
+        warnings.append("No local or object-storage PDFs found for the active context.")
+    elif stored_pdf_ids and local_pdf_count < len(active_ids):
+        warnings.append("Some PDFs are storage-only and are not present in the local paper directory.")
     if parsed_count == 0:
         warnings.append("No successfully parsed full-text PDFs yet.")
 
@@ -86,7 +114,17 @@ def benchmark_pdf_parsing(
         failed_count=failed_count,
         parsed_with_page_evidence=parsed_with_page_evidence,
         average_evidence_confidence=round(average, 3),
+        object_storage_pdf_count=len(set(active_ids) & stored_pdf_ids),
         local_pdf_rate=round(local_pdf_count / len(active_ids), 3) if active_ids else 0.0,
+        object_storage_pdf_rate=round(
+            len(set(active_ids) & stored_pdf_ids) / len(active_ids), 3
+        ) if active_ids else 0.0,
+        pdf_available_rate=round(
+            len(set(active_ids) & (stored_pdf_ids | {
+                paper_id for paper_id in active_ids
+                if local_pdf_path(config, workspace.papers[paper_id]).exists()
+            })) / len(active_ids), 3
+        ) if active_ids else 0.0,
         parsed_rate=round(parsed_count / len(active_ids), 3) if active_ids else 0.0,
         warnings=warnings,
     )

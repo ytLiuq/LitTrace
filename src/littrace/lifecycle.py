@@ -75,6 +75,7 @@ def dispatch_embedding_outbox(
     config: LitTraceConfig,
     *,
     limit: int = 20,
+    session_id: str | None = None,
 ) -> tuple[int, int, list[str]]:
     """Promote ``artifact_outbox`` rows into ``embedding_job`` rows in the
     consolidated ``async_tasks`` table.
@@ -85,9 +86,14 @@ def dispatch_embedding_outbox(
     """
     store = state_store_from_config(config)
     worker_id = f"outbox:{datetime.now(UTC).timestamp():.6f}"
-    records = store.claim_pending_async_tasks(
-        worker_id=worker_id, kind="artifact_outbox", limit=limit
-    )
+    claim_kwargs = {
+        "worker_id": worker_id,
+        "kind": "artifact_outbox",
+        "limit": limit,
+    }
+    if session_id is not None:
+        claim_kwargs["session_id"] = session_id
+    records = store.claim_pending_async_tasks(**claim_kwargs)
     dispatched = failed = 0
     warnings: list[str] = []
     for record in records:

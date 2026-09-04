@@ -21,12 +21,15 @@ def run(
     ledger: ToolExecutionLedger | None = None,
     policy: ToolExecutionPolicy | None = None,
     idempotency_key: str | None = None,
+    session_id: str | None = None,
 ):
     return _output_or_raise(
         _run_sync_skill(
             "quality_report",
-            lambda payload: build_quality_report(payload["config"], payload["workspace"]),
-            {"config": config, "workspace": workspace},
+            lambda payload: build_quality_report(
+                payload["config"], payload["workspace"], session_id=payload.get("session_id")
+            ),
+            {"config": config, "workspace": workspace, "session_id": session_id},
             context=context,
             ledger=ledger,
             policy=policy,

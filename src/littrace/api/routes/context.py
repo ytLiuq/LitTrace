@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from littrace.api.backend import api_app
+from littrace.api.backend import api_app, current_session_id
 from littrace.citations import citation_records_for_papers
 from littrace.retrieval.full_text import backfill_workspace_by_dois
 from littrace.models import (
@@ -13,6 +13,7 @@ from littrace.models import (
     LiteratureWorkspace,
 )
 from littrace.skill_runner import audit_citation_links_skill, resolve_workspace_full_text_skill
+from littrace.session import load_or_create_session, save_workspace
 
 
 
@@ -28,24 +29,29 @@ def get_context() -> LiteratureWorkspace:
 def update_context(update: ContextUpdate) -> LiteratureWorkspace:
     from littrace.context import apply_context_update
 
-    api_app._set_workspace(apply_context_update(api_app.WORKSPACE, update))
-    return api_app.WORKSPACE
+    workspace = apply_context_update(api_app.WORKSPACE, update)
+    if current_session_id():
+        session = load_or_create_session(api_app.load_config(), current_session_id())
+        save_workspace(session, workspace, config=api_app.load_config())
+    return api_app._set_workspace(workspace)
 
 
 @router.post("/full-text/resolve", response_model=dict[str, object])
 async def full_text_resolve() -> dict[str, object]:
-    api_app._set_workspace(
-        await resolve_workspace_full_text_skill(api_app.WORKSPACE, api_app.load_config())
-    )
-    return api_app.WORKSPACE.full_text_reports
+    config = api_app.load_config()
+    workspace = await resolve_workspace_full_text_skill(api_app.WORKSPACE, config)
+    if current_session_id():
+        save_workspace(load_or_create_session(config, current_session_id()), workspace, config=config)
+    return api_app._set_workspace(workspace).full_text_reports
 
 
 @router.post("/papers/backfill-dois", response_model=LiteratureWorkspace)
 async def papers_backfill_dois(request: DOIBackfillRequest) -> LiteratureWorkspace:
-    api_app._set_workspace(
-        await backfill_workspace_by_dois(api_app.WORKSPACE, request.dois, api_app.load_config())
-    )
-    return api_app.WORKSPACE
+    config = api_app.load_config()
+    workspace = await backfill_workspace_by_dois(api_app.WORKSPACE, request.dois, config)
+    if current_session_id():
+        save_workspace(load_or_create_session(config, current_session_id()), workspace, config=config)
+    return api_app._set_workspace(workspace)
 
 
 @router.get("/citations/context", response_model=list[CitationRecord])

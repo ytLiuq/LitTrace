@@ -471,6 +471,7 @@ class WorkspaceFilters(BaseModel):
     # Search-related
     search_mode: str | None = None
     topic: str | None = None
+    search_query: str | None = None
     research_background: str | None = None
     research_retrieval_policy: TopicRetrievalPolicy | None = None
     research_background_status: str | None = None
@@ -497,6 +498,9 @@ class WorkspaceFilters(BaseModel):
     # Parse-related
     parsed_full_text_count: int = 0
     downloaded_full_text_count: int = 0
+    requested_rag_ready_count: int = 0
+    rag_ready_count: int = 0
+    paper_pipeline_status: dict[str, str] = Field(default_factory=dict)
 
     # Full-text context
     full_text_context_warnings: list[str] = Field(default_factory=list)

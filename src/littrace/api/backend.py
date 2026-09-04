@@ -1,7 +1,26 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 from littrace.api import state as api_state
 from littrace.models import LiteratureWorkspace
+
+
+_CURRENT_SESSION_ID: ContextVar[str | None] = ContextVar(
+    "littrace_api_session_id", default=None
+)
+
+
+def set_current_session_id(session_id: str | None):
+    return _CURRENT_SESSION_ID.set(session_id.strip() if session_id else None)
+
+
+def reset_current_session_id(token) -> None:
+    _CURRENT_SESSION_ID.reset(token)
+
+
+def current_session_id() -> str | None:
+    return _CURRENT_SESSION_ID.get()
 
 
 class APIBackend:
@@ -13,7 +32,19 @@ class APIBackend:
 
     @property
     def WORKSPACE(self) -> LiteratureWorkspace:  # noqa: N802 - compatibility API
-        return api_state.get_workspace()
+        # Keep legacy callers that replace ``littrace.api.app.WORKSPACE``
+        # working while the migrated routes use the state module underneath.
+        # ``_set_workspace`` updates both references, so this does not create
+        # a second source of truth in normal operation.
+        from littrace.api import app as app_module
+
+        session_id = current_session_id()
+        if session_id:
+            from littrace.session import load_or_create_session, load_workspace
+
+            config = self.load_config()
+            return load_workspace(load_or_create_session(config, session_id))
+        return getattr(app_module, "WORKSPACE", api_state.get_workspace())
 
     @staticmethod
     def load_config(path: str | None = None):

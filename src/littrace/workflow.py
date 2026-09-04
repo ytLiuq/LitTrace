@@ -153,6 +153,8 @@ async def _build_search_workspace(
     ledger: ToolExecutionLedger | None = None,
     policy: ToolExecutionPolicy | None = None,
     idempotency_key: str | None = None,
+    include_full_text: bool = False,
+    session_id: str | None = None,
 ) -> tuple[LiteratureWorkspace, SearchSkillResult]:
     routes = (
         routes if routes is not None else route_sources(request.discipline, request.wants_recent)
@@ -201,7 +203,7 @@ async def _build_search_workspace(
             search.result.papers,
             search.diagnostics.source_health,
         )
-    if search.use_live:
+    if search.use_live and include_full_text and session_id:
         context_result = await build_full_text_context(
             workspace,
             request,
@@ -209,6 +211,7 @@ async def _build_search_workspace(
             context=context,
             ledger=ledger,
             policy=policy,
+            session_id=session_id,
         )
         workspace = context_result.workspace
         workspace.context.filters.full_text_context_warnings = context_result.warnings
@@ -222,6 +225,8 @@ async def run_search_preview(
     tool_context: ToolCallContext | None = None,
     tool_ledger: ToolExecutionLedger | None = None,
     tool_policy: ToolExecutionPolicy | None = None,
+    include_full_text: bool = False,
+    session_id: str | None = None,
 ) -> LiteratureWorkspace:
     context = tool_context or ToolCallContext(caller="workflow.preview", task_id=uuid4().hex)
     workspace, _ = await _build_search_workspace(
@@ -231,6 +236,8 @@ async def run_search_preview(
         ledger=tool_ledger or ToolExecutionLedger(),
         policy=tool_policy,
         idempotency_key=_workflow_idempotency_key(request, "search_papers"),
+        include_full_text=include_full_text,
+        session_id=session_id,
     )
     return workspace
 

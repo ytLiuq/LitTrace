@@ -313,6 +313,7 @@ class StateStore(Protocol):
         *,
         worker_id: str,
         kind: str | None = None,
+        session_id: str | None = None,
         limit: int = 20,
         lease_seconds: float = 300.0,
     ) -> list[AsyncTaskRecord]: ...
@@ -1444,39 +1445,36 @@ class PostgresStateStore:
         *,
         worker_id: str,
         kind: str | None = None,
+        session_id: str | None = None,
         limit: int = 20,
         lease_seconds: float = 300.0,
     ) -> list[AsyncTaskRecord]:
         self._ensure_schema()
         s = self.schema_name
         with self._connect() as conn, conn.cursor() as cur:
+            clauses = [
+                "(status = 'queued' OR "
+                "(status = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= now()) "
+                f"OR {_LEASE_RECLAIM_SQL})"
+            ]
+            params: list[object] = []
             if kind is not None:
-                cur.execute(
-                    f"""
-                    SELECT task_id FROM {s}.async_tasks
-                    WHERE kind = %s
-                      AND (status = 'queued'
-                           OR (status = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= now())
-                           OR {_LEASE_RECLAIM_SQL})
-                    ORDER BY created_at
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT %s
-                    """,
-                    (kind, limit),
-                )
-            else:
-                cur.execute(
-                    f"""
-                    SELECT task_id FROM {s}.async_tasks
-                    WHERE (status = 'queued'
-                           OR (status = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= now())
-                           OR {_LEASE_RECLAIM_SQL})
-                    ORDER BY created_at
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT %s
-                    """,
-                    (limit,),
-                )
+                clauses.append("kind = %s")
+                params.append(kind)
+            if session_id is not None:
+                clauses.append("session_id = %s")
+                params.append(session_id)
+            params.append(limit)
+            cur.execute(
+                f"""
+                SELECT task_id FROM {s}.async_tasks
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+                """,
+                tuple(params),
+            )
             ids = [row[0] for row in cur.fetchall()]
             if not ids:
                 conn.commit()

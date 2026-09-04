@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from dataclasses import dataclass
 
+from littrace.artifact_registry import artifact_registry_from_config
+from littrace.artifact_store import BlobRef, artifact_store_from_config
 from littrace.config import LitTraceConfig
 from littrace.context import _merge_filters
 from littrace.retrieval.full_text import resolve_full_text_for_papers
@@ -15,7 +19,7 @@ from littrace.models import (
     ParsedPaper,
     coerce_parsed,
 )
-from littrace.evidence.parsing import local_pdf_path
+from littrace.access_layer.paths import target_pdf_path
 from littrace.retrieval.search import build_query_variants, rank_papers
 from littrace.skill_runner import execute_downloads_skill, parse_workspace_skill
 from littrace.tool_contracts import ToolCallContext, ToolExecutionLedger, ToolExecutionPolicy
@@ -42,6 +46,7 @@ async def build_full_text_context(
     context: ToolCallContext | None = None,
     ledger: ToolExecutionLedger | None = None,
     policy: ToolExecutionPolicy | None = None,
+    session_id: str | None = None,
 ) -> FullTextContextResult:
     candidates = _candidate_papers(workspace)
     valid = _valid_candidate_papers(candidates)
@@ -70,7 +75,14 @@ async def build_full_text_context(
     downloadable = [
         paper for paper in valid if paper.access_type == AccessType.OPEN_ACCESS and paper.pdf_url
     ]
-    if downloadable:
+    original_active = list(workspace.context.active_papers)
+    downloaded_ids: list[str] = []
+    parse_report: dict[str, object] = {"parsed_count": 0}
+    if downloadable and session_id:
+        # The downloader skill intentionally receives active papers only. For
+        # this acquisition stage, make the complete OA set active temporarily
+        # so every resolved candidate is eligible for storage.
+        workspace.context.active_papers = [paper.paper_id for paper in downloadable]
         tool_kwargs = {
             key: value
             for key, value in {
@@ -85,6 +97,7 @@ async def build_full_text_context(
             workspace,
             DownloadExecutionRequest(
                 paper_ids=[paper.paper_id for paper in downloadable],
+                session_id=session_id,
                 target="storage_only",
             ),
             **tool_kwargs,
@@ -92,30 +105,84 @@ async def build_full_text_context(
         for item in download_result.items:
             if item.error:
                 warnings.append(f"download:{item.paper_id}: {item.error}")
+        registry = artifact_registry_from_config(config)
+        store = artifact_store_from_config(config)
+        for item in download_result.items:
+            if item.status != "downloaded":
+                continue
+            record = registry.find_in_session(
+                f"paper_pdf:{item.paper_id}", session_id=session_id
+            )
+            if record is None or not record.sha256:
+                warnings.append(f"download:{item.paper_id}: artifact registration missing")
+                continue
+            ref = BlobRef(
+                backend=record.backend,
+                bucket=record.bucket,
+                object_key=record.object_key,
+                sha256=record.sha256,
+                size_bytes=record.size_bytes,
+                content_type=record.content_type,
+            )
+            if not store.exists(ref):
+                warnings.append(f"download:{item.paper_id}: artifact object missing")
+                continue
+            downloaded_ids.append(item.paper_id)
 
-    downloaded_ids = [paper.paper_id for paper in valid if local_pdf_path(config, paper).exists()]
-    original_active = list(workspace.context.active_papers)
-    workspace.context.active_papers = downloaded_ids
-    if downloaded_ids:
-        tool_kwargs = {
-            key: value
-            for key, value in {
-                "context": context,
-                "ledger": ledger,
-                "policy": policy,
-            }.items()
-            if value is not None
-        }
-        workspace, parse_report = await parse_workspace_skill(
-            workspace,
-            config,
-            **tool_kwargs,
-        )
-    else:
-        parse_report = {"parsed_count": 0}
+        # Parse from immutable object-storage bytes in a temporary local
+        # workspace. The user's paper directory stays clean while the parser
+        # continues to use its established local-path interface.
+        if downloaded_ids:
+            with TemporaryDirectory(prefix="littrace-full-text-") as temporary:
+                parse_config = config.model_copy(deep=True)
+                parse_config.storage.paper_library_dir = Path(temporary) / "papers"
+                parse_workspace = workspace.model_copy(deep=True)
+                parse_workspace.context.active_papers = downloaded_ids
+                for paper_id in downloaded_ids:
+                    paper = parse_workspace.papers[paper_id]
+                    record = registry.find_in_session(
+                        f"paper_pdf:{paper_id}", session_id=session_id
+                    )
+                    assert record is not None
+                    data = store.get_bytes(
+                        BlobRef(
+                            backend=record.backend,
+                            bucket=record.bucket,
+                            object_key=record.object_key,
+                            sha256=record.sha256,
+                            size_bytes=record.size_bytes,
+                            content_type=record.content_type,
+                        )
+                    )
+                    target = target_pdf_path(parse_config, paper)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+                tool_kwargs = {
+                    key: value
+                    for key, value in {
+                        "context": context,
+                        "ledger": ledger,
+                        "policy": policy,
+                    }.items()
+                    if value is not None
+                }
+                parsed_workspace, parse_report = await parse_workspace_skill(
+                    parse_workspace,
+                    parse_config,
+                    **tool_kwargs,
+                )
+                workspace.parsed_papers.update(parsed_workspace.parsed_papers)
+                workspace.context.filters.docling_quality_reports.update(
+                    parsed_workspace.context.filters.docling_quality_reports
+                )
+    elif downloadable and not session_id:
+        warnings.append("Full-text acquisition deferred because session_id is required.")
 
+    workspace.context.active_papers = downloaded_ids if session_id else original_active
+
+    context_ids = downloaded_ids if session_id else original_active
     ranked = _rank_full_text_papers(
-        [workspace.papers[paper_id] for paper_id in downloaded_ids],
+        [workspace.papers[paper_id] for paper_id in context_ids if paper_id in workspace.papers],
         request,
         workspace,
         config,
@@ -133,7 +200,7 @@ async def build_full_text_context(
             "parsed_full_text_count": int(parse_report.get("parsed_count") or 0),
         },
     )
-    if not workspace.context.active_papers:
+    if session_id and not workspace.context.active_papers:
         warnings.append("No downloaded full-text PDFs are available for the current context.")
     return FullTextContextResult(
         workspace=workspace,
@@ -188,7 +255,7 @@ def _rank_full_text_papers(
         parsed_score = (
             _parsed_content_relevance(request.topic, _parsed) if _parsed is not None else 0.0
         )
-        full_text_bonus = 0.18 if local_pdf_path(config, paper).exists() else 0.0
+        full_text_bonus = 0.18 if paper.paper_id in workspace.parsed_papers else 0.0
         paper.relevance_score = min(
             1.0,
             0.74 * (paper.relevance_score or 0.0) + 0.22 * parsed_score + full_text_bonus,

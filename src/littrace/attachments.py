@@ -5,6 +5,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from littrace.artifact_registry import artifact_registry_from_config
+from littrace.artifact_store import BlobRef, artifact_store_from_config
 from littrace.access_layer.paths import target_pdf_path
 from littrace.config import LitTraceConfig
 from littrace.models import LiteratureWorkspace
@@ -71,26 +73,51 @@ def attach_pdf_to_paper(
 def check_download_presence(
     config: LitTraceConfig,
     workspace: LiteratureWorkspace,
+    *,
+    session_id: str | None = None,
 ) -> DownloadPresenceReport:
     selected = set(workspace.context.selected_for_download)
     items: list[DownloadPresenceItem] = []
+    stored_ids: set[str] = set()
+    if session_id:
+        try:
+            registry = artifact_registry_from_config(config)
+            store = artifact_store_from_config(config)
+            for record in registry.list_for_session(session_id=session_id):
+                if record.kind != "paper_pdf" or not record.paper_id or not record.sha256:
+                    continue
+                if store.exists(BlobRef(
+                    backend=record.backend,
+                    bucket=record.bucket,
+                    object_key=record.object_key,
+                    sha256=record.sha256,
+                    size_bytes=record.size_bytes,
+                    content_type=record.content_type,
+                )):
+                    stored_ids.add(record.paper_id)
+        except Exception as exc:  # noqa: BLE001 - presence is best effort
+            warnings = [f"Object-storage audit unavailable: {exc.__class__.__name__}: {exc}"]
+        else:
+            warnings = []
+    else:
+        warnings = []
     for paper_id in workspace.context.active_papers:
         paper = workspace.papers[paper_id]
         expected = target_pdf_path(config, paper)
+        local_exists = expected.exists()
         items.append(
             DownloadPresenceItem(
                 paper_id=paper_id,
                 title=paper.title,
                 expected_path=str(expected),
-                exists=expected.exists(),
+                exists=local_exists or paper_id in stored_ids,
                 selected_for_download=paper_id in selected,
             )
         )
     ready = sum(item.exists for item in items)
     missing = len(items) - ready
-    warnings = []
     if missing:
-        warnings.append(f"{missing} active papers do not have local PDFs yet.")
+        warnings.append(f"{missing} active papers do not have local or object-storage PDFs yet.")
     return DownloadPresenceReport(
         items=items,
         ready_to_parse_count=ready,

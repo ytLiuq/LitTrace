@@ -18,10 +18,17 @@ class QualityReport(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-def build_quality_report(config: LitTraceConfig, workspace: LiteratureWorkspace) -> QualityReport:
+def build_quality_report(
+    config: LitTraceConfig,
+    workspace: LiteratureWorkspace,
+    *,
+    session_id: str | None = None,
+) -> QualityReport:
     papers = [workspace.papers[paper_id] for paper_id in workspace.context.active_papers]
-    download_presence = check_download_presence(config, workspace)
-    pdf_report = benchmark_pdf_parsing(workspace, config)
+    download_presence = check_download_presence(
+        config, workspace, session_id=session_id
+    )
+    pdf_report = benchmark_pdf_parsing(workspace, config, session_id=session_id)
     matrix = build_comparison_matrices(workspace)
     storyline_review = review_storyline(workspace)
     storyline_text = _render_structured_storyline_report(workspace)
@@ -50,6 +57,8 @@ def build_quality_report(config: LitTraceConfig, workspace: LiteratureWorkspace)
         if active_count
         else 0.0,
         "local_pdf_rate": pdf_report.local_pdf_rate,
+        "object_storage_pdf_rate": pdf_report.object_storage_pdf_rate,
+        "pdf_available_rate": pdf_report.pdf_available_rate,
         "parsed_rate": pdf_report.parsed_rate,
         "performance_cell_count": float(len(workspace.performance_cells)),
         "comparison_matrix_count": float(len(matrix.matrices)),

@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from littrace.api import state as api_state
+from littrace.api.backend import reset_current_session_id, set_current_session_id
 from littrace.api.routes.agents import router as agents_router
 from littrace.api.routes.artifacts import router as artifacts_router
 from littrace.api.routes.context import router as context_router
@@ -136,6 +137,18 @@ def make_app() -> FastAPI:
     instance.include_router(research_router)
     instance.include_router(sessions_router)
     instance.include_router(artifacts_router)
+
+    @instance.middleware("http")
+    async def bind_api_session(request, call_next):
+        """Bind X-LitTrace-Session-Id to all legacy route workspace access."""
+        token = set_current_session_id(
+            request.headers.get("X-LitTrace-Session-Id")
+            or request.query_params.get("session_id")
+        )
+        try:
+            return await call_next(request)
+        finally:
+            reset_current_session_id(token)
 
     @instance.middleware("http")
     async def add_api_version(request, call_next):
