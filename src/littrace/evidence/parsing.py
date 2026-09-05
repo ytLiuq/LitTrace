@@ -17,6 +17,8 @@ def parse_workspace_papers(
     tool: OCRTool | None = None,
     mode: OCRMode = OCRMode.ACCURATE,
 ) -> tuple[LiteratureWorkspace, dict[str, object]]:
+    if config.parsing.parse_strategy in {"text_only", "text-only", "text"}:
+        mode = OCRMode.FAST
     paper_lookup = workspace.papers
     parser = tool or build_ocr_tool(config, paper_lookup)
     parsed_count = 0

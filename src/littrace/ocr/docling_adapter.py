@@ -58,7 +58,7 @@ class DoclingOCRTool:
             docling_config = getattr(getattr(self.config, "parsing", None), "docling", None)
             pipeline_options = PdfPipelineOptions(
                 do_ocr=False,
-                generate_picture_images=True,
+                generate_picture_images=mode not in {OCRMode.FAST},
                 do_picture_description=bool(
                     getattr(docling_config, "describe_figures", False)
                 ),
