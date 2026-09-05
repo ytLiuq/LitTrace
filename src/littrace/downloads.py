@@ -19,7 +19,6 @@ from littrace.artifact_registry import ArtifactRecord, artifact_registry_from_co
 from littrace.access_layer.cdp import (
     check_cdp_status,
     download_paper_via_cdp,
-    identify_publisher,
 )
 from littrace.access_layer.paths import build_download_plan, target_pdf_path
 from littrace.config import LitTraceConfig
@@ -167,9 +166,18 @@ async def execute_downloads(
     # Keep this field aligned with the download plan: it describes selected
     # papers whose publisher requires authentication, regardless of whether
     # this attempt already reached a terminal auth-required state.
-    requires_login_count = sum(
+    planned_login_count = sum(
         paper.access_type == AccessType.REQUIRES_LOGIN for paper in target_papers
     )
+    # A source can be classified as OPEN_ACCESS/UNAVAILABLE before the
+    # request, then reveal a WAF (for example sciengine's HTTP 418) only when
+    # the browser path runs.  Count the terminal item status as well so the
+    # UI accurately tells the user that interactive login/verification is
+    # required for that paper.
+    item_login_count = sum(
+        item.status in {"requires_login", "auth_required"} for item in items
+    )
+    requires_login_count = max(planned_login_count, item_login_count)
     return DownloadExecutionResult(
         items=items,
         downloaded_count=sum(item.status == "downloaded" for item in items),
@@ -213,6 +221,14 @@ async def _execute_one(
     if paper.access_type == AccessType.OPEN_ACCESS and not pdf_url:
         report = await resolve_full_text_for_paper(client, paper, config)
         pdf_url = report.best_pdf_url
+    # A DOI with no HTTP-verified PDF is still actionable: the publisher
+    # landing page may require the user's authenticated Chrome session, or a
+    # WAF may return 418 to ordinary HTTP clients.  Route it through CDP so
+    # the browser can surface the login/challenge and extract the PDF after
+    # the user completes it, instead of reporting a misleading permanent
+    # "no verified PDF URL" failure.
+    if not pdf_url and paper.doi:
+        return await run_cdp("No verified PDF URL; trying authenticated browser")
     if paper.access_type != AccessType.OPEN_ACCESS or not pdf_url:
         error = "Full text PDF is required, but no verified PDF URL is available."
         task.mark(DownloadTaskStatus.FAILED, error=error)
@@ -500,6 +516,14 @@ def _looks_like_human_verification_response(response: httpx.Response) -> bool:
         "misuse.ncbi.nlm.nih.gov",
         "请验证",
         "正在进行安全验证",
+        "cloudwaf",
+        "访问被拦截",
+        "block-event-id",
+        "aliyun_waf_aa",
+        "aliyuncaptcha",
+        "滑动验证",
+        "访问验证",
+        "别离开，为了更好的访问体验",
     ]
     return any(marker in sample for marker in markers)
 
@@ -520,7 +544,9 @@ def _should_try_cdp_after_open_access_http_error(
     if paper.access_type != AccessType.OPEN_ACCESS or not paper.doi:
         return False
     if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
-        return identify_publisher(paper.doi) != "unknown"
+        # DOI resolvers and regional publishers may time out before returning
+        # an HTTP response. The authenticated browser can still load them.
+        return True
     return True
 
 

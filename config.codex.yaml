@@ -106,6 +106,5 @@ agent_runtime:
   turn_timeout_seconds: 300
   sandbox_policy: "read-only"
   rollout_enabled: true
-  codex_config_overrides:
-    model_provider: '"openai"'
+  codex_config_overrides: {}
   mcp_server_name: "littrace"

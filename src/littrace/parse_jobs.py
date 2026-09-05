@@ -36,6 +36,7 @@ from littrace.state_db import (
     AsyncTaskQueueReport,
     AsyncTaskRecord,
     StateStore,
+    sanitize_json_value,
     state_store_from_config,
 )
 
@@ -145,6 +146,7 @@ async def run_pending_parse_jobs(
     limit: int = 10,
     worker_id: str | None = None,
     session_id: str | None = None,
+    task_ids: set[str] | None = None,
     state_store: StateStore | None = None,
     executor: ParseExecutor | None = None,
     source_sha_lookup: SourceShaLookup | None = None,
@@ -176,6 +178,8 @@ async def run_pending_parse_jobs(
     }
     if session_id is not None:
         claim_kwargs["session_id"] = session_id
+    if task_ids is not None:
+        claim_kwargs["task_ids"] = task_ids
     jobs = state_store.claim_pending_async_tasks(**claim_kwargs)
     if not jobs:
         report.finished_at = datetime.now(UTC).isoformat()
@@ -462,7 +466,7 @@ def _commit_parse_output(
             "stale_paper_ids": stale_ids,
             "committed_revision": state.revision + 1,
         }
-        workspace_json = workspace.model_dump(mode="json")
+        workspace_json = sanitize_json_value(workspace.model_dump(mode="json"))
         canonical_json = json.dumps(
             workspace_json,
             ensure_ascii=False,

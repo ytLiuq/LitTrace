@@ -314,6 +314,8 @@ class StateStore(Protocol):
         worker_id: str,
         kind: str | None = None,
         session_id: str | None = None,
+        task_ids: set[str] | None = None,
+        artifact_ids: set[str] | None = None,
         limit: int = 20,
         lease_seconds: float = 300.0,
     ) -> list[AsyncTaskRecord]: ...
@@ -1446,6 +1448,8 @@ class PostgresStateStore:
         worker_id: str,
         kind: str | None = None,
         session_id: str | None = None,
+        task_ids: set[str] | None = None,
+        artifact_ids: set[str] | None = None,
         limit: int = 20,
         lease_seconds: float = 300.0,
     ) -> list[AsyncTaskRecord]:
@@ -1464,6 +1468,16 @@ class PostgresStateStore:
             if session_id is not None:
                 clauses.append("session_id = %s")
                 params.append(session_id)
+            if task_ids is not None:
+                if not task_ids:
+                    return []
+                clauses.append("task_id = ANY(%s)")
+                params.append(list(task_ids))
+            if artifact_ids is not None:
+                if not artifact_ids:
+                    return []
+                clauses.append("artifact_id = ANY(%s)")
+                params.append(list(artifact_ids))
             params.append(limit)
             cur.execute(
                 f"""
@@ -1731,7 +1745,26 @@ def _jsonb(value: object) -> str:
     def _default(value):
         return str(value)
 
-    return _json.dumps(value, ensure_ascii=False, default=_default)
+    return _json.dumps(sanitize_json_value(value), ensure_ascii=False, default=_default)
+
+
+def sanitize_json_value(value: object) -> object:
+    """Remove characters PostgreSQL JSONB rejects from parser output.
+
+    PDF extraction engines can emit NUL bytes in text fields. JSON permits
+    them as ``\\u0000`` escapes, but PostgreSQL rejects that escape while
+    casting to JSONB. Sanitize recursively at the persistence boundary so
+    one malformed text span cannot abort an entire parse batch.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {key: sanitize_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_json_value(item) for item in value]
+    return value
 
 
 def _from_jsonb(value) -> object:

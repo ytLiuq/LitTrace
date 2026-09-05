@@ -278,6 +278,7 @@ async def run_pending_embedding_jobs(
     *,
     limit: int = 20,
     session_id: str | None = None,
+    artifact_ids: set[str] | None = None,
 ) -> RagEmbeddingJobBatchReport:
     report = RagEmbeddingJobBatchReport()
     state_store = state_store_from_config(config)
@@ -286,7 +287,7 @@ async def run_pending_embedding_jobs(
         report.finished_at = datetime.now(UTC).isoformat()
         return report
     dispatched, outbox_failed, outbox_warnings = dispatch_embedding_outbox(
-        config, limit=limit, session_id=session_id,
+        config, limit=limit, session_id=session_id, artifact_ids=artifact_ids,
     )
     report.outbox_dispatched = dispatched
     report.outbox_failed = outbox_failed
@@ -304,6 +305,8 @@ async def run_pending_embedding_jobs(
     }
     if session_id is not None:
         claim_kwargs["session_id"] = session_id
+    if artifact_ids is not None:
+        claim_kwargs["artifact_ids"] = artifact_ids
     jobs = state_store.claim_pending_async_tasks(**claim_kwargs)
     if not jobs:
         report.finished_at = datetime.now(UTC).isoformat()

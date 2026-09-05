@@ -215,6 +215,7 @@ _AUTH_REASON_TEXT = {
     "no_id_token": "Codex 凭据文件缺少 id_token",
     "unparseable_jwt": "Codex id_token 不是合法 JWT",
     "token_expired": "Codex 登录已过期",
+    "api_key": "已配置 API Key",
 }
 
 
@@ -2324,7 +2325,7 @@ class DailyConfigDialog(QtWidgets.QDialog):
 
       * 研究主题 (natural-language search topic, required)
       * 开始 / 结束年份 (year range for retrieval)
-      * RAG 目标数量 (minimum papers that should become RAG-ready)
+      * 检索目标数量 (minimum papers that should become RAG-ready)
 
     Round 19: the dialog is non-modal (``setModal(False)``) so the
     user can still browse the context panel, switch sessions, or
@@ -2356,7 +2357,8 @@ class DailyConfigDialog(QtWidgets.QDialog):
         # rest of the window while they tweak the parameters.
         # Closing the dialog (X button, Esc, "取消") rejects the run.
         self.setModal(False)
-        self.resize(540, 380)
+        self.resize(680, 460)
+        self.setMinimumSize(620, 420)
 
         # Round 19: the dialog now remembers the last accepted values
         # across sessions via ``QSettings`` so the user doesn't have
@@ -2394,6 +2396,8 @@ class DailyConfigDialog(QtWidgets.QDialog):
             self._settings.value("daily/topic", default_topic, type=str)
         )
         self._topic_input.setPlaceholderText("例如：柔性压阻传感器")
+        self._topic_input.setMinimumWidth(480)
+        self._topic_input.setMinimumHeight(34)
         self._topic_input.selectAll()
         form.addRow("研究主题 *", self._topic_input)
 
@@ -2402,6 +2406,8 @@ class DailyConfigDialog(QtWidgets.QDialog):
             self._settings.value("daily/keywords", "", type=str)
         )
         self._keywords_input.setPlaceholderText("可选：更精确的检索词（多个用空格分隔）")
+        self._keywords_input.setMinimumWidth(480)
+        self._keywords_input.setMinimumHeight(34)
         form.addRow("关键词", self._keywords_input)
 
         # 年份范围
@@ -2409,6 +2415,8 @@ class DailyConfigDialog(QtWidgets.QDialog):
         year_row.setSpacing(6)
         self._year_min_input = QtWidgets.QSpinBox()
         self._year_min_input.setRange(1990, 2030)
+        self._year_min_input.setMinimumWidth(130)
+        self._year_min_input.setMinimumHeight(34)
         self._year_min_input.setValue(int(
             self._settings.value("daily/year_min", default_year_min)
         ))
@@ -2416,6 +2424,8 @@ class DailyConfigDialog(QtWidgets.QDialog):
         year_row.addWidget(QtWidgets.QLabel("至"))
         self._year_max_input = QtWidgets.QSpinBox()
         self._year_max_input.setRange(1990, 2030)
+        self._year_max_input.setMinimumWidth(130)
+        self._year_max_input.setMinimumHeight(34)
         self._year_max_input.setValue(int(
             self._settings.value("daily/year_max", default_year_max)
         ))
@@ -2423,14 +2433,16 @@ class DailyConfigDialog(QtWidgets.QDialog):
         year_row.addStretch(1)
         form.addRow("年份区间", year_row)
 
-        # RAG 目标数量
+        # 检索目标数量
         self._min_papers_input = QtWidgets.QSpinBox()
         self._min_papers_input.setRange(1, 200)
+        self._min_papers_input.setMinimumWidth(180)
+        self._min_papers_input.setMinimumHeight(34)
         self._min_papers_input.setValue(int(
             self._settings.value("daily/min_papers", default_min_papers)
         ))
         self._min_papers_input.setSuffix(" 篇")
-        form.addRow("RAG 目标数量", self._min_papers_input)
+        form.addRow("检索目标数量", self._min_papers_input)
 
         layout.addLayout(form)
         layout.addStretch(1)
@@ -5955,7 +5967,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             ),
             (
                 "2. 点 \"🔍 搜索研究主题\"",
-                "弹窗里填主题 / 关键词 / 年份区间 / 最少下载数。"
+                "弹窗里填主题 / 关键词 / 年份区间 / 检索目标数量。"
                 "Sentinel 会按主题检索并解析 PDF。",
             ),
             (

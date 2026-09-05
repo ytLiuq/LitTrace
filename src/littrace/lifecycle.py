@@ -76,6 +76,7 @@ def dispatch_embedding_outbox(
     *,
     limit: int = 20,
     session_id: str | None = None,
+    artifact_ids: set[str] | None = None,
 ) -> tuple[int, int, list[str]]:
     """Promote ``artifact_outbox`` rows into ``embedding_job`` rows in the
     consolidated ``async_tasks`` table.
@@ -93,6 +94,8 @@ def dispatch_embedding_outbox(
     }
     if session_id is not None:
         claim_kwargs["session_id"] = session_id
+    if artifact_ids is not None:
+        claim_kwargs["artifact_ids"] = artifact_ids
     records = store.claim_pending_async_tasks(**claim_kwargs)
     dispatched = failed = 0
     warnings: list[str] = []

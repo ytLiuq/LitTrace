@@ -17,6 +17,7 @@ import base64
 import json
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -166,6 +167,7 @@ class ShellController:
         # never lands on a not-yet-ready service and silently
         # downgrades to the legacy ``handle_agent_chat`` path.
         self._service_ready = threading.Event()
+        self._chat_future: Future | None = None
         # Round 17: throttle auth re-checks so the shell's "Re-check"
         # button doesn't hammer the auth.json file on every click.
         # The last-check timestamp is recorded here; the controller
@@ -252,7 +254,6 @@ class ShellController:
         # first user turn pays the spawn cost (5-10 s) once and then
         # every subsequent turn reuses the warm client.
         asyncio.create_task(self._run_warmup())
-        self._service_ready.set()
 
     async def _run_warmup(self) -> None:
         # Step through the warmup with progress events so the shell
@@ -271,12 +272,14 @@ class ShellController:
                 phase="failed",
                 detail=f"{type(exc).__name__}: {exc}",
             )
+            self._service_ready.set()
             return
         self._emit(
             self.EVENT_WARMUP_DONE,
             phase="ready" if ok else "failed",
             detail="" if ok else "codex app-server 启动失败；首轮对话会自动重试",
         )
+        self._service_ready.set()
 
     async def _emit_progress_loop(self, started_at: float) -> None:
         """Emit ``EVENT_THINKING_PROGRESS`` heartbeats while a turn
@@ -332,6 +335,9 @@ class ShellController:
     def stop(self) -> None:
         if self._loop is None:
             return
+        future = self._chat_future
+        if future is not None and not future.done():
+            future.cancel()
         self._loop.call_soon_threadsafe(self._loop.stop)
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=2.0)
@@ -462,6 +468,16 @@ class ShellController:
                 reason="auth_file_unreadable",
                 detail=f"{path} 解析失败：{exc.__class__.__name__}: {exc}",
             )
+        # Codex supports both ChatGPT OAuth tokens and direct API-key auth.
+        # The previous probe only understood ``tokens.id_token`` and marked a
+        # valid OPENAI_API_KEY profile as unauthenticated.
+        api_key = raw.get("OPENAI_API_KEY")
+        if isinstance(api_key, str) and api_key.strip() and api_key.strip() != "null":
+            return self._AuthStatus(
+                ok=True,
+                reason="api_key",
+                detail=f"{path} 已配置 OpenAI API Key",
+            )
         tokens = raw.get("tokens")
         if not isinstance(tokens, dict):
             return self._AuthStatus(
@@ -510,6 +526,13 @@ class ShellController:
         try:
             self._loop.run_forever()
         finally:
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
             self._loop.close()
             self._loop = None
 
@@ -553,7 +576,7 @@ class ShellController:
         if self._loop is None:
             self._emit(self.EVENT_ERROR, message="controller event loop not ready")
             return
-        asyncio.run_coroutine_threadsafe(
+        self._chat_future = asyncio.run_coroutine_threadsafe(
             self._run_chat_turn(text, silent=False), self._loop
         )
 
@@ -587,12 +610,16 @@ class ShellController:
         # path (which doesn't take ``on_delta`` and therefore never
         # streams). The wait is bounded so a hung warm-up never
         # freezes the chat thread.
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._service_ready.wait, 30.0,
-            )
-        except Exception:
-            pass
+        # A pre-built service (including injected test/fallback services) is
+        # already safe to call. Only wait for the background warmup when the
+        # controller has not created a service yet.
+        if self._service is None:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self._service_ready.wait, 30.0,
+                )
+            except Exception:
+                pass
         request = ChatRequest(
             session_id=self._session.session_id,
             message=text,
@@ -661,6 +688,46 @@ class ShellController:
                     session=self._session,
                 )
         except Exception as exc:
+            # The Qt controller calls the long-lived App Server directly for
+            # streaming. If that transport/provider path fails, use the same
+            # legacy fallback policy as the API/CLI route instead of leaving
+            # the chat bubble stuck in "处理中".
+            if (
+                service is not None
+                and self._config.agent_runtime.fallback_to_legacy
+            ):
+                self._emit(
+                    self.EVENT_THINKING,
+                    active=True,
+                    label="Codex 不可用，切换兼容对话链路…",
+                )
+                try:
+                    fallback_response, fallback_workspace = await handle_agent_chat(
+                        request,
+                        self._workspace,
+                        self._config,
+                        session=self._session,
+                    )
+                except Exception as fallback_exc:
+                    exc = fallback_exc
+                else:
+                    with self._lock:
+                        self._workspace = fallback_workspace
+                    if not silent:
+                        self._emit(
+                            self.EVENT_MESSAGE_APPENDED,
+                            role="assistant",
+                            text=fallback_response.reply,
+                            action=fallback_response.action,
+                            warnings=fallback_response.warnings,
+                        )
+                        self._emit(self.EVENT_WORKSPACE_REFRESHED)
+                    self._emit(self.EVENT_THINKING, active=False)
+                    self._emit(
+                        self.EVENT_STATUS_CHANGED,
+                        text="就绪" if not silent else "已就绪",
+                    )
+                    return
             # Round 17: classify the failure before forwarding it
             # to the shell. ``codex_runtime.errors`` already maps
             # transport failures to ``CodexErrorCode`` enums; we

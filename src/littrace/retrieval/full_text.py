@@ -364,7 +364,7 @@ async def _verify_candidate(
     if "xml" in content_type.lower():
         update["is_xml"] = True
         update["content_type"] = content_type
-    if response.status_code in {401, 402, 403}:
+    if response.status_code in {401, 402, 403, 418}:
         if _has_open_access_evidence(candidate):
             update["requires_login"] = False
             update["access_type"] = AccessType.OPEN_ACCESS
@@ -424,7 +424,7 @@ def _failure_class(exc: httpx.HTTPError) -> str:
         status = exc.response.status_code
         if status in {429, 500, 502, 503, 504}:
             return "transient_http"
-        if status in {401, 402, 403}:
+        if status in {401, 402, 403, 418}:
             return "auth_or_forbidden"
         if status == 404:
             return "not_found"

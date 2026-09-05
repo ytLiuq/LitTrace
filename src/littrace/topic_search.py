@@ -12,6 +12,7 @@ from littrace.downloads import execute_downloads
 from littrace.models import DownloadExecutionRequest, LiteratureWorkspace, PaperSearchRequest
 from littrace.parse_jobs import enqueue_parse_job, run_pending_parse_jobs
 from littrace.rag_jobs import run_pending_embedding_jobs
+from littrace.retrieval.rag_refresh import refresh_session_rag_index
 from littrace.session import ChatSession, load_workspace, save_workspace
 from littrace.skills.search_papers import run as search_papers_skill
 
@@ -256,11 +257,12 @@ async def run_topic_search(
         return result
 
     current = load_workspace(session)
-    enqueue_parse_job(config, session, current, downloaded_ids)
+    parse_job = enqueue_parse_job(config, session, current, downloaded_ids)
     parse_report = await run_pending_parse_jobs(
         config,
         limit=len(downloaded_ids),
         session_id=session.session_id,
+        task_ids={parse_job.task_id} if parse_job is not None else None,
     )
     progress("parse_finished", parsed=parse_report.parsed, total=len(downloaded_ids))
     result.parsed_count = parse_report.parsed
@@ -269,7 +271,26 @@ async def run_topic_search(
         config,
         limit=len(downloaded_ids),
         session_id=session.session_id,
+        artifact_ids={f"paper_pdf:{paper_id}" for paper_id in downloaded_ids},
     )
+    # If an artifact was reused, its original outbox may already be completed
+    # even though this session has no RAG chunks. Refresh the just-parsed papers
+    # directly so "parsed" cannot silently end with RAG ready = 0.
+    if result.parsed_count and not embedding_report.ready_paper_ids:
+        current = load_workspace(session)
+        _, direct_rag = await refresh_session_rag_index(
+            config,
+            session,
+            current,
+            artifact_ids=set(downloaded_ids),
+        )
+        if not direct_rag.skipped:
+            save_workspace(session, current, config=config)
+            embedding_report.ready_paper_ids = list(direct_rag.paper_ids)
+            embedding_report.processed = max(
+                embedding_report.processed,
+                len(direct_rag.paper_ids),
+            )
     progress("rag_finished", ready=len(embedding_report.ready_paper_ids), total=len(downloaded_ids))
     result.embedded_count = embedding_report.processed
     result.warnings.extend(embedding_report.warnings)
@@ -297,7 +318,7 @@ async def run_topic_search(
             for paper_id in current.context.active_papers
             if paper_id not in ready_ids
             and current.context.filters.paper_pipeline_status.get(paper_id)
-            not in {"requires_login", "auth_required"}
+            in {"candidate", "failed", "storage_failed"}
         ]
         if not retry_ids:
             break
@@ -321,6 +342,7 @@ async def run_topic_search(
         new_downloaded = set(retry_downloaded) - all_downloaded_ids
         all_downloaded_ids.update(retry_downloaded)
         result.downloaded_count += len(new_downloaded)
+        failed_ids.difference_update(retry_downloaded)
         failed_ids.update(item.paper_id for item in retry_result.items if item.status == "failed")
         result.failed_download_count = len(failed_ids)
         for item in retry_result.items:
@@ -330,15 +352,17 @@ async def run_topic_search(
             break
         current = _persist_topic_workspace(session, current, config)
         retry_workspace = load_workspace(session)
-        enqueue_parse_job(config, session, retry_workspace, retry_downloaded)
+        retry_parse_job = enqueue_parse_job(config, session, retry_workspace, retry_downloaded)
         retry_parse = await run_pending_parse_jobs(
             config, limit=len(retry_downloaded), session_id=session.session_id,
+            task_ids={retry_parse_job.task_id} if retry_parse_job is not None else None,
         )
         progress("parse_retry_finished", retry=retry_index + 1, parsed=retry_parse.parsed)
         result.parsed_count += retry_parse.parsed
         result.warnings.extend(retry_parse.warnings)
         retry_embedding = await run_pending_embedding_jobs(
             config, limit=len(retry_downloaded), session_id=session.session_id,
+            artifact_ids={f"paper_pdf:{paper_id}" for paper_id in retry_downloaded},
         )
         progress(
             "rag_retry_finished", retry=retry_index + 1,

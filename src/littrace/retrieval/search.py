@@ -183,7 +183,8 @@ class LiveSearchClient:
                 if self.config.api.enable_europe_pmc:
                     sources[f"europe_pmc_variant_{index}"] = self._search_europe_pmc(client, variant_request)
                 if self.config.api.enable_arxiv:
-                    sources[f"arxiv_variant_{index}"] = self._search_arxiv(client, variant_request)
+                    if _has_arxiv_terms(variant_request.topic):
+                        sources[f"arxiv_variant_{index}"] = self._search_arxiv(client, variant_request)
                 if self.config.api.core_api_key:
                     sources[f"core_variant_{index}"] = self._search_core(client, variant_request)
                 source_results = await asyncio.wait_for(
@@ -364,6 +365,8 @@ class LiveSearchClient:
             },
             source="arxiv",
             diagnostics=self.diagnostics,
+            attempts=1,
+            timeout_seconds=min(self.config.api.request_timeout_seconds, 20.0),
         )
         try:
             root = ET.fromstring(response.text)
@@ -568,6 +571,14 @@ class LiveSearchClient:
                 continue
             year = _crossref_year(item)
             source_urls = [item.get("URL")] if item.get("URL") else []
+            pdf_url = None
+            for link in item.get("link") or []:
+                link_url = link.get("URL")
+                link_type = str(link.get("content-type") or "").lower()
+                if link_url and ("pdf" in link_type or str(link_url).lower().split("?", 1)[0].endswith(".pdf")):
+                    pdf_url = link_url
+                    source_urls.append(link_url)
+                    break
             papers.append(
                 PaperMetadata(
                     paper_id=_paper_id(doi, title),
@@ -580,7 +591,8 @@ class LiveSearchClient:
                     abstract=_strip_crossref_abstract(item.get("abstract")),
                     citation_count=item.get("is-referenced-by-count"),
                     source_urls=source_urls,
-                    access_type=AccessType.UNAVAILABLE,
+                    pdf_url=pdf_url,
+                    access_type=AccessType.OPEN_ACCESS if pdf_url else AccessType.UNAVAILABLE,
                 )
             )
         return papers
@@ -788,6 +800,11 @@ def _arxiv_search_query(topic: str) -> str:
     return " AND ".join(f"all:{term}" for term in terms[:8])
 
 
+def _has_arxiv_terms(topic: str) -> bool:
+    """Return whether a query contains searchable Latin/ASCII terms."""
+    return bool(re.search(r"[A-Za-z0-9]", topic or ""))
+
+
 async def _crossref_items(client: httpx.AsyncClient, params: dict[str, str | int]) -> list[dict]:
     response = await client.get("https://api.crossref.org/works", params=params)
     response.raise_for_status()
@@ -823,6 +840,7 @@ async def _get_with_retries(
     source: str,
     diagnostics: SearchDiagnostics,
     attempts: int = 3,
+    timeout_seconds: float | None = None,
 ) -> httpx.Response:
     """Fetch a URL with unified retry via @retry_async.
 
@@ -850,7 +868,7 @@ async def _get_with_retries(
         on_retry=_on_retry,
     )
     async def _single_get() -> httpx.Response:
-        response = await client.get(url, params=params)
+        response = await client.get(url, params=params, timeout=timeout_seconds)
         response.raise_for_status()
         return response
 
