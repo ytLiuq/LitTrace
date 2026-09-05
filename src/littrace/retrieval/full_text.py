@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import httpx
 
 from littrace.config import LitTraceConfig
@@ -12,6 +13,7 @@ from littrace.models import (
     PaperMetadata,
 )
 from littrace.retry import retry_async, RetryConfig, BackoffStrategy
+from littrace.retrieval.publisher_adapters import adapter_for_url
 from littrace.retrieval.search import (
     _crossref_authors,
     _crossref_year,
@@ -20,6 +22,8 @@ from littrace.retrieval.search import (
     _paper_id,
     _strip_crossref_abstract,
 )
+
+_PUBLISHER_PROBE_TIMEOUT_SECONDS = 8.0
 
 
 def full_text_config_warnings(config: LitTraceConfig) -> list[str]:
@@ -55,10 +59,15 @@ async def resolve_full_text_for_papers(
     timeout = httpx.Timeout(config.api.request_timeout_seconds)
     headers = {"User-Agent": config.api.user_agent}
     async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
-        reports = []
-        for paper in papers:
-            reports.append(await resolve_full_text_for_paper(client, paper, config))
-    return reports
+        semaphore = asyncio.Semaphore(
+            max(1, min(config.paper_download.max_concurrent_downloads * 2, 8))
+        )
+
+        async def resolve_one(paper: PaperMetadata) -> FullTextResolutionReport:
+            async with semaphore:
+                return await resolve_full_text_for_paper(client, paper, config)
+
+        return list(await asyncio.gather(*(resolve_one(paper) for paper in papers)))
 
 
 async def resolve_full_text_for_paper(
@@ -78,6 +87,11 @@ async def resolve_full_text_for_paper(
             )
             candidates.extend(unpaywall_candidates)
             warnings.extend(unpaywall_warnings)
+    publisher_candidates, publisher_warnings = await _discover_publisher_candidates(
+        client, paper, candidates
+    )
+    candidates.extend(publisher_candidates)
+    warnings.extend(publisher_warnings)
     candidates = _dedupe_candidates(candidates)
     candidates, verify_warnings = await verify_full_text_candidates(client, candidates)
     warnings.extend(verify_warnings)
@@ -147,14 +161,15 @@ async def fetch_crossref_paper_by_doi(
 def _seed_candidates(paper: PaperMetadata) -> list[FullTextCandidate]:
     candidates: list[FullTextCandidate] = []
     if paper.pdf_url:
+        content_type = _content_type_from_url(str(paper.pdf_url))
         candidates.append(
             FullTextCandidate(
                 paper_id=paper.paper_id,
                 url=paper.pdf_url,
                 source="paper.pdf_url",
-                content_type="pdf",
+                content_type=content_type,
                 access_type=AccessType.OPEN_ACCESS,
-                is_pdf=True,
+                is_pdf=content_type == "pdf",
                 confidence=0.9,
             )
         )
@@ -197,6 +212,58 @@ def _seed_candidates(paper: PaperMetadata) -> list[FullTextCandidate]:
     return candidates
 
 
+async def _discover_publisher_candidates(
+    client: httpx.AsyncClient,
+    paper: PaperMetadata,
+    candidates: list[FullTextCandidate],
+) -> tuple[list[FullTextCandidate], list[str]]:
+    """Extract publisher-rendered PDF links from landing pages after redirect."""
+    discovered: list[FullTextCandidate] = []
+    warnings: list[str] = []
+    seen_pages: set[str] = set()
+    for candidate in candidates:
+        if candidate.is_pdf or candidate.source.startswith("unpaywall"):
+            continue
+        page_url = str(candidate.url)
+        if page_url in seen_pages:
+            continue
+        seen_pages.add(page_url)
+        try:
+            response = await _request_with_retry(
+                client,
+                "GET",
+                page_url,
+                max_attempts=1,
+                timeout=_PUBLISHER_PROBE_TIMEOUT_SECONDS,
+                follow_redirects=True,
+            )
+        except httpx.HTTPError as exc:
+            warnings.append(
+                f"publisher_page:{_failure_class(exc)}: {exc.__class__.__name__}: {page_url}"
+            )
+            continue
+        content_type = response.headers.get("content-type", "").lower()
+        if not _is_html_like_content_type(content_type):
+            continue
+        adapter = adapter_for_url(str(response.url)) or adapter_for_url(page_url)
+        if adapter is None:
+            continue
+        for pdf_url in adapter.extract_pdf_urls(str(response.url), response.text):
+            discovered.append(
+                FullTextCandidate(
+                    paper_id=paper.paper_id,
+                    url=pdf_url,
+                    source=f"publisher:{adapter.family}",
+                    content_type="pdf",
+                    access_type=AccessType.OPEN_ACCESS,
+                    confidence=0.84,
+                    is_pdf=True,
+                    note="publisher_page_link",
+                )
+            )
+    return discovered, warnings
+
+
 async def _crossref_full_text_candidates(
     client: httpx.AsyncClient,
     paper: PaperMetadata,
@@ -232,7 +299,12 @@ async def _crossref_full_text_candidates(
         url = link.get("URL")
         if not url:
             continue
-        content_type = str(link.get("content-type") or _content_type_from_url(url))
+        declared_type = str(link.get("content-type") or "").strip().lower()
+        content_type = (
+            declared_type
+            if declared_type and declared_type not in {"unspecified", "unknown"}
+            else _content_type_from_url(url)
+        )
         candidates.append(
             FullTextCandidate(
                 paper_id=paper.paper_id,
@@ -336,18 +408,36 @@ async def _verify_candidate(
     client: httpx.AsyncClient,
     candidate: FullTextCandidate,
 ) -> FullTextCandidate:
-    response = await _request_with_retry(
-        client,
-        "HEAD",
-        str(candidate.url),
-        follow_redirects=True,
-    )
-    if response.status_code == 405:
+    try:
+        response = await _request_with_retry(
+            client,
+            "HEAD",
+            str(candidate.url),
+            max_attempts=1,
+            timeout=_PUBLISHER_PROBE_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        )
+    except httpx.HTTPError:
+        if not candidate.is_pdf:
+            raise
         response = await _request_with_retry(
             client,
             "GET",
             str(candidate.url),
+            max_attempts=1,
+            timeout=_PUBLISHER_PROBE_TIMEOUT_SECONDS,
             follow_redirects=True,
+            headers={"Range": "bytes=0-4"},
+        )
+    if candidate.is_pdf and response.status_code in {403, 405, 501}:
+        response = await _request_with_retry(
+            client,
+            "GET",
+            str(candidate.url),
+            max_attempts=1,
+            timeout=_PUBLISHER_PROBE_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers={"Range": "bytes=0-4"},
         )
     content_type = response.headers.get("content-type", "")
     update = candidate.model_dump()
@@ -357,6 +447,9 @@ async def _verify_candidate(
     if "pdf" in content_type.lower():
         update["is_pdf"] = True
         update["content_type"] = content_type
+    elif candidate.is_pdf and response.content.lstrip().startswith(b"%PDF-"):
+        update["is_pdf"] = True
+        update["content_type"] = "application/pdf"
     elif 200 <= response.status_code < 400 and _is_html_like_content_type(content_type):
         update["is_pdf"] = False
         update["content_type"] = "landing_page"
@@ -482,7 +575,7 @@ def _full_text_next_steps(
 
 def _content_type_from_url(url: str) -> str:
     lowered = url.lower()
-    if lowered.endswith(".pdf") or "/pdf/" in lowered:
+    if lowered.endswith(".pdf") or "/pdf" in lowered:
         return "pdf"
     if lowered.endswith(".xml") or "full-xml" in lowered:
         return "xml"

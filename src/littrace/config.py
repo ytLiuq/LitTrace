@@ -188,6 +188,10 @@ class APIConfig(BaseModel):
     # configurable lets offline/minimal deployments disable the source
     # without changing the search pipeline.
     enable_arxiv: bool = True
+    semantic_scholar_api_key: str | None = None
+    enable_semantic_scholar: bool = False
+    enable_chemrxiv: bool = True
+    enable_semantic_query_planner: bool = True
     request_timeout_seconds: float = 20.0
     enable_live_search: bool = False
 
@@ -690,6 +694,10 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     config.llm.api_key = os.environ.get("DEEPSEEK_API_KEY") or config.llm.api_key
     config.llm.base_url = os.environ.get("DEEPSEEK_BASE_URL") or config.llm.base_url
     config.llm.model = os.environ.get("DEEPSEEK_MODEL") or config.llm.model
+    config.api.semantic_scholar_api_key = (
+        os.environ.get("LITTRACE_SEMANTIC_SCHOLAR_API_KEY")
+        or config.api.semantic_scholar_api_key
+    )
     config.browser.browser_act_path = (
         os.environ.get("LITTRACE_BROWSER_ACT_PATH") or config.browser.browser_act_path
     )

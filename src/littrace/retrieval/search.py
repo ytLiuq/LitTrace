@@ -168,6 +168,8 @@ class LiveSearchClient:
         self._progress(stage="search_started", status="running", variant_count=len(requests))
         openalex_results: list[PaperMetadata] = []
         crossref_results: list[PaperMetadata] = []
+        arxiv_results: list[PaperMetadata] = []
+        supplemental_results: list[PaperMetadata] = []
         async with httpx.AsyncClient(
             timeout=timeout, headers=headers, follow_redirects=True
         ) as client:
@@ -182,25 +184,48 @@ class LiveSearchClient:
                 }
                 if self.config.api.enable_europe_pmc:
                     sources[f"europe_pmc_variant_{index}"] = self._search_europe_pmc(client, variant_request)
-                if self.config.api.enable_arxiv:
-                    if _has_arxiv_terms(variant_request.topic):
-                        sources[f"arxiv_variant_{index}"] = self._search_arxiv(client, variant_request)
                 if self.config.api.core_api_key:
                     sources[f"core_variant_{index}"] = self._search_core(client, variant_request)
+                if self.config.api.enable_arxiv:
+                    sources[f"arxiv_variant_{index}"] = self._search_arxiv(client, variant_request)
+                if getattr(self.config.api, "enable_semantic_scholar", False) and self.config.api.semantic_scholar_api_key:
+                    sources[f"semantic_scholar_variant_{index}"] = self._search_semantic_scholar(
+                        client, variant_request
+                    )
+                elif getattr(self.config.api, "enable_semantic_scholar", False):
+                    self.diagnostics.errors.append("semantic_scholar: api_key_missing")
+                if getattr(self.config.api, "enable_chemrxiv", False):
+                    sources[f"chemrxiv_variant_{index}"] = self._search_chemrxiv(
+                        client, variant_request
+                    )
                 source_results = await asyncio.wait_for(
                     _gather_named(sources, self.diagnostics), timeout=60.0
                 )
-                openalex_results.extend(source_results[0])
-                crossref_results.extend(source_results[1])
-                extra_results = [paper for source in source_results[2:] for paper in source]
-                openalex_results.extend(extra_results)
-                for source_name, source_papers in zip(sources, source_results):
+                openalex_results.extend(source_results.get(f"openalex_variant_{index}", []))
+                crossref_results.extend(source_results.get(f"crossref_variant_{index}", []))
+                arxiv_results.extend(source_results.get(f"arxiv_variant_{index}", []))
+                extra_source_names = {
+                    name for name in sources
+                    if name not in {
+                        f"openalex_variant_{index}",
+                        f"crossref_variant_{index}",
+                        f"arxiv_variant_{index}",
+                    }
+                }
+                for source_name in extra_source_names:
+                    supplemental_results.extend(source_results.get(source_name, []))
+                for source_name, source_papers in source_results.items():
                     self.diagnostics.source_counts[source_name] = len(source_papers)
                     self._progress(
                         stage="search_source_finished", status="finished",
                         variant=index, source=source_name, count=len(source_papers),
                     )
-                all_results = [*openalex_results, *crossref_results]
+                all_results = [
+                    *openalex_results,
+                    *crossref_results,
+                    *arxiv_results,
+                    *supplemental_results,
+                ]
                 relevant_so_far = rank_papers(
                     filter_search_results(
                         merge_papers(all_results),
@@ -233,8 +258,21 @@ class LiveSearchClient:
 
             self.diagnostics.source_counts["openalex"] = len(openalex_results)
             self.diagnostics.source_counts["crossref"] = len(crossref_results)
+            if self.config.api.enable_arxiv:
+                self.diagnostics.source_counts["arxiv"] = len(arxiv_results)
+            for source_name in ("semantic_scholar", "chemrxiv"):
+                if getattr(self.config.api, f"enable_{source_name}", False):
+                    self.diagnostics.source_counts[source_name] = sum(
+                        count for key, count in self.diagnostics.source_counts.items()
+                        if key.startswith(f"{source_name}_variant_")
+                    )
 
-            merged_raw = merge_papers([*openalex_results, *crossref_results])
+            merged_raw = merge_papers([
+                *openalex_results,
+                *crossref_results,
+                *arxiv_results,
+                *supplemental_results,
+            ])
             merged = filter_search_results(merged_raw, request)
             self.diagnostics.filtered_counts["merged"] = len(merged_raw) - len(merged)
             self.diagnostics.filtered_counts["basic_candidate_pool"] = len(merged)
@@ -257,7 +295,12 @@ class LiveSearchClient:
             self.diagnostics.ranking_counts["context_ready"] = len(
                 [paper for paper in merged if _context_relevance_score(request, paper) >= 0.45]
             )
-            result = PaperSearchResult(request=request, papers=merged[: request.limit])
+            candidate_limit = min(
+                max(request.limit, request.min_relevant_results * 4),
+                100,
+            )
+            self.diagnostics.ranking_counts["returned_candidate_limit"] = candidate_limit
+            result = PaperSearchResult(request=request, papers=merged[:candidate_limit])
             self._progress(
                 stage="search_finished", status="finished", count=len(result.papers),
                 source_counts=self.diagnostics.source_counts,
@@ -414,6 +457,89 @@ class LiveSearchClient:
             page=1, count=len(papers), total=len(papers),
         )
         return papers[:target]
+
+    async def _search_semantic_scholar(
+        self, client: httpx.AsyncClient, request: PaperSearchRequest
+    ) -> list[PaperMetadata]:
+        target = min(max(request.limit, 10), 100)
+        response = await _get_with_retries(
+            client,
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={
+                "query": request.topic,
+                "limit": target,
+                "fields": "title,abstract,year,authors,externalIds,openAccessPdf,venue,publicationDate",
+                "sort": "relevance" if not request.wants_recent else "publicationDate:desc",
+            },
+            source="semantic_scholar",
+            diagnostics=self.diagnostics,
+            headers={"x-api-key": self.config.api.semantic_scholar_api_key},
+        )
+        papers: list[PaperMetadata] = []
+        for item in response.json().get("data", []):
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            external = item.get("externalIds") or {}
+            doi = _normalize_doi(external.get("DOI"))
+            oa = item.get("openAccessPdf") or {}
+            pdf_url = oa.get("url") or None
+            paper_key = str(item.get("paperId") or doi or title)
+            papers.append(PaperMetadata(
+                paper_id=_paper_id(doi, title),
+                title=title,
+                authors=[str(author.get("name")) for author in item.get("authors", []) if author.get("name")],
+                year=_safe_year(item.get("year")),
+                journal=item.get("venue") or None,
+                publisher="Semantic Scholar",
+                doi=doi,
+                abstract=item.get("abstract"),
+                source_urls=[f"https://www.semanticscholar.org/paper/{paper_key}"],
+                pdf_url=pdf_url,
+                access_type=AccessType.OPEN_ACCESS if pdf_url else AccessType.UNAVAILABLE,
+            ))
+        return papers
+
+    async def _search_chemrxiv(
+        self, client: httpx.AsyncClient, request: PaperSearchRequest
+    ) -> list[PaperMetadata]:
+        target = min(max(request.limit, 10), 100)
+        response = await _get_with_retries(
+            client,
+            "https://api.crossref.org/works",
+            params={
+                "query.bibliographic": request.topic,
+                "filter": "prefix:10.26434",
+                "rows": target,
+                "sort": "relevance" if not request.wants_recent else "published",
+                "order": "desc",
+            },
+            source="chemrxiv",
+            diagnostics=self.diagnostics,
+        )
+        papers: list[PaperMetadata] = []
+        for item in response.json().get("message", {}).get("items", []):
+            doi = _normalize_doi(item.get("DOI"))
+            title = _first(item.get("title"))
+            if not doi or not title or not doi.startswith("10.26434/"):
+                continue
+            links = item.get("link") or []
+            pdf_url = next(
+                (link.get("URL") for link in links
+                 if "pdf" in str(link.get("content-type") or "").lower()
+                 or str(link.get("URL") or "").lower().endswith(".pdf")),
+                None,
+            )
+            papers.append(PaperMetadata(
+                paper_id=_paper_id(doi, title), title=title,
+                authors=_crossref_authors(item), year=_crossref_year(item),
+                journal="ChemRxiv", publisher="ChemRxiv", doi=doi,
+                abstract=_strip_crossref_abstract(item.get("abstract")),
+                source_urls=[item.get("URL") or f"https://doi.org/{doi}"],
+                pdf_url=pdf_url,
+                access_type=AccessType.OPEN_ACCESS if pdf_url else AccessType.UNAVAILABLE,
+            ))
+        return papers
 
     async def _search_core(
         self, client: httpx.AsyncClient, request: PaperSearchRequest
@@ -639,7 +765,7 @@ class LiveSearchClient:
 async def _gather_named(
     coroutines: dict[str, object],
     diagnostics: SearchDiagnostics,
-) -> list[list[PaperMetadata]]:
+) -> dict[str, list[PaperMetadata]]:
     async def run_one(name: str, coroutine: object) -> list[PaperMetadata]:
         try:
             response = await asyncio.wait_for(coroutine, timeout=30.0)
@@ -658,9 +784,9 @@ async def _gather_named(
             )
             return []
 
-    return list(await asyncio.gather(*(
-        run_one(name, coroutine) for name, coroutine in coroutines.items()
-    )))
+    names = list(coroutines)
+    results = await asyncio.gather(*(run_one(name, coroutines[name]) for name in names))
+    return dict(zip(names, results))
 
 
 def _crossref_attempt_params(request: PaperSearchRequest) -> list[dict[str, str | int]]:
@@ -841,6 +967,7 @@ async def _get_with_retries(
     diagnostics: SearchDiagnostics,
     attempts: int = 3,
     timeout_seconds: float | None = None,
+    headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     """Fetch a URL with unified retry via @retry_async.
 
@@ -868,7 +995,7 @@ async def _get_with_retries(
         on_retry=_on_retry,
     )
     async def _single_get() -> httpx.Response:
-        response = await client.get(url, params=params, timeout=timeout_seconds)
+        response = await client.get(url, params=params, headers=headers, timeout=timeout_seconds)
         response.raise_for_status()
         return response
 

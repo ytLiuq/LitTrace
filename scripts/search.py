@@ -41,7 +41,7 @@ async def main():
     papers = [workspace.papers[pid] for pid in workspace.context.active_papers]
     result = {
         "paper_count": len(papers),
-        "search_mode": workspace.context.filters.get("search_mode", "unknown"),
+        "search_mode": getattr(workspace.context.filters, "search_mode", "unknown"),
         "papers": [
             {
                 "id": p.paper_id,

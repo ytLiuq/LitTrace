@@ -57,6 +57,12 @@ class SourceResult(BaseModel):
 
 def classify_source_exception(exc: Exception) -> SourceFailureClass:
     name = exc.__class__.__name__.lower()
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code in {401, 403}:
+        return SourceFailureClass.POLICY_BLOCKED
+    if status_code == 429 or status_code in {408, 425, 500, 502, 503, 504}:
+        return SourceFailureClass.TRANSIENT
     if "timeout" in name or "transport" in name or "connect" in name:
         return SourceFailureClass.TRANSIENT
     if "permission" in name or "policy" in name:

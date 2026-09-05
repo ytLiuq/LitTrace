@@ -67,6 +67,11 @@ api:
   request_timeout_seconds: 20
   enable_live_search: true
   enable_arxiv: true
+  semantic_scholar_api_key: null
+  # Enable after setting the API key; anonymous requests are rate-limited.
+  enable_semantic_scholar: false
+  enable_chemrxiv: true
+  enable_semantic_query_planner: true
 
 cdp_downloader:
   cdp_url: "http://127.0.0.1:19222"
@@ -105,7 +110,7 @@ paper_download:
   allow_requires_login_download: true
 
 parsing:
-  default_parser: "paddleocr"
+  default_parser: "docling"
   docling_workers: 2
   preferred_engines:
     - "docling"

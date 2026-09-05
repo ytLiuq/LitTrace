@@ -9,6 +9,7 @@ from littrace.retrieval.search import (
     LiveSearchClient,
     MockMaterialsSearchClient,
 )
+from littrace.retrieval.query_planner import plan_query_variants
 from littrace.tool_contracts import (
     ToolCallContext,
     ToolExecutionLedger,
@@ -39,6 +40,12 @@ async def run(
         if use_live
         else MockMaterialsSearchClient()
     )
+    if use_live and (
+        not request.query_variants
+        or request.query_variants == [request.topic]
+    ):
+        variants = await plan_query_variants(request.topic, config)
+        request = request.model_copy(update={"query_variants": variants})
     result = await _run_async_skill(
         "search_papers",
         client.fetch,

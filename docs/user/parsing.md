@@ -39,4 +39,4 @@ Renders each page to an image and runs PaddleOCR / Docling on it. Slow (seconds 
 
 ## Configuration
 
-The default parser backend is `paddleocr` (set in `config.yaml` under `parsing.default_parser`). Per-paper choice lives on the workspace's `parse_strategy` filter; the runtime honors both.
+The default parser backend is `docling` (set in `config.yaml` under `parsing.default_parser`). Per-paper choice lives on the workspace's `parse_strategy` filter; the runtime honors both.

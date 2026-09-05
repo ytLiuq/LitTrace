@@ -65,6 +65,33 @@
           "title": "Enable Arxiv",
           "type": "boolean"
         },
+        "semantic_scholar_api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Semantic Scholar Api Key"
+        },
+        "enable_semantic_scholar": {
+          "default": false,
+          "title": "Enable Semantic Scholar",
+          "type": "boolean"
+        },
+        "enable_chemrxiv": {
+          "default": true,
+          "title": "Enable Chemrxiv",
+          "type": "boolean"
+        },
+        "enable_semantic_query_planner": {
+          "default": true,
+          "title": "Enable Semantic Query Planner",
+          "type": "boolean"
+        },
         "request_timeout_seconds": {
           "default": 20.0,
           "title": "Request Timeout Seconds",
@@ -347,7 +374,7 @@
               "type": "null"
             }
           ],
-          "default": null,
+          "default": "data/chrome-cdp",
           "title": "Chrome User Data Dir"
         },
         "chrome_profile_name": {
@@ -361,8 +388,13 @@
           "type": "integer"
         },
         "auto_launch_chrome": {
-          "default": false,
+          "default": true,
           "title": "Auto Launch Chrome",
+          "type": "boolean"
+        },
+        "headless": {
+          "default": true,
+          "title": "Headless",
           "type": "boolean"
         },
         "cloudflare_wait_seconds": {
@@ -371,7 +403,7 @@
           "type": "number"
         },
         "user_action_wait_seconds": {
-          "default": 30.0,
+          "default": 300.0,
           "title": "User Action Wait Seconds",
           "type": "number"
         },
@@ -416,6 +448,58 @@
       ],
       "title": "CodexHomeMode",
       "type": "string"
+    },
+    "CompactionConfig": {
+      "description": "Round 5 settings for the Codex thread-compaction worker.\n\n``threshold_turns`` and ``threshold_tokens`` are OR-ed when\ndeciding whether a session is due for compaction. Once a\nsuccessful ``thread/compact`` RPC runs, ``last_compacted_at``\nis stamped and the session is ignored for one hour\nregardless of how fast more turns pile up.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "background_worker_enabled": {
+          "default": false,
+          "title": "Background Worker Enabled",
+          "type": "boolean"
+        },
+        "interval_seconds": {
+          "default": 60.0,
+          "title": "Interval Seconds",
+          "type": "number"
+        },
+        "batch_size": {
+          "default": 5,
+          "title": "Batch Size",
+          "type": "integer"
+        },
+        "max_attempts": {
+          "default": 3,
+          "title": "Max Attempts",
+          "type": "integer"
+        },
+        "base_delay_seconds": {
+          "default": 30.0,
+          "title": "Base Delay Seconds",
+          "type": "number"
+        },
+        "threshold_turns": {
+          "default": 30,
+          "title": "Threshold Turns",
+          "type": "integer"
+        },
+        "threshold_tokens": {
+          "default": 50000,
+          "title": "Threshold Tokens",
+          "type": "integer"
+        },
+        "request_timeout_seconds": {
+          "default": 120.0,
+          "title": "Request Timeout Seconds",
+          "type": "number"
+        }
+      },
+      "title": "CompactionConfig",
+      "type": "object"
     },
     "CostBudgetConfig": {
       "description": "Token cost budget and tracking configuration.\n\nSet ``max_total_tokens`` to 0 to disable budget enforcement.",
@@ -1087,6 +1171,36 @@
           "default": "queue_only",
           "title": "Login Required Policy",
           "type": "string"
+        },
+        "index_kind": {
+          "default": "hnsw",
+          "enum": [
+            "hnsw",
+            "ivfflat",
+            "none"
+          ],
+          "title": "Index Kind",
+          "type": "string"
+        },
+        "hnsw_m": {
+          "default": 16,
+          "title": "Hnsw M",
+          "type": "integer"
+        },
+        "hnsw_ef_construction": {
+          "default": 64,
+          "title": "Hnsw Ef Construction",
+          "type": "integer"
+        },
+        "hnsw_ef_search": {
+          "default": 40,
+          "title": "Hnsw Ef Search",
+          "type": "integer"
+        },
+        "ivfflat_lists": {
+          "default": 100,
+          "title": "Ivfflat Lists",
+          "type": "integer"
         }
       },
       "title": "RagConfig",
@@ -1227,6 +1341,9 @@
     },
     "download_retry": {
       "$ref": "#/$defs/DownloadRetryConfig"
+    },
+    "compaction": {
+      "$ref": "#/$defs/CompactionConfig"
     },
     "api": {
       "$ref": "#/$defs/APIConfig"

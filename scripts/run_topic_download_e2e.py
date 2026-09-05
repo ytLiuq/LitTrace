@@ -197,7 +197,19 @@ async def _run(topic: str, limit: int) -> int:
             for paper in papers
             if paper.access_type == AccessType.OPEN_ACCESS and paper.pdf_url
         ]
-        selected = eligible[:limit]
+        def downloadability_score(paper: PaperMetadata) -> tuple[int, int]:
+            url = str(paper.pdf_url or "").lower()
+            direct = int("doi.org/" not in url)
+            host_priority = 0
+            if "arxiv.org" in url or "ace.ewapub.com" in url:
+                host_priority = 4
+            elif "iopscience.org" in url or "link.springer.com/content/pdf" in url:
+                host_priority = 3
+            elif "mdpi.com" in url:
+                host_priority = 2
+            return host_priority, direct
+
+        selected = sorted(eligible, key=downloadability_score, reverse=True)[:limit]
         if len(selected) < limit:
             raise RuntimeError(
                 f"Real source search returned only {len(selected)} open PDF candidates; need {limit}."
@@ -263,21 +275,41 @@ async def _run(topic: str, limit: int) -> int:
 
         config.parsing.default_parser = "docling"
         config.parsing.parse_strategy = "text_only"
+        config.parsing.docling_workers = 1
         config.parsing.paddleocr.max_pages = 2
         workspace, parse_report = await parse_workspace_skill(workspace, config)
         print(json.dumps({"stage": "parse", **parse_report}, ensure_ascii=False), flush=True)
         save_workspace(session, workspace, config=config)
 
         state_store = state_store_from_config(config)
-        pending_before = state_store.list_pending_embedding_jobs(limit=20) if state_store else []
+        pending_before = (
+            state_store.list_async_tasks(
+                session_id=session.session_id,
+                status="queued",
+                kind="embedding_job",
+                limit=20,
+            )
+            if state_store
+            else []
+        )
         embedding_processed = 0
         for _ in range(6):
             report = await run_pending_embedding_jobs(config)
             embedding_processed += report.processed
-            if state_store is None or not state_store.list_pending_embedding_jobs(limit=20):
+            pending_after = (
+                state_store.list_async_tasks(
+                    session_id=session.session_id,
+                    status="queued",
+                    kind="embedding_job",
+                    limit=20,
+                )
+                if state_store
+                else []
+            )
+            if state_store is None or not pending_after:
                 break
 
-        profile = load_session_rag_profile(session)
+        profile = load_session_rag_profile(session, config=config)
         rag_hits = []
         if profile is not None:
             rag_result = await search_session_rag(config, session, "柔性薄膜压阻传感器", top_k=5)
