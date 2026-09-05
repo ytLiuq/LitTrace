@@ -45,6 +45,7 @@ DOI_PREFIX_MAP: dict[str, str] = {
     "10.1007": "springer_nature",
     "10.3390": "mdpi",
     "10.1109": "ieee",
+    "10.12677": "hans",
     "10.1021": "acs",
     "10.1016": "elsevier",
     "10.1039": "rsc",
@@ -56,6 +57,7 @@ PUBLISHER_NAMES: dict[str, str] = {
     "springer_nature": "Springer Nature",
     "mdpi": "MDPI",
     "ieee": "IEEE",
+    "hans": "Hans Publishers",
     "acs": "ACS",
     "elsevier": "Elsevier",
     "rsc": "RSC",
@@ -167,6 +169,19 @@ CLOUDFLARE_MARKERS: list[str] = [
     "安全验证",
     "请验证",
     "请稍候",
+    # Chinese publisher WAFs (notably sciengine.com) return HTTP 418
+    # challenge pages without the word "Cloudflare".  Treat these as the
+    # same interactive browser-verification state so the user can clear the
+    # block in LitTrace Chrome instead of receiving a misleading PDF-URL error.
+    "cloudwaf",
+    "访问被拦截",
+    "block-event-id",
+    # Aliyun WAF pages used by some Chinese journals (e.g. rrsurg.com).
+    "aliyun_waf_aa",
+    "aliyuncaptcha",
+    "滑动验证",
+    "访问验证",
+    "别离开，为了更好的访问体验",
 ]
 
 #: Strings that indicate an institutional login (CARSI / Shibboleth) is required.
@@ -237,9 +252,92 @@ def publisher_urls(doi: str, publisher: str) -> dict[str, str | None]:
             "landing": f"https://doi.org/{doi}",
             "pdf": f"https://www.nature.com/articles/{article_id}.pdf",
         }
-    # For mdpi, ieee, elsevier, rsc, unknown:
+    if publisher == "ieee":
+        arnumber = doi.rsplit(".", 1)[-1]
+        if arnumber.isdigit():
+            return {
+                "landing": f"https://ieeexplore.ieee.org/document/{arnumber}/",
+                "pdf": f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}",
+            }
+    # The 10.7507 prefix is shared by several Chinese journal sites; DOI.org
+    # can intermittently fail inside CDP, so use the stable site mapping for
+    # the known journal suffixes instead of relying on resolver redirects.
+    if doi.startswith("10.7507/1001-5515."):
+        return {
+            "landing": f"https://www.biomedeng.cn/article/{doi}",
+            "pdf": None,
+        }
+    if doi.startswith("10.7507/1002-1892."):
+        return {
+            "landing": f"https://www.rrsurg.com/article/{doi}",
+            "pdf": None,
+        }
+    if doi.startswith("10.3760/"):
+        return {
+            "landing": f"https://www.yiigle.com/LinkIn.do?linkin_type=DOI&DOI={doi}",
+            "pdf": None,
+        }
+    # For mdpi, hans, elsevier, rsc, unknown:
     # doi.org redirects to the correct page; PDF URL is extracted later.
     return {"landing": f"https://doi.org/{doi}", "pdf": None}
+
+
+def discover_hans_pdf_url(doi: str, timeout_seconds: float = 20.0) -> str | None:
+    """Resolve a Hans Publishers DOI to its generated ``pdf.hanspub.org`` URL."""
+    try:
+        response = httpx.get(
+            f"https://doi.org/{doi}",
+            headers={"User-Agent": "LitTrace/0.1"},
+            follow_redirects=True,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    match = re.search(
+        r"(?:https?:)?//pdf\.hanspub\.org/[^\"'<>\s]+?\.pdf(?:\?[^\"'<>\s]*)?",
+        response.text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(0) if match.group(0).startswith("http") else f"https:{match.group(0)}"
+
+
+def discover_crossref_pdf_url(doi: str, timeout_seconds: float = 20.0) -> str | None:
+    """Find a publisher PDF link exposed by Crossref for regional journals."""
+    try:
+        response = httpx.get(
+            f"https://api.crossref.org/works/{doi}",
+            headers={"User-Agent": "LitTrace/0.1"},
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+        item = response.json().get("message", {})
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None
+    for link in item.get("link") or []:
+        url = link.get("URL")
+        content_type = str(link.get("content-type") or "").lower()
+        if url and ("pdf" in content_type or "/pdf/" in str(url).lower()):
+            return str(url)
+    return None
+
+
+def click_publisher_pdf_download(browser: CDPBrowser) -> bool:
+    """Click JS-backed publisher PDF buttons (e.g. biomedeng.cn)."""
+    value = browser.eval(
+        """(function() {
+          const node = document.querySelector(
+            'a[onclick*="getOssPdf"], a.download[title*="PDF" i], '
+            'a[title*="下载PDF"], button.download_btn'
+          );
+          if (!node) return false;
+          setTimeout(() => node.click(), 50);
+          return true;
+        })()"""
+    )
+    return bool(value)
 
 
 def normalize_doi(doi: str) -> str:
@@ -291,6 +389,33 @@ def find_recent_pdf(
         if is_pdf_file(path):
             candidates.append(path)
     return max(candidates, key=lambda item: item.stat().st_mtime) if candidates else None
+
+
+def wait_for_recent_pdf(
+    directory: Path,
+    preferred_path: Path,
+    timeout_seconds: float = 120.0,
+) -> Path | None:
+    """Wait for Chrome's ``.crdownload`` to finish and return a valid PDF."""
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    while time.monotonic() <= deadline:
+        found = find_recent_pdf(
+            directory,
+            preferred_path,
+            max_age_seconds=max(timeout_seconds + 30.0, 120.0),
+        )
+        if found is not None:
+            return found
+        # If Chrome did not create a partial download at all, waiting for the
+        # full repository timeout only hides a deterministic publisher error.
+        if not any(path.name.endswith(".crdownload") for path in directory.glob("*")):
+            return None
+        time.sleep(1.0)
+    return find_recent_pdf(
+        directory,
+        preferred_path,
+        max_age_seconds=max(timeout_seconds + 30.0, 120.0),
+    )
 
 
 def move_pdf(source: Path, target: Path) -> None:
@@ -360,6 +485,7 @@ class CDPBrowser:
         self.tab_id: str | None = None
         self._download_path: str | None = None
         self.stealth_notes: list[str] = []
+        self._reconnecting = False
 
     def connect_new_tab(self) -> None:
         """Create a new browser tab and connect to its WebSocket."""
@@ -576,8 +702,23 @@ class CDPBrowser:
                 pass
             self.tab_id = None
 
+    def reset_tab(self) -> None:
+        """Replace the current target with one clean tab without accumulating tabs."""
+        self.close_tab()
+        self.connect_new_tab()
+
     def _reconnect(self) -> None:
         """Attempt to reconnect to an existing tab, or create a new one."""
+        if self._reconnecting:
+            raise RuntimeError("CDP reconnect failed while restoring the target")
+        self._reconnecting = True
+        try:
+            self._reconnect_once()
+        finally:
+            self._reconnecting = False
+
+    def _reconnect_once(self) -> None:
+        """Reconnect implementation guarded against recursive retries."""
         self.close()
         if self.tab_id:
             try:
@@ -636,17 +777,22 @@ PDF_URL_EXTRACTION_JS: str = r"""
     'a[title*="PDF" i]',
     'iframe[src*="pdf"]',
     'iframe[src*="stampPDF"]',
-    'meta[name="citation_pdf_url"]'
+    'meta[name="citation_pdf_url"]',
+    'a[href*="pdf.hanspub.org"]'
   ];
   for (const selector of selectors) {
     for (const node of document.querySelectorAll(selector)) {
       const raw = node.href || node.src || node.content || node.getAttribute('href');
-      if (raw) return new URL(raw, location.href).href;
+      if (raw && !/^(javascript:|data:|about:blank)/i.test(raw)) {
+        return new URL(raw, location.href).href;
+      }
     }
   }
   const html = document.documentElement.outerHTML;
   const pdfft = html.match(/["']([^"']*pdfft[^"']*)["']/);
   if (pdfft) return new URL(pdfft[1], location.href).href;
+  const hans = html.match(/(?:https?:)?\/\/pdf\.hanspub\.org\/[^"'<>\\s]+?\.pdf(?:\?[^"'<>\\s]*)?/i);
+  if (hans) return new URL(hans[0], location.href).href;
   return '';
 })()
 """

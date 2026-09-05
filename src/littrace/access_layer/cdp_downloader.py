@@ -28,12 +28,16 @@ from littrace.access_layer.cdp_core import (
     CDPBrowser,
     click_sciencedirect_institution_login,
     find_recent_pdf,
+    wait_for_recent_pdf,
     identify_publisher,
     is_pdf_file,
     looks_like_institutional_login_needed,
     move_pdf,
     normalize_doi,
     extract_pdf_url_from_page,
+    discover_hans_pdf_url,
+    discover_crossref_pdf_url,
+    click_publisher_pdf_download,
     prepare_elsevier_pdf_url,
     prepare_ieee_pdf_url,
     prepare_rsc_pdf_url,
@@ -186,6 +190,11 @@ def download_paper_via_cdp(
             reconnect_attempts=config.cdp_downloader.websocket_reconnect_attempts,
             command_timeout_seconds=config.cdp_downloader.command_timeout_seconds,
         )
+    else:
+        # A publisher PDF download can leave the shared target in a download
+        # or browser-PDF navigation state. Reset exactly one tab before the
+        # next paper so batch downloads are isolated without leaking blank tabs.
+        browser.reset_tab()
     try:
         result.steps.append("cdp_open")
         if own_browser:
@@ -204,6 +213,21 @@ def download_paper_via_cdp(
             result.steps.append(f"stealth:{note}")
         browser.set_download_path(target_path.parent)
         urls = publisher_urls(normalized_doi, publisher)
+        if publisher == "hans" and not urls.get("pdf"):
+            urls["pdf"] = discover_hans_pdf_url(
+                normalized_doi,
+                timeout_seconds=config.api.request_timeout_seconds,
+            )
+            if urls.get("pdf"):
+                result.steps.append("hans_pdf_url_discovered")
+        if not urls.get("pdf"):
+            crossref_pdf = discover_crossref_pdf_url(
+                normalized_doi,
+                timeout_seconds=config.api.request_timeout_seconds,
+            )
+            if crossref_pdf:
+                urls["pdf"] = crossref_pdf
+                result.steps.append("crossref_pdf_url_discovered")
         landing_url = urls["landing"]
         result.steps.append(f"landing:{landing_url}")
         browser.navigate(landing_url, wait_seconds=12.0)
@@ -249,16 +273,29 @@ def download_paper_via_cdp(
                 )
                 return result
             result.steps.append("user_action:cloudflare_acknowledged")
+        # Some Chinese journal sites expose the PDF only through a
+        # JavaScript-backed download button. Click it after the landing page
+        # has rendered and capture Chrome's actual downloaded PDF.
+        if publisher == "unknown" or any(
+            host in browser.get_url().lower() for host in ("biomedeng.cn", "rrsurg.com")
+        ):
+            if click_publisher_pdf_download(browser):
+                result.steps.append("publisher_js_pdf_download_clicked")
+                time.sleep(12.0)
+                found = wait_for_recent_pdf(
+                    target_path.parent,
+                    target_path,
+                    config.cdp_downloader.repository_download_timeout_seconds,
+                )
+                if found:
+                    move_pdf(found, target_path)
+                    result.downloaded = True
+                    result.method = "cdp_publisher_js_download"
+                    result.file_size = target_path.stat().st_size
+                    return result
         # Round 27: clear the institutional-login wait flag too
         # before the body-text check so a successful CF pass doesn't
         # leave stale "waiting" markers in the data dir.
-        if looks_like_institutional_login_needed(browser.get_body_text(1200)):
-            result.requires_user_action = True
-            result.user_action = "请在已打开的本地 Chrome 窗口中完成机构登录。"
-            result.steps.append("user_action:institutional_login")
-            _surface_browser(browser.get_url())
-            time.sleep(max(config.cdp_downloader.user_action_wait_seconds, 0.0))
-
         if looks_like_institutional_login_needed(browser.get_body_text(1200)):
             result.requires_user_action = True
             result.user_action = "请在已打开的本地 Chrome 窗口中完成机构登录。"
@@ -293,9 +330,49 @@ def download_paper_via_cdp(
 
         pdf_url = urls.get("pdf") or extract_pdf_url_from_page(browser, normalized_doi, publisher)
         if not pdf_url:
+            access_context = " ".join((landing_url, pdf_url or "", browser.get_url())).lower()
+            if any(host in access_context for host in ("biomedeng.cn", "rrsurg.com", "sciengine.com", "yiigle.com")):
+                result.requires_user_action = True
+                result.user_action = (
+                    "请在 LitTrace Chrome 中完成该出版社的访问验证，"
+                    "完成后保持页面打开并重试下载。"
+                )
+                result.steps.append("user_action:publisher_access_verification")
+                result.error = "Publisher page did not expose a PDF URL before access verification."
+                return result
             result.error = "Could not infer a publisher PDF URL from the CDP browser page."
             return result
         result.source_url = pdf_url
+
+        if any(marker in pdf_url.lower() for marker in ("/doi/pdf/", "pdf.hanspub.org", ".pdf")):
+            result.steps.append("publisher_direct_pdf_navigation")
+            browser.navigate(pdf_url, wait_seconds=10.0)
+            found = wait_for_recent_pdf(
+                target_path.parent,
+                target_path,
+                config.cdp_downloader.repository_download_timeout_seconds,
+            )
+            if found:
+                move_pdf(found, target_path)
+                result.downloaded = True
+                result.method = "cdp_direct_pdf_download"
+                result.file_size = target_path.stat().st_size
+                return result
+
+        if publisher == "hans":
+            result.steps.append("hans_pdf_direct_navigation")
+            browser.navigate(pdf_url, wait_seconds=10.0)
+            found = wait_for_recent_pdf(
+                target_path.parent,
+                target_path,
+                config.cdp_downloader.repository_download_timeout_seconds,
+            )
+            if found:
+                move_pdf(found, target_path)
+                result.downloaded = True
+                result.method = "cdp_hans_direct_download"
+                result.file_size = target_path.stat().st_size
+                return result
 
         if publisher == "wiley":
             result.steps.append("wiley_pdfdirect_goto")
@@ -379,12 +456,26 @@ def download_paper_via_cdp(
         result.steps.append("anchor_download")
         browser.trigger_anchor_download(pdf_url, target_path.name)
         time.sleep(15.0)
-        found = find_recent_pdf(target_path.parent, target_path)
+        found = wait_for_recent_pdf(
+            target_path.parent,
+            target_path,
+            config.cdp_downloader.repository_download_timeout_seconds,
+        )
         if found:
             move_pdf(found, target_path)
             result.downloaded = True
             result.method = "cdp_anchor_download"
             result.file_size = target_path.stat().st_size
+            return result
+        access_context = " ".join((landing_url, pdf_url or "", browser.get_url())).lower()
+        if any(host in access_context for host in ("biomedeng.cn", "rrsurg.com", "sciengine.com", "yiigle.com")):
+            result.requires_user_action = True
+            result.user_action = (
+                "请在 LitTrace Chrome 中完成该出版社的访问验证，"
+                "完成后保持页面打开并重试下载。"
+            )
+            result.steps.append("user_action:publisher_access_verification")
+            result.error = "Publisher download requires interactive access verification."
             return result
         result.error = "All CDP publisher download methods failed."
         return result
