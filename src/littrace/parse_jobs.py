@@ -313,6 +313,11 @@ async def _execute_parse_job(
     with TemporaryDirectory(prefix="littrace-parse-") as temporary:
         parse_config = config.model_copy(deep=True)
         parse_config.parsing.parse_strategy = strategy
+        # Docling's native layout/ML runtime is not safely reusable across
+        # concurrent workers in one process. Durable parse jobs already batch
+        # papers, so keep one converter worker per job for deterministic memory
+        # use and stable semaphore cleanup.
+        parse_config.parsing.docling_workers = 1
         parse_config.storage.paper_library_dir = Path(temporary) / "papers"
         workspace = LiteratureWorkspace(papers={paper.paper_id: paper for paper in papers})
         workspace.context.active_papers = [paper.paper_id for paper in papers]

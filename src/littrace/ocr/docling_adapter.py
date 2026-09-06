@@ -12,6 +12,7 @@ class DoclingOCRTool:
 
     def __init__(self, config=None):
         self.config = config
+        self._converter = None
 
     def parse_pdf(
         self,
@@ -63,13 +64,23 @@ class DoclingOCRTool:
                     getattr(docling_config, "describe_figures", False)
                 ),
             )
-            converter = DocumentConverter(
-                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
-            )
+            if self._converter is None:
+                self._converter = DocumentConverter(
+                    format_options={
+                        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                    }
+                )
+            converter = self._converter
             result = converter.convert(str(pdf_path))
             document = result.document
             raw_dict = _safe_export_dict(document)
-            figures, figure_assets = _extract_figures(document, pdf_path)
+            # Text-only parsing must not invoke native image extraction. On
+            # large publisher PDFs that path can allocate image buffers and
+            # leak multiprocessing semaphores even when picture generation is
+            # disabled; figure extraction remains available in accurate mode.
+            figures, figure_assets = (
+                ([], []) if mode == OCRMode.FAST else _extract_figures(document, pdf_path)
+            )
             markdown = document.export_to_markdown()
             markdown = _decode_html_entities(markdown)
             markdown = _replace_image_placeholders(markdown, figures)

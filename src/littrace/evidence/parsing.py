@@ -44,7 +44,13 @@ def parse_workspace_papers(
             ), True
         # Docling creates a converter per invocation, so workers must not share
         # a parser instance with mutable converter state.
-        active_parser = build_ocr_tool(config, paper_lookup) if tool is None else parser
+        # Reuse one Docling converter for sequential batches. Recreating it per
+        # PDF repeatedly loads native model weights and can leak semaphores.
+        active_parser = (
+            build_ocr_tool(config, paper_lookup)
+            if tool is None and config.parsing.docling_workers > 1
+            else parser
+        )
         return paper_id, active_parser.parse_pdf(pdf_path, mode=mode), False
 
     paper_ids = list(workspace.context.active_papers)
