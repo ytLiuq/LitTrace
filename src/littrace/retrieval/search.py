@@ -22,6 +22,7 @@ from littrace.models import (
 from littrace.retrieval.adapters import SourceHealth, classify_source_exception
 from littrace.retry import retry_async, RetryConfig, BackoffStrategy
 from littrace.llm import chat_completion
+from littrace.retrieval.codex_reranker import rank_with_codex
 
 
 class PaperSearchClient(Protocol):
@@ -327,6 +328,21 @@ class LiveSearchClient:
             }
             for index, paper in enumerate(candidates)
         ]
+        codex_scores = await rank_with_codex(self.config, request.topic, records)
+        if codex_scores:
+            for index, paper in enumerate(candidates):
+                if index in codex_scores:
+                    paper.relevance_score = round(
+                        0.65 * (paper.relevance_score or 0.0) + 0.35 * codex_scores[index],
+                        6,
+                    )
+            self.diagnostics.ranking_counts["codex_model_reranked_count"] = len(codex_scores)
+            reranked = sorted(
+                candidates,
+                key=lambda paper: (paper.relevance_score or 0.0, paper.year or 0),
+                reverse=True,
+            )
+            return [*reranked, *papers[30:]]
         try:
             reply = await asyncio.wait_for(
                 chat_completion(
