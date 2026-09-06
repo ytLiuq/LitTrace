@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 from littrace.access_layer.paths import paper_storage_dir
@@ -46,11 +49,9 @@ def parse_workspace_papers(
         # a parser instance with mutable converter state.
         # Reuse one Docling converter for sequential batches. Recreating it per
         # PDF repeatedly loads native model weights and can leak semaphores.
-        active_parser = (
-            build_ocr_tool(config, paper_lookup)
-            if tool is None and config.parsing.docling_workers > 1
-            else parser
-        )
+        if tool is None and parser.name == "docling" and config.parsing.docling_workers <= 1:
+            return paper_id, _parse_docling_isolated(pdf_path, config, mode), False
+        active_parser = build_ocr_tool(config, paper_lookup) if tool is None else parser
         return paper_id, active_parser.parse_pdf(pdf_path, mode=mode), False
 
     paper_ids = list(workspace.context.active_papers)
@@ -84,6 +85,70 @@ def parse_workspace_papers(
         "failed_count": failed_count,
         "missing_pdf_count": missing_pdf_count,
     }
+
+
+def _parse_docling_isolated(
+    pdf_path: Path,
+    config: LitTraceConfig,
+    mode: OCRMode,
+) -> ParsedPaper:
+    command = [
+        sys.executable,
+        "-m",
+        "littrace.ocr.docling_worker",
+        str(pdf_path),
+        "--mode",
+        mode.value,
+    ]
+    timeout = max(float(config.api.request_timeout_seconds) * 6.0, 120.0)
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ParsedPaper(
+            pdf_path=pdf_path,
+            parser_reports=[{"parser": "docling", "mode": mode, "error": "isolated_worker_timeout"}],
+            parsed=False,
+            error="Docling isolated worker timed out.",
+        )
+    if completed.returncode != 0:
+        try:
+            retry = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if retry.returncode == 0 or retry.stdout.strip():
+                completed = retry
+        except subprocess.TimeoutExpired:
+            pass
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if lines:
+        try:
+            payload = json.loads(lines[-1])
+            return ParsedPaper.model_validate(payload)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    error = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "worker_no_output"
+    return ParsedPaper(
+        pdf_path=pdf_path,
+        parser_reports=[
+            {
+                "parser": "docling",
+                "mode": mode,
+                "error": f"isolated_worker_exit_{completed.returncode}: {error}",
+            }
+        ],
+        parsed=False,
+        error=f"Docling isolated worker failed with exit code {completed.returncode}.",
+    )
 
 
 def local_pdf_path(config: LitTraceConfig, paper: PaperMetadata) -> Path:
