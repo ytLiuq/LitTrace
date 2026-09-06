@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager, nullcontext
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from littrace.codex_runtime.client import (
     AppServerClient,
@@ -18,7 +18,6 @@ from littrace.codex_runtime.client import (
     SteerTurnResult,
 )
 from littrace.codex_runtime.errors import CodexErrorCode
-from littrace.codex_runtime.gateway import APP_SERVER_TOOL_NAMES
 from littrace.codex_runtime.runtime import (
     CodexAppServerRuntimeManager,
     shared_runtime_manager,
@@ -31,8 +30,12 @@ from littrace.codex_runtime.errors import (
 )
 from littrace.codex_runtime.rollout import RolloutRecorder, rollout_path_for
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
-from littrace.session import ChatSession
 from littrace.state_db import AgentThreadBindingRecord, StateStore, state_store_from_config
+
+if TYPE_CHECKING:
+    # ChatSession is only used in annotations. Importing it at runtime creates
+    # a cycle: session -> retrieval.search -> codex_reranker -> this module.
+    from littrace.session import ChatSession
 
 DEVELOPER_INSTRUCTIONS = """\
 You are the conversational research layer inside LitTrace. LitTrace Postgres state is the
@@ -673,6 +676,12 @@ class CodexAppServerChatService:
         alphabetical order so a future operator can sort
         ``littrace plugin list`` against the same set.
         """
+        # Import lazily to keep the gateway bootstrap acyclic. The gateway
+        # itself imports retrieval modules, whose Codex reranker imports this
+        # service; importing the constant at module load time would therefore
+        # fail when ``littrace.mcp_server`` starts with the gateway first.
+        from littrace.codex_runtime.gateway import APP_SERVER_TOOL_NAMES
+
         names = list(APP_SERVER_TOOL_NAMES)
         try:
             from littrace.marketplace import list_plugins
