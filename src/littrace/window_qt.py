@@ -865,6 +865,15 @@ class ChatPanel(QtWidgets.QFrame):
 
         self._view = QtWidgets.QTextBrowser()
         self._view.setObjectName("chat_view")
+        self._view.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        self._view.setMinimumHeight(0)
+        self._view.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._view.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
         self._view.document().setDefaultStyleSheet(
             "body { font-size: 14px; line-height: 1.55; }"
             "p { margin: 3px 0 7px 0; }"
@@ -908,7 +917,14 @@ class ChatPanel(QtWidgets.QFrame):
         # the controller is alive while a turn is in flight.
         self._thinking = QtWidgets.QLabel("")
         self._thinking.setObjectName("thinking_strip")
-        self._thinking.setMinimumHeight(22)
+        # Keep the animated status row from changing the chat layout as its
+        # label, dots, or elapsed time changes during a slow fallback turn.
+        self._thinking.setFixedHeight(26)
+        self._thinking.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self._thinking.setWordWrap(False)
         self._thinking.setStyleSheet(
             f"color:{DESIGN['ink_muted']};padding:2px 6px;font-style:italic;"
         )
@@ -1315,60 +1331,59 @@ class ChatPanel(QtWidgets.QFrame):
     # ---- Event handlers wired by LitTraceQtWindow ----------------------
 
     def append_message(self, role: str, text: str, **extras: Any) -> None:
-        # Render a Codex reply as a left/right chat bubble. ChatGPT
-        # Codex App shows user on the right, assistant on the left, with
-        # no per-message name label (the visual side is the speaker
-        # marker). Markdown is rendered by ``_render_message_html``;
-        # any leading Codex internal-narration sentence is stripped.
+        """Append one independent, role-styled message bubble.
+
+        Qt's rich-text engine does not reliably honor CSS
+        ``display:inline-block`` inside a QTextBrowser. Each message is
+        therefore a one-cell QTextTable with its own alignment, background,
+        border, and padding; this prevents adjacent messages from collapsing
+        into one document-flow bubble.
+        """
         body = _strip_leading_narration(_render_message_html(text))
         body = _strip_trailing_narration(body)
         if role == "user":
             bubble_color = "#95EC69"
             text_color = "#182018"
             align = "right"
-            wrap = "7px"
-            max_width = "82%"
+            width = 82
         elif role == "system":
             bubble_color = "#EDEFF2"
             text_color = DESIGN["ink_muted"]
             align = "left"
-            wrap = "6px"
-            max_width = "88%"
+            width = 88
         else:  # assistant
             bubble_color = "#ffffff"
             text_color = DESIGN["ink"]
             align = "left"
-            wrap = "7px"
-            max_width = "82%"
-        from PySide6.QtGui import QTextBlockFormat
+            width = 82
 
         cursor = self._view.textCursor()
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        cursor.insertBlock()
 
-        # Set the block format on a new block (so the previous bubble's
-        # alignment doesn't bleed in) then ``insertHtml`` the bubble.
-        # ``<p align="...">`` in HTML was silently coerced to right by
-        # QTextBrowser's HTML parser, so we have to set the alignment
-        # via the block format instead.
-        block_fmt = QTextBlockFormat()
-        block_fmt.setAlignment(
+        table_fmt = QtGui.QTextTableFormat()
+        table_fmt.setAlignment(
             QtCore.Qt.AlignmentFlag.AlignRight
             if align == "right"
             else QtCore.Qt.AlignmentFlag.AlignLeft
         )
-        block_fmt.setTopMargin(10)
-        block_fmt.setBottomMargin(10)
-        cursor.insertBlock(block_fmt)
-        cursor.insertHtml(
-            f'<span style="display:inline-block;max-width:{max_width};'
-            f"background:{bubble_color};color:{text_color};"
-            f"border:1px solid {DESIGN['hairline']};"
-            f"border-radius:{wrap};padding:11px 15px;"
-            f"font-size:14px;line-height:1.55;"
-            f'">'
-            f"{body}"
-            f"</span>"
-        )
+        table_fmt.setWidth(QtGui.QTextLength(
+            QtGui.QTextLength.Type.PercentageLength, width
+        ))
+        table_fmt.setBorder(1)
+        table_fmt.setBorderBrush(QtGui.QColor(DESIGN["hairline"]))
+        table_fmt.setCellPadding(11)
+        table_fmt.setCellSpacing(0)
+        table_fmt.setTopMargin(4)
+        table_fmt.setBottomMargin(4)
+        table = cursor.insertTable(1, 1, table_fmt)
+        cell = table.cellAt(0, 0)
+        cell_format = QtGui.QTextCharFormat()
+        cell_format.setBackground(QtGui.QColor(bubble_color))
+        cell_format.setForeground(QtGui.QColor(text_color))
+        cell.setFormat(cell_format)
+        cell_cursor = cell.firstCursorPosition()
+        cell_cursor.insertHtml(body)
         self._view.setTextCursor(cursor)
         # ``ensureCursorVisible`` is not reliable enough on
         # ``QTextBrowser`` once the cursor is at the very end (the
@@ -1423,35 +1438,28 @@ class ChatPanel(QtWidgets.QFrame):
         ``_streaming_anchor`` is ``None`` when no streaming bubble
         is open; ``append_delta`` is a no-op in that state.
         """
-        from PySide6.QtGui import QTextBlockFormat
-
-        bubble_color = "#ffffff"
-        text_color = DESIGN["ink"]
-        wrap = "7px"
-        max_width = "82%"
         cursor = self._view.textCursor()
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        block_fmt = QTextBlockFormat()
-        block_fmt.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
-        block_fmt.setTopMargin(10)
-        block_fmt.setBottomMargin(10)
-        cursor.insertBlock(block_fmt)
-        # Remember the block start position before ``insertHtml``
-        # moves the cursor past the inserted span. The anchor is
-        # the character offset of the new block's first character;
-        # ``append_delta`` calls ``setPosition`` then ``EndOfBlock``
-        # to land at the tail.
-        doc = self._view.document()
-        anchor = doc.lastBlock().position()
-        cursor.insertHtml(
-            f'<span style="display:inline-block;max-width:{max_width};'
-            f"background:{bubble_color};color:{text_color};"
-            f"border:1px solid {DESIGN['hairline']};"
-            f"border-radius:{wrap};padding:11px 15px;"
-            f"font-size:14px;line-height:1.55;"
-            f'"></span>'
-        )
-        self._streaming_anchor = anchor
+        cursor.insertBlock()
+        table_fmt = QtGui.QTextTableFormat()
+        table_fmt.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        table_fmt.setWidth(QtGui.QTextLength(
+            QtGui.QTextLength.Type.PercentageLength, 82
+        ))
+        table_fmt.setBorder(1)
+        table_fmt.setBorderBrush(QtGui.QColor(DESIGN["hairline"]))
+        table_fmt.setCellPadding(11)
+        table_fmt.setCellSpacing(0)
+        table_fmt.setTopMargin(4)
+        table_fmt.setBottomMargin(4)
+        table = cursor.insertTable(1, 1, table_fmt)
+        cell = table.cellAt(0, 0)
+        cell_format = QtGui.QTextCharFormat()
+        cell_format.setBackground(QtGui.QColor("#ffffff"))
+        cell_format.setForeground(QtGui.QColor(DESIGN["ink"]))
+        cell.setFormat(cell_format)
+        cell_cursor = cell.firstCursorPosition()
+        self._streaming_anchor = cell_cursor.position()
         self._view.setTextCursor(cursor)
         sb = self._view.verticalScrollBar()
         sb.setValue(sb.maximum())
@@ -1537,34 +1545,20 @@ class ChatPanel(QtWidgets.QFrame):
         body = _strip_trailing_narration(body)
         cursor = self._view.textCursor()
         cursor.setPosition(anchor)
-        cursor.movePosition(QtGui.QTextCursor.MoveOperation.EndOfBlock)
-        # ``cursor.hasSelection()`` is False — we are collapsed at the
-        # end of the block, which contains the streaming span. The
-        # span is the LAST element in the block, so a forward
-        # selection to the block end + a backward selection to the
-        # span start picks up everything inside the span. Using
-        # ``StartOfBlock`` → ``EndOfBlock`` would also work but
-        # would erase any whitespace or block-level markers we want
-        # to keep — the block itself only contains the streaming
-        # span in practice.
-        cursor.movePosition(
-            QtGui.QTextCursor.MoveOperation.StartOfBlock,
-            QtGui.QTextCursor.MoveMode.MoveAnchor,
+        table = cursor.currentTable()
+        if table is None:
+            # Defensive fallback for a stale anchor after the document was
+            # cleared while a stream was in flight.
+            self.append_message("assistant", full_text)
+            return
+        cell = table.cellAt(cursor)
+        cell_cursor = cell.firstCursorPosition()
+        end_cursor = cell.lastCursorPosition()
+        cell_cursor.setPosition(
+            end_cursor.position(), QtGui.QTextCursor.MoveMode.KeepAnchor
         )
-        cursor.movePosition(
-            QtGui.QTextCursor.MoveOperation.EndOfBlock,
-            QtGui.QTextCursor.MoveMode.KeepAnchor,
-        )
-        # Replace the selection (which is the entire streaming span)
-        # with the freshly rendered HTML.
-        cursor.insertHtml(
-            f'<span style="display:inline-block;max-width:82%;'
-            f"background:#ffffff;color:{DESIGN['ink']};"
-            f"border:1px solid {DESIGN['hairline']};"
-            f"border-radius:7px;padding:11px 15px;"
-            f"font-size:14px;line-height:1.55;"
-            f'">{body}</span>'
-        )
+        cell_cursor.insertHtml(body)
+        cursor = cell.firstCursorPosition()
         self._view.setTextCursor(cursor)
 
 
@@ -1672,6 +1666,12 @@ class ContextPanel(QtWidgets.QFrame):
         self._compare_btn.setEnabled(False)
         self._compare_btn.clicked.connect(self._on_compare_clicked)
         compare_row.addWidget(self._compare_btn)
+        self._download_btn = QtWidgets.QPushButton("⬇ 下载到本地")
+        self._download_btn.setObjectName("context_download_btn")
+        self._download_btn.setToolTip("从对象存储复制选中文献 PDF 到本地论文库")
+        self._download_btn.setEnabled(False)
+        self._download_btn.clicked.connect(self._on_download_clicked)
+        compare_row.addWidget(self._download_btn)
         self._compare_count = QtWidgets.QLabel("未选中")
         self._compare_count.setObjectName("compare_count")
         self._compare_count.setStyleSheet(
@@ -1880,6 +1880,7 @@ class ContextPanel(QtWidgets.QFrame):
         fires every time the user adds / removes a row.
         """
         n = len(self._list.selectedItems())
+        self._download_btn.setEnabled(n >= 1)
         if n == 0:
             self._compare_btn.setEnabled(False)
             self._compare_count.setText("未选中")
@@ -1944,6 +1945,18 @@ class ContextPanel(QtWidgets.QFrame):
         # previous pick.
         self._list.clearSelection()
         self._refresh_compare_button()
+
+    def _on_download_clicked(self) -> None:
+        paper_ids = [
+            paper.paper_id
+            for item in self._list.selectedItems()
+            if (paper := item.data(QtCore.Qt.ItemDataRole.UserRole)) is not None
+        ]
+        if not paper_ids:
+            return
+        window = self.window()
+        if window is not None and hasattr(window, "_on_context_download_requested"):
+            window._on_context_download_requested(paper_ids)
 
 
 class PaperDetailDialog(QtWidgets.QDialog):
@@ -4461,6 +4474,38 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             {"stage": "status_message", "message": text}
         )
 
+    @QtCore.Slot("QString")
+    def _show_context_download_result_from_any_thread(self, payload_json: str) -> None:
+        try:
+            payload = json.loads(payload_json)
+        except Exception:
+            payload = {"downloaded": [], "errors": []}
+        self._context_download_inflight = False
+        self._context_panel._refresh_compare_button()
+        downloaded = payload.get("downloaded") or []
+        errors = payload.get("errors") or []
+        lines = ["### 本地文献下载完成", ""]
+        if downloaded:
+            lines.append(f"已从对象存储复制 **{len(downloaded)} 篇**：")
+            lines.extend(
+                f"- {item.get('title', item.get('paper_id', '-'))}\n  `{item.get('path', '-')}`"
+                for item in downloaded
+            )
+        if errors:
+            if downloaded:
+                lines.append("")
+            lines.append("未完成：")
+            lines.extend(
+                f"- {item.get('paper_id', '-')}: {item.get('error', '未知错误')}"
+                for item in errors
+            )
+        if not downloaded and not errors:
+            lines.append("没有可下载的文献。")
+        self._chat_panel.append_message("system", "\n".join(lines))
+        self._status_bar.showMessage(
+            f"本地下载完成：{len(downloaded)} 篇，失败：{len(errors)} 篇", 6000
+        )
+
     def _post_status(self, text: str) -> None:
         # Posted from a daemon worker thread (``_on_run_daily``). The
         # ``@Slot(str)`` decorator on ``_set_rag_status_from_any_thread``
@@ -4480,6 +4525,15 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             "_set_trace_status_from_any_thread",
             QtCore.Qt.ConnectionType.QueuedConnection,
             QtCore.Q_ARG(str, text),
+        )
+
+    def _post_context_download_result(self, payload: dict[str, object]) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False)
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_show_context_download_result_from_any_thread",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, encoded),
         )
 
     @QtCore.Slot("QString")
@@ -4690,6 +4744,32 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 if statuses.get(paper.paper_id) == "rag_ready"
             ]
         return papers
+
+    def _on_context_download_requested(self, paper_ids: list[str]) -> None:
+        """Copy selected RAG-ready PDFs from object storage in the background."""
+        if getattr(self, "_context_download_inflight", False):
+            return
+        self._context_download_inflight = True
+        self._context_panel._download_btn.setEnabled(False)
+        self._post_status(f"正在从对象存储下载 {len(paper_ids)} 篇到本地…")
+
+        def _worker() -> None:
+            try:
+                result = self._controller.materialize_context_papers(paper_ids)
+            except Exception as exc:
+                result = {
+                    "requested": len(paper_ids),
+                    "downloaded": [],
+                    "errors": [{
+                        "paper_id": "-",
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                    }],
+                }
+            self._post_context_download_result(result)
+
+        threading.Thread(
+            target=_worker, daemon=True, name="littrace-context-download"
+        ).start()
 
     def _build_brand_strip(self) -> QtWidgets.QWidget:
         strip = QtWidgets.QWidget()
