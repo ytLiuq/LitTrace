@@ -20,6 +20,7 @@ import pytest
 from littrace.shell_controller import (
     ShellController,
     ShellEvent,
+    _legacy_model_display,
     _decode_jwt_exp,
     _classify_chat_error,
     _CHAT_ERROR_MESSAGES,
@@ -81,6 +82,13 @@ def _make_test_config(tmp_path: Path) -> LitTraceConfig:
         encoding="utf-8",
     )
     return load_config(str(cfg_path))
+
+
+def test_fallback_status_names_the_active_compatibility_model(tmp_path):
+    config = _make_test_config(tmp_path)
+    config.llm.model = "qwen-plus"
+    config.llm.fallback_models = ["deepseek-chat"]
+    assert _legacy_model_display(config) == "qwen-plus（备用：deepseek-chat）"
 
 
 class _StubSession:

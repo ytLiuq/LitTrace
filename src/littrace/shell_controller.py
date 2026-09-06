@@ -65,6 +65,21 @@ def _summarize_topic_search_issues(warnings: list[str]) -> list[str]:
     ]
 
 
+def _legacy_model_display(config: LitTraceConfig) -> str:
+    """Describe the model used by the non-Codex compatibility path."""
+    primary = str(config.llm.model or "未配置模型").strip()
+    alternatives = [
+        str(model).strip()
+        for model in config.llm.fallback_models
+        if str(model).strip() and str(model).strip() != primary
+    ]
+    if config.llm.fallback_model and config.llm.fallback_model.strip() not in alternatives:
+        alternatives.append(config.llm.fallback_model.strip())
+    if alternatives:
+        return f"{primary}（备用：{'、'.join(alternatives)}）"
+    return primary
+
+
 @dataclass(frozen=True)
 class ShellEvent:
     """Immutable event payload broadcast on the ``ShellEventBus``."""
@@ -674,6 +689,9 @@ class ShellController:
         # model is moving instead of staring at a frozen chat input.
         await _thinking("正在解析任务意图…")
 
+        legacy_model = _legacy_model_display(self._config)
+        codex_requested = self._config.agent_runtime.mode == "codex_app_server"
+
         try:
             self._emit(self.EVENT_THINKING, active=True, label="调用 Codex / 模型…")
             if service is not None:
@@ -708,6 +726,10 @@ class ShellController:
                     on_delta=_on_delta,
                 )
             else:
+                if codex_requested:
+                    fallback_label = f"Codex 不可用，当前使用兼容模型：{legacy_model}"
+                    self._emit(self.EVENT_THINKING, active=True, label=fallback_label)
+                    self._emit(self.EVENT_STATUS_CHANGED, text=fallback_label)
                 response, workspace = await handle_agent_chat(
                     request,
                     self._workspace,
@@ -726,7 +748,11 @@ class ShellController:
                 self._emit(
                     self.EVENT_THINKING,
                     active=True,
-                    label="Codex 不可用，切换兼容对话链路…",
+                    label=f"Codex 不可用，当前使用兼容模型：{legacy_model}",
+                )
+                self._emit(
+                    self.EVENT_STATUS_CHANGED,
+                    text=f"Codex 不可用，当前使用兼容模型：{legacy_model}",
                 )
                 try:
                     fallback_response, fallback_workspace = await handle_agent_chat(
