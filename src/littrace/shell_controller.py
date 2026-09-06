@@ -38,6 +38,33 @@ except Exception:  # pragma: no cover - defensive
     _HAS_CODEX_SERVICE = False
 
 
+def _summarize_topic_search_issues(warnings: list[str]) -> list[str]:
+    """Collapse per-paper acquisition noise into a few actionable causes."""
+    buckets: dict[str, int] = {}
+    for warning in warnings:
+        text = str(warning)
+        lowered = text.lower()
+        if "requires_login" in lowered or "interactive access" in lowered or "登录" in text:
+            label = "出版社要求登录或人工验证"
+        elif "403" in lowered or "forbidden" in lowered or "418" in lowered:
+            label = "出版社拒绝自动下载（HTTP 403/418）"
+        elif "timeout" in lowered or "timed out" in lowered or "超时" in text:
+            label = "出版社或网络请求超时"
+        elif "does not look like a pdf" in lowered or "pdf" in lowered and "required" in lowered:
+            label = "返回内容不是可解析的 PDF"
+        elif "rag ready 未达到目标" in text:
+            label = text
+        elif "候选池已扩展" in text:
+            label = text
+        else:
+            label = "部分来源或处理步骤失败"
+        buckets[label] = buckets.get(label, 0) + 1
+    return [
+        f"{label}（{count} 次）" if count > 1 else label
+        for label, count in buckets.items()
+    ]
+
+
 @dataclass(frozen=True)
 class ShellEvent:
     """Immutable event payload broadcast on the ``ShellEventBus``."""
@@ -846,9 +873,10 @@ class ShellController:
             topic=query,
             year_min=year_min,
             year_max=year_max,
-            # Over-fetch candidates because the target is defined on the
-            # final RAG-ready set, after download/parse/embedding failures.
-            limit=max(requested_rag_ready * 5, 50),
+            # Keep a small ranked reserve for failed downloads without turning
+            # every candidate into work. Acquisition is staged by
+            # ``run_topic_search`` and stops as soon as the RAG target is met.
+            limit=min(30, max(requested_rag_ready * 3, 10)),
             live=self._config.api.enable_live_search,
         )
         try:
@@ -873,21 +901,31 @@ class ShellController:
             return
         with self._lock:
             self._workspace = result.workspace
-        status = result.workspace.context.filters.paper_pipeline_status
+        ready_papers = list(self.list_active_papers())
         reply = "\n".join([
-            f"### 研究主题检索完成：{query}",
-            f"- 检索候选：**{result.candidate_count} 篇**",
-            f"- 已进入对象存储：**{result.downloaded_count} 篇**",
-            f"- 已解析：**{result.parsed_count} 篇**",
-            f"- RAG ready：**{result.rag_ready_count} 篇** / 目标 {requested_rag_ready} 篇",
-            f"- 需要登录：{result.requires_login_count} 篇；下载失败：{result.failed_download_count} 篇",
+            f"### 文献检索完成：{query}",
+            "",
+            "| 环节 | 结果 |",
+            "| --- | ---: |",
+            f"| RAG 目标 | {requested_rag_ready} 篇 |",
+            f"| 候选池 | {result.candidate_count} 篇 |",
+            f"| 对象存储 | {result.downloaded_count} 篇 |",
+            f"| 解析完成 | {result.parsed_count} 篇 |",
+            f"| RAG ready | **{result.rag_ready_count} 篇** |",
         ])
-        if status:
-            reply += "\n\n#### 文献状态\n" + "\n".join(
-                f"- {paper_id}：{state}" for paper_id, state in status.items()
+        if ready_papers:
+            reply += "\n\n#### 已加入文献上下文\n" + "\n".join(
+                f"- {paper.title}（{paper.year or '年份未知'}）"
+                for paper in ready_papers[:requested_rag_ready]
             )
-        if result.warnings:
-            reply += "\n\n> " + "\n> ".join(result.warnings[:8])
+        issues = _summarize_topic_search_issues(result.warnings)
+        if result.requires_login_count or result.failed_download_count or issues:
+            reply += "\n\n#### 未完成项"
+            if result.requires_login_count:
+                reply += f"\n- 需要登录或人工验证：{result.requires_login_count} 篇"
+            if result.failed_download_count:
+                reply += f"\n- 下载失败：{result.failed_download_count} 篇"
+            reply += "".join(f"\n- {item}" for item in issues[:4])
         self._emit(self.EVENT_MESSAGE_APPENDED, role="assistant", text=reply)
         self._emit(self.EVENT_WORKSPACE_REFRESHED)
         self._emit(self.EVENT_RAG_PANEL_REFRESHED)
