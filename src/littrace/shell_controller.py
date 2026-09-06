@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
+import os
 import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterable
 
 from littrace.agent_runtime import handle_agent_chat
@@ -979,6 +983,75 @@ class ShellController:
             if paper is not None:
                 papers.append(paper)
         return papers
+
+    def materialize_context_papers(self, paper_ids: Iterable[str]) -> dict[str, object]:
+        """Copy selected RAG-ready PDFs from object storage to the local library."""
+        from littrace.access_layer.paths import target_pdf_path
+        from littrace.artifact_registry import artifact_registry_from_config
+        from littrace.artifact_store import BlobRef, artifact_store_from_config
+
+        requested = list(dict.fromkeys(str(item) for item in paper_ids if item))
+        with self._lock:
+            workspace = self._workspace.model_copy(deep=True)
+            session_id = self._session.session_id
+        statuses = workspace.context.filters.paper_pipeline_status
+        active_ids = set(workspace.context.active_papers)
+        registry = artifact_registry_from_config(self._config)
+        store = artifact_store_from_config(self._config)
+        downloaded: list[dict[str, str]] = []
+        errors: list[dict[str, str]] = []
+
+        for paper_id in requested:
+            paper = workspace.papers.get(paper_id)
+            if paper is None or paper_id not in active_ids:
+                errors.append({"paper_id": paper_id, "error": "文献不在当前上下文中"})
+                continue
+            if statuses.get(paper_id) != "rag_ready":
+                errors.append({"paper_id": paper_id, "error": "文献尚未完成 RAG 入库"})
+                continue
+            record = registry.find_in_session(
+                f"paper_pdf:{paper_id}", session_id=session_id
+            )
+            if record is None:
+                errors.append({"paper_id": paper_id, "error": "对象存储记录不存在"})
+                continue
+            ref = BlobRef(
+                backend=record.backend,
+                bucket=record.bucket,
+                object_key=record.object_key,
+                sha256=record.sha256,
+                size_bytes=record.size_bytes,
+                content_type=record.content_type,
+            )
+            try:
+                data = store.get_bytes(ref)
+                digest = hashlib.sha256(data).hexdigest()
+                if record.sha256 and digest != record.sha256:
+                    raise ValueError("对象存储 PDF 校验失败")
+                target = target_pdf_path(self._config, paper)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with NamedTemporaryFile("wb", dir=target.parent, delete=False) as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    temporary = Path(handle.name)
+                os.replace(temporary, target)
+            except Exception as exc:
+                errors.append({
+                    "paper_id": paper_id,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                })
+                continue
+            downloaded.append({
+                "paper_id": paper_id,
+                "title": paper.title,
+                "path": str(target),
+            })
+        return {
+            "requested": len(requested),
+            "downloaded": downloaded,
+            "errors": errors,
+        }
 
     # ------------------------------------------------------------------
     # Session switching (Round 17)
