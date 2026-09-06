@@ -85,6 +85,13 @@ async def run_topic_search(
         if progress_callback is not None:
             progress_callback({"stage": stage, **payload})
 
+    def source_progress(payload: dict[str, object]) -> None:
+        # The source skill emits its own pre-truncation ``search_finished``
+        # count. Suppress that duplicate so the UI reports the final bounded
+        # candidate pool exactly once.
+        if progress_callback is not None and payload.get("stage") != "search_finished":
+            progress_callback(payload)
+
     progress("search_started", query=request.topic)
     if progress_callback is None:
         # Keep the call signature compatible with lightweight test/mocking
@@ -92,9 +99,8 @@ async def run_topic_search(
         search = await search_papers_skill(request, config)
     else:
         search = await search_papers_skill(
-            request, config, progress_callback=progress_callback
+            request, config, progress_callback=source_progress
         )
-    progress("search_finished", count=len(search.result.papers))
     # Expand the candidate pool before acquisition when the first response is
     # smaller than the requested RAG target. Source adapters cap each request
     # at 100; merging by paper_id keeps retries idempotent and avoids replacing
@@ -107,7 +113,7 @@ async def run_topic_search(
             expanded = await search_papers_skill(expanded_request, config)
         else:
             expanded = await search_papers_skill(
-                expanded_request, config, progress_callback=progress_callback
+                expanded_request, config, progress_callback=source_progress
             )
         progress("candidate_expansion", count=len(expanded.result.papers), limit=expansion_limit)
         by_id = {paper.paper_id: paper for paper in search.result.papers}
@@ -123,40 +129,34 @@ async def run_topic_search(
         if expansion_limit >= 100:
             break
         expansion_limit = min(100, expansion_limit * 2)
+    # Source adapters may return a merged list larger than the requested
+    # client-facing reserve. Keep only the ranked head for acquisition and
+    # context accounting; the adapters already performed the broad recall.
+    if len(search.result.papers) > request.limit:
+        search.result.papers = search.result.papers[: request.limit]
+    progress("search_finished", count=len(search.result.papers))
     # Search results are an incremental update. Preserve previously parsed
     # papers, pipeline statuses, and RAG metadata when the user repeats a
     # topic search; replacing the workspace with a blank model would make
     # idempotent parse jobs look like they had never run.
     previous_workspace = load_workspace(session)
-    previous_active = list(previous_workspace.context.active_papers)
     workspace = add_ranked_candidate_papers(
         previous_workspace,
         search.result.papers,
         request,
-        active_limit=max(request.limit, config.literature_context.active_context_limit),
+        # The candidate pool is deliberately wider than the active context.
+        # Only papers that complete RAG processing may become active below.
+        active_limit=requested_rag_ready,
     )
-    active_limit = max(request.limit, config.literature_context.active_context_limit)
-    priority_preserved = [
-        paper_id for paper_id in previous_workspace.context.pinned_papers
-        if paper_id in previous_active
-    ] + [
-        paper_id for paper_id in previous_workspace.parsed_papers
-        if paper_id in previous_active
-    ]
-    preserved_active = [
-        paper_id
-        for paper_id in dict.fromkeys(priority_preserved + previous_active)
-        if paper_id in workspace.papers
-        and paper_id not in workspace.context.excluded_papers
-        and paper_id not in workspace.context.active_papers
-    ]
-    workspace.context.active_papers = (
-        workspace.context.active_papers + preserved_active
-    )[:active_limit]
+    # Do not expose raw candidates in the literature context while acquisition
+    # is still running. Parse jobs temporarily add only verified stored IDs and
+    # the final context is pruned to RAG-ready IDs.
+    workspace.context.active_papers = []
     filters = workspace.context.filters
     filters.topic = canonical_topic or request.topic
     filters.search_query = request.topic
     filters.year_min = request.year_min
+    filters.year_max = request.year_max
     filters.search_mode = "live" if search.use_live else "mock"
     filters.requested_rag_ready_count = requested_rag_ready
     filters.paper_pipeline_status = {
@@ -185,195 +185,139 @@ async def run_topic_search(
         result.status = "exhausted"
         return result
 
-    # A topic search owns the whole candidate set. Override the user's
-    # general download preference for this run so every candidate enters the
-    # downloader; unavailable papers will receive an explicit failed status,
-    # while gated papers enter the existing CDP/auth path.
+    # A topic search owns a staged acquisition queue. The first batch is no
+    # larger than the requested RAG target; failed papers are replaced from
+    # the ranked reserve only when needed.
     download_config = config.model_copy(deep=True)
     download_config.paper_download.mode = DownloadMode.DOWNLOAD_SELECTED
     download_config.cdp_downloader.auto_launch_chrome = True
     download_config.cdp_downloader.headless = False
-    download_result = await execute_downloads(
-        download_config,
-        list(workspace.papers.values()),
-        DownloadExecutionRequest(
-            paper_ids=list(workspace.context.active_papers),
-            session_id=session.session_id,
-            target="storage_only",
-        ),
-    )
-    progress(
-        "download_finished",
-        downloaded=download_result.downloaded_count,
-        requires_login=download_result.requires_login_count,
-        failed=sum(1 for item in download_result.items if item.status == "failed"),
-    )
-    result.downloaded_count = download_result.downloaded_count
-    result.requires_login_count = download_result.requires_login_count
-    failed_ids = {item.paper_id for item in download_result.items if item.status == "failed"}
-    result.failed_download_count = len(failed_ids)
-    for item in download_result.items:
-        filters.paper_pipeline_status[item.paper_id] = item.status
-        if item.error:
-            result.warnings.append(f"{item.paper_id}: {item.error}")
-    filters.downloaded_full_text_count = result.downloaded_count
-    workspace = _persist_topic_workspace(session, workspace, config)
-    filters = workspace.context.filters
-    downloaded_ids = [item.paper_id for item in download_result.items if item.status == "downloaded"]
-    # A downloader result is not sufficient proof of object-storage success;
-    # validate each registered artifact before creating parse jobs.
-    registry = artifact_registry_from_config(download_config)
-    artifact_store = artifact_store_from_config(download_config)
-    stored_ids: list[str] = []
-    for paper_id in downloaded_ids:
-        record = registry.find_in_session(
-            f"paper_pdf:{paper_id}", session_id=session.session_id
-        )
-        if record is None:
-            filters.paper_pipeline_status[paper_id] = "storage_failed"
-            result.warnings.append(f"{paper_id}: 下载器返回成功但未登记对象存储 artifact")
-            continue
-        ref = BlobRef(
-            backend=record.backend,
-            bucket=record.bucket,
-            object_key=record.object_key,
-            sha256=record.sha256,
-            size_bytes=record.size_bytes,
-            content_type=record.content_type,
-        )
-        if not artifact_store.exists(ref):
-            filters.paper_pipeline_status[paper_id] = "storage_failed"
-            result.warnings.append(f"{paper_id}: 对象存储 artifact 不存在")
-            continue
-        stored_ids.append(paper_id)
-    result.downloaded_count = len(stored_ids)
-    filters.downloaded_full_text_count = result.downloaded_count
-    workspace = _persist_topic_workspace(session, workspace, config)
-    filters = workspace.context.filters
-    downloaded_ids = stored_ids
-    if not downloaded_ids:
-        result.workspace = load_workspace(session)
-        result.status = "waiting_for_auth" if result.requires_login_count else "exhausted"
-        return result
+    candidate_ids = [paper.paper_id for paper in search.result.papers]
+    attempted_ids: set[str] = set()
+    ready_ids: list[str] = []
+    stored_ids_seen: set[str] = set()
+    failed_ids: set[str] = set()
+    login_ids: set[str] = set()
 
-    current = load_workspace(session)
-    parse_job = enqueue_parse_job(config, session, current, downloaded_ids)
-    parse_report = await run_pending_parse_jobs(
-        config,
-        limit=len(downloaded_ids),
-        session_id=session.session_id,
-        task_ids={parse_job.task_id} if parse_job is not None else None,
-    )
-    progress("parse_finished", parsed=parse_report.parsed, total=len(downloaded_ids))
-    result.parsed_count = parse_report.parsed
-    result.warnings.extend(parse_report.warnings)
-    embedding_report = await run_pending_embedding_jobs(
-        config,
-        limit=len(downloaded_ids),
-        session_id=session.session_id,
-        artifact_ids={f"paper_pdf:{paper_id}" for paper_id in downloaded_ids},
-    )
-    # If an artifact was reused, its original outbox may already be completed
-    # even though this session has no RAG chunks. Refresh the just-parsed papers
-    # directly so "parsed" cannot silently end with RAG ready = 0.
-    if result.parsed_count and not embedding_report.ready_paper_ids:
-        current = load_workspace(session)
-        _, direct_rag = await refresh_session_rag_index(
-            config,
-            session,
-            current,
-            artifact_ids=set(downloaded_ids),
-        )
-        if not direct_rag.skipped:
-            save_workspace(session, current, config=config)
-            embedding_report.ready_paper_ids = list(direct_rag.paper_ids)
-            embedding_report.processed = max(
-                embedding_report.processed,
-                len(direct_rag.paper_ids),
-            )
-    progress("rag_finished", ready=len(embedding_report.ready_paper_ids), total=len(downloaded_ids))
-    result.embedded_count = embedding_report.processed
-    result.warnings.extend(embedding_report.warnings)
-    result.workspace = load_workspace(session)
-    result.workspace.context.filters.requested_rag_ready_count = requested_rag_ready
-    ready_ids = set(embedding_report.ready_paper_ids)
-    all_downloaded_ids = set(downloaded_ids)
-    result.workspace.context.filters.rag_ready_count = len(ready_ids)
-    for paper_id in downloaded_ids:
-        parsed = result.workspace.parsed_papers.get(paper_id)
-        if paper_id in ready_ids:
-            result.workspace.context.filters.paper_pipeline_status[paper_id] = "rag_ready"
-        elif parsed is not None and parsed.parsed:
-            result.workspace.context.filters.paper_pipeline_status[paper_id] = "parsed"
-
-    # Retry transient acquisition/embedding failures without re-downloading
-    # papers that are already RAG-ready. This is bounded so a gated publisher
-    # or a permanently bad source cannot block the UI forever.
-    for retry_index in range(2):
-        if len(ready_ids) >= requested_rag_ready:
-            break
-        current = load_workspace(session)
-        retry_ids = [
-            paper_id
-            for paper_id in current.context.active_papers
-            if paper_id not in ready_ids
-            and current.context.filters.paper_pipeline_status.get(paper_id)
-            in {"candidate", "failed", "storage_failed"}
-        ]
-        if not retry_ids:
-            break
-        retry_result = await execute_downloads(
+    async def process_batch(batch_ids: list[str], *, retry_index: int = 0) -> None:
+        nonlocal workspace
+        if not batch_ids:
+            return
+        batch_papers = [workspace.papers[paper_id] for paper_id in batch_ids if paper_id in workspace.papers]
+        download_result = await execute_downloads(
             download_config,
-            [current.papers[paper_id] for paper_id in retry_ids if paper_id in current.papers],
+            batch_papers,
             DownloadExecutionRequest(
-                paper_ids=retry_ids,
+                paper_ids=batch_ids,
                 session_id=session.session_id,
                 target="storage_only",
             ),
         )
         progress(
-            "download_retry_finished", retry=retry_index + 1,
-            downloaded=retry_result.downloaded_count,
-            failed=sum(1 for item in retry_result.items if item.status == "failed"),
+            "download_finished" if retry_index == 0 else "download_retry_finished",
+            retry=retry_index or None,
+            downloaded=download_result.downloaded_count,
+            requires_login=download_result.requires_login_count,
+            failed=sum(1 for item in download_result.items if item.status == "failed"),
         )
-        retry_downloaded = [
-            item.paper_id for item in retry_result.items if item.status == "downloaded"
-        ]
-        new_downloaded = set(retry_downloaded) - all_downloaded_ids
-        all_downloaded_ids.update(retry_downloaded)
-        result.downloaded_count += len(new_downloaded)
-        failed_ids.difference_update(retry_downloaded)
-        failed_ids.update(item.paper_id for item in retry_result.items if item.status == "failed")
-        result.failed_download_count = len(failed_ids)
-        for item in retry_result.items:
-            current.context.filters.paper_pipeline_status[item.paper_id] = item.status
-        if not retry_downloaded:
-            result.warnings.append(f"第 {retry_index + 2} 轮下载未产生新增成功文献。")
-            break
-        current = _persist_topic_workspace(session, current, config)
-        retry_workspace = load_workspace(session)
-        retry_parse_job = enqueue_parse_job(config, session, retry_workspace, retry_downloaded)
-        retry_parse = await run_pending_parse_jobs(
-            config, limit=len(retry_downloaded), session_id=session.session_id,
-            task_ids={retry_parse_job.task_id} if retry_parse_job is not None else None,
-        )
-        progress("parse_retry_finished", retry=retry_index + 1, parsed=retry_parse.parsed)
-        result.parsed_count += retry_parse.parsed
-        result.warnings.extend(retry_parse.warnings)
-        retry_embedding = await run_pending_embedding_jobs(
-            config, limit=len(retry_downloaded), session_id=session.session_id,
-            artifact_ids={f"paper_pdf:{paper_id}" for paper_id in retry_downloaded},
-        )
-        progress(
-            "rag_retry_finished", retry=retry_index + 1,
-            ready=len(retry_embedding.ready_paper_ids),
-        )
-        result.embedded_count += retry_embedding.processed
-        result.warnings.extend(retry_embedding.warnings)
-        ready_ids.update(retry_embedding.ready_paper_ids)
-        result.workspace = load_workspace(session)
-        result.workspace.context.filters.rag_ready_count = len(ready_ids)
+        for item in download_result.items:
+            if item.status in {"requires_login", "auth_required"}:
+                login_ids.add(item.paper_id)
+            if item.status == "failed":
+                failed_ids.add(item.paper_id)
+            if item.error:
+                result.warnings.append(f"{item.paper_id}: {item.error}")
+            workspace.context.filters.paper_pipeline_status[item.paper_id] = item.status
 
+        downloaded_ids = [item.paper_id for item in download_result.items if item.status == "downloaded"]
+        registry = artifact_registry_from_config(download_config)
+        artifact_store = artifact_store_from_config(download_config)
+        stored_ids: list[str] = []
+        for paper_id in downloaded_ids:
+            record = registry.find_in_session(f"paper_pdf:{paper_id}", session_id=session.session_id)
+            if record is None:
+                failed_ids.add(paper_id)
+                workspace.context.filters.paper_pipeline_status[paper_id] = "storage_failed"
+                result.warnings.append(f"{paper_id}: 下载成功但对象存储 artifact 未登记")
+                continue
+            ref = BlobRef(
+                backend=record.backend, bucket=record.bucket,
+                object_key=record.object_key, sha256=record.sha256,
+                size_bytes=record.size_bytes, content_type=record.content_type,
+            )
+            if not artifact_store.exists(ref):
+                failed_ids.add(paper_id)
+                workspace.context.filters.paper_pipeline_status[paper_id] = "storage_failed"
+                result.warnings.append(f"{paper_id}: 对象存储 artifact 不存在")
+                continue
+            stored_ids.append(paper_id)
+            stored_ids_seen.add(paper_id)
+
+        result.downloaded_count = len(stored_ids_seen)
+        result.requires_login_count = len(login_ids)
+        result.failed_download_count = len(failed_ids)
+        workspace.context.filters.downloaded_full_text_count = result.downloaded_count
+        if not stored_ids:
+            workspace = _persist_topic_workspace(session, workspace, config)
+            return
+
+        # Parse commit validation requires the papers to be active temporarily;
+        # failed/unverified candidates never enter this list.
+        workspace.context.active_papers = list(dict.fromkeys(ready_ids + stored_ids))
+        workspace = _persist_topic_workspace(session, workspace, config)
+        current = load_workspace(session)
+        parse_job = enqueue_parse_job(config, session, current, stored_ids)
+        parse_report = await run_pending_parse_jobs(
+            config, limit=len(stored_ids), session_id=session.session_id,
+            task_ids={parse_job.task_id} if parse_job is not None else None,
+        )
+        result.parsed_count += parse_report.parsed
+        result.warnings.extend(parse_report.warnings)
+        progress(
+            "parse_finished" if retry_index == 0 else "parse_retry_finished",
+            retry=retry_index or None, parsed=parse_report.parsed, total=len(stored_ids),
+        )
+        embedding_report = await run_pending_embedding_jobs(
+            config, limit=len(stored_ids), session_id=session.session_id,
+            artifact_ids={f"paper_pdf:{paper_id}" for paper_id in stored_ids},
+        )
+        result.embedded_count += embedding_report.processed
+        result.warnings.extend(embedding_report.warnings)
+        batch_ready = list(embedding_report.ready_paper_ids)
+        if parse_report.parsed and not batch_ready:
+            current = load_workspace(session)
+            _, direct_rag = await refresh_session_rag_index(
+                config, session, current, artifact_ids=set(stored_ids),
+            )
+            if not direct_rag.skipped:
+                save_workspace(session, current, config=config)
+                batch_ready = list(direct_rag.paper_ids)
+        ready_ids.extend(paper_id for paper_id in batch_ready if paper_id not in ready_ids)
+        workspace = load_workspace(session)
+        for paper_id in stored_ids:
+            workspace.context.filters.paper_pipeline_status[paper_id] = (
+                "rag_ready" if paper_id in ready_ids else "parsed"
+            )
+        workspace.context.filters.rag_ready_count = len(ready_ids)
+        workspace.context.active_papers = list(dict.fromkeys(ready_ids))
+        workspace = _persist_topic_workspace(session, workspace, config)
+        progress(
+            "rag_finished" if retry_index == 0 else "rag_retry_finished",
+            retry=retry_index or None, ready=len(ready_ids), total=len(stored_ids),
+        )
+
+    max_attempts = min(len(candidate_ids), max(requested_rag_ready * 3, requested_rag_ready))
+    wave = 0
+    while len(ready_ids) < requested_rag_ready and len(attempted_ids) < max_attempts:
+        remaining = requested_rag_ready - len(ready_ids)
+        batch = [paper_id for paper_id in candidate_ids if paper_id not in attempted_ids][:remaining]
+        if not batch:
+            break
+        attempted_ids.update(batch)
+        await process_batch(batch, retry_index=wave)
+        wave += 1
+        if wave >= 3:
+            break
     if len(ready_ids) < requested_rag_ready:
         result.warnings.append(
             f"RAG ready 未达到目标：{len(ready_ids)}/{requested_rag_ready}。"
@@ -381,5 +325,7 @@ async def run_topic_search(
         result.status = "waiting_for_auth" if result.requires_login_count else "exhausted"
     else:
         result.status = "completed"
-    result.workspace = _persist_topic_workspace(session, result.workspace, config)
+    workspace.context.active_papers = ready_ids[:requested_rag_ready]
+    workspace.context.filters.rag_ready_count = len(workspace.context.active_papers)
+    result.workspace = _persist_topic_workspace(session, workspace, config)
     return result

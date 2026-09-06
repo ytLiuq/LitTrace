@@ -484,6 +484,7 @@ class WorkspaceFilters(BaseModel):
     discipline: str | None = None
     expanded_year_range_from: int | None = None
     year_min: int | None = None
+    year_max: int | None = None
     journals: list[str] = Field(default_factory=list)
     active_context_limit: int | None = None
     candidate_pool_count: int = 0
