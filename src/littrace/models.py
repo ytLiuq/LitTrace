@@ -293,6 +293,7 @@ def _normalize_observed_measurement(
 
 
 class PaperMetadata(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
     paper_id: str
     title: str
     authors: list[str] = Field(default_factory=list)

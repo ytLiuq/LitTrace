@@ -72,6 +72,7 @@ api:
   enable_semantic_scholar: false
   enable_chemrxiv: true
   enable_semantic_query_planner: true
+  enable_model_rerank: true
 
 cdp_downloader:
   cdp_url: "http://127.0.0.1:19222"

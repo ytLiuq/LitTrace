@@ -192,6 +192,7 @@ class APIConfig(BaseModel):
     enable_semantic_scholar: bool = False
     enable_chemrxiv: bool = True
     enable_semantic_query_planner: bool = True
+    enable_model_rerank: bool = True
     request_timeout_seconds: float = 20.0
     enable_live_search: bool = False
 

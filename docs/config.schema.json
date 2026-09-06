@@ -92,6 +92,11 @@
           "title": "Enable Semantic Query Planner",
           "type": "boolean"
         },
+        "enable_model_rerank": {
+          "default": true,
+          "title": "Enable Model Rerank",
+          "type": "boolean"
+        },
         "request_timeout_seconds": {
           "default": 20.0,
           "title": "Request Timeout Seconds",

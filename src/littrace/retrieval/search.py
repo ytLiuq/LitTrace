@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import json
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -20,6 +21,7 @@ from littrace.models import (
 )
 from littrace.retrieval.adapters import SourceHealth, classify_source_exception
 from littrace.retry import retry_async, RetryConfig, BackoffStrategy
+from littrace.llm import chat_completion
 
 
 class PaperSearchClient(Protocol):
@@ -291,6 +293,7 @@ class LiveSearchClient:
                         count=self.diagnostics.source_counts["unpaywall_enriched"],
                     )
             merged = rank_papers(merged, request)
+            merged = await self._apply_model_rerank(merged, request)
             self.diagnostics.ranking_counts["ranked_candidate_pool"] = len(merged)
             self.diagnostics.ranking_counts["context_ready"] = len(
                 [paper for paper in merged if _context_relevance_score(request, paper) >= 0.45]
@@ -306,6 +309,69 @@ class LiveSearchClient:
                 source_counts=self.diagnostics.source_counts,
             )
             return result
+
+    async def _apply_model_rerank(
+        self, papers: list[PaperMetadata], request: PaperSearchRequest
+    ) -> list[PaperMetadata]:
+        if not getattr(self.config.api, "enable_model_rerank", False):
+            return papers
+        if not self.config.llm.enabled or not self.config.llm.api_key or len(papers) < 2:
+            return papers
+        candidates = papers[:30]
+        records = [
+            {
+                "index": index,
+                "title": paper.title[:240],
+                "abstract": (paper.abstract or "")[:500],
+                "venue": (paper.journal or paper.publisher or "")[:120],
+            }
+            for index, paper in enumerate(candidates)
+        ]
+        try:
+            reply = await asyncio.wait_for(
+                chat_completion(
+                    self.config,
+                    "You rank academic literature for a materials/device research topic. "
+                    "Return JSON only with scores: [{\"index\":0,\"score\":0.0}]. "
+                    "Score material/device relevance and penalize unrelated medicine, "
+                    "infrastructure, control, or generic monitoring papers.",
+                    json.dumps({"topic": request.topic, "papers": records}, ensure_ascii=False),
+                    json_mode=True,
+                ),
+                timeout=min(self.config.llm.request_timeout_seconds, 45.0),
+            )
+            payload = json.loads(reply.text) if reply.used_llm else {}
+            if isinstance(payload, dict):
+                scores = payload.get("scores", [])
+            elif isinstance(payload, list):
+                scores = payload
+            else:
+                scores = []
+            score_map = {
+                int(item["index"]): max(0.0, min(1.0, float(item["score"])))
+                for item in scores
+                if isinstance(item, dict)
+                and str(item.get("index", "")).isdigit()
+                and isinstance(item.get("score"), (int, float))
+            }
+            if not score_map:
+                return papers
+            for index, paper in enumerate(candidates):
+                if index in score_map:
+                    paper.relevance_score = round(
+                        0.65 * (paper.relevance_score or 0.0) + 0.35 * score_map[index],
+                        6,
+                    )
+            reranked = sorted(
+                candidates,
+                key=lambda paper: (paper.relevance_score or 0.0, paper.year or 0),
+                reverse=True,
+            )
+            self.diagnostics.ranking_counts["model_reranked_count"] = len(score_map)
+            return [*reranked, *papers[30:]]
+        except (TimeoutError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self.diagnostics.errors.append(f"model_rerank:{exc.__class__.__name__}: {exc}")
+            return papers
 
     async def _search_europe_pmc(
         self, client: httpx.AsyncClient, request: PaperSearchRequest
@@ -1050,6 +1116,7 @@ def rank_papers(papers: list[PaperMetadata], request: PaperSearchRequest) -> lis
         title_score = _title_relevance_score(request.topic, paper)
         phrase_score = _key_phrase_score(request.topic, paper)
         venue_score = _materials_venue_score(paper)
+        domain_penalty = _cross_domain_penalty(request.topic, paper)
         relevance = paper.relevance_score or lexical_score
         access = 1.0 if paper.access_type == AccessType.OPEN_ACCESS else 0.4
         paper.relevance_score = min(
@@ -1061,7 +1128,8 @@ def rank_papers(papers: list[PaperMetadata], request: PaperSearchRequest) -> lis
             + 0.10 * paper.recency_score
             + 0.06 * venue_score
             + 0.02 * citation_score
-            + 0.02 * access,
+            + 0.02 * access
+            - domain_penalty,
         )
     return sorted(
         papers,
@@ -1446,6 +1514,26 @@ def _materials_venue_score(paper: PaperMetadata) -> float:
         "diamond and related materials",
     ]
     return 1.0 if any(marker in venue for marker in markers) else 0.0
+
+
+def _cross_domain_penalty(topic: str, paper: PaperMetadata) -> float:
+    """Penalize obvious non-material/device uses without deleting recall."""
+    lowered_topic = topic.lower()
+    if not any(marker in topic or marker in lowered_topic for marker in ("sensor", "传感", "压力", "压敏")):
+        return 0.0
+    text = _paper_search_text(paper)
+    material_markers = (
+        "pdms", "mxene", "graphene", "carbon", "nanotube", "composite",
+        "polymer", "hydrogel", "thin film", "dielectric", "electrode", "microstructure",
+    )
+    if any(marker in text for marker in material_markers):
+        return 0.0
+    noise_markers = (
+        "pressure dressing", "wound therapy", "intraocular", "blood pressure",
+        "pressure vessel", "hydraulic", "water system", "routing protocol",
+        "state estimator", "fault diagnosis", "fuel supply", "accelerometer damping",
+    )
+    return 0.12 if any(marker in text for marker in noise_markers) else 0.0
 
 
 def _merge_paper(left: PaperMetadata, right: PaperMetadata) -> PaperMetadata:
