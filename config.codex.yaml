@@ -23,6 +23,7 @@ api:
   enable_live_search: true
   enable_europe_pmc: true
   enable_arxiv: true
+  enable_semantic_query_planner: true
 
 rag:
   enabled: true
@@ -92,6 +93,10 @@ llm:
   enabled: true
   intent_parser_enabled: true
   temperature: 0.2
+  model: "qwen3.8-max"
+  fallback_models:
+    - "qwen3.7-plus"
+    - "qwen3.8-flash"
 
 agent_runtime:
   mode: "codex_app_server"

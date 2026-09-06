@@ -695,6 +695,9 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     config.llm.api_key = os.environ.get("DEEPSEEK_API_KEY") or config.llm.api_key
     config.llm.base_url = os.environ.get("DEEPSEEK_BASE_URL") or config.llm.base_url
     config.llm.model = os.environ.get("DEEPSEEK_MODEL") or config.llm.model
+    config.api.openalex_api_key = (
+        os.environ.get("LITTRACE_OPENALEX_API_KEY") or config.api.openalex_api_key
+    )
     config.api.semantic_scholar_api_key = (
         os.environ.get("LITTRACE_SEMANTIC_SCHOLAR_API_KEY")
         or config.api.semantic_scholar_api_key
