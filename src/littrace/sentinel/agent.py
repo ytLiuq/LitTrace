@@ -107,7 +107,9 @@ class LiteratureSentinel:
             # Each UI round should process the amount the user requested,
             # rather than the model default (20) regardless of the target.
             # A later round can broaden the query when too few PDFs succeed.
-            limit=max(1, self.watchlist.target_papers),
+            # Search a recovery pool substantially larger than the target so
+            # publisher/Cloudflare failures can be replaced in the same run.
+            limit=max(self.watchlist.target_papers * 3, 50),
             live=self.config.api.enable_live_search,
             query_variants=list(self.watchlist.query_variants),
         )
@@ -160,11 +162,28 @@ class LiteratureSentinel:
 
         # Full-text resolution is incremental. Re-probing every publisher URL on
         # every daily tick causes needless 429s/timeouts for papers already seen.
+        candidate_ids = list(dict.fromkeys(
+            paper.paper_id
+            for paper in candidate_papers[: max(self.watchlist.target_papers * 3, 20)]
+        ))
         unresolved_ids = [
             paper_id
-            for paper_id in workspace.context.active_papers
+            for paper_id in candidate_ids
             if paper_id not in workspace.full_text_reports
+            and workspace.papers.get(paper_id) is not None
+            and workspace.papers[paper_id].pdf_url
         ]
+        # Only probe a small DOI-only tail for recovery. Search adapters already
+        # provide verified OA URLs for most candidates; probing every DOI through
+        # Crossref/Unpaywall multiplies publisher timeouts without improving the
+        # first download batch.
+        unresolved_ids.extend(
+            paper_id
+            for paper_id in candidate_ids
+            if paper_id not in unresolved_ids
+            and paper_id not in workspace.full_text_reports
+        )
+        unresolved_ids = unresolved_ids[: max(self.watchlist.target_papers * 2, 8)]
         if unresolved_ids:
             try:
                 probe_workspace = workspace.model_copy(deep=True)
@@ -193,80 +212,79 @@ class LiteratureSentinel:
         # Sentinel auto-downloads to the object store only — never to the
         # user's working directory. Same posture as daily_update: bytes go
         # to the artifact backend, leaving paper_library_dir clean.
-        downloadable_ids = [
-            paper.paper_id
-            for paper in workspace.papers.values()
-            if paper.access_type == AccessType.OPEN_ACCESS
-            and paper.paper_id in workspace.context.active_papers
+        downloadable_candidates = [
+            workspace.papers[paper_id]
+            for paper_id in candidate_ids
+            if paper_id in workspace.papers
+            and workspace.papers[paper_id].access_type == AccessType.OPEN_ACCESS
+            and workspace.papers[paper_id].pdf_url
+            and not _is_rag_ready(workspace, paper_id)
         ]
         downloaded_count = 0
+        downloaded_ids: list[str] = []
+        attempted_download_ids: set[str] = set()
+        ready_before = sum(
+            _is_rag_ready(workspace, paper_id) for paper_id in candidate_ids
+        )
         download_warnings: list[str] = []
         parse_report: dict[str, object] = {"parsed_count": 0, "warnings": []}
-        if downloadable_ids:
+        remaining_target = max(self.watchlist.target_papers - ready_before, 0)
+        for _round in range(2):
+            if remaining_target <= 0:
+                break
+            batch = [
+                paper for paper in downloadable_candidates
+                if paper.paper_id not in attempted_download_ids
+            ][: max(remaining_target * 2, remaining_target)]
+            if not batch:
+                break
+            batch_ids = [paper.paper_id for paper in batch]
+            attempted_download_ids.update(batch_ids)
+            workspace.context.active_papers = batch_ids
+            batch_downloaded: list[str] = []
             try:
                 download_result = await execute_downloads_skill(
                     self.config,
                     workspace,
                     DownloadExecutionRequest(
-                        paper_ids=downloadable_ids,
+                        paper_ids=batch_ids,
                         session_id=self.target_session_id,
                         target="storage_only",
                     ),
                 )
-                downloaded_count = download_result.downloaded_count
-                # Round 17: a zero-download count on a non-empty
-                # candidate list is almost always a transport / auth
-                # failure that used to be silent. Surface it as a
-                # warning so the user can see "下载 0 篇" in the
-                # status strip instead of wondering why
-                # ``downloaded=0`` while ``new_candidates>0``.
-                if downloadable_ids and downloaded_count == 0:
-                    download_warnings.append(
-                        f"下载阶段：{len(downloadable_ids)} 篇候选全部失败（详见 digest.md）"
-                    )
-                downloaded_ids = [
-                    item.paper_id
-                    for item in download_result.items
-                    if item.status == "downloaded"
+                downloaded_count += download_result.downloaded_count
+                batch_downloaded = [
+                    item.paper_id for item in download_result.items if item.status == "downloaded"
                 ]
-                if downloaded_ids:
-                    # Persist the paper/artifact-bearing workspace first, then
-                    # let the durable parse worker materialize object-store
-                    # bytes and commit parsed output under CAS.
+                downloaded_ids.extend(batch_downloaded)
+                for item in download_result.items:
+                    if item.error:
+                        download_warnings.append(f"download:{item.paper_id}: {item.error}")
+                if batch_downloaded:
                     save_sentinel_workspace(self.store, workspace, config=self.config)
-                    target_session = load_or_create_session(
-                        self.config, self.target_session_id
-                    )
+                    target_session = load_or_create_session(self.config, self.target_session_id)
                     current_workspace = load_session_workspace(target_session)
                     enqueue_parse_job(
-                        self.config,
-                        target_session,
-                        current_workspace,
-                        downloaded_ids,
+                        self.config, target_session, current_workspace, batch_downloaded
                     )
                     parse_execution = await run_pending_parse_jobs(
                         self.config,
-                        limit=len(downloaded_ids),
+                        limit=len(batch_downloaded),
                         session_id=self.target_session_id,
                     )
                     workspace = load_session_workspace(target_session)
-                    parse_report = {
-                        "parsed_count": parse_execution.parsed,
-                        "warnings": parse_execution.warnings,
-                    }
-                else:
-                    parse_report = {"parsed_count": 0, "warnings": []}
+                    parse_report["parsed_count"] = int(parse_report.get("parsed_count") or 0) + parse_execution.parsed
+                    parse_report.setdefault("warnings", []).extend(parse_execution.warnings)
+                ready_now = sum(_is_rag_ready(workspace, paper_id) for paper_id in candidate_ids)
+                remaining_target = max(self.watchlist.target_papers - ready_now, 0)
             except Exception as exc:
-                # Round 17: previously an exception inside
-                # ``execute_downloads_skill`` would propagate up and
-                # abort the whole sentinel run (no digest, no
-                # quality report, no resource pack). Now we capture
-                # it as a warning so the user at least sees the
-                # rest of the run results — search hits, candidates,
-                # parse status — instead of an opaque traceback.
-                download_warnings.append(
-                    f"下载阶段失败：{exc.__class__.__name__}: {exc}"
-                )
+                download_warnings.append(f"下载阶段失败：{exc.__class__.__name__}: {exc}")
+                remaining_target = max(remaining_target - len(batch_downloaded), 0)
+
+        if remaining_target > 0:
+            download_warnings.append(
+                f"RAG ready 未达到目标：当前 {self.watchlist.target_papers - remaining_target} / {self.watchlist.target_papers}。"
+            )
 
         # Round 25: parse + table metrics now run unconditionally
         # at the end of every sentinel run. Previously the parse step
@@ -309,16 +327,11 @@ class LiteratureSentinel:
             # Guard the attribute access so an unexpected rename
             # degrades to a 0 count instead of an unrecoverable
             # crash.
-            "parsed_count": (
-                getattr(
-                    workspace.context.filters,
-                    "parsed_full_text_count",
-                    0,
-                )
-                if hasattr(workspace.context, "filters")
-                else 0
+            "parsed_count": max(
+                int(parse_report.get("parsed_count") or 0),
+                int(getattr(workspace.context.filters, "parsed_full_text_count", 0) or 0),
             ),
-            "warnings": [],
+            "warnings": list(parse_report.get("warnings", [])),
         }
         quality_report = build_quality_report_skill(
             self.config, workspace, session_id=self.target_session_id
@@ -569,6 +582,17 @@ def _build_access_tasks(workspace: LiteratureWorkspace, state: SentinelState) ->
                 )
             )
     return tasks
+
+
+def _is_rag_ready(workspace: LiteratureWorkspace, paper_id: str) -> bool:
+    parsed = workspace.parsed_papers.get(paper_id)
+    if parsed is None:
+        return False
+    value = parsed if isinstance(parsed, dict) else parsed.model_dump()
+    if not value.get("parsed"):
+        return False
+    quality = workspace.context.filters.docling_quality_reports.get(paper_id)
+    return not isinstance(quality, dict) or quality.get("rag_eligible", True) is not False
 
 
 def _merge_access_tasks(existing: list[AccessTask], new_tasks: list[AccessTask]) -> list[AccessTask]:

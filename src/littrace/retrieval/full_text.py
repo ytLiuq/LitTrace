@@ -77,7 +77,9 @@ async def resolve_full_text_for_paper(
 ) -> FullTextResolutionReport:
     candidates = _seed_candidates(paper)
     warnings: list[str] = []
-    if paper.doi and ".mock" not in paper.doi:
+    direct_pdf = str(paper.pdf_url or "").lower()
+    has_direct_pdf = bool(direct_pdf) and "doi.org/" not in direct_pdf
+    if paper.doi and ".mock" not in paper.doi and not has_direct_pdf:
         crossref_candidates, crossref_warnings = await _crossref_full_text_candidates(client, paper)
         candidates.extend(crossref_candidates)
         warnings.extend(crossref_warnings)
