@@ -42,6 +42,7 @@ gui-qt = [
   # https://doc.qt.io/qt-6/qtwebengine-platform-notes.html for platform
   # requirements.
   "PySide6>=6.7",
+  "markdown-it-py>=3.0",
 ]
 dev = [
   "pytest>=8.2",

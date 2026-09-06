@@ -46,6 +46,7 @@ from littrace.publisher_catalog import (
 )
 from littrace.session import list_chat_sessions
 from littrace.shell_controller import ShellController, ShellEvent
+from markdown_it import MarkdownIt
 
 
 # Animated "thinking" dots used in the chat-panel status strip. Cycles
@@ -230,133 +231,28 @@ def _reason_to_text(reason: str, detail: str) -> str:
 # Message body rendering
 # ---------------------------------------------------------------------------
 #
-# Codex replies come back as plain text that happens to use Markdown
-# conventions: bold with **...**, inline code with `...`, code fences
-# with ```...```, headings with ``#``/``##``, list items with ``- ``,
-# and block quotes with ``> ``. ``QTextBrowser.append`` accepts an HTML
-# fragment, so we convert Markdown to a small whitelist of HTML tags
-# here and inject the result. We escape the input first, then run
-# Markdown rules against the escaped text — that way any literal
-# ``<``/``>`` in the reply never opens a tag the browser interprets.
-# No external Markdown dependency; the rule set is intentionally
-# minimal (whatever Codex 0.149 emits today, not CommonMark).
-
-
-def _xml_escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+# Codex replies are Markdown. Use a real CommonMark renderer so nested lists,
+# tables, links, fenced code, and inline emphasis render consistently.
+_MARKDOWN = MarkdownIt("commonmark", {"html": False, "linkify": False})
+_MARKDOWN.enable("table").enable("strikethrough")
 
 
 def _render_message_html(text: str) -> str:
-    """Render a Codex reply as the small HTML subset Qt's text browser
-    understands. ``text`` is treated as Markdown; the rules above cover
-    the cases Codex 0.149 actually emits (bold / code / fenced code /
-    headings / lists / block quotes).
-
-    Implementation note: escape-then-rewrite would re-escape the ``<b>``
-    / ``<code>`` / ``<pre>`` we just inserted when a later rule (e.g.
-    the list rule) sees those tags inside its match group. So we do
-    three passes:
-
-      1. Run the markdown rules on the raw text. Each rule's callback
-         emits the *final* HTML for its match (escaping the captured
-         text group itself), so the result is already valid HTML.
-      2. ``_xml_escape`` the whole string once. That escapes any
-         literal ``<``/``>``/``&`` in the reply that was outside the
-         markdown patterns, but leaves the already-emitted HTML tags
-         (we swapped them for sentinels just before escaping so they
-         pass through untouched).
-      3. Swap the sentinels back to their final ``<b>``/``<code>``/etc.
-    """
-    sentinel_map = {
-        "@@LT_B@@": "<b>",
-        "@@RT_B@@": "</b>",
-        "@@LT_I@@": "<i>",
-        "@@RT_I@@": "</i>",
-        "@@LT_CODE@@": (
-            "<code style='background:" + DESIGN["surface_2"]
-            + ";padding:1px 4px;border-radius:3px;"
-            + "font-family:Menlo,Consolas,monospace;font-size:12px;'>"
-        ),
-        "@@RT_CODE@@": "</code>",
-        "@@LT_PRE@@": (
-            "<pre style='background:" + DESIGN["surface_2"]
-            + ";padding:6px 8px;border-radius:4px;"
-            + "white-space:pre-wrap;font-family:Menlo,Consolas,monospace;"
-            + "font-size:12px;'>"
-        ),
-        "@@RT_PRE@@": "</pre>",
-        "@@LT_H3@@": "<h3 style='margin:6px 0;'>",
-        "@@RT_H3@@": "</h3>",
-        "@@LT_H4@@": "<h4>",
-        "@@RT_H4@@": "</h4>",
-        "@@LT_H5@@": "<h5>",
-        "@@RT_H5@@": "</h5>",
-        "@@LT_H6@@": "<h6>",
-        "@@RT_H6@@": "</h6>",
-        "@@LT_BQ@@": (
-            "<blockquote style='margin:4px 0;padding:2px 8px;"
-            + "border-left:3px solid " + DESIGN["hairline"] + ";"
-            + "color:" + DESIGN["ink_muted"] + ";'>"
-        ),
-        "@@RT_BQ@@": "</blockquote>",
-        "@@LI_START@@": (
-            "<div style='margin-left:12px;'>"
-        ),
-        "@@LI_END@@": "</div>",
-    }
-
-    def fence(m):
-        return "@@LT_PRE@@" + _xml_escape(m.group(1).strip()) + "@@RT_PRE@@"
-
-    def code(m):
-        return "@@LT_CODE@@" + _xml_escape(m.group(1)) + "@@RT_CODE@@"
-
-    def bold(m):
-        return "@@LT_B@@" + _xml_escape(m.group(1)) + "@@RT_B@@"
-
-    def italic(m):
-        return "@@LT_I@@" + _xml_escape(m.group(1)) + "@@RT_I@@"
-
-    def heading(level: str):
-        return lambda m: f"@@LT_H{level}@@" + _xml_escape(m.group(1)) + f"@@RT_H{level}@@"
-
-    def bq(m):
-        return "@@LT_BQ@@" + _xml_escape(m.group(1)) + "@@RT_BQ@@"
-
-    def li_dash(m):
-        return "@@LI_START@@• " + _xml_escape(m.group(1)) + "@@LI_END@@"
-
-    def li_num(m):
-        return "@@LI_START@@" + m.group(0) + "@@LI_END@@"
-
-    body = text
-    body = re.sub(r"```([\s\S]*?)```", fence, body)
-    body = re.sub(r"`([^`\n]+)`", code, body)
-    body = re.sub(r"\*\*([^*\n]+)\*\*", bold, body)
-    body = re.sub(r"(?<![*\w])\*([^*\n]+)\*(?!\w)", italic, body)
-    body = re.sub(r"^###### ([^\n]+)$", heading("6"), body, flags=re.MULTILINE)
-    body = re.sub(r"^##### ([^\n]+)$", heading("5"), body, flags=re.MULTILINE)
-    body = re.sub(r"^#### ([^\n]+)$", heading("5"), body, flags=re.MULTILINE)
-    body = re.sub(r"^### ([^\n]+)$", heading("4"), body, flags=re.MULTILINE)
-    body = re.sub(r"^## ([^\n]+)$", heading("4"), body, flags=re.MULTILINE)
-    body = re.sub(r"^# ([^\n]+)$", heading("3"), body, flags=re.MULTILINE)
-    body = re.sub(r"^> ([^\n]+)$", bq, body, flags=re.MULTILINE)
-    body = re.sub(r"^(?:[-*] )([^\n]+)$", li_dash, body, flags=re.MULTILINE)
-    body = re.sub(r"^\d+\. ([^\n]+)$", li_num, body, flags=re.MULTILINE)
-    # Escape anything left over so a literal ``<`` or ``&`` in the
-    # user's reply can't open a tag.
-    body = _xml_escape(body)
-    # Re-emit the previously-substituted HTML tags. Order doesn't
-    # matter because the sentinels are unique placeholder strings.
-    for sentinel, html in sentinel_map.items():
-        body = body.replace(sentinel, html)
-    body = body.replace("\n", "<br>")
-    return body
+    """Render safe CommonMark/GFM-like text for Qt's rich-text view."""
+    rendered = _MARKDOWN.render(str(text or ""))
+    # QTextBrowser supports these tags but does not apply a document-level
+    # stylesheet consistently across Qt versions, so keep the key spacing
+    # inline. Raw HTML is disabled in MarkdownIt and therefore escaped.
+    rendered = rendered.replace(
+        "<table>",
+        "<table border='1' cellspacing='0' cellpadding='5' "
+        "style='border-collapse:collapse;border-color:#d8d9dc;'>",
+    )
+    # Qt's rich-text subset accepts both tags, but the shorter forms keep the
+    # generated document compatible with existing clipboard/transcript tests.
+    rendered = rendered.replace("<strong>", "<b>").replace("</strong>", "</b>")
+    rendered = rendered.replace("<em>", "<i>").replace("</em>", "</i>")
+    return rendered
 
 
 # Codex 0.149 alpha frequently leaks sentences of internal narration
@@ -549,8 +445,13 @@ QLabel#pane_title {{
     padding: 2px 4px;
 }}
 
-QTextBrowser#trace_view, QTextBrowser#chat_view {{
+QTextBrowser#trace_view {{
     background: {DESIGN["surface_1"]};
+    border: none;
+    color: {DESIGN["ink"]};
+}}
+QTextBrowser#chat_view {{
+    background: #F3F3F3;
     border: none;
     color: {DESIGN["ink"]};
 }}
@@ -821,18 +722,13 @@ class TracePanel(QtWidgets.QFrame):
         label = labels.get(stage, stage or "运行中")
         if stage == "status_message" and payload.get("message"):
             label = str(payload["message"])
-        source = str(payload.get("source", ""))
         count = payload.get("count")
         details: list[str] = []
-        if source:
-            details.append(source)
         if count is not None:
             details.append(f"{count} 篇")
         for key, name in (("downloaded", "下载"), ("parsed", "解析"), ("ready", "RAG"), ("failed", "失败"), ("requires_login", "待登录")):
             if key in payload:
                 details.append(f"{name} {payload[key]}")
-        if payload.get("query"):
-            details.append(f"查询：{payload['query']}")
         line = label + (" · " + " · ".join(details) if details else "")
         self._trace_lines.append(line)
         self._trace_lines = self._trace_lines[-80:]
@@ -969,6 +865,20 @@ class ChatPanel(QtWidgets.QFrame):
 
         self._view = QtWidgets.QTextBrowser()
         self._view.setObjectName("chat_view")
+        self._view.document().setDefaultStyleSheet(
+            "body { font-size: 14px; line-height: 1.55; }"
+            "p { margin: 3px 0 7px 0; }"
+            "h1, h2, h3, h4 { margin: 8px 0 5px 0; }"
+            "ul, ol { margin: 4px 0 7px 18px; }"
+            "li { margin: 2px 0; }"
+            "blockquote { color: #5c6068; margin: 5px 0 7px 8px; }"
+            "pre { background: #eef0f2; padding: 8px; white-space: pre-wrap; }"
+            "code { background: #eef0f2; font-family: Menlo, Consolas, monospace; }"
+            "table { border-collapse: collapse; margin: 7px 0; }"
+            "th { background: #eef0f2; font-weight: 600; }"
+            "th, td { border: 1px solid #d8d9dc; padding: 5px 8px; }"
+            "a { color: #2b7a78; text-decoration: none; }"
+        )
         self._view.setOpenExternalLinks(False)
         self._view.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._view.customContextMenuRequested.connect(self._on_chat_context_menu)
@@ -1413,23 +1323,23 @@ class ChatPanel(QtWidgets.QFrame):
         body = _strip_leading_narration(_render_message_html(text))
         body = _strip_trailing_narration(body)
         if role == "user":
-            bubble_color = DESIGN["primary"]
-            text_color = "#ffffff"
+            bubble_color = "#95EC69"
+            text_color = "#182018"
             align = "right"
-            wrap = "12px 12px 4px 12px"  # tail bottom-right
-            max_width = "78%"
+            wrap = "7px"
+            max_width = "82%"
         elif role == "system":
-            bubble_color = DESIGN["surface_2"]
+            bubble_color = "#EDEFF2"
             text_color = DESIGN["ink_muted"]
             align = "left"
-            wrap = "8px"
-            max_width = "78%"
+            wrap = "6px"
+            max_width = "88%"
         else:  # assistant
             bubble_color = "#ffffff"
             text_color = DESIGN["ink"]
             align = "left"
-            wrap = "12px 12px 12px 4px"  # tail bottom-left
-            max_width = "78%"
+            wrap = "7px"
+            max_width = "82%"
         from PySide6.QtGui import QTextBlockFormat
 
         cursor = self._view.textCursor()
@@ -1446,15 +1356,15 @@ class ChatPanel(QtWidgets.QFrame):
             if align == "right"
             else QtCore.Qt.AlignmentFlag.AlignLeft
         )
-        block_fmt.setTopMargin(8)
-        block_fmt.setBottomMargin(8)
+        block_fmt.setTopMargin(10)
+        block_fmt.setBottomMargin(10)
         cursor.insertBlock(block_fmt)
         cursor.insertHtml(
             f'<span style="display:inline-block;max-width:{max_width};'
             f"background:{bubble_color};color:{text_color};"
             f"border:1px solid {DESIGN['hairline']};"
-            f"border-radius:{wrap};padding:8px 12px;"
-            f"line-height:1.4;"
+            f"border-radius:{wrap};padding:11px 15px;"
+            f"font-size:14px;line-height:1.55;"
             f'">'
             f"{body}"
             f"</span>"
@@ -1517,14 +1427,14 @@ class ChatPanel(QtWidgets.QFrame):
 
         bubble_color = "#ffffff"
         text_color = DESIGN["ink"]
-        wrap = "12px 12px 12px 4px"  # assistant tail bottom-left
-        max_width = "78%"
+        wrap = "7px"
+        max_width = "82%"
         cursor = self._view.textCursor()
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
         block_fmt = QTextBlockFormat()
         block_fmt.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
-        block_fmt.setTopMargin(8)
-        block_fmt.setBottomMargin(8)
+        block_fmt.setTopMargin(10)
+        block_fmt.setBottomMargin(10)
         cursor.insertBlock(block_fmt)
         # Remember the block start position before ``insertHtml``
         # moves the cursor past the inserted span. The anchor is
@@ -1537,8 +1447,8 @@ class ChatPanel(QtWidgets.QFrame):
             f'<span style="display:inline-block;max-width:{max_width};'
             f"background:{bubble_color};color:{text_color};"
             f"border:1px solid {DESIGN['hairline']};"
-            f"border-radius:{wrap};padding:8px 12px;"
-            f"line-height:1.4;"
+            f"border-radius:{wrap};padding:11px 15px;"
+            f"font-size:14px;line-height:1.55;"
             f'"></span>'
         )
         self._streaming_anchor = anchor
@@ -1648,11 +1558,11 @@ class ChatPanel(QtWidgets.QFrame):
         # Replace the selection (which is the entire streaming span)
         # with the freshly rendered HTML.
         cursor.insertHtml(
-            f'<span style="display:inline-block;max-width:78%;'
+            f'<span style="display:inline-block;max-width:82%;'
             f"background:#ffffff;color:{DESIGN['ink']};"
             f"border:1px solid {DESIGN['hairline']};"
-            f"border-radius:12px 12px 12px 4px;padding:8px 12px;"
-            f"line-height:1.4;"
+            f"border-radius:7px;padding:11px 15px;"
+            f"font-size:14px;line-height:1.55;"
             f'">{body}</span>'
         )
         self._view.setTextCursor(cursor)
@@ -4765,9 +4675,21 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             )
         except Exception:
             pass
-        self._context_panel.refresh(list(self._controller.list_active_papers()))
+        self._context_panel.refresh(self._visible_context_papers())
         self._chat_panel.clear()
         self._trace_panel.render_workflow_trace(["已切换 Session", session_id])
+
+    def _visible_context_papers(self) -> list[PaperMetadata]:
+        """Return papers allowed in the user-facing literature context."""
+        papers = list(self._controller.list_active_papers())
+        filters = self._controller.workspace.context.filters
+        statuses = getattr(filters, "paper_pipeline_status", {}) or {}
+        if getattr(filters, "requested_rag_ready_count", 0) and statuses:
+            return [
+                paper for paper in papers
+                if statuses.get(paper.paper_id) == "rag_ready"
+            ]
+        return papers
 
     def _build_brand_strip(self) -> QtWidgets.QWidget:
         strip = QtWidgets.QWidget()
@@ -5563,9 +5485,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         label = f"/{name}" if name else "command"
         self._chat_panel.append_message(
             "system",
-            f"<b>{label}</b><br><pre style='white-space:pre-wrap;"
-            "font-family:Menlo,Consolas,monospace;font-size:12px;'>"
-            f"{_render_message_html(text)}</pre>",
+            f"**{label}**\n\n```text\n{text}\n```",
         )
         if self._status_bar is not None:
             self._status_bar.showMessage(f"执行 /{name}", 3000)
@@ -5588,13 +5508,12 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         )
 
     def _on_workspace_event(self, body: dict) -> None:
-        self._context_panel.refresh(list(self._controller.list_active_papers()))
+        papers = self._visible_context_papers()
+        self._context_panel.refresh(papers)
+        filters = self._controller.workspace.context.filters
+        ready = int(getattr(filters, "rag_ready_count", 0) or 0)
         self._trace_panel.render_workflow_trace(
-            ["工作区刷新"]
-            + [
-                f"{i + 1}. {p.title}"
-                for i, p in enumerate(self._controller.list_active_papers())
-            ]
+            [f"工作区已刷新 · 当前上下文 {len(papers)} 篇 · RAG ready {ready} 篇"]
         )
 
     def _on_trace_progress_event(self, body: dict) -> None:
@@ -5623,12 +5542,9 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         suggestion = body.get("suggestion", "")
         error_code = body.get("error_code", "other")
         raw = body.get("raw", "")
-        html_parts = [f"⚠️ {message}"]
+        markdown_parts = [f"⚠️ **{message}**"]
         if suggestion:
-            html_parts.append(
-                f'<br><span style="color:#5c6068;font-size:11px;">'
-                f"{suggestion}</span>"
-            )
+            markdown_parts.append(str(suggestion))
         # Build the inline action row. Each link uses the
         # ``littrace:`` URI scheme so we can route the activation
         # through ``_on_chat_anchor_clicked`` without opening a
@@ -5636,36 +5552,17 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         actions: list[str] = []
         last_msg = getattr(self, "_last_user_message", None)
         if last_msg:
-            actions.append(
-                '<a href="littrace:retry-last" '
-                'style="color:#3a8a8c;font-size:11px;'
-                'text-decoration:none;margin-right:10px;">'
-                '🔁 重试</a>'
-            )
+            actions.append("[重试](littrace:retry-last)")
         if raw:
-            actions.append(
-                '<a href="littrace:show-error-detail" '
-                'style="color:#3a8a8c;font-size:11px;'
-                'text-decoration:none;margin-right:10px;">'
-                '查看技术细节</a>'
-            )
+            actions.append("[查看技术细节](littrace:show-error-detail)")
             # Stash for the click handler.
             self._last_error_detail = (error_code, message, raw)
         if error_code == "unauthorized":
-            actions.append(
-                '<a href="littrace:relogin" '
-                'style="color:#3a8a8c;font-size:11px;'
-                'text-decoration:none;margin-right:10px;">'
-                '🔑 重新登录</a>'
-            )
+            actions.append("[重新登录](littrace:relogin)")
         if actions:
-            html_parts.append(
-                '<br><div style="margin-top:6px;font-size:11px;">'
-                + "".join(actions)
-                + "</div>"
-            )
+            markdown_parts.append(" · ".join(actions))
         self._chat_panel.append_message(
-            "system", "".join(html_parts)
+            "system", "\n\n".join(markdown_parts)
         )
         # Status bar: condensed one-liner. The full detail is in
         # the chat bubble + the click-through dialog.
@@ -5910,7 +5807,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
     # ---- Initial state ---------------------------------------------------
 
     def _refresh_initial_state(self) -> None:
-        self._context_panel.refresh(list(self._controller.list_active_papers()))
+        self._context_panel.refresh(self._visible_context_papers())
         self._trace_panel.render_workflow_trace(["等待任务…"])
         try:
             sessions = list_chat_sessions(self._controller.config)
@@ -6101,24 +5998,12 @@ def main(argv: list[str] | None = None) -> int:
     QtCore.QCoreApplication.setApplicationName("LitTrace Qt")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
-    # Round 18: redirect QtWebEngine's default profile storage to the
-    # same ``data/chrome-cdp`` directory sentinel uses via CDP, so
-    # cookies written by the embedded BrowserPanel (when the user logs
-    # into Wiley / ACS / Springer / Nature) are immediately visible to
-    # the next ``sentinel run`` without a separate "open external
-    # browser and log in again" step. The env-var
-    # ``QTWEBENGINE_USER_DATA_DIR`` is documented as the standard knob
-    # but is silently ignored on PySide6 6.7.2 / Windows (verified
-    # 2026-09: the default profile still resolves to
-    # ``%LOCALAPPDATA%\\...\\QtWebEngine\\OffTheRecord``); the API
-    # path is the only thing that actually moves cookies.
-    from PySide6.QtWebEngineCore import QWebEngineProfile
-
-    profile_dir = config.cdp_downloader.chrome_user_data_dir.expanduser()
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    default_profile = QWebEngineProfile.defaultProfile()
-    default_profile.setPersistentStoragePath(str(profile_dir))
-    default_profile.setCachePath(str(profile_dir))
+    # The publisher panel no longer embeds QtWebEngine; authentication runs
+    # in LitTrace's external CDP-managed Chrome. Do not instantiate a
+    # ``QWebEngineProfile`` here: on macOS that eagerly starts Chromium's
+    # native power-monitor services and can abort the process before the
+    # window is shown. Keep the WebEngine import above only for compatibility
+    # with callers that import the historical symbol.
 
     controller = ShellController(config)
     controller.start()
