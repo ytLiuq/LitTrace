@@ -203,7 +203,7 @@ class LiveSearchClient:
                         client, variant_request
                     )
                 source_results = await asyncio.wait_for(
-                    _gather_named(sources, self.diagnostics), timeout=60.0
+                    _gather_named(sources, self.diagnostics), timeout=25.0
                 )
                 for source_name, source_papers in source_results.items():
                     self.diagnostics.source_counts[source_name] = len(source_papers)
@@ -293,19 +293,44 @@ class LiveSearchClient:
             self.diagnostics.filtered_counts["merged"] = len(merged_raw) - len(merged)
             self.diagnostics.filtered_counts["basic_candidate_pool"] = len(merged)
             if self.config.api.unpaywall_email:
+                # Unpaywall is enrichment, not retrieval. Rank locally first
+                # and only enrich candidates that can still enter the bounded
+                # return pool. Enriching every merged result made a target-1
+                # search wait on dozens of external DOI lookups.
+                merged = rank_papers(merged, request)
+                enrichment_limit = min(
+                    len(merged),
+                    max(
+                        _retrieval_limit(request),
+                        request.min_relevant_results * 3,
+                        _source_limit(request, 12, 50),
+                    ),
+                )
+                enrichment_candidates = [
+                    paper for paper in merged[:enrichment_limit]
+                    if paper.doi and not paper.pdf_url
+                ]
                 try:
-                    merged = await asyncio.wait_for(
-                        self._enrich_unpaywall(client, merged), timeout=45.0
+                    await asyncio.wait_for(
+                        self._enrich_unpaywall(client, enrichment_candidates),
+                        timeout=20.0,
                     )
                 except asyncio.TimeoutError:
                     self.diagnostics.errors.append("unpaywall: timeout")
-                    self.diagnostics.source_counts["unpaywall_enriched"] = len(
-                        [paper for paper in merged if paper.access_type == AccessType.OPEN_ACCESS]
-                    )
-                    self._progress(
-                        stage="search_unpaywall_finished", status="finished",
-                        count=self.diagnostics.source_counts["unpaywall_enriched"],
-                    )
+                self.diagnostics.source_counts["unpaywall_checked"] = len(
+                    enrichment_candidates
+                )
+                self.diagnostics.source_counts["unpaywall_enriched"] = len(
+                    [
+                        paper for paper in enrichment_candidates
+                        if paper.access_type == AccessType.OPEN_ACCESS
+                    ]
+                )
+                self._progress(
+                    stage="search_unpaywall_finished", status="finished",
+                    count=self.diagnostics.source_counts["unpaywall_enriched"],
+                    checked=self.diagnostics.source_counts["unpaywall_checked"],
+                )
             merged = rank_papers(merged, request)
             merged = await self._apply_model_rerank(merged, request)
             self.diagnostics.ranking_counts["ranked_candidate_pool"] = len(merged)
@@ -313,7 +338,7 @@ class LiveSearchClient:
                 [paper for paper in merged if _context_relevance_score(request, paper) >= 0.45]
             )
             candidate_limit = min(
-                max(request.limit, request.min_relevant_results * 4),
+                max(_retrieval_limit(request), request.min_relevant_results * 2),
                 100,
             )
             self.diagnostics.ranking_counts["returned_candidate_limit"] = candidate_limit
@@ -331,7 +356,7 @@ class LiveSearchClient:
             return papers
         if not self.config.llm.enabled or not self.config.llm.api_key or len(papers) < 2:
             return papers
-        candidate_count = min(len(papers), max(request.limit, 10), 20)
+        candidate_count = min(len(papers), max(_retrieval_limit(request), 5), 20)
         candidates = papers[:candidate_count]
         records = [
             {
@@ -391,7 +416,7 @@ class LiveSearchClient:
     async def _search_europe_pmc(
         self, client: httpx.AsyncClient, request: PaperSearchRequest
     ) -> list[PaperMetadata]:
-        target = min(max(request.limit, 25), 200)
+        target = _source_limit(request, 25, 200)
         papers: list[PaperMetadata] = []
         cursor: str | None = "*"
         while cursor and len(papers) < target:
@@ -476,7 +501,7 @@ class LiveSearchClient:
         defensive: malformed entries are skipped individually so one record
         cannot make the whole source unavailable.
         """
-        target = min(max(request.limit, 25), 200)
+        target = _source_limit(request, 25, 200)
         response = await _get_with_retries(
             client,
             "https://export.arxiv.org/api/query",
@@ -542,7 +567,7 @@ class LiveSearchClient:
     async def _search_semantic_scholar(
         self, client: httpx.AsyncClient, request: PaperSearchRequest
     ) -> list[PaperMetadata]:
-        target = min(max(request.limit, 10), 100)
+        target = _source_limit(request, 10, 100)
         response = await _get_with_retries(
             client,
             "https://api.semanticscholar.org/graph/v1/paper/search",
@@ -584,7 +609,7 @@ class LiveSearchClient:
     async def _search_chemrxiv(
         self, client: httpx.AsyncClient, request: PaperSearchRequest
     ) -> list[PaperMetadata]:
-        target = min(max(request.limit, 10), 100)
+        target = _source_limit(request, 10, 100)
         response = await _get_with_retries(
             client,
             "https://api.crossref.org/works",
@@ -625,7 +650,7 @@ class LiveSearchClient:
     async def _search_core(
         self, client: httpx.AsyncClient, request: PaperSearchRequest
     ) -> list[PaperMetadata]:
-        target = min(max(request.limit, 25), 200)
+        target = _source_limit(request, 25, 200)
         response = await client.get(
             "https://api.core.ac.uk/v3/search/works",
             params={"q": request.topic, "limit": target, "offset": 0},
@@ -656,8 +681,8 @@ class LiveSearchClient:
         client: httpx.AsyncClient,
         request: PaperSearchRequest,
     ) -> list[PaperMetadata]:
-        per_page = 50
-        target = min(max(request.limit, 50), 200)
+        target = _source_limit(request, 50, 200)
+        per_page = min(50, target)
         params: dict[str, str | int] = {
             "search": request.topic,
             "per-page": per_page,
@@ -757,7 +782,8 @@ class LiveSearchClient:
         for index, params in enumerate(attempts, start=1):
             try:
                 items = await _crossref_items_paginated(
-                    client, params, request.limit, progress_callback=self._progress
+                    client, params, _source_limit(request, 25, 200),
+                    progress_callback=self._progress
                 )
             except httpx.HTTPError as exc:
                 self.diagnostics.errors.append(
@@ -934,15 +960,36 @@ def _variant_requests(request: PaperSearchRequest) -> list[PaperSearchRequest]:
     ]
 
 
+def _retrieval_limit(request: PaperSearchRequest) -> int:
+    return max(1, int(request.retrieval_limit or request.limit))
+
+
+def _source_limit(
+    request: PaperSearchRequest, legacy_floor: int, maximum: int
+) -> int:
+    if request.source_limit is not None:
+        return min(max(1, int(request.source_limit)), maximum)
+    return min(max(request.limit, legacy_floor), maximum)
+
+
 def _has_enough_relevant_results(
     papers: list[PaperMetadata],
     request: PaperSearchRequest,
 ) -> bool:
+    if request.retrieval_limit is None:
+        if len(papers) < request.min_relevant_results:
+            return False
+        if len(papers) >= request.limit:
+            return True
+        return len(papers) >= min(
+            request.limit, max(request.min_relevant_results * 4, 20)
+        )
+    target = _retrieval_limit(request)
     if len(papers) < request.min_relevant_results:
         return False
-    if len(papers) >= request.limit:
+    if len(papers) >= target:
         return True
-    if len(papers) >= min(request.limit, max(request.min_relevant_results * 4, 20)):
+    if len(papers) >= min(target, max(request.min_relevant_results * 2, 5)):
         return True
     return False
 
@@ -955,7 +1002,7 @@ def _crossref_params(
 ) -> dict[str, str | int]:
     return {
         query_key: query,
-        "rows": rows or min(max(request.limit, 10), 25),
+        "rows": rows or min(max(_source_limit(request, 10, 25), 1), 25),
         "sort": "relevance",
         "order": "desc",
     }
@@ -1027,8 +1074,8 @@ async def _crossref_items_paginated(
     limit: int,
     progress_callback: Callable[..., None] | None = None,
 ) -> list[dict]:
-    target = min(max(limit, 25), 200)
-    rows = min(int(params.get("rows", 25)), 50)
+    target = min(max(limit, 1), 200)
+    rows = min(int(params.get("rows", target)), 50)
     items: list[dict] = []
     for offset in range(0, target, rows):
         page = await _crossref_items(client, {**params, "rows": rows, "offset": offset})

@@ -416,6 +416,10 @@ class PaperSearchRequest(BaseModel):
     # payloads from pre-Round-17 callers didn't have the field).
     year_max: int | None = None
     limit: int = 40
+    # Candidate recall cap, separate from the final RAG-ready target.
+    retrieval_limit: int | None = None
+    # Per-source fetch cap. ``None`` preserves legacy adapter defaults.
+    source_limit: int | None = None
     min_relevant_results: int = 5
     wants_recent: bool = True
     live: bool | None = None

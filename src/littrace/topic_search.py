@@ -105,10 +105,13 @@ async def run_topic_search(
     # smaller than the requested RAG target. Source adapters cap each request
     # at 100; merging by paper_id keeps retries idempotent and avoids replacing
     # good candidates with a later, narrower response.
-    expansion_limit = min(100, max(request.limit * 2, requested_rag_ready * 5))
+    retrieval_limit = int(request.retrieval_limit or request.limit)
+    expansion_limit = min(100, max(retrieval_limit * 2, requested_rag_ready * 5))
     expansion_rounds = 0
     while len(search.result.papers) < requested_rag_ready and expansion_limit > request.limit:
-        expanded_request = request.model_copy(update={"limit": expansion_limit})
+        expanded_request = request.model_copy(
+            update={"limit": requested_rag_ready, "retrieval_limit": expansion_limit}
+        )
         if progress_callback is None:
             expanded = await search_papers_skill(expanded_request, config)
         else:
@@ -132,8 +135,8 @@ async def run_topic_search(
     # Source adapters may return a merged list larger than the requested
     # client-facing reserve. Keep only the ranked head for acquisition and
     # context accounting; the adapters already performed the broad recall.
-    if len(search.result.papers) > request.limit:
-        search.result.papers = search.result.papers[: request.limit]
+    if len(search.result.papers) > retrieval_limit:
+        search.result.papers = search.result.papers[:retrieval_limit]
     progress("search_finished", count=len(search.result.papers))
     # Search results are an incremental update. Preserve previously parsed
     # papers, pipeline statuses, and RAG metadata when the user repeats a
@@ -192,6 +195,26 @@ async def run_topic_search(
     download_config.paper_download.mode = DownloadMode.DOWNLOAD_SELECTED
     download_config.cdp_downloader.auto_launch_chrome = True
     download_config.cdp_downloader.headless = False
+    # Topic search is an automated bounded pipeline. Do not inherit the
+    # interactive login wait (five minutes by default) for every gated paper:
+    # one shared CDP tab serializes those waits and can otherwise stall a
+    # whole batch. Users can complete login in LitTrace Chrome beforehand and
+    # retry; an unresolved paper is then replaced from the reserve pool.
+    download_config.cdp_downloader.cloudflare_wait_seconds = min(
+        float(download_config.cdp_downloader.cloudflare_wait_seconds), 12.0
+    )
+    download_config.cdp_downloader.user_action_wait_seconds = min(
+        float(download_config.cdp_downloader.user_action_wait_seconds), 8.0
+    )
+    download_config.cdp_downloader.command_timeout_seconds = min(
+        float(download_config.cdp_downloader.command_timeout_seconds), 20.0
+    )
+    # Keep ordinary HTTP PDF resolution bounded as well. The global API
+    # timeout can be 60s for interactive calls; applying it to every paper in
+    # a topic batch would delay reserve-candidate substitution unnecessarily.
+    download_config.api.request_timeout_seconds = min(
+        float(download_config.api.request_timeout_seconds), 15.0
+    )
     candidate_ids = [paper.paper_id for paper in search.result.papers]
     attempted_ids: set[str] = set()
     ready_ids: list[str] = []
