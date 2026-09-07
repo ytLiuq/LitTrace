@@ -24,6 +24,7 @@ api:
   enable_europe_pmc: true
   enable_arxiv: true
   enable_semantic_query_planner: true
+  query_variant_limit: 3
 
 rag:
   enabled: true
@@ -97,6 +98,7 @@ llm:
   fallback_models:
     - "qwen3.7-plus"
     - "qwen3.8-flash"
+  rag_answer_model: "qwen3.7-plus"
 
 agent_runtime:
   mode: "codex_app_server"
@@ -107,8 +109,8 @@ agent_runtime:
   codex_home_mode: "shared"
   fallback_to_legacy: true
   startup_timeout_seconds: 30
-  request_timeout_seconds: 60
-  turn_timeout_seconds: 300
+  request_timeout_seconds: 180
+  turn_timeout_seconds: 600
   sandbox_policy: "read-only"
   rollout_enabled: true
   codex_config_overrides: {}

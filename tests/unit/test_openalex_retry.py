@@ -23,9 +23,19 @@ from littrace.config import APIConfig, LitTraceConfig
 from littrace.models import PaperMetadata, PaperSearchRequest
 from littrace.retrieval.search import (
     LiveSearchClient,
+    _arxiv_search_query,
     _has_enough_relevant_results,
     build_query_variants,
 )
+
+
+def test_arxiv_query_does_not_treat_boolean_operators_as_terms() -> None:
+    query = _arxiv_search_query(
+        "flexible pressure sensors OR flexible pressure sensing"
+    )
+
+    assert "all:OR" not in query
+    assert query == "all:flexible AND all:pressure AND all:sensors AND all:sensing"
 
 
 @pytest.mark.anyio

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 
 from pydantic import BaseModel, Field
 
@@ -51,27 +52,42 @@ async def plan_query_variants(
     cached = read_text_cache(config, "query-plans", cache_id)
     if cached:
         try:
-            return _normalize_plan(json.loads(cached), normalized, fallback)
+            return _normalize_plan(
+                json.loads(cached), normalized, fallback,
+                limit=getattr(config.api, "query_variant_limit", 3),
+            )
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
-    reply = await chat_completion(
-        config,
-        "你是学术检索查询规划器。只返回 JSON，不要解释。",
-        (
-            f"原始研究主题：{normalized}\n"
-            "请生成适合学术数据库检索的中英文 query_variants（最多 6 条）。"
-            "保留原始主题；英文变体只做忠实翻译、同义词和常见学术表达扩展，"
-            "不得凭空添加材料、机制、应用或年份。JSON 字段："
-            "canonical_topic（简短英文主题），query_variants（字符串数组）。"
-        ),
-        workspace=None,
-        json_mode=True,
-    )
+    try:
+        # Query planning is an enhancement, not a prerequisite. Bound this
+        # call so a slow model cannot hold the entire literature search open;
+        # deterministic bilingual variants remain a valid fallback.
+        reply = await asyncio.wait_for(
+            chat_completion(
+                config,
+                "你是学术检索查询规划器。只返回 JSON，不要解释。",
+                (
+                    f"原始研究主题：{normalized}\n"
+                    "请生成适合学术数据库检索的中英文 query_variants（最多 3 条）。"
+                    "保留原始主题；英文变体只做忠实翻译、同义词和常见学术表达扩展，"
+                    "不得凭空添加材料、机制、应用或年份。JSON 字段："
+                    "canonical_topic（简短英文主题），query_variants（字符串数组）。"
+                ),
+                workspace=None,
+                json_mode=True,
+            ),
+            timeout=min(float(config.llm.request_timeout_seconds), 8.0),
+        )
+    except asyncio.TimeoutError:
+        return fallback
     if not reply.used_llm or not reply.text.strip():
         return fallback
     try:
         payload = json.loads(_extract_json(reply.text))
-        plan = _normalize_plan(payload, normalized, fallback)
+        plan = _normalize_plan(
+            payload, normalized, fallback,
+            limit=getattr(config.api, "query_variant_limit", 3),
+        )
     except (TypeError, ValueError, json.JSONDecodeError):
         return fallback
     write_text_cache(
@@ -104,6 +120,8 @@ def _normalize_plan(
     payload: object,
     original: str,
     fallback: list[str],
+    *,
+    limit: int = 3,
 ) -> list[str]:
     if not isinstance(payload, dict):
         return fallback
@@ -114,7 +132,8 @@ def _normalize_plan(
         for value in values
         if isinstance(value, str) and value.strip()
     ]
-    return list(dict.fromkeys([original, *variants, *fallback]))[:6]
+    bounded_limit = max(1, min(6, int(limit)))
+    return list(dict.fromkeys([original, *variants, *fallback]))[:bounded_limit]
 
 
 def _extract_json(text: str) -> str:

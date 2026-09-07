@@ -22,7 +22,6 @@ from littrace.models import (
 from littrace.retrieval.adapters import SourceHealth, classify_source_exception
 from littrace.retry import retry_async, RetryConfig, BackoffStrategy
 from littrace.llm import chat_completion
-from littrace.retrieval.codex_reranker import rank_with_codex
 
 
 class PaperSearchClient(Protocol):
@@ -176,7 +175,9 @@ class LiveSearchClient:
         async with httpx.AsyncClient(
             timeout=timeout, headers=headers, follow_redirects=True
         ) as client:
-            for index, variant_request in enumerate(requests, start=1):
+            async def fetch_variant(
+                index: int, variant_request: PaperSearchRequest,
+            ) -> tuple[int, dict[str, list[PaperMetadata]]]:
                 self._progress(
                     stage="search_variant_started", status="running",
                     variant=index, query=variant_request.topic,
@@ -204,25 +205,38 @@ class LiveSearchClient:
                 source_results = await asyncio.wait_for(
                     _gather_named(sources, self.diagnostics), timeout=60.0
                 )
-                openalex_results.extend(source_results.get(f"openalex_variant_{index}", []))
-                crossref_results.extend(source_results.get(f"crossref_variant_{index}", []))
-                arxiv_results.extend(source_results.get(f"arxiv_variant_{index}", []))
-                extra_source_names = {
-                    name for name in sources
-                    if name not in {
-                        f"openalex_variant_{index}",
-                        f"crossref_variant_{index}",
-                        f"arxiv_variant_{index}",
-                    }
-                }
-                for source_name in extra_source_names:
-                    supplemental_results.extend(source_results.get(source_name, []))
                 for source_name, source_papers in source_results.items():
                     self.diagnostics.source_counts[source_name] = len(source_papers)
                     self._progress(
                         stage="search_source_finished", status="finished",
                         variant=index, source=source_name, count=len(source_papers),
                     )
+                return index, source_results
+
+            # Run the original and primary translated query together. Only run
+            # the optional third semantic expansion when that first batch does
+            # not yield enough context-ready candidates.
+            next_offset = 0
+            while next_offset < len(requests):
+                batch = list(enumerate(
+                    requests[next_offset:next_offset + 2], start=next_offset + 1
+                ))
+                fetched = await asyncio.gather(*(
+                    fetch_variant(index, variant_request)
+                    for index, variant_request in batch
+                ))
+                next_offset += len(batch)
+                for index, source_results in sorted(fetched):
+                    openalex_results.extend(source_results.get(f"openalex_variant_{index}", []))
+                    crossref_results.extend(source_results.get(f"crossref_variant_{index}", []))
+                    arxiv_results.extend(source_results.get(f"arxiv_variant_{index}", []))
+                    for source_name, source_papers in source_results.items():
+                        if source_name not in {
+                            f"openalex_variant_{index}",
+                            f"crossref_variant_{index}",
+                            f"arxiv_variant_{index}",
+                        }:
+                            supplemental_results.extend(source_papers)
                 all_results = [
                     *openalex_results,
                     *crossref_results,
@@ -241,23 +255,22 @@ class LiveSearchClient:
                     for paper in relevant_so_far
                     if _context_relevance_score(request, paper) >= 0.45
                 ]
-                self.diagnostics.ranking_counts[f"context_ready_after_variant_{index}"] = len(
+                last_index = fetched[-1][0]
+                self.diagnostics.ranking_counts[f"context_ready_after_variant_{last_index}"] = len(
                     context_ready_so_far
                 )
-                self.diagnostics.filtered_counts[f"after_variant_{index}"] = len(all_results) - len(relevant_so_far)
-                self.diagnostics.source_counts[f"relevant_after_variant_{index}"] = len(
+                self.diagnostics.filtered_counts[f"after_variant_{last_index}"] = len(all_results) - len(relevant_so_far)
+                self.diagnostics.source_counts[f"relevant_after_variant_{last_index}"] = len(
                     relevant_so_far
                 )
-                if _has_enough_relevant_results(context_ready_so_far, request):
+                enough = _has_enough_relevant_results(context_ready_so_far, request)
+                for index, _source_results in fetched:
                     self._progress(
                         stage="search_variant_finished", status="finished",
-                        variant=index, count=len(context_ready_so_far), early_stop=True,
+                        variant=index, count=len(context_ready_so_far), early_stop=enough,
                     )
+                if enough:
                     break
-                self._progress(
-                    stage="search_variant_finished", status="finished",
-                    variant=index, count=len(context_ready_so_far), early_stop=False,
-                )
 
             self.diagnostics.source_counts["openalex"] = len(openalex_results)
             self.diagnostics.source_counts["crossref"] = len(crossref_results)
@@ -318,7 +331,8 @@ class LiveSearchClient:
             return papers
         if not self.config.llm.enabled or not self.config.llm.api_key or len(papers) < 2:
             return papers
-        candidates = papers[:30]
+        candidate_count = min(len(papers), max(request.limit, 10), 20)
+        candidates = papers[:candidate_count]
         records = [
             {
                 "index": index,
@@ -328,21 +342,6 @@ class LiveSearchClient:
             }
             for index, paper in enumerate(candidates)
         ]
-        codex_scores = await rank_with_codex(self.config, request.topic, records)
-        if codex_scores:
-            for index, paper in enumerate(candidates):
-                if index in codex_scores:
-                    paper.relevance_score = round(
-                        0.65 * (paper.relevance_score or 0.0) + 0.35 * codex_scores[index],
-                        6,
-                    )
-            self.diagnostics.ranking_counts["codex_model_reranked_count"] = len(codex_scores)
-            reranked = sorted(
-                candidates,
-                key=lambda paper: (paper.relevance_score or 0.0, paper.year or 0),
-                reverse=True,
-            )
-            return [*reranked, *papers[30:]]
         try:
             reply = await asyncio.wait_for(
                 chat_completion(
@@ -354,7 +353,7 @@ class LiveSearchClient:
                     json.dumps({"topic": request.topic, "papers": records}, ensure_ascii=False),
                     json_mode=True,
                 ),
-                timeout=min(self.config.llm.request_timeout_seconds, 45.0),
+                timeout=min(self.config.llm.request_timeout_seconds, 25.0),
             )
             payload = json.loads(reply.text) if reply.used_llm else {}
             if isinstance(payload, dict):
@@ -384,7 +383,7 @@ class LiveSearchClient:
                 reverse=True,
             )
             self.diagnostics.ranking_counts["model_reranked_count"] = len(score_map)
-            return [*reranked, *papers[30:]]
+            return [*reranked, *papers[candidate_count:]]
         except (TimeoutError, ValueError, TypeError, json.JSONDecodeError) as exc:
             self.diagnostics.errors.append(f"model_rerank:{exc.__class__.__name__}: {exc}")
             return papers
@@ -1000,7 +999,10 @@ def _arxiv_search_query(topic: str) -> str:
     source useful precision while preserving a single-term/CJK query.
     """
     terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9-]*|[\u4e00-\u9fff]+", topic or "")
-    terms = list(dict.fromkeys(term for term in terms if term.strip()))
+    terms = list(dict.fromkeys(
+        term for term in terms
+        if term.strip() and term.upper() not in {"AND", "OR", "NOT"}
+    ))
     if not terms:
         return f"all:{topic.strip()}"
     if len(terms) == 1:

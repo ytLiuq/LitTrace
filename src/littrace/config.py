@@ -193,6 +193,7 @@ class APIConfig(BaseModel):
     enable_chemrxiv: bool = True
     enable_semantic_query_planner: bool = True
     enable_model_rerank: bool = True
+    query_variant_limit: int = Field(default=3, ge=1, le=6)
     request_timeout_seconds: float = 20.0
     enable_live_search: bool = False
 
@@ -257,6 +258,7 @@ class LLMConfig(BaseModel):
     fallback_api_key: str | None = None
     fallback_base_url: str | None = None
     fallback_model: str | None = None
+    rag_answer_model: str | None = None
     request_timeout_seconds: float = 60.0
     metric_extraction_timeout_seconds: float = 150.0
     temperature: float = 0.2
@@ -320,8 +322,8 @@ class AgentRuntimeConfig(BaseModel):
     codex_home: Path = Path("./data/codex-home")
     scratch_root: Path = Path("./data/codex-runtime")
     startup_timeout_seconds: float = 20.0
-    request_timeout_seconds: float = 60.0
-    turn_timeout_seconds: float = 300.0
+    request_timeout_seconds: float = 180.0
+    turn_timeout_seconds: float = 600.0
     fallback_to_legacy: bool = True
     mcp_server_name: str = "littrace"
     sandbox_policy: SandboxPolicy = SandboxPolicy.READ_ONLY
@@ -702,6 +704,12 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
         os.environ.get("LITTRACE_SEMANTIC_SCHOLAR_API_KEY")
         or config.api.semantic_scholar_api_key
     )
+    query_variant_limit = os.environ.get("LITTRACE_QUERY_VARIANT_LIMIT")
+    if query_variant_limit:
+        try:
+            config.api.query_variant_limit = int(query_variant_limit)
+        except ValueError:
+            pass
     config.browser.browser_act_path = (
         os.environ.get("LITTRACE_BROWSER_ACT_PATH") or config.browser.browser_act_path
     )
@@ -754,6 +762,9 @@ def _with_env_overrides(config: LitTraceConfig) -> LitTraceConfig:
     )
     config.llm.fallback_model = (
         os.environ.get("LITTRACE_FALLBACK_LLM_MODEL") or config.llm.fallback_model
+    )
+    config.llm.rag_answer_model = (
+        os.environ.get("LITTRACE_RAG_ANSWER_MODEL") or config.llm.rag_answer_model
     )
     config.figure_enrichment.base_url = (
         os.environ.get("LITTRACE_FIGURE_ENRICHMENT_BASE_URL")
