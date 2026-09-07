@@ -477,15 +477,43 @@ async def _execute_cdp_download_async(
     hand. Reusing the tab keeps Chrome's tab bar clean and cuts
     the per-paper CDP connection setup cost.
     """
-    return await asyncio.to_thread(
-        _execute_cdp_download,
-        config,
-        paper,
-        dry_run,
-        task,
-        prior_error=prior_error,
-        browser=browser,
+    # The CDP implementation is synchronous and runs in a worker thread.
+    # A thread cancellation alone does not bound the await, so a stalled
+    # publisher page could block the whole topic-search wave indefinitely.
+    # Bound the coroutine; the worker thread may finish later, but the caller
+    # gets a terminal failure and can continue with the next reserve candidate.
+    timeout = max(
+        30.0,
+        float(config.cdp_downloader.command_timeout_seconds)
+        + float(config.cdp_downloader.cloudflare_wait_seconds)
+        + float(config.cdp_downloader.user_action_wait_seconds)
+        + 10.0,
     )
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _execute_cdp_download,
+                config,
+                paper,
+                dry_run,
+                task,
+                prior_error=prior_error,
+                browser=browser,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        error = f"CDP download timed out after {timeout:.0f}s"
+        task.mark(DownloadTaskStatus.FAILED, error=error)
+        task.schedule_retry(config.download_retry.base_delay_seconds)
+        return DownloadExecutionItem(
+            paper_id=paper.paper_id,
+            action="cdp_publisher_download",
+            status="failed",
+            target_path=str(target_pdf_path(config, paper)),
+            task_id=task.task_id,
+            error=error,
+        ), task
 
 
 # _target_pdf_path internal alias removed; callers use
