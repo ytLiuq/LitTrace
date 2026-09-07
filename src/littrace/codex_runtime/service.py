@@ -68,6 +68,14 @@ evidence and paper identifiers in answers when available.
 If a tool returns a successful 200 response, treat that as the authoritative
 result — do not reinterpret the reply as "rejected" or "denied" because the
 workspace happens to be empty.
+
+RESPONSE STYLE:
+- Do not expose internal reasoning, tool deliberation, or progress narration.
+- Answer with the minimum evidence-backed result needed by the user.
+- For literature summaries, use at most four short sections: objective,
+  method/materials, key results, and limitations.
+- Keep normal answers under roughly 1200 Chinese characters unless the user
+  explicitly asks for a detailed report.
 """
 
 

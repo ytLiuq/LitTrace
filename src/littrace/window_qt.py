@@ -1341,6 +1341,9 @@ class ChatPanel(QtWidgets.QFrame):
         """
         body = _strip_leading_narration(_render_message_html(text))
         body = _strip_trailing_narration(body)
+        scrollbar = self._view.verticalScrollBar()
+        previous_scroll = scrollbar.value()
+        follow_tail = self._should_follow_tail()
         if role == "user":
             bubble_color = "#95EC69"
             text_color = "#182018"
@@ -1391,8 +1394,10 @@ class ChatPanel(QtWidgets.QFrame):
         # nothing scrolls). Set the vertical scroll bar to its
         # maximum directly so the new bubble always appears at the
         # bottom of the scrollback.
-        sb = self._view.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        if follow_tail:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(min(previous_scroll, scrollbar.maximum()))
 
     def _on_chat_context_menu(self, pos: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
@@ -1411,6 +1416,14 @@ class ChatPanel(QtWidgets.QFrame):
         # right-click "清屏" menu item and the session switch path
         # both go through here.
         self._view.clear()
+        self._streaming_anchor = None
+
+    def _should_follow_tail(self) -> bool:
+        scrollbar = self._view.verticalScrollBar()
+        return scrollbar.value() >= scrollbar.maximum() - 12
+
+    def abort_streaming(self) -> None:
+        """Close the logical stream while preserving already-rendered text."""
         self._streaming_anchor = None
 
     # ---- Streaming bubble -----------------------------------------------
@@ -1481,13 +1494,18 @@ class ChatPanel(QtWidgets.QFrame):
         anchor = getattr(self, "_streaming_anchor", None)
         if anchor is None:
             return
+        scrollbar = self._view.verticalScrollBar()
+        previous_scroll = scrollbar.value()
+        follow_tail = self._should_follow_tail()
         cursor = self._view.textCursor()
         cursor.setPosition(anchor)
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.EndOfBlock)
         cursor.insertText(delta)
         self._view.setTextCursor(cursor)
-        sb = self._view.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        if follow_tail:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(min(previous_scroll, scrollbar.maximum()))
 
     def finalize_streaming(self, full_text: str = "") -> None:
         """Close the streaming bubble.
@@ -5618,6 +5636,8 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         #   * [查看技术细节]   pops the raw stack trace
         #   * For ``unauthorized`` errors, also surface [🔑 重新登录]
         #     so the user doesn't have to hunt for the login button.
+        if body.get("partial_output"):
+            self._chat_panel.abort_streaming()
         message = body.get("message", "对话出错")
         suggestion = body.get("suggestion", "")
         error_code = body.get("error_code", "other")
