@@ -84,6 +84,24 @@ def _legacy_model_display(config: LitTraceConfig) -> str:
     return primary
 
 
+def _is_read_only_context_question(text: str) -> bool:
+    normalized = " ".join((text or "").lower().split())
+    if not normalized:
+        return False
+    mutation_markers = (
+        "检索", "搜索", "下载", "解析", "入库", "添加", "删除", "生成文档",
+        "写论文", "导出", "pin", "unpin", "search", "download", "parse",
+    )
+    if any(marker in normalized for marker in mutation_markers):
+        return False
+    question_markers = (
+        "总结", "概括", "比较", "对比", "方法", "结果", "局限", "材料",
+        "结构", "性能", "为什么", "如何", "是什么", "文献", "论文",
+        "summarize", "compare", "method", "result", "limitation", "paper",
+    )
+    return any(marker in normalized for marker in question_markers)
+
+
 @dataclass(frozen=True)
 class ShellEvent:
     """Immutable event payload broadcast on the ``ShellEventBus``."""
@@ -649,6 +667,20 @@ class ShellController:
                     pass
 
     async def _drive_chat_turn(self, text: str, *, silent: bool) -> None:
+        # Read-only questions over an existing RAG context bypass Codex startup
+        # and generic intent parsing entirely.
+        fast_reply = await self._try_fast_rag_answer(text)
+        if fast_reply is not None:
+            if not silent:
+                self._emit(
+                    self.EVENT_MESSAGE_APPENDED,
+                    role="assistant",
+                    text=fast_reply,
+                    action="fast_rag_answer",
+                )
+            self._emit(self.EVENT_THINKING, active=False)
+            self._emit(self.EVENT_STATUS_CHANGED, text="就绪")
+            return
         # Wait for ``_prime_service`` to finish (or skip) before
         # touching the service — otherwise a user turn that races
         # the background warm-up can land on a not-yet-ready client
@@ -698,6 +730,7 @@ class ShellController:
 
         try:
             self._emit(self.EVENT_THINKING, active=True, label="调用 Codex / 模型…")
+            stream_open_emitted = False
             if service is not None:
                 # Round 17: stream assistant deltas so the chat bubble
                 # fills token-by-token instead of waiting for the full
@@ -714,8 +747,6 @@ class ShellController:
                 # first delta so the shell can open a bubble with the
                 # cursor pinned to its end; ``append_delta`` is a
                 # no-op until that fires.
-                stream_open_emitted = False
-
                 def _on_delta(delta: str) -> None:
                     nonlocal stream_open_emitted
                     if not stream_open_emitted:
@@ -748,6 +779,7 @@ class ShellController:
             if (
                 service is not None
                 and self._config.agent_runtime.fallback_to_legacy
+                and not stream_open_emitted
             ):
                 self._emit(
                     self.EVENT_THINKING,
@@ -785,6 +817,21 @@ class ShellController:
                         text="就绪" if not silent else "已就绪",
                     )
                     return
+            if service is not None and stream_open_emitted:
+                # Do not replace an already visible Codex answer with a fresh
+                # legacy answer after a timeout or transport failure. Preserve
+                # the partial stream and let the UI offer an explicit retry.
+                self._emit(
+                    self.EVENT_ERROR,
+                    error_code="codex_partial_output",
+                    message="Codex 输出中断，已保留已生成内容",
+                    suggestion="请点击“重试”重新生成完整回答。",
+                    raw=f"{type(exc).__name__}: {exc}",
+                    partial_output=True,
+                )
+                self._emit(self.EVENT_THINKING, active=False)
+                self._emit(self.EVENT_STATUS_CHANGED, text="Codex 输出中断")
+                return
             # Round 17: classify the failure before forwarding it
             # to the shell. ``codex_runtime.errors`` already maps
             # transport failures to ``CodexErrorCode`` enums; we
@@ -814,6 +861,77 @@ class ShellController:
             self._emit(self.EVENT_WORKSPACE_REFRESHED)
         self._emit(self.EVENT_THINKING, active=False)
         self._emit(self.EVENT_STATUS_CHANGED, text="就绪" if not silent else "已就绪")
+
+    async def _try_fast_rag_answer(self, question: str) -> str | None:
+        filters = self._workspace.context.filters
+        if (
+            not _is_read_only_context_question(question)
+            or int(getattr(filters, "rag_ready_count", 0) or 0) < 1
+            or not getattr(filters, "rag_profile", None)
+        ):
+            return None
+        try:
+            from littrace.cache import cache_key, read_text_cache, write_text_cache
+            from littrace.llm import chat_completion
+            from littrace.retrieval.rag_search import search_workspace_rag
+
+            answer_config = self._config.model_copy(deep=True)
+            answer_model = (
+                answer_config.llm.rag_answer_model
+                or (answer_config.llm.fallback_models[0] if answer_config.llm.fallback_models else None)
+                or answer_config.llm.model
+            )
+            answer_config.llm.model = answer_model
+            answer_config.llm.fallback_models = [
+                model for model in answer_config.llm.fallback_models
+                if model != answer_model
+            ]
+            answer_cache_id = cache_key(
+                "rag-answer-v1\n"
+                f"{self._session.session_id}\n{answer_model}\n"
+                f"{getattr(filters, 'rag_last_refreshed_at', None)}\n"
+                f"{getattr(filters, 'rag_chunk_count', 0)}\n{question.strip()}"
+            )
+            cached_answer = read_text_cache(
+                answer_config, "rag-answers", answer_cache_id
+            )
+            if cached_answer:
+                return cached_answer
+            self._emit(
+                self.EVENT_THINKING,
+                active=True,
+                label=f"正在用 {answer_model} 查询文献证据…",
+            )
+            rag_result = await search_workspace_rag(
+                answer_config, self._workspace, question, top_k=5
+            )
+            if rag_result is None or not rag_result.hits:
+                return None
+            evidence_blocks: list[str] = []
+            for index, hit in enumerate(rag_result.hits, start=1):
+                paper = self._workspace.papers.get(hit.paper_id)
+                title = paper.title if paper is not None else hit.paper_id
+                evidence_blocks.append(
+                    f"[{index}] {title}\nsection={hit.section or '-'} page={hit.page or '-'}\n{hit.text[:900]}"
+                )
+            reply = await chat_completion(
+                answer_config,
+                (
+                    "你是学术文献问答助手。只能依据给定 RAG 证据回答，不得补充外部事实。"
+                    "回答简洁、结构化；若证据不足请明确说明。文献总结最多使用研究目标、"
+                    "器件/材料结构、关键结果、局限四个小节，并引用证据编号。"
+                ),
+                f"问题：{question}\n\nRAG 证据：\n" + "\n\n".join(evidence_blocks),
+            )
+            if reply.used_llm and reply.text.strip():
+                answer = reply.text.strip()
+                write_text_cache(
+                    answer_config, "rag-answers", answer_cache_id, answer
+                )
+                return answer
+        except Exception:
+            return None
+        return None
 
     # ------------------------------------------------------------------
     # Refresh hooks (mirrors Tk shell's refresh_* methods)

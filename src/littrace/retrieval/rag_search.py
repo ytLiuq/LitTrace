@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
 from littrace.models import EvidenceSpan, EvidenceSourceKind
 
+from littrace.cache import cache_key, read_text_cache, write_text_cache
 from littrace.config import LitTraceConfig
 from littrace.retrieval.embeddings import embedding_client_from_config
 from littrace.retrieval.pgvector_store import PgvectorRagStore, RagSearchHit
@@ -32,10 +34,30 @@ async def search_session_rag(
         return None
     if not question.strip():
         return RagSearchResult(profile=profile, hits=[])
+    effective_top_k = top_k or profile.top_k
+    cache_id = cache_key(
+        "rag-query-v1\n"
+        f"{profile.profile_id}\n{profile.embedding_model}\n"
+        f"{effective_top_k}\n{question.strip()}"
+    )
+    cached = read_text_cache(config, "rag-queries", cache_id)
+    if cached:
+        try:
+            raw_hits = json.loads(cached)
+            hits = [RagSearchHit.model_validate(item) for item in raw_hits]
+            return RagSearchResult(profile=profile, hits=hits)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
     embedding_client = embedding_client_from_config(config, profile)
     embedding = await embedding_client.embed_texts([question.strip()])
     store = PgvectorRagStore(config, profile)
-    hits = store.query_chunks(embedding[0], top_k=top_k or profile.top_k)
+    hits = store.query_chunks(embedding[0], top_k=effective_top_k)
+    write_text_cache(
+        config,
+        "rag-queries",
+        cache_id,
+        json.dumps([hit.model_dump(mode="json") for hit in hits], ensure_ascii=False),
+    )
     return RagSearchResult(profile=profile, hits=hits)
 
 

@@ -21,6 +21,7 @@ from littrace.shell_controller import (
     ShellController,
     ShellEvent,
     _legacy_model_display,
+    _is_read_only_context_question,
     _decode_jwt_exp,
     _classify_chat_error,
     _CHAT_ERROR_MESSAGES,
@@ -36,6 +37,11 @@ from littrace.codex_runtime.errors import (
 )
 from littrace.models import LiteratureWorkspace
 from littrace.session import ChatSession
+
+
+def test_read_only_literature_questions_use_fast_rag_route() -> None:
+    assert _is_read_only_context_question("请总结这篇文献的方法和局限")
+    assert not _is_read_only_context_question("请下载并解析这篇文献")
 
 
 # ---------------------------------------------------------------------------
