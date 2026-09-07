@@ -25,6 +25,7 @@ from littrace.retrieval.search import (
     LiveSearchClient,
     _arxiv_search_query,
     _has_enough_relevant_results,
+    _source_limit,
     build_query_variants,
 )
 
@@ -36,6 +37,13 @@ def test_arxiv_query_does_not_treat_boolean_operators_as_terms() -> None:
 
     assert "all:OR" not in query
     assert query == "all:flexible AND all:pressure AND all:sensors AND all:sensing"
+
+
+def test_explicit_source_limit_overrides_legacy_fetch_floor() -> None:
+    request = PaperSearchRequest(
+        topic="pressure sensor", limit=1, retrieval_limit=2, source_limit=3
+    )
+    assert _source_limit(request, 25, 200) == 3
 
 
 @pytest.mark.anyio
