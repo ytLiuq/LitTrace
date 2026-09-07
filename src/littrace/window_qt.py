@@ -614,6 +614,8 @@ class TracePanel(QtWidgets.QFrame):
         self._view.setOpenExternalLinks(False)
         self._workflow_body.layout().addWidget(self._view)
         self._trace_lines: list[str] = []
+        self._trace_run_id: str | None = None
+        self._trace_stage_rank = -1
 
         # Section 2: session history.
         self._sessions_toggle, self._sessions_body = self._build_collapsible(
@@ -699,17 +701,36 @@ class TracePanel(QtWidgets.QFrame):
 
     def render_workflow_trace(self, trace_steps: Iterable[str]) -> None:
         self._trace_lines = [str(step) for step in trace_steps]
+        self._trace_stage_rank = -1
         self._render_trace()
 
     def render_trace_progress(self, payload: dict[str, object]) -> None:
         """Append a concise, human-readable live pipeline update."""
+        run_id = str(payload.get("run_id") or "")
+        if run_id and run_id != self._trace_run_id:
+            self._trace_run_id = run_id
+            self._trace_lines = []
+            self._trace_stage_rank = -1
         stage = str(payload.get("stage", ""))
+        ranks = {
+            "search_started": 0, "search_variant_started": 0,
+            "search_source_page": 0, "search_source_finished": 0,
+            "search_variant_finished": 0, "candidate_expansion": 0,
+            "search_finished": 1, "search_unpaywall_finished": 1,
+            "download_finished": 2, "download_retry_finished": 2,
+            "parse_finished": 3, "parse_retry_finished": 3,
+            "rag_finished": 4, "rag_retry_finished": 4,
+            "status_message": 5,
+        }
+        rank = ranks.get(stage, self._trace_stage_rank)
+        if rank < self._trace_stage_rank:
+            return
         labels = {
             "search_started": "开始检索",
             "search_variant_started": "检索查询变体",
-            "search_source_finished": "检索源完成",
-            "search_source_page": "检索源分页完成",
-            "candidate_expansion": "候选池扩展",
+            "search_source_finished": "检索中",
+            "search_source_page": "检索中",
+            "candidate_expansion": "候选池扩展中",
             "search_finished": "检索完成",
             "download_finished": "下载阶段完成",
             "download_retry_finished": "下载重试完成",
@@ -729,9 +750,17 @@ class TracePanel(QtWidgets.QFrame):
         for key, name in (("downloaded", "下载"), ("parsed", "解析"), ("ready", "RAG"), ("failed", "失败"), ("requires_login", "待登录")):
             if key in payload:
                 details.append(f"{name} {payload[key]}")
-        line = label + (" · " + " · ".join(details) if details else "")
-        self._trace_lines.append(line)
-        self._trace_lines = self._trace_lines[-80:]
+        if stage in {"search_started", "search_variant_started", "search_source_page", "search_source_finished", "search_variant_finished"}:
+            line = "检索中 · 多源并行"
+        else:
+            line = label + (" · " + " · ".join(details) if details else "")
+        previous_rank = self._trace_stage_rank
+        self._trace_stage_rank = rank
+        if self._trace_lines and rank == previous_rank:
+            self._trace_lines[-1] = line
+        else:
+            self._trace_lines.append(line)
+        self._trace_lines = self._trace_lines[-20:]
         self._render_trace()
 
     def _render_trace(self) -> None:
@@ -2427,11 +2456,27 @@ class DailyConfigDialog(QtWidgets.QDialog):
         # they typed. We do that by accepting the dialog and storing
         # the chosen values back through the parent (``_on_run_daily``
         # reads them). The parent then launches the browser.
-        self._validate_and_accept()
-        if self.result() == QtWidgets.QDialog.DialogCode.Accepted:
-            # Mark "open publisher login" intent on the parent so it
-            # knows to launch the browser after the dialog returns.
-            self._open_login_after = True
+        topic = self._topic_input.text().strip()
+        if not topic:
+            self._error_label.setText("研究主题不能为空")
+            return
+        if self._year_min_input.value() > self._year_max_input.value():
+            self._error_label.setText("开始年份不能晚于结束年份")
+            return
+        # Set the intent before emitting ``accepted``. Qt invokes the
+        # parent's connected slot synchronously during ``accept()``, so
+        # assigning it afterwards loses the login request.
+        self._open_login_after = True
+        self._persist_settings()
+        self.accept()
+
+    def _persist_settings(self) -> None:
+        self._settings.setValue("daily/topic", self._topic_input.text().strip())
+        self._settings.setValue("daily/keywords", self._keywords_input.text().strip())
+        self._settings.setValue("daily/year_min", self._year_min_input.value())
+        self._settings.setValue("daily/year_max", self._year_max_input.value())
+        self._settings.setValue("daily/min_papers", self._min_papers_input.value())
+        self._settings.sync()
 
     def _validate_and_accept(self) -> None:
         topic = self._topic_input.text().strip()
@@ -2445,12 +2490,7 @@ class DailyConfigDialog(QtWidgets.QDialog):
         # dialog open pre-fills with the same values. ``sync()``
         # flushes the in-memory cache to disk immediately so a
         # crash doesn't lose the just-accepted values.
-        self._settings.setValue("daily/topic", topic)
-        self._settings.setValue("daily/keywords", self._keywords_input.text().strip())
-        self._settings.setValue("daily/year_min", self._year_min_input.value())
-        self._settings.setValue("daily/year_max", self._year_max_input.value())
-        self._settings.setValue("daily/min_papers", self._min_papers_input.value())
-        self._settings.sync()
+        self._persist_settings()
         self.accept()
 
     def open_login_after(self) -> bool:
@@ -4038,6 +4078,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
     def __init__(self, controller: ShellController) -> None:
         super().__init__()
         self._controller = controller
+        self._cleanup_done = False
 
         self.setWindowTitle("LitTrace")
         self.resize(1280, 820)
@@ -4748,7 +4789,6 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         self._context_panel.refresh(self._visible_context_papers())
-        self._chat_panel.clear()
         self._trace_panel.render_workflow_trace(["已切换 Session", session_id])
 
     def _visible_context_papers(self) -> list[PaperMetadata]:
@@ -5537,8 +5577,51 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
                 self._controller.EVENT_SLASH_RESULT: self._on_slash_result_event,
                 self._controller.EVENT_RAG_PANEL_REFRESHED: self._on_rag_panel_event,
                 self._controller.EVENT_TRACE_PROGRESS: self._on_trace_progress_event,
+                self._controller.EVENT_SESSION_HISTORY_REFRESHED: self._on_session_history_refreshed,
             },
         )
+
+    @staticmethod
+    def _history_message_text(message: dict[str, object]) -> str:
+        """Extract the user-visible text from persisted ChatRequest/Response JSON."""
+        text = message.get("content_text")
+        payload = message.get("content_json")
+        if isinstance(payload, dict):
+            for key in ("message", "reply", "text"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+        if isinstance(text, str):
+            stripped = text.strip()
+            if stripped.startswith("{"):
+                try:
+                    decoded = json.loads(stripped)
+                except Exception:
+                    decoded = None
+                if isinstance(decoded, dict):
+                    for key in ("message", "reply", "text"):
+                        value = decoded.get(key)
+                        if isinstance(value, str) and value.strip():
+                            return value
+            return text
+        return ""
+
+    def _on_session_history_refreshed(self, _body: dict | None = None) -> None:
+        """Reload persisted chat history after startup or Session switch."""
+        if getattr(self, "_cleanup_done", False):
+            return
+        self._chat_panel.clear()
+        try:
+            messages = self._controller.list_chat_messages()
+        except Exception:
+            messages = []
+        for message in messages:
+            role = str(message.get("role") or "system")
+            if role not in {"user", "assistant", "system"}:
+                role = "system"
+            text = self._history_message_text(message)
+            if text:
+                self._chat_panel.append_message(role, text)
 
     def _on_message_event(self, body: dict) -> None:
         # Round 17: routed through ``EventBridge`` so the
@@ -5608,11 +5691,6 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
     def _on_workspace_event(self, body: dict) -> None:
         papers = self._visible_context_papers()
         self._context_panel.refresh(papers)
-        filters = self._controller.workspace.context.filters
-        ready = int(getattr(filters, "rag_ready_count", 0) or 0)
-        self._trace_panel.render_workflow_trace(
-            [f"工作区已刷新 · 当前上下文 {len(papers)} 篇 · RAG ready {ready} 篇"]
-        )
 
     def _on_trace_progress_event(self, body: dict) -> None:
         self._trace_panel.render_trace_progress(body)
@@ -5908,6 +5986,7 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
 
     def _refresh_initial_state(self) -> None:
         self._context_panel.refresh(self._visible_context_papers())
+        self._on_session_history_refreshed({})
         self._trace_panel.render_workflow_trace(["等待任务…"])
         try:
             sessions = list_chat_sessions(self._controller.config)
@@ -5930,6 +6009,45 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
             QtCore.QTimer.singleShot(
                 400, lambda: self._show_welcome_banner(marker)
             )
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        """Stop all background work before Qt tears down child widgets."""
+        if self._cleanup_done:
+            event.accept()
+            return
+        self._cleanup_done = True
+        cancel = getattr(self, "_daily_cancel_event", None)
+        if cancel is not None:
+            cancel.set()
+        for attr in (
+            "_cf_poll_timer", "_rag_tick_timer", "_workspace_sync_timer",
+            "_login_poll_timer", "_login_heartbeat_timer",
+        ):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+        proc = getattr(self, "_sentinel_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            self._release_external_chrome_for_sentinel()
+        except Exception:
+            pass
+        try:
+            self._controller.stop()
+        except Exception:
+            pass
+        event.accept()
 
     def _show_welcome_banner(self, marker_path: "Path") -> None:
         dialog = QtWidgets.QDialog(self)

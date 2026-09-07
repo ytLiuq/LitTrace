@@ -19,6 +19,7 @@ import json
 import os
 import threading
 import time
+from uuid import uuid4
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -232,6 +233,7 @@ class ShellController:
         # downgrades to the legacy ``handle_agent_chat`` path.
         self._service_ready = threading.Event()
         self._chat_future: Future | None = None
+        self._topic_search_future: Future | None = None
         # Round 17: throttle auth re-checks so the shell's "Re-check"
         # button doesn't hammer the auth.json file on every click.
         # The last-check timestamp is recorded here; the controller
@@ -397,14 +399,49 @@ class ShellController:
             pass
 
     def stop(self) -> None:
-        if self._loop is None:
-            return
+        """Stop the worker loop and release the shared Codex runtime.
+
+        This method is intentionally idempotent because both the Qt close
+        event and process shutdown hooks can reach it.  Runtime managers are
+        shared across controller instances, so they must be closed even when
+        this controller never started its event loop.
+        """
         future = self._chat_future
-        if future is not None and not future.done():
-            future.cancel()
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._loop_thread is not None:
-            self._loop_thread.join(timeout=2.0)
+        topic_future = self._topic_search_future
+        loop = self._loop
+        if loop is not None:
+            if future is not None and not future.done():
+                future.cancel()
+            if topic_future is not None and not topic_future.done():
+                topic_future.cancel()
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+            if self._loop_thread is not None and self._loop_thread is not threading.current_thread():
+                self._loop_thread.join(timeout=2.0)
+        self._loop = None
+        self._loop_thread = None
+        self._chat_future = None
+        self._topic_search_future = None
+        try:
+            from littrace.codex_runtime.runtime import shutdown_runtime_managers
+
+            shutdown_runtime_managers()
+        except Exception:
+            pass
+
+    def list_chat_messages(self, session_id: str | None = None) -> list[dict[str, object]]:
+        """Return persisted chat messages for the active (or given) session."""
+        from littrace.state_db import state_store_from_config
+
+        target_id = session_id or self._session.session_id
+        try:
+            return state_store_from_config(self._config).list_chat_messages(target_id)
+        except Exception:
+            # History restoration must never make the shell unusable when the
+            # metadata database is temporarily unavailable.
+            return []
 
     # ------------------------------------------------------------------
     # Auth (Round 17)
@@ -989,7 +1026,11 @@ class ShellController:
         if self._loop is None:
             self._emit(self.EVENT_ERROR, message="controller event loop not ready")
             return
-        asyncio.run_coroutine_threadsafe(
+        if self._topic_search_future is not None and not self._topic_search_future.done():
+            self._emit(self.EVENT_STATUS_CHANGED, text="已有主题检索正在运行")
+            return
+        run_id = uuid4().hex[:12]
+        self._topic_search_future = asyncio.run_coroutine_threadsafe(
             self._run_topic_search(
                 query,
                 canonical_topic=topic,
@@ -997,6 +1038,7 @@ class ShellController:
                 year_min=year_min,
                 year_max=year_max,
                 requested_rag_ready=max(1, int(requested_rag_ready)),
+                run_id=run_id,
             ),
             self._loop,
         )
@@ -1010,12 +1052,16 @@ class ShellController:
         year_min: int | None,
         year_max: int | None,
         requested_rag_ready: int,
+        run_id: str,
     ) -> None:
         from littrace.models import PaperSearchRequest
         from littrace.topic_search import run_topic_search
 
         def on_progress(payload: dict[str, object]) -> None:
-            self._emit(self.EVENT_TRACE_PROGRESS, **payload)
+            self._emit(self.EVENT_TRACE_PROGRESS, run_id=run_id, **payload)
+
+        retrieval_limit = min(30, max(requested_rag_ready * 2, 2))
+        source_limit = min(12, max(requested_rag_ready * 2, 3))
 
         request = PaperSearchRequest(
             topic=query,
@@ -1024,7 +1070,10 @@ class ShellController:
             # Keep a small ranked reserve for failed downloads without turning
             # every candidate into work. Acquisition is staged by
             # ``run_topic_search`` and stops as soon as the RAG target is met.
-            limit=min(30, max(requested_rag_ready * 3, 10)),
+            limit=requested_rag_ready,
+            min_relevant_results=requested_rag_ready,
+            retrieval_limit=retrieval_limit,
+            source_limit=source_limit,
             live=self._config.api.enable_live_search,
         )
         try:
