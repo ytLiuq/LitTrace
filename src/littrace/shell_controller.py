@@ -1060,8 +1060,8 @@ class ShellController:
         def on_progress(payload: dict[str, object]) -> None:
             self._emit(self.EVENT_TRACE_PROGRESS, run_id=run_id, **payload)
 
-        retrieval_limit = min(30, max(requested_rag_ready * 2, 2))
-        source_limit = min(12, max(requested_rag_ready * 2, 3))
+        retrieval_limit = min(40, max(requested_rag_ready * 3, requested_rag_ready + 5, 2))
+        source_limit = min(20, max(requested_rag_ready * 2, 3))
 
         request = PaperSearchRequest(
             topic=query,

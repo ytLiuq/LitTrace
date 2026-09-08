@@ -51,7 +51,7 @@ def test_topic_search_counts_rag_ready_and_keeps_all_candidates(monkeypatch, tmp
             tool_result=SimpleNamespace(ok=True),
         )
 
-    async def fake_download(config, papers, request):
+    async def fake_download(config, papers, request, **kwargs):
         return DownloadExecutionResult(
             items=[
                 DownloadExecutionItem(

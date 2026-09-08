@@ -8,8 +8,13 @@ from littrace.config import DownloadMode, LitTraceConfig
 from littrace.artifact_registry import artifact_registry_from_config
 from littrace.artifact_store import BlobRef, artifact_store_from_config
 from littrace.context import add_ranked_candidate_papers
-from littrace.downloads import execute_downloads
-from littrace.models import DownloadExecutionRequest, LiteratureWorkspace, PaperSearchRequest
+from littrace.downloads import CDPDownloadSession, execute_downloads
+from littrace.models import (
+    AccessType,
+    DownloadExecutionRequest,
+    LiteratureWorkspace,
+    PaperSearchRequest,
+)
 from littrace.parse_jobs import enqueue_parse_job, run_pending_parse_jobs
 from littrace.rag_jobs import run_pending_embedding_jobs
 from littrace.retrieval.rag_refresh import refresh_session_rag_index
@@ -209,6 +214,10 @@ async def run_topic_search(
     download_config.cdp_downloader.command_timeout_seconds = min(
         float(download_config.cdp_downloader.command_timeout_seconds), 20.0
     )
+    download_config.cdp_downloader.repository_download_timeout_seconds = min(
+        float(download_config.cdp_downloader.repository_download_timeout_seconds),
+        15.0,
+    )
     # Keep ordinary HTTP PDF resolution bounded as well. The global API
     # timeout can be 60s for interactive calls; applying it to every paper in
     # a topic batch would delay reserve-candidate substitution unnecessarily.
@@ -216,13 +225,35 @@ async def run_topic_search(
         float(download_config.api.request_timeout_seconds), 15.0
     )
     candidate_ids = [paper.paper_id for paper in search.result.papers]
-    attempted_ids: set[str] = set()
+    candidate_by_id = {
+        paper.paper_id: paper for paper in search.result.papers
+    }
+    # Acquisition is explicitly two-phase. Direct PDF candidates are
+    # exhausted first; DOI candidates remain in the browser reserve so a
+    # 403/418/timeout can be retried through the authenticated Chrome path.
+    direct_queue = [
+        paper_id for paper_id in candidate_ids
+        if candidate_by_id[paper_id].pdf_url
+        and candidate_by_id[paper_id].access_type != AccessType.REQUIRES_LOGIN
+    ]
+    browser_queue = [
+        paper_id for paper_id in candidate_ids
+        if candidate_by_id[paper_id].doi
+    ]
+    direct_seen: set[str] = set()
+    browser_seen: set[str] = set()
+    cdp_session = CDPDownloadSession(download_config)
     ready_ids: list[str] = []
     stored_ids_seen: set[str] = set()
     failed_ids: set[str] = set()
     login_ids: set[str] = set()
 
-    async def process_batch(batch_ids: list[str], *, retry_index: int = 0) -> None:
+    async def process_batch(
+        batch_ids: list[str],
+        *,
+        retry_index: int = 0,
+        allow_cdp_fallback: bool = True,
+    ) -> None:
         nonlocal workspace
         if not batch_ids:
             return
@@ -234,7 +265,9 @@ async def run_topic_search(
                 paper_ids=batch_ids,
                 session_id=session.session_id,
                 target="storage_only",
+                allow_cdp_fallback=allow_cdp_fallback,
             ),
+            cdp_session=cdp_session,
         )
         progress(
             "download_finished" if retry_index == 0 else "download_retry_finished",
@@ -329,18 +362,40 @@ async def run_topic_search(
             retry=retry_index or None, ready=len(ready_ids), total=len(stored_ids),
         )
 
-    max_attempts = min(len(candidate_ids), max(requested_rag_ready * 3, requested_rag_ready))
     wave = 0
-    while len(ready_ids) < requested_rag_ready and len(attempted_ids) < max_attempts:
-        remaining = requested_rag_ready - len(ready_ids)
-        batch = [paper_id for paper_id in candidate_ids if paper_id not in attempted_ids][:remaining]
-        if not batch:
-            break
-        attempted_ids.update(batch)
-        await process_batch(batch, retry_index=wave)
-        wave += 1
-        if wave >= 3:
-            break
+    try:
+        while len(ready_ids) < requested_rag_ready:
+            remaining = requested_rag_ready - len(ready_ids)
+            if direct_queue:
+                batch = [
+                    paper_id for paper_id in direct_queue
+                    if paper_id not in direct_seen
+                ][:remaining]
+                if batch:
+                    direct_seen.update(batch)
+                    await process_batch(
+                        batch,
+                        retry_index=wave,
+                        allow_cdp_fallback=False,
+                    )
+                    wave += 1
+                    continue
+            batch = [
+                paper_id for paper_id in browser_queue
+                if paper_id not in browser_seen
+                and paper_id not in ready_ids
+            ][:remaining]
+            if not batch:
+                break
+            browser_seen.update(batch)
+            await process_batch(
+                batch,
+                retry_index=wave,
+                allow_cdp_fallback=True,
+            )
+            wave += 1
+    finally:
+        await cdp_session.close()
     if len(ready_ids) < requested_rag_ready:
         result.warnings.append(
             f"RAG ready 未达到目标：{len(ready_ids)}/{requested_rag_ready}。"
