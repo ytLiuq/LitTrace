@@ -27,6 +27,7 @@ from littrace.shell_controller import (
     _CHAT_ERROR_MESSAGES,
     _fmt_unix,
     get_slash_command_names,
+    context_download_path,
 )
 from littrace.config import LitTraceConfig, load_config
 from littrace.codex_runtime.errors import (
@@ -111,6 +112,20 @@ def test_fallback_status_names_the_active_compatibility_model(tmp_path):
     config.llm.model = "qwen-plus"
     config.llm.fallback_models = ["deepseek-chat"]
     assert _legacy_model_display(config) == "qwen-plus（备用：deepseek-chat）"
+
+
+def test_context_download_path_uses_selected_folder(tmp_path):
+    from littrace.models import PaperMetadata
+
+    config = _make_test_config(tmp_path)
+    config.storage.paper_library_dir = tmp_path / "library"
+    paper = PaperMetadata(
+        paper_id="p1", title="A paper", doi="10.1000/example", year=2025
+    )
+    path = context_download_path(config, paper, tmp_path / "chosen")
+    assert path == (
+        tmp_path / "chosen" / "2025" / "10.1000_example" / "paper.pdf"
+    )
 
 
 class _StubSession:

@@ -31,6 +31,22 @@ from littrace.config import LitTraceConfig
 from littrace.models import ChatRequest, ChatResponse, LiteratureWorkspace
 from littrace.session import ChatSession, create_chat_session, load_workspace
 
+
+def context_download_path(
+    config: LitTraceConfig,
+    paper: object,
+    destination_dir: str | Path | None = None,
+) -> Path:
+    """Build a user-selected destination while preserving paper layout."""
+    from littrace.access_layer.paths import paper_storage_dir, target_pdf_path
+
+    if destination_dir is None:
+        return target_pdf_path(config, paper)
+    root = Path(destination_dir).expanduser().resolve()
+    library = config.storage.paper_library_dir.expanduser().resolve()
+    relative = paper_storage_dir(config, paper).resolve().relative_to(library)
+    return root / relative / "paper.pdf"
+
 try:
     # Hold a long-lived CodexAppServerChatService so the Codex CLI subprocess
     # and JSON-RPC handshake are reused across turns. Without this every chat
@@ -1197,13 +1213,17 @@ class ShellController:
                 papers.append(paper)
         return papers
 
-    def materialize_context_papers(self, paper_ids: Iterable[str]) -> dict[str, object]:
+    def materialize_context_papers(
+        self, paper_ids: Iterable[str], *, destination_dir: str | Path | None = None
+    ) -> dict[str, object]:
         """Copy selected RAG-ready PDFs from object storage to the local library."""
-        from littrace.access_layer.paths import target_pdf_path
         from littrace.artifact_registry import artifact_registry_from_config
         from littrace.artifact_store import BlobRef, artifact_store_from_config
 
         requested = list(dict.fromkeys(str(item) for item in paper_ids if item))
+        destination_root = (
+            Path(destination_dir).expanduser().resolve() if destination_dir else None
+        )
         with self._lock:
             workspace = self._workspace.model_copy(deep=True)
             session_id = self._session.session_id
@@ -1241,7 +1261,9 @@ class ShellController:
                 digest = hashlib.sha256(data).hexdigest()
                 if record.sha256 and digest != record.sha256:
                     raise ValueError("对象存储 PDF 校验失败")
-                target = target_pdf_path(self._config, paper)
+                target = context_download_path(
+                    self._config, paper, destination_root
+                )
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with NamedTemporaryFile("wb", dir=target.parent, delete=False) as handle:
                     handle.write(data)
