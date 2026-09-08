@@ -44,6 +44,22 @@ def test_read_only_literature_questions_use_fast_rag_route() -> None:
     assert not _is_read_only_context_question("请下载并解析这篇文献")
 
 
+def test_codex_mode_does_not_bypass_codex_with_fast_rag(tmp_path) -> None:
+    config = _make_test_config(tmp_path)
+    controller = _make_controller(config)
+
+    async def fail_if_called(_question: str):
+        raise AssertionError("fast RAG must not run before Codex")
+
+    controller._try_fast_rag_answer = fail_if_called
+    controller._service = object()
+    # Reaching the service invocation proves the compatibility RAG shortcut
+    # did not run first. The object intentionally has no chat method.
+    __import__("asyncio").run(
+        controller._drive_chat_turn("请总结这篇文献", silent=True)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

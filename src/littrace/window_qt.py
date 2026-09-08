@@ -237,9 +237,53 @@ _MARKDOWN = MarkdownIt("commonmark", {"html": False, "linkify": False})
 _MARKDOWN.enable("table").enable("strikethrough")
 
 
+_MATH_PATTERN = re.compile(
+    r"\\\[(.+?)\\\]|\\\((.+?)\\\)|\$\$(.+?)\$\$|\$(.+?)\$|"
+    r"\[\s*([^\]\n]*\\[A-Za-z]+[^\]\n]*)\]",
+    re.DOTALL,
+)
+
+
+def _latex_to_qt_html(value: str) -> str:
+    """Render common inline LaTeX into Qt-rich-text-safe HTML."""
+    value = value.replace("\\\\", "\\").replace(r"\_", "_")
+    value = html.escape(" ".join(value.split()))
+    value = re.sub(r"\\(varepsilon|epsilon|alpha|beta|gamma|mu|sigma|Delta|Omega)",
+                   lambda match: {
+                       "varepsilon": "ε", "epsilon": "ε", "alpha": "α",
+                       "beta": "β", "gamma": "γ", "mu": "μ", "sigma": "σ",
+                       "Delta": "Δ", "Omega": "Ω",
+                   }[match.group(1)], value)
+    value = re.sub(r"\\(text|mathrm|mathbf)\s*\{([^{}]*)\}", r"\2", value)
+    value = re.sub(r"([A-Za-zΑ-Ωα-ω0-9εμΔΩ])_\{([^{}]+)\}", r"\1<sub>\2</sub>", value)
+    value = re.sub(r"([A-Za-zΑ-Ωα-ω0-9εμΔΩ])_([A-Za-z0-9]+)", r"\1<sub>\2</sub>", value)
+    value = re.sub(r"([A-Za-zΑ-Ωα-ω0-9εμΔΩ])\^\{([^{}]+)\}", r"\1<sup>\2</sup>", value)
+    value = re.sub(r"([A-Za-zΑ-Ωα-ω0-9εμΔΩ])\^([A-Za-z0-9]+)", r"\1<sup>\2</sup>", value)
+    value = value.replace("\\", "")
+    return (
+        "<span style='font-family:STIX Two Math,Times New Roman,serif;"
+        "font-style:italic;background:#f5f6f6;padding:2px 5px;'>"
+        + value
+        + "</span>"
+    )
+
+
 def _render_message_html(text: str) -> str:
     """Render safe CommonMark/GFM-like text for Qt's rich-text view."""
-    rendered = _MARKDOWN.render(str(text or ""))
+    raw = str(text or "")
+    math_replacements: dict[str, str] = {}
+
+    def replace_math(match: re.Match[str]) -> str:
+        value = next((group for group in match.groups() if group is not None), "")
+        token = f"LITTRACE_MATH_{len(math_replacements)}_TOKEN"
+        math_replacements[token] = _latex_to_qt_html(value)
+        return token
+
+    raw = _MATH_PATTERN.sub(replace_math, raw)
+    rendered = _MARKDOWN.render(raw)
+    for token, replacement in math_replacements.items():
+        rendered = rendered.replace(token, replacement)
+    rendered = rendered.replace("\\<span style=", "<span style=")
     # QTextBrowser supports these tags but does not apply a document-level
     # stylesheet consistently across Qt versions, so keep the key spacing
     # inline. Raw HTML is disabled in MarkdownIt and therefore escaped.

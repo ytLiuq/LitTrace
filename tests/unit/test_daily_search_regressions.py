@@ -44,6 +44,17 @@ def test_daily_preview_is_markdown_not_nested_html() -> None:
     assert "&amp;nbsp;" not in rendered
 
 
+def test_chat_formula_renders_latex_subscripts() -> None:
+    rendered = _render_message_html(
+        r"[ C=\varepsilon_0\varepsilon_r A/d ] and $V=IR$"
+    )
+
+    assert "ε<sub>0</sub>" in rendered
+    assert "ε<sub>r</sub>" in rendered
+    assert "A/d" in rendered
+    assert "V=IR" in rendered
+
+
 def test_publisher_auth_plan_uses_visible_private_new_window(tmp_path: Path) -> None:
     executable = tmp_path / "chrome"
     executable.touch()
