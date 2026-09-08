@@ -44,6 +44,19 @@ def test_daily_preview_is_markdown_not_nested_html() -> None:
     assert "&amp;nbsp;" not in rendered
 
 
+def test_formula_with_propto_and_named_subscripts_is_rendered() -> None:
+    rendered = _render_message_html(
+        r"[ C_\mathrm{EDL}\propto A_\mathrm{contact} ]"
+    )
+    assert "C<sub>EDL</sub>∝ A<sub>contact</sub>" in rendered
+    assert "propto" not in rendered
+
+
+def test_formula_with_stripped_latex_markers_is_normalized() -> None:
+    rendered = _render_message_html("[ CEDLpropto Acontact ]")
+    assert "C<sub>EDL</sub>∝ A<sub>contact</sub>" in rendered
+
+
 def test_chat_formula_renders_latex_subscripts() -> None:
     rendered = _render_message_html(
         r"[ C=\varepsilon_0\varepsilon_r A/d ] and $V=IR$"

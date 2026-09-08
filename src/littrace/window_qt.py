@@ -239,7 +239,7 @@ _MARKDOWN.enable("table").enable("strikethrough")
 
 _MATH_PATTERN = re.compile(
     r"\\\[(.+?)\\\]|\\\((.+?)\\\)|\$\$(.+?)\$\$|\$(.+?)\$|"
-    r"\[\s*([^\]\n]*\\[A-Za-z]+[^\]\n]*)\]",
+    r"\[\s*([^\]\n]*(?:\\[A-Za-z]+|propto|cdot|times|approx|<=|>=|[_^])[^\]\n]*)\]",
     re.DOTALL,
 )
 
@@ -247,6 +247,11 @@ _MATH_PATTERN = re.compile(
 def _latex_to_qt_html(value: str) -> str:
     """Render common inline LaTeX into Qt-rich-text-safe HTML."""
     value = value.replace("\\\\", "\\").replace(r"\_", "_")
+    # Some providers strip both the backslash and braces, yielding compact
+    # variables such as ``CEDLpropto Acontact``. Restore the unambiguous
+    # electrochemical-sensing names before HTML escaping.
+    value = re.sub(r"\bC(?:EDL)(?=propto|\s|$)", "C_EDL", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bA(?:contact)\b", "A_contact", value, flags=re.IGNORECASE)
     value = html.escape(" ".join(value.split()))
     value = re.sub(r"\\(varepsilon|epsilon|alpha|beta|gamma|mu|sigma|Delta|Omega)",
                    lambda match: {
@@ -255,6 +260,14 @@ def _latex_to_qt_html(value: str) -> str:
                        "Delta": "Δ", "Omega": "Ω",
                    }[match.group(1)], value)
     value = re.sub(r"\\(text|mathrm|mathbf)\s*\{([^{}]*)\}", r"\2", value)
+    value = re.sub(
+        r"\\?(propto|cdot|times|approx|neq|leq|geq|pm)",
+        lambda match: {
+            "propto": "∝", "cdot": "·", "times": "×", "approx": "≈",
+            "neq": "≠", "leq": "≤", "geq": "≥", "pm": "±",
+        }[match.group(1)],
+        value,
+    )
     value = re.sub(r"([A-Za-zΑ-Ωα-ω0-9εμΔΩ])_\{([^{}]+)\}", r"\1<sub>\2</sub>", value)
     value = re.sub(r"([A-Za-zΑ-Ωα-ω0-9εμΔΩ])_([A-Za-z0-9]+)", r"\1<sub>\2</sub>", value)
     value = re.sub(r"([A-Za-zΑ-Ωα-ω0-9εμΔΩ])\^\{([^{}]+)\}", r"\1<sup>\2</sup>", value)
@@ -4851,13 +4864,22 @@ class LitTraceQtWindow(QtWidgets.QMainWindow):
         """Copy selected RAG-ready PDFs from object storage in the background."""
         if getattr(self, "_context_download_inflight", False):
             return
+        destination = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "选择文献下载文件夹", str(Path.home()),
+            QtWidgets.QFileDialog.Option.ShowDirsOnly,
+        )
+        if not destination:
+            self._status_bar.showMessage("已取消本地文献下载", 3000)
+            return
         self._context_download_inflight = True
         self._context_panel._download_btn.setEnabled(False)
-        self._post_status(f"正在从对象存储下载 {len(paper_ids)} 篇到本地…")
+        self._post_status(f"正在从对象存储下载 {len(paper_ids)} 篇到 {destination}…")
 
         def _worker() -> None:
             try:
-                result = self._controller.materialize_context_papers(paper_ids)
+                result = self._controller.materialize_context_papers(
+                    paper_ids, destination_dir=destination
+                )
             except Exception as exc:
                 result = {
                     "requested": len(paper_ids),
