@@ -32,6 +32,7 @@ from littrace.retrieval.search import build_query_variants
 from littrace.session import create_chat_session, save_workspace
 from littrace.skill_runner import parse_workspace_skill, search_papers_skill
 from littrace.state_db import state_store_from_config
+from littrace.topic_search import run_topic_search
 
 
 def _ensure_bucket(config: LitTraceConfig) -> None:
@@ -181,174 +182,84 @@ async def _run(topic: str, limit: int) -> int:
         )
 
     try:
-        request = PaperSearchRequest(
-            topic=topic,
-            year_min=2021,
-            # Search a wider pool, then select exactly `limit` real OA PDFs.
-            limit=max(limit * 3, 50),
-            wants_recent=True,
-            live=True,
-            query_variants=build_query_variants(topic),
-        )
-        search = await search_papers_skill(request, config)
-        papers = search.result.papers
-        eligible = [
-            paper
-            for paper in papers
-            if paper.access_type == AccessType.OPEN_ACCESS and paper.pdf_url
-        ]
-        def downloadability_score(paper: PaperMetadata) -> tuple[int, int]:
-            url = str(paper.pdf_url or "").lower()
-            direct = int("doi.org/" not in url)
-            host_priority = 0
-            if "arxiv.org" in url or "ace.ewapub.com" in url:
-                host_priority = 4
-            elif "iopscience.org" in url or "link.springer.com/content/pdf" in url:
-                host_priority = 3
-            elif "mdpi.com" in url:
-                host_priority = 2
-            return host_priority, direct
-
-        selected = sorted(eligible, key=downloadability_score, reverse=True)[:limit]
-        if len(selected) < limit:
-            raise RuntimeError(
-                f"Real source search returned only {len(selected)} open PDF candidates; need {limit}."
-            )
-        print(
-            json.dumps(
-                {
-                    "stage": "search",
-                    "searched": len(papers),
-                    "eligible": len(eligible),
-                    "selected_for_download": len(selected),
-                    "open_access": sum(paper.access_type == AccessType.OPEN_ACCESS for paper in papers),
-                    "requires_login": sum(paper.access_type == AccessType.REQUIRES_LOGIN for paper in papers),
-                    "titles": [
-                        {
-                            "paper_id": paper.paper_id,
-                            "title": paper.title,
-                            "access_type": str(paper.access_type),
-                            "pdf_url": str(paper.pdf_url) if paper.pdf_url else None,
-                        }
-                        for paper in papers
-                    ],
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
-        session = create_chat_session(config)
-        workspace = LiteratureWorkspace()
-        workspace.papers = {paper.paper_id: paper for paper in selected}
-        workspace.context.active_papers = [paper.paper_id for paper in selected]
-        workspace.context.filters.research_background = topic
-        workspace.context.filters.topic = topic
-        save_workspace(session, workspace, config=config)
-
-        download_items = await _execute_downloads_with_progress(
-            config,
-            selected,
-            session_id=session.session_id,
-        )
-        print(
-            json.dumps(
-                {
-                    "stage": "download",
-                    "downloaded_count": sum(item.status == "downloaded" for item in download_items),
-                    "requires_login_count": sum(
-                        item.action == "cdp_publisher_download" or item.status == "requires_login"
-                        for item in download_items
-                    ),
-                    "cdp_attempted_count": sum(
-                        item.action == "cdp_publisher_download" for item in download_items
-                    ),
-                    "cdp_downloaded_count": sum(
-                        item.action == "cdp_publisher_download" and item.status == "downloaded"
-                        for item in download_items
-                    ),
-                    "items": [item.model_dump(mode="json") for item in download_items],
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
-
         config.parsing.default_parser = "docling"
         config.parsing.parse_strategy = "text_only"
         config.parsing.docling_workers = 1
         config.parsing.paddleocr.max_pages = 2
-        workspace, parse_report = await parse_workspace_skill(workspace, config)
-        print(json.dumps({"stage": "parse", **parse_report}, ensure_ascii=False), flush=True)
-        save_workspace(session, workspace, config=config)
-
-        state_store = state_store_from_config(config)
-        pending_before = (
-            state_store.list_async_tasks(
-                session_id=session.session_id,
-                status="queued",
-                kind="embedding_job",
-                limit=20,
-            )
-            if state_store
-            else []
+        request = PaperSearchRequest(
+            topic=topic,
+            year_min=2021,
+            year_max=2026,
+            limit=limit,
+            retrieval_limit=min(40, max(limit * 3, limit + 5, 2)),
+            source_limit=min(20, max(limit * 2, 3)),
+            wants_recent=True,
+            live=True,
+            query_variants=build_query_variants(topic),
         )
-        embedding_processed = 0
-        for _ in range(6):
-            report = await run_pending_embedding_jobs(config)
-            embedding_processed += report.processed
-            pending_after = (
-                state_store.list_async_tasks(
-                    session_id=session.session_id,
-                    status="queued",
-                    kind="embedding_job",
-                    limit=20,
-                )
-                if state_store
-                else []
-            )
-            if state_store is None or not pending_after:
-                break
+        session = create_chat_session(config)
 
+        def on_progress(payload: dict[str, object]) -> None:
+            if payload.get("stage") in {
+                "search_finished", "search_unpaywall_finished",
+                "download_finished", "download_retry_finished",
+                "parse_finished", "parse_retry_finished",
+                "rag_finished", "rag_retry_finished",
+            }:
+                print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+        run = await run_topic_search(
+            config,
+            session,
+            request,
+            requested_rag_ready=limit,
+            canonical_topic=topic,
+            progress_callback=on_progress,
+        )
+        workspace = run.workspace
         profile = load_session_rag_profile(session, config=config)
         rag_hits = []
         if profile is not None:
-            rag_result = await search_session_rag(config, session, "柔性薄膜压阻传感器", top_k=5)
+            rag_result = await search_session_rag(
+                config, session, topic, top_k=5
+            )
             rag_hits = rag_result.hits if rag_result is not None else []
 
         object_store = artifact_store_from_config(config)
-        storage_refs = [item.storage_ref for item in download_items if item.storage_ref]
+        records = artifact_registry_from_config(config).list_for_session(
+            session_id=session.session_id
+        )
+        storage_refs = [
+            {
+                "backend": record.backend,
+                "bucket": record.bucket,
+                "object_key": record.object_key,
+                "sha256": record.sha256,
+                "size_bytes": record.size_bytes,
+                "content_type": record.content_type,
+            }
+            for record in records
+            if record.kind == "paper_pdf"
+        ]
         summary = {
             "stage": "summary",
             "topic": topic,
             "session_id": session.session_id,
             "work_root": str(work_root),
-            "searched": len(papers),
-            "eligible": len(eligible),
-            "downloaded_count": sum(item.status == "downloaded" for item in download_items),
-            "requires_login_count": sum(
-                item.action == "cdp_publisher_download" or item.status == "requires_login"
-                for item in download_items
-            ),
-            "cdp_attempted_count": sum(
-                item.action == "cdp_publisher_download" for item in download_items
-            ),
-            "cdp_downloaded_count": sum(
-                item.action == "cdp_publisher_download" and item.status == "downloaded"
-                for item in download_items
-            ),
+            "status": run.status,
+            "searched": run.candidate_count,
+            "downloaded_count": run.downloaded_count,
+            "parsed_count": run.parsed_count,
+            "rag_ready_count": run.rag_ready_count,
+            "active_context_count": len(workspace.context.active_papers),
+            "requires_login_count": run.requires_login_count,
+            "failed_download_count": run.failed_download_count,
             "storage_refs": storage_refs,
             "object_exists": [
                 object_store.exists(BlobRef.model_validate(ref))
                 for ref in storage_refs
             ],
-            "registry_count": len(
-                artifact_registry_from_config(config).list_for_session(
-                    session_id=session.session_id
-                )
-            ),
-            "parsed_count": parse_report.get("parsed_count"),
-            "pending_embedding_jobs_before": len(pending_before),
-            "embedding_processed": embedding_processed,
+            "registry_count": len(records),
             "rag_profile_loaded": profile is not None,
             "rag_hits": len(rag_hits),
         }
