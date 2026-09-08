@@ -706,18 +706,23 @@ class ShellController:
     async def _drive_chat_turn(self, text: str, *, silent: bool) -> None:
         # Read-only questions over an existing RAG context bypass Codex startup
         # and generic intent parsing entirely.
-        fast_reply = await self._try_fast_rag_answer(text)
-        if fast_reply is not None:
-            if not silent:
-                self._emit(
-                    self.EVENT_MESSAGE_APPENDED,
-                    role="assistant",
-                    text=fast_reply,
-                    action="fast_rag_answer",
-                )
-            self._emit(self.EVENT_THINKING, active=False)
-            self._emit(self.EVENT_STATUS_CHANGED, text="就绪")
-            return
+        # Codex is the primary interactive runtime. The fast RAG path uses
+        # the compatibility LLM directly, so it must never bypass Codex when
+        # the user configured codex_app_server. It remains an optimization for
+        # legacy-only deployments.
+        if self._config.agent_runtime.mode != "codex_app_server":
+            fast_reply = await self._try_fast_rag_answer(text)
+            if fast_reply is not None:
+                if not silent:
+                    self._emit(
+                        self.EVENT_MESSAGE_APPENDED,
+                        role="assistant",
+                        text=fast_reply,
+                        action="fast_rag_answer",
+                    )
+                self._emit(self.EVENT_THINKING, active=False)
+                self._emit(self.EVENT_STATUS_CHANGED, text="就绪")
+                return
         # Wait for ``_prime_service`` to finish (or skip) before
         # touching the service — otherwise a user turn that races
         # the background warm-up can land on a not-yet-ready client
@@ -843,7 +848,10 @@ class ShellController:
                         self._emit(
                             self.EVENT_MESSAGE_APPENDED,
                             role="assistant",
-                            text=fallback_response.reply,
+                            text=(
+                                f"> 使用模型：`{legacy_model}`\n\n"
+                                f"{fallback_response.reply}"
+                            ),
                             action=fallback_response.action,
                             warnings=fallback_response.warnings,
                         )
@@ -891,7 +899,11 @@ class ShellController:
             self._emit(
                 self.EVENT_MESSAGE_APPENDED,
                 role="assistant",
-                text=response.reply,
+                text=(
+                    f"> 使用模型：`Codex App Server`\n\n{response.reply}"
+                    if service is not None
+                    else f"> 使用模型：`{legacy_model}`\n\n{response.reply}"
+                ),
                 action=response.action,
                 warnings=response.warnings,
             )
@@ -924,7 +936,7 @@ class ShellController:
                 if model != answer_model
             ]
             answer_cache_id = cache_key(
-                "rag-answer-v1\n"
+                "rag-answer-v2\n"
                 f"{self._session.session_id}\n{answer_model}\n"
                 f"{getattr(filters, 'rag_last_refreshed_at', None)}\n"
                 f"{getattr(filters, 'rag_chunk_count', 0)}\n{question.strip()}"
@@ -939,29 +951,63 @@ class ShellController:
                 active=True,
                 label=f"正在用 {answer_model} 查询文献证据…",
             )
+            # Use a wider, paper-diverse evidence window for summaries. The
+            # old top-5/900-char window often contained only title/metadata
+            # chunks, causing the model to report "证据不足" for a full PDF.
             rag_result = await search_workspace_rag(
-                answer_config, self._workspace, question, top_k=5
+                answer_config,
+                self._workspace,
+                question,
+                top_k=16,
+                query_variants=[
+                    f"{question} 研究背景 研究目标",
+                    f"{question} 材料 器件结构 工作机理 制备方法",
+                    f"{question} 实验结果 性能指标 创新点 局限 展望",
+                ],
             )
             if rag_result is None or not rag_result.hits:
                 return None
             evidence_blocks: list[str] = []
+            seen_chunk_ids: set[str] = set()
             for index, hit in enumerate(rag_result.hits, start=1):
+                if hit.chunk_id in seen_chunk_ids:
+                    continue
+                seen_chunk_ids.add(hit.chunk_id)
                 paper = self._workspace.papers.get(hit.paper_id)
                 title = paper.title if paper is not None else hit.paper_id
+                metadata = ""
+                if paper is not None:
+                    metadata = (
+                        f"\nauthors={', '.join(paper.authors[:8]) or '-'}"
+                        f"\nyear={paper.year or '-'}"
+                        f"\njournal={paper.journal or paper.publisher or '-'}"
+                        f"\nabstract={(paper.abstract or '')[:1200]}"
+                    )
                 evidence_blocks.append(
-                    f"[{index}] {title}\nsection={hit.section or '-'} page={hit.page or '-'}\n{hit.text[:900]}"
+                    f"[{index}] {title}{metadata}\n"
+                    f"section={hit.section or '-'} page={hit.page or '-'}\n"
+                    f"{hit.text[:1600]}"
                 )
             reply = await chat_completion(
                 answer_config,
                 (
                     "你是学术文献问答助手。只能依据给定 RAG 证据回答，不得补充外部事实。"
-                    "回答简洁、结构化；若证据不足请明确说明。文献总结最多使用研究目标、"
-                    "器件/材料结构、关键结果、局限四个小节，并引用证据编号。"
+                    "用户要求介绍单篇文献时，必须优先综合摘要、引言、器件结构、实验结果、"
+                    "讨论和结论等全文片段，不要只复述标题和关键词。回答至少包含：研究背景与目标、"
+                    "材料/器件结构与工作机理、制备或实验方法、关键性能结果、创新点、局限与展望。"
+                    "如果某一项在证据中确实没有，再明确标注证据不足；不要因为单个 chunk 缺失就把整篇"
+                    "论文判定为证据不足。每个事实引用证据编号。"
                 ),
                 f"问题：{question}\n\nRAG 证据：\n" + "\n\n".join(evidence_blocks),
             )
             if reply.used_llm and reply.text.strip():
-                answer = reply.text.strip()
+                model_name = reply.model or answer_model
+                answer = (
+                    f"> 使用模型：`{model_name}`"
+                    + (f"（{reply.endpoint}）" if reply.endpoint else "")
+                    + "\n\n"
+                    + reply.text.strip()
+                )
                 write_text_cache(
                     answer_config, "rag-answers", answer_cache_id, answer
                 )

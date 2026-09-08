@@ -20,6 +20,8 @@ class LLMReply:
     text: str
     used_llm: bool
     error: str | None = None
+    model: str | None = None
+    endpoint: str | None = None
 
 
 def _build_retry_config(config: LitTraceConfig) -> RetryConfig:
@@ -176,6 +178,7 @@ async def chat_completion(
     errors: list[str] = []
     response = None
     used_endpoint_label = ""
+    used_model = ""
     retry_config = _build_retry_config(config)
     for endpoint in _llm_endpoints(config):
         try:
@@ -189,6 +192,7 @@ async def chat_completion(
                         json_mode=json_mode,
                     )
             used_endpoint_label = endpoint.label
+            used_model = endpoint.model
             break
         except Exception as exc:
             errors.append(f"{endpoint.label}:{exc.__class__.__name__}: {exc}")
@@ -204,6 +208,7 @@ async def chat_completion(
         return LLMReply(text="", used_llm=False, error="; ".join(errors) or "no_llm_endpoint")
 
     payload = response.json()
+    response_model = str(payload.get("model") or used_model or config.llm.model)
     content = payload.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     usage = payload.get("usage", {})
     prompt_tokens = usage.get("prompt_tokens", 0)
@@ -235,8 +240,17 @@ async def chat_completion(
         },
     )
     if not content:
-        return LLMReply(text="", used_llm=False, error="empty_llm_response")
-    return LLMReply(text=content, used_llm=True)
+        return LLMReply(
+            text="", used_llm=False, error="empty_llm_response",
+            model=response_model,
+            endpoint=used_endpoint_label,
+        )
+    return LLMReply(
+        text=content,
+        used_llm=True,
+        model=response_model,
+        endpoint=used_endpoint_label,
+    )
 
 
 async def vision_completion(
