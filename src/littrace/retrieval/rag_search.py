@@ -26,6 +26,7 @@ async def search_session_rag(
     question: str,
     *,
     top_k: int | None = None,
+    query_variants: list[str] | None = None,
 ) -> RagSearchResult | None:
     profile = load_session_rag_profile(session, config=config)
     if profile is None:
@@ -35,10 +36,15 @@ async def search_session_rag(
     if not question.strip():
         return RagSearchResult(profile=profile, hits=[])
     effective_top_k = top_k or profile.top_k
+    variants = [question.strip()]
+    for variant in query_variants or []:
+        normalized = " ".join(str(variant).split())
+        if normalized and normalized not in variants:
+            variants.append(normalized)
     cache_id = cache_key(
         "rag-query-v1\n"
         f"{profile.profile_id}\n{profile.embedding_model}\n"
-        f"{effective_top_k}\n{question.strip()}"
+        f"{effective_top_k}\n" + "\n".join(variants)
     )
     cached = read_text_cache(config, "rag-queries", cache_id)
     if cached:
@@ -49,9 +55,26 @@ async def search_session_rag(
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
     embedding_client = embedding_client_from_config(config, profile)
-    embedding = await embedding_client.embed_texts([question.strip()])
+    embeddings = await embedding_client.embed_texts(variants)
     store = PgvectorRagStore(config, profile)
-    hits = store.query_chunks(embedding[0], top_k=effective_top_k)
+    merged: dict[str, RagSearchHit] = {}
+    for embedding in embeddings:
+        for hit in store.query_chunks(embedding, top_k=effective_top_k):
+            previous = merged.get(hit.chunk_id)
+            if previous is None or hit.score > previous.score:
+                merged[hit.chunk_id] = hit
+    hits = sorted(merged.values(), key=lambda hit: hit.score, reverse=True)
+    selected: list[RagSearchHit] = []
+    section_counts: dict[tuple[str, str], int] = {}
+    for hit in hits:
+        key = (hit.paper_id, (hit.section or "").casefold())
+        if section_counts.get(key, 0) >= 3:
+            continue
+        selected.append(hit)
+        section_counts[key] = section_counts.get(key, 0) + 1
+        if len(selected) >= effective_top_k:
+            break
+    hits = selected
     write_text_cache(
         config,
         "rag-queries",
@@ -67,6 +90,7 @@ async def search_workspace_rag(
     question: str,
     *,
     top_k: int | None = None,
+    query_variants: list[str] | None = None,
 ) -> RagSearchResult | None:
     profile_data = getattr(getattr(workspace, "context", None), "filters", None)
     profile_raw = getattr(profile_data, "rag_profile", None) if profile_data is not None else None
@@ -83,7 +107,13 @@ async def search_workspace_rag(
         session_id=profile.session_id,
         workspace_dir=session_root / "workspace",
     )
-    return await search_session_rag(config, session, question, top_k=top_k or profile.top_k)
+    return await search_session_rag(
+        config,
+        session,
+        question,
+        top_k=top_k or profile.top_k,
+        query_variants=query_variants,
+    )
 
 
 def rag_hits_to_evidence_spans(
