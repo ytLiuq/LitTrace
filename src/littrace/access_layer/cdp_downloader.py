@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -109,6 +110,7 @@ def download_paper_via_cdp(
     email: str | None = None,
     *,
     browser: "CDPBrowser | None" = None,
+    cancel_event: threading.Event | None = None,
 ) -> CDPDownloadResult:
     """Download a paper PDF via the three-step pipeline:
 
@@ -123,6 +125,17 @@ def download_paper_via_cdp(
         publisher=publisher,
         target_path=str(target_path),
     )
+
+    def cancelled_wait(seconds: float) -> bool:
+        if cancel_event is None:
+            time.sleep(max(seconds, 0.0))
+            return False
+        return cancel_event.wait(max(seconds, 0.0))
+
+    def cancelled_result() -> CDPDownloadResult:
+        result.error = "CDP download cancelled after timeout."
+        result.steps.append("cancelled")
+        return result
     target_path.parent.mkdir(parents=True, exist_ok=True)
     email = email or config.api.unpaywall_email or config.api.crossref_mailto
 
@@ -191,10 +204,11 @@ def download_paper_via_cdp(
             command_timeout_seconds=config.cdp_downloader.command_timeout_seconds,
         )
     else:
-        # A publisher PDF download can leave the shared target in a download
-        # or browser-PDF navigation state. Reset exactly one tab before the
-        # next paper so batch downloads are isolated without leaking blank tabs.
-        browser.reset_tab()
+        # The workflow owns one browser object (and therefore one target) per
+        # paper. Create that paper's target once and keep it stable while the
+        # user completes authentication; another paper must never reset it.
+        if browser.tab_id is None:
+            browser.connect_new_tab()
     try:
         result.steps.append("cdp_open")
         if own_browser:
@@ -252,6 +266,7 @@ def download_paper_via_cdp(
                 config,
                 max_wait_seconds=config.cdp_downloader.user_action_wait_seconds,
                 browser=browser,
+                cancel_event=cancel_event,
             )
             _clear_cf_wait_flag(config)
             if not ack:
@@ -281,11 +296,13 @@ def download_paper_via_cdp(
         ):
             if click_publisher_pdf_download(browser):
                 result.steps.append("publisher_js_pdf_download_clicked")
-                time.sleep(12.0)
+                if cancelled_wait(12.0):
+                    return cancelled_result()
                 found = wait_for_recent_pdf(
                     target_path.parent,
                     target_path,
                     config.cdp_downloader.repository_download_timeout_seconds,
+                    cancel_event=cancel_event,
                 )
                 if found:
                     move_pdf(found, target_path)
@@ -301,7 +318,8 @@ def download_paper_via_cdp(
             result.user_action = "请在已打开的本地 Chrome 窗口中完成机构登录。"
             result.steps.append("user_action:institutional_login")
             _surface_browser(browser.get_url())
-            time.sleep(max(config.cdp_downloader.user_action_wait_seconds, 0.0))
+            if cancelled_wait(config.cdp_downloader.user_action_wait_seconds):
+                return cancelled_result()
 
         if publisher == "elsevier":
             access_status = sciencedirect_access_status(browser)
@@ -310,7 +328,8 @@ def download_paper_via_cdp(
                 clicked = click_sciencedirect_institution_login(browser)
                 if clicked:
                     result.steps.append(f"elsevier_login_clicked:{clicked[:80]}")
-                    time.sleep(3.0)
+                    if cancelled_wait(3.0):
+                        return cancelled_result()
                 result.requires_user_action = True
                 result.user_action = (
                     "ScienceDirect 当前会话没有 PDF 机构授权。"
@@ -351,6 +370,7 @@ def download_paper_via_cdp(
                 target_path.parent,
                 target_path,
                 config.cdp_downloader.repository_download_timeout_seconds,
+                cancel_event=cancel_event,
             )
             if found:
                 move_pdf(found, target_path)
@@ -366,6 +386,7 @@ def download_paper_via_cdp(
                 target_path.parent,
                 target_path,
                 config.cdp_downloader.repository_download_timeout_seconds,
+                cancel_event=cancel_event,
             )
             if found:
                 move_pdf(found, target_path)
@@ -421,7 +442,8 @@ def download_paper_via_cdp(
             )
             result.steps.append("user_action:pdf_403_retry")
             _surface_browser(browser.get_url())
-            time.sleep(max(config.cdp_downloader.user_action_wait_seconds, 0.0))
+            if cancelled_wait(config.cdp_downloader.user_action_wait_seconds):
+                return cancelled_result()
             result.steps.append("fetch_blob_retry_after_user_action")
             ok, info = browser.fetch_blob_to_file(pdf_url, target_path)
         if ok:
@@ -444,7 +466,8 @@ def download_paper_via_cdp(
             )
             result.steps.append("user_action:publisher_login_retry")
             _surface_browser(browser.get_url())
-            time.sleep(max(config.cdp_downloader.user_action_wait_seconds, 0.0))
+            if cancelled_wait(config.cdp_downloader.user_action_wait_seconds):
+                return cancelled_result()
             result.steps.append("fetch_blob_retry_after_publisher_login")
             ok, info = browser.fetch_blob_to_file(pdf_url, target_path)
             if ok:
@@ -455,11 +478,13 @@ def download_paper_via_cdp(
                 return result
         result.steps.append("anchor_download")
         browser.trigger_anchor_download(pdf_url, target_path.name)
-        time.sleep(15.0)
+        if cancelled_wait(15.0):
+            return cancelled_result()
         found = wait_for_recent_pdf(
             target_path.parent,
             target_path,
             config.cdp_downloader.repository_download_timeout_seconds,
+            cancel_event=cancel_event,
         )
         if found:
             move_pdf(found, target_path)
@@ -483,17 +508,9 @@ def download_paper_via_cdp(
         result.error = f"{exc.__class__.__name__}: {exc}"
         return result
     finally:
-        # Round 29: only tear down the tab when we own the
-        # browser. ``downloads.execute_downloads`` builds a single
-        # shared ``CDPBrowser`` for the whole batch and threads it
-        # through every gated paper; closing the tab here would
-        # force the next paper to open a fresh ``about:blank`` and
-        # 45 gated papers → 45 phantom tabs the user has to close
-        # by hand. When we own the browser (``own_browser`` was
-        # true above) the per-tab close is part of the per-paper
-        # lifecycle, but a follow-up Round 30 will move that
-        # cleanup into the batch teardown instead of leaking the
-        # tab open at the end of a per-paper call.
+        # Externally owned browsers stay open until the complete topic-search
+        # workflow ends. This keeps each authentication page stable and lets
+        # the user finish sign-in without another paper replacing the tab.
         if own_browser:
             try:
                 browser.close_tab()
@@ -821,6 +838,7 @@ def _wait_for_user_acknowledgement(
     *,
     max_wait_seconds: float,
     browser,
+    cancel_event=None,
 ) -> bool:
     """Block (poll every 2s, ~no CPU) until either the GUI writes
     ``sentinel_cf_ack.json`` (the user clicked "我处理好了") **or**
@@ -834,6 +852,8 @@ def _wait_for_user_acknowledgement(
     ack_path = _cf_ack_file(config)
     deadline = time.monotonic() + max(max_wait_seconds, 5.0)
     while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         # 1) User clicked OK in the GUI
         if ack_path.exists():
             try:
@@ -850,5 +870,9 @@ def _wait_for_user_acknowledgement(
             # subprocess can report a clean error instead of hanging
             # forever.
             return False
-        time.sleep(2.0)
+        if cancel_event is not None:
+            if cancel_event.wait(2.0):
+                return False
+        else:
+            time.sleep(2.0)
     return False

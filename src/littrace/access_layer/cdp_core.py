@@ -395,10 +395,13 @@ def wait_for_recent_pdf(
     directory: Path,
     preferred_path: Path,
     timeout_seconds: float = 120.0,
+    cancel_event=None,
 ) -> Path | None:
     """Wait for Chrome's ``.crdownload`` to finish and return a valid PDF."""
     deadline = time.monotonic() + max(timeout_seconds, 0.0)
     while time.monotonic() <= deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         found = find_recent_pdf(
             directory,
             preferred_path,
@@ -410,7 +413,11 @@ def wait_for_recent_pdf(
         # full repository timeout only hides a deterministic publisher error.
         if not any(path.name.endswith(".crdownload") for path in directory.glob("*")):
             return None
-        time.sleep(1.0)
+        if cancel_event is not None:
+            if cancel_event.wait(1.0):
+                return None
+        else:
+            time.sleep(1.0)
     return find_recent_pdf(
         directory,
         preferred_path,

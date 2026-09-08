@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 import time
 from html.parser import HTMLParser
 from pathlib import Path
@@ -38,10 +39,91 @@ from littrace.models import (
 )
 
 
+class CDPDownloadSession:
+    """Own one CDP tab per paper for the lifetime of a user workflow."""
+
+    def __init__(self, config: LitTraceConfig) -> None:
+        self.config = config
+        self._prepare_lock = asyncio.Lock()
+        self._prepared = False
+        self._available = False
+        self._browsers: dict[str, object] = {}
+
+    async def _prepare(self) -> bool:
+        async with self._prepare_lock:
+            if self._prepared:
+                return self._available
+            self._prepared = True
+            try:
+                status = check_cdp_status(self.config)
+                from littrace.chrome_profiles import (
+                    cdp_uses_configured_profile,
+                    launch_chrome_for_cdp,
+                )
+
+                private_profile = status.available and cdp_uses_configured_profile(
+                    self.config
+                )
+                if (
+                    (not status.available or not private_profile)
+                    and self.config.cdp_downloader.auto_launch_chrome
+                ):
+                    launch = await asyncio.to_thread(
+                        launch_chrome_for_cdp,
+                        self.config,
+                        headless=False,
+                    )
+                    if launch.error and launch.process is not None:
+                        try:
+                            launch.process.terminate()
+                        except Exception:
+                            pass
+                    if launch.cdp_status is not None:
+                        status = launch.cdp_status
+                    private_profile = status.available and cdp_uses_configured_profile(
+                        self.config
+                    )
+                self._available = bool(status.available and private_profile)
+            except Exception:
+                self._available = False
+            return self._available
+
+    async def browser_for(self, paper_id: str):
+        existing = self._browsers.get(paper_id)
+        if existing is not None:
+            return existing
+        if not await self._prepare():
+            return None
+        from littrace.access_layer.cdp_core import CDPBrowser
+
+        browser = CDPBrowser(
+            self.config.cdp_downloader.cdp_url,
+            reconnect_attempts=(
+                self.config.cdp_downloader.websocket_reconnect_attempts
+            ),
+            command_timeout_seconds=(
+                self.config.cdp_downloader.command_timeout_seconds
+            ),
+        )
+        self._browsers[paper_id] = browser
+        return browser
+
+    async def close(self) -> None:
+        browsers = list(self._browsers.values())
+        self._browsers.clear()
+        if browsers:
+            await asyncio.gather(
+                *(asyncio.to_thread(browser.close_tab) for browser in browsers),
+                return_exceptions=True,
+            )
+
+
 async def execute_downloads(
     config: LitTraceConfig,
     papers: list[PaperMetadata],
     request: DownloadExecutionRequest,
+    *,
+    cdp_session: CDPDownloadSession | None = None,
 ) -> DownloadExecutionResult:
     selected_ids = set(request.paper_ids)
     target_papers = [
@@ -54,72 +136,9 @@ async def execute_downloads(
     headers = {"User-Agent": config.api.user_agent}
     task_store = download_task_store_from_config(config)
     session_id = request.session_id or "adhoc"
+    owns_cdp_session = cdp_session is None
+    cdp_session = cdp_session or CDPDownloadSession(config)
     async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
-        # Round 28: build ONE shared CDP browser for the whole batch
-        # so gated papers reuse a single Chrome tab instead of
-        # creating 45 phantom ``about:blank`` tabs. The browser is
-        # synchronised with the asyncio semaphore so concurrent
-        # plan items still serialize through one tab — that's
-        # actually what we want for CF / SSO flows which need the
-        # page state to settle between navigations.
-        from littrace.access_layer.cdp_core import CDPBrowser
-        shared_browser: "CDPBrowser | None" = None
-        shared_browser_lock = asyncio.Lock()
-        if not request.dry_run and any(
-            p.access_type == AccessType.REQUIRES_LOGIN
-            for p in target_papers
-        ):
-            try:
-                status = check_cdp_status(config)
-                from littrace.chrome_profiles import (
-                    cdp_uses_configured_profile,
-                    launch_chrome_for_cdp,
-                )
-
-                private_profile = status.available and cdp_uses_configured_profile(config)
-                if (not status.available or not private_profile) and config.cdp_downloader.auto_launch_chrome:
-
-                    launch = await asyncio.to_thread(
-                        launch_chrome_for_cdp,
-                        config,
-                        headless=False,
-                    )
-                    if launch.error and launch.process is not None:
-                        try:
-                            launch.process.terminate()
-                        except Exception:
-                            pass
-                    if launch.cdp_status is not None:
-                        status = launch.cdp_status
-                if not status.available:
-                    raise RuntimeError(
-                        f"CDP browser unavailable at {config.cdp_downloader.cdp_url}"
-                    )
-                if not private_profile and not config.cdp_downloader.auto_launch_chrome:
-                    raise RuntimeError(
-                        "Configured CDP endpoint is not owned by LitTrace's private Chrome profile"
-                    )
-                shared_browser = await asyncio.to_thread(
-                    CDPBrowser,
-                    config.cdp_downloader.cdp_url,
-                    reconnect_attempts=(
-                        config.cdp_downloader.websocket_reconnect_attempts
-                    ),
-                    command_timeout_seconds=(
-                        config.cdp_downloader.command_timeout_seconds
-                    ),
-                )
-                await asyncio.to_thread(shared_browser.connect_new_tab)
-            except Exception:
-                # If the shared browser can't start up, fall back
-                # to the per-paper one — the previous behaviour.
-                if shared_browser is not None:
-                    try:
-                        await asyncio.to_thread(shared_browser.close_tab)
-                    except Exception:
-                        pass
-                shared_browser = None
-
         async def run_plan_item(plan_item):
             paper = next(paper for paper in target_papers if paper.paper_id == plan_item.paper_id)
             task = DownloadTask.from_paper(
@@ -138,8 +157,8 @@ async def execute_downloads(
                 request.dry_run,
                 task,
                 write_local=(request.target != "storage_only"),
-                shared_browser=shared_browser,
-                shared_browser_lock=shared_browser_lock,
+                cdp_session=cdp_session,
+                allow_cdp_fallback=request.allow_cdp_fallback,
             )
             _record_terminal_acquisition_event(config, task)
             if not request.dry_run and config.download_retry.enabled:
@@ -155,13 +174,8 @@ async def execute_downloads(
         try:
             items = list(await asyncio.gather(*(run_bounded(item) for item in plan.items)))
         finally:
-            # Close the target as well as the WebSocket, including cancellation
-            # and exception paths. ``close()`` alone leaves about:blank open.
-            if shared_browser is not None:
-                try:
-                    await asyncio.to_thread(shared_browser.close_tab)
-                except Exception:
-                    pass
+            if owns_cdp_session:
+                await cdp_session.close()
 
     # Keep this field aligned with the download plan: it describes selected
     # papers whose publisher requires authentication, regardless of whether
@@ -194,26 +208,25 @@ async def _execute_one(
     task: DownloadTask,
     *,
     write_local: bool = True,
-    shared_browser: "CDPBrowser | None" = None,
-    shared_browser_lock: asyncio.Lock | None = None,
+    cdp_session: CDPDownloadSession | None = None,
+    allow_cdp_fallback: bool = True,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
     _record_task_lifecycle(config, task, "acquisition_started")
 
     async def run_cdp(prior_error: str | None = None):
-        async def execute():
-            return await _execute_cdp_download_async(
-                config,
-                paper,
-                dry_run,
-                task,
-                prior_error=prior_error,
-                browser=shared_browser,
-            )
-
-        if shared_browser is not None and shared_browser_lock is not None:
-            async with shared_browser_lock:
-                return await execute()
-        return await execute()
+        browser = (
+            await cdp_session.browser_for(paper.paper_id)
+            if cdp_session is not None
+            else None
+        )
+        return await _execute_cdp_download_async(
+            config,
+            paper,
+            dry_run,
+            task,
+            prior_error=prior_error,
+            browser=browser,
+        )
 
     if paper.access_type == AccessType.REQUIRES_LOGIN and paper.doi:
         return await run_cdp()
@@ -227,7 +240,7 @@ async def _execute_one(
     # the browser can surface the login/challenge and extract the PDF after
     # the user completes it, instead of reporting a misleading permanent
     # "no verified PDF URL" failure.
-    if not pdf_url and paper.doi:
+    if not pdf_url and paper.doi and allow_cdp_fallback:
         return await run_cdp("No verified PDF URL; trying authenticated browser")
     if paper.access_type != AccessType.OPEN_ACCESS or not pdf_url:
         error = "Full text PDF is required, but no verified PDF URL is available."
@@ -264,9 +277,10 @@ async def _execute_one(
                         candidate_response.raise_for_status()
                     except httpx.HTTPStatusError as exc:
                         if paper.doi and exc.response.status_code in {401, 403, 418, 429}:
-                            return await run_cdp(
-                                f"{exc.__class__.__name__}: {exc}"
-                            )
+                            if allow_cdp_fallback:
+                                return await run_cdp(
+                                    f"{exc.__class__.__name__}: {exc}"
+                                )
                         continue
                     except httpx.HTTPError:
                         continue
@@ -307,7 +321,7 @@ async def _execute_one(
                         storage_ref=storage_ref,
                     ), task
             error = f"Response does not look like a PDF: {content_type}"
-            if paper.doi and _should_try_cdp_fallback(response):
+            if allow_cdp_fallback and paper.doi and _should_try_cdp_fallback(response):
                 return await run_cdp(error)
             if _looks_like_human_verification_response(response):
                 error = (
@@ -371,7 +385,7 @@ async def _execute_one(
         ), task
     except httpx.HTTPStatusError as exc:
         error = f"{exc.__class__.__name__}: {exc}"
-        if paper.doi and exc.response.status_code in {401, 403, 418, 429}:
+        if allow_cdp_fallback and paper.doi and exc.response.status_code in {401, 403, 418, 429}:
             return await run_cdp(error)
         task.mark(DownloadTaskStatus.FAILED, error=error)
         task.schedule_retry(config.download_retry.base_delay_seconds)
@@ -385,7 +399,7 @@ async def _execute_one(
         ), task
     except httpx.HTTPError as exc:
         error = f"{exc.__class__.__name__}: {exc}"
-        if paper.doi and _should_try_cdp_after_open_access_http_error(paper, exc):
+        if allow_cdp_fallback and _should_try_cdp_after_open_access_http_error(paper, exc):
             return await run_cdp(error)
         task.mark(DownloadTaskStatus.FAILED, error=error)
         task.schedule_retry(config.download_retry.base_delay_seconds)
@@ -407,6 +421,7 @@ def _execute_cdp_download(
     *,
     prior_error: str | None = None,
     browser=None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[DownloadExecutionItem, DownloadTask]:
     target_path = target_pdf_path(config, paper)
     if dry_run:
@@ -422,6 +437,7 @@ def _execute_cdp_download(
     result = download_paper_via_cdp(
         config, paper.doi or paper.paper_id, target_path,
         browser=browser,
+        cancel_event=cancel_event,
     )
     error = result.error or prior_error
     storage_ref: dict[str, object] | None = None
@@ -478,32 +494,67 @@ async def _execute_cdp_download_async(
     the per-paper CDP connection setup cost.
     """
     # The CDP implementation is synchronous and runs in a worker thread.
-    # A thread cancellation alone does not bound the await, so a stalled
-    # publisher page could block the whole topic-search wave indefinitely.
-    # Bound the coroutine; the worker thread may finish later, but the caller
-    # gets a terminal failure and can continue with the next reserve candidate.
+    # Bound the coroutine and signal the blocking waits cooperatively on
+    # timeout so the worker exits before the next reserve candidate starts.
     timeout = max(
-        30.0,
+        15.0,
         float(config.cdp_downloader.command_timeout_seconds)
-        + float(config.cdp_downloader.cloudflare_wait_seconds)
-        + float(config.cdp_downloader.user_action_wait_seconds)
-        + 10.0,
+        + min(
+            float(config.cdp_downloader.cloudflare_wait_seconds)
+            + float(config.cdp_downloader.user_action_wait_seconds),
+            10.0,
+        ),
+    )
+    cancel_event = threading.Event()
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _execute_cdp_download,
+            config,
+            paper,
+            dry_run,
+            task,
+            prior_error=prior_error,
+            browser=browser,
+            cancel_event=cancel_event,
+        )
     )
     try:
         return await asyncio.wait_for(
-            asyncio.to_thread(
-                _execute_cdp_download,
-                config,
-                paper,
-                dry_run,
-                task,
-                prior_error=prior_error,
-                browser=browser,
-            ),
+            asyncio.shield(worker),
             timeout=timeout,
         )
+    except asyncio.CancelledError:
+        # Controller/window shutdown can cancel the topic task while the
+        # synchronous CDP worker is still inside navigation or websocket I/O.
+        # Signal its cooperative waits, close the current target, and give the
+        # worker a short grace period before propagating cancellation.
+        cancel_event.set()
+        if browser is not None:
+            try:
+                await asyncio.to_thread(browser.close)
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(worker, timeout=5.0)
+        except BaseException:
+            worker.cancel()
+        raise
     except asyncio.TimeoutError:
         error = f"CDP download timed out after {timeout:.0f}s"
+        cancel_event.set()
+        if browser is not None:
+            # The synchronous worker may still be blocked inside websocket or
+            # page navigation code after the coroutine timeout. Closing the
+            # shared target forces that worker to fail and lets the next
+            # candidate create a clean target without accumulating tabs.
+            try:
+                await asyncio.to_thread(browser.close)
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(worker, timeout=5.0)
+        except (asyncio.CancelledError, Exception):
+            worker.cancel()
         task.mark(DownloadTaskStatus.FAILED, error=error)
         task.schedule_retry(config.download_retry.base_delay_seconds)
         return DownloadExecutionItem(

@@ -615,6 +615,11 @@ class DownloadExecutionRequest(BaseModel):
     #   paths (daily_update, sentinel) so user machines don't get surprise
     #   PDF files under their working directory.
     target: Literal["local_and_storage", "storage_only"] = "local_and_storage"
+    # Topic acquisition uses two phases: direct PDF URLs first, then a
+    # bounded authenticated-browser phase. Direct phase callers can disable
+    # automatic CDP escalation so a blocked URL is returned to the reserve
+    # scheduler instead of serializing the whole batch behind Chrome.
+    allow_cdp_fallback: bool = True
 
 
 class DownloadExecutionItem(BaseModel):
